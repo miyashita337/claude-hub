@@ -16,6 +16,7 @@ import {
   getRunningSessions,
   getLastSessionByChannel,
 } from "../infra/db";
+import { openTab, markTabStopped } from "./iterm2";
 
 const LOGS_DIR = resolve(homedir(), "claude-hub", "logs", "sessions");
 
@@ -175,6 +176,13 @@ export class SessionManager {
     console.log(
       `[SessionManager] Started ${config.channelName} via tmux (PID: ${pid}, session: ${tmuxName})`
     );
+
+    openTab({
+      tmuxSessionName: tmuxName,
+      channelName: config.channelName,
+      projectDir: config.dir,
+    });
+
     return info;
   }
 
@@ -269,6 +277,13 @@ export class SessionManager {
     console.log(
       `[SessionManager] Resumed ${config.channelName} via tmux (PID: ${pid}, session: ${tmuxName})`
     );
+
+    openTab({
+      tmuxSessionName: tmuxName,
+      channelName: config.channelName,
+      projectDir: config.dir,
+    });
+
     return info;
   }
 
@@ -308,6 +323,7 @@ export class SessionManager {
     });
 
     this.sessions.delete(channelName);
+    markTabStopped(channelName);
     updateSessionStatus(session.id, "stopped", reason);
   }
 
@@ -341,6 +357,7 @@ export class SessionManager {
           `[SessionManager] tmux session ${tmuxName} exited`
         );
         this.sessions.delete(channelName);
+        markTabStopped(channelName);
         updateSessionStatus(sessionId, "stopped", "tmux_exited");
         clearInterval(interval);
       }
