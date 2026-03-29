@@ -63,87 +63,100 @@ function capturePaneContent(tmuxSessionName: string): string {
  */
 function isAtPrompt(content: string): boolean {
   const lines = content.trim().split("\n");
-  // Check last few non-empty lines for the prompt
-  for (let i = lines.length - 1; i >= Math.max(0, lines.length - 5); i--) {
+  // Look for empty prompt "❯" near the end of output
+  // The prompt appears as a standalone "❯" line between separator lines (────)
+  for (let i = lines.length - 1; i >= Math.max(0, lines.length - 8); i--) {
     const line = lines[i]?.trim() ?? "";
-    if (line === "❯" || line.startsWith("❯ ")) {
-      if (line === "❯") return true;
-    }
+    // Empty prompt — Claude Code is ready for input
+    if (line === "❯") return true;
   }
   return false;
 }
 
 /**
  * Extract Claude Code's response from capture-pane output.
- * Looks for content between our input and the next prompt.
+ *
+ * tmux capture-pane output format:
+ * ```
+ * ❯ <user input>
+ *
+ *   Read N file(s) (ctrl+o to expand)     ← optional tool use
+ *
+ * ⏺ <response text>                       ← main response (may span multiple lines)
+ *   <continuation>
+ *
+ * ─────────────────────                    ← separator
+ * ❯                                        ← next prompt (empty = ready)
+ * ─────────────────────                    ← separator
+ *   status bar...                          ← status info
+ * ```
  */
 function extractResponse(
-  beforeContent: string,
+  _beforeContent: string,
   afterContent: string,
   inputMessage: string
 ): string {
-  // Find new content that appeared after sending the message
-  const beforeLines = beforeContent.split("\n");
   const afterLines = afterContent.split("\n");
 
-  // Find where our input appears in the after content
+  // Find where our input appears
   let inputLineIdx = -1;
-  const inputFirstLine = inputMessage.slice(0, 60); // First part of our message
+  const inputFirstWords = inputMessage.slice(0, 50);
   for (let i = 0; i < afterLines.length; i++) {
-    if (afterLines[i]?.includes(inputFirstLine)) {
+    if (afterLines[i]?.includes(inputFirstWords)) {
       inputLineIdx = i;
       break;
     }
   }
 
-  if (inputLineIdx === -1) {
-    // Couldn't find our input, try to extract everything new
-    return extractNewContent(beforeLines, afterLines);
-  }
+  if (inputLineIdx === -1) return "";
 
-  // Extract content between our input and the next prompt
+  // Find the response block: lines starting with ⏺ or indented continuation
   const responseLines: string[] = [];
-  let foundResponse = false;
+  let inResponse = false;
+
   for (let i = inputLineIdx + 1; i < afterLines.length; i++) {
     const line = afterLines[i] ?? "";
     const trimmed = line.trim();
 
-    // Skip the horizontal rule separators
+    // Stop at separator line followed by empty prompt
     if (trimmed.match(/^[─━]{10,}$/)) {
-      if (foundResponse) break; // End of response section
+      if (inResponse) break;
       continue;
     }
 
-    // Stop at the next prompt
+    // Stop at empty prompt
     if (trimmed === "❯") break;
 
-    // Skip empty lines at the start
-    if (!foundResponse && trimmed === "") continue;
+    // Skip status bar lines
+    if (trimmed.includes("⏵⏵") || trimmed.includes("bypass permissions")) continue;
+    if (trimmed.match(/^\S.*\|.*ctx/)) continue;
 
-    // Skip lines that are part of the status bar
-    if (trimmed.includes("bypass permissions") || trimmed.includes("ctx")) continue;
-    if (trimmed.includes("⏵⏵")) continue;
-
-    // Skip the "Read N file" tool usage indicator
+    // Skip tool use indicators
     if (trimmed.match(/^Read \d+ files?/)) continue;
+    if (trimmed.includes("ctrl+o to expand")) continue;
 
-    // Collect response content
-    // Remove the "⏺ " prefix that Claude Code adds
-    const cleaned = line.replace(/^\s*⏺\s?/, "").replace(/^\s*⎿\s*/, "  ");
-    if (cleaned.trim() || foundResponse) {
-      foundResponse = true;
-      responseLines.push(cleaned);
+    // Skip thinking/choreography indicators (✱)
+    if (trimmed.startsWith("✱")) continue;
+
+    // Detect response start (⏺ prefix)
+    if (trimmed.startsWith("⏺")) {
+      inResponse = true;
+      const text = line.replace(/^\s*⏺\s?/, "");
+      responseLines.push(text);
+      continue;
+    }
+
+    // Continuation lines (indented text after ⏺)
+    if (inResponse) {
+      // Tool result lines (⎿ prefix)
+      const cleaned = line.replace(/^\s*⎿\s*/, "  ");
+      if (cleaned.trim() || responseLines.length > 0) {
+        responseLines.push(cleaned);
+      }
     }
   }
 
   return responseLines.join("\n").trim();
-}
-
-function extractNewContent(beforeLines: string[], afterLines: string[]): string {
-  // Simple diff: find lines in after that weren't in before
-  const beforeSet = new Set(beforeLines.map((l) => l.trim()));
-  const newLines = afterLines.filter((l) => !beforeSet.has(l.trim()) && l.trim());
-  return newLines.join("\n").trim();
 }
 
 /**
