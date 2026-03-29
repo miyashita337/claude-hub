@@ -5,12 +5,15 @@ import {
   Routes,
   Events,
   type Interaction,
+  type Message,
+  type ThreadChannel,
 } from "discord.js";
 import { SessionManager } from "./session/manager";
 import { Reaper } from "./session/reaper";
 import { ResourceMonitor } from "./session/resource-monitor";
 import { createSessionCommand, createSessionHandler } from "./commands/session";
 import { CHANNEL_MAP } from "./config/channels";
+import type { AttachmentInfo } from "./session/relay";
 
 export async function startBot(token: string): Promise<void> {
   const client = new Client({
@@ -37,8 +40,6 @@ export async function startBot(token: string): Promise<void> {
     const command = createSessionCommand();
 
     try {
-      // Register commands globally (takes up to 1 hour to propagate)
-      // For immediate testing, use guild-specific registration
       const guilds = readyClient.guilds.cache;
       for (const [guildId, guild] of guilds) {
         await rest.put(
@@ -64,25 +65,82 @@ export async function startBot(token: string): Promise<void> {
       await sessionHandler(interaction);
     } catch (err) {
       console.error("[Bot] Command error:", err);
-      const reply = {
-        content: `❌ エラーが発生しました: ${err instanceof Error ? err.message : String(err)}`,
-        flags: 64 as const,
-      };
+      const content = `❌ エラーが発生しました: ${err instanceof Error ? err.message : String(err)}`;
       if (interaction.deferred || interaction.replied) {
-        await interaction.editReply(reply);
+        await interaction.editReply({ content });
       } else {
-        await interaction.reply(reply);
+        await interaction.reply({ content, flags: 64 });
       }
     }
   });
 
-  // Track activity: update lastActivityAt when messages are sent in registered channels
-  client.on(Events.MessageCreate, (message) => {
+  // Message relay: thread messages → Claude Code → thread reply
+  client.on(Events.MessageCreate, async (message: Message) => {
     if (message.author.bot) return;
-    const channelName =
-      "name" in message.channel ? message.channel.name : "";
-    if (CHANNEL_MAP.has(channelName)) {
-      sessionManager.touchActivity(channelName);
+
+    // Only handle messages in threads
+    if (!message.channel.isThread()) {
+      // Legacy: touch activity for channel-based messages
+      const channelName =
+        "name" in message.channel ? (message.channel.name as string) : "";
+      if (channelName && CHANNEL_MAP.has(channelName)) {
+        // No-op in thread-based mode, but keep for compatibility
+      }
+      return;
+    }
+
+    const threadId = message.channel.id;
+
+    // Check if this thread has an active session
+    if (!sessionManager.has(threadId)) {
+      return; // Not a session thread, ignore
+    }
+
+    const thread = message.channel as ThreadChannel;
+
+    // Collect attachments
+    const attachments: AttachmentInfo[] = [];
+    for (const [, att] of message.attachments) {
+      attachments.push({
+        url: att.url,
+        filename: att.name ?? "attachment",
+        contentType: att.contentType ?? "application/octet-stream",
+      });
+    }
+
+    // Build the message text
+    let messageText = message.content;
+    if (!messageText && attachments.length > 0) {
+      messageText = "添付ファイルを確認してください。";
+    }
+    if (!messageText) return;
+
+    // Show typing indicator
+    try {
+      await thread.sendTyping();
+    } catch {
+      // Ignore typing errors
+    }
+
+    // Relay to Claude Code
+    try {
+      const result = await sessionManager.sendMessage(
+        threadId,
+        messageText,
+        attachments
+      );
+
+      // Send response chunks to the thread
+      for (const chunk of result.chunks) {
+        if (chunk.trim()) {
+          await thread.send(chunk);
+        }
+      }
+    } catch (err) {
+      console.error(`[Bot] Relay error in thread ${threadId}:`, err);
+      await thread.send(
+        `⚠️ Claude Code への中継中にエラーが発生しました: ${err instanceof Error ? err.message : String(err)}`
+      );
     }
   });
 

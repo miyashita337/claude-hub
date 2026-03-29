@@ -1,6 +1,5 @@
 import type { SessionManager } from "./manager";
-import type { TextChannel } from "discord.js";
-import type { Client } from "discord.js";
+import type { ThreadChannel, Client } from "discord.js";
 import {
   IDLE_TIMEOUT_MS,
   IDLE_CHECK_INTERVAL_MS,
@@ -30,31 +29,36 @@ export class Reaper {
 
   private async check(): Promise<void> {
     const now = Date.now();
-    for (const [name, session] of this.sessionManager.entries()) {
+    for (const [threadId, session] of this.sessionManager.entries()) {
       const idleMs = now - session.lastActivityAt.getTime();
       if (idleMs > IDLE_TIMEOUT_MS) {
         console.log(
-          `[Reaper] ${name} idle for ${(idleMs / 1000 / 60 / 60 / 24).toFixed(1)} days, terminating`
+          `[Reaper] Thread ${threadId} (${session.channelName}) idle for ${(idleMs / 1000 / 60 / 60 / 24).toFixed(1)} days, terminating`
         );
-        await this.sessionManager.stop(name, "idle_timeout");
-        await this.notifyChannel(name);
+        await this.sessionManager.stop(threadId, "idle_timeout");
+        await this.notifyThread(threadId);
       }
     }
   }
 
-  private async notifyChannel(channelName: string): Promise<void> {
+  private async notifyThread(threadId: string): Promise<void> {
     try {
-      const channel = this.client.channels.cache.find(
-        (ch) => ch.isTextBased() && "name" in ch && ch.name === channelName
-      ) as TextChannel | undefined;
+      const thread = this.client.channels.cache.get(threadId) as
+        | ThreadChannel
+        | undefined;
 
-      if (channel) {
-        await channel.send(
-          `⏰ 7日間無操作のためセッションを自動終了しました。\n再開するには \`/session resume\` を使用してください。`
+      if (thread?.isThread()) {
+        await thread.send(
+          `⏰ 7日間無操作のためセッションを自動終了しました。`
         );
+
+        // Rename and archive
+        const stoppedName = thread.name.replace("🟢", "🔴");
+        await thread.setName(stoppedName);
+        await thread.setArchived(true);
       }
     } catch (err) {
-      console.error(`[Reaper] Failed to notify channel ${channelName}:`, err);
+      console.error(`[Reaper] Failed to notify thread ${threadId}:`, err);
     }
   }
 }
