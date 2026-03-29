@@ -41,9 +41,10 @@ function hlsToRgb(h: number, l: number, s: number): [number, number, number] {
   };
   const q = l < 0.5 ? l * (1 + s) : l + s - l * s;
   const p = 2 * l - q;
-  const r = Math.round(hueToRgb(p, q, h + 1 / 3) * 255);
-  const g = Math.round(hueToRgb(p, q, h) * 255);
-  const b = Math.round(hueToRgb(p, q, h - 1 / 3) * 255);
+  // Use Math.floor to match Python's int() truncation behavior
+  const r = Math.floor(hueToRgb(p, q, h + 1 / 3) * 255);
+  const g = Math.floor(hueToRgb(p, q, h) * 255);
+  const b = Math.floor(hueToRgb(p, q, h - 1 / 3) * 255);
   return [r, g, b];
 }
 
@@ -71,11 +72,11 @@ export function resolveColor(projectName: string): string {
 
 export function isItermRunning(): boolean {
   try {
-    const result = execSync(
-      `osascript -e 'tell app "System Events" to (name of processes) contains "iTerm2"'`,
-      { encoding: "utf8", timeout: 3000 }
-    ).trim();
-    return result === "true";
+    const result = execSync("pgrep -x iTerm2", {
+      encoding: "utf8",
+      timeout: 3000,
+    }).trim();
+    return result.length > 0;
   } catch {
     return false;
   }
