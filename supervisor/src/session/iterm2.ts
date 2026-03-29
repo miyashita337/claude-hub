@@ -68,3 +68,26 @@ export function resolveColor(projectName: string): string {
   const [r, g, b] = hlsToRgb(hue, brightness, saturation);
   return `#${r.toString(16).padStart(2, "0")}${g.toString(16).padStart(2, "0")}${b.toString(16).padStart(2, "0")}`;
 }
+
+export function isItermRunning(): boolean {
+  try {
+    const result = execSync(
+      `osascript -e 'tell app "System Events" to (name of processes) contains "iTerm2"'`,
+      { encoding: "utf8", timeout: 3000 }
+    ).trim();
+    return result === "true";
+  } catch {
+    return false;
+  }
+}
+
+export function dimColor(hexColor: string): string {
+  const hex = hexColor.replace("#", "");
+  const r = parseInt(hex.slice(0, 2), 16);
+  const g = parseInt(hex.slice(2, 4), 16);
+  const b = parseInt(hex.slice(4, 6), 16);
+  const dr = Math.round(r * 0.5);
+  const dg = Math.round(g * 0.5);
+  const db = Math.round(b * 0.5);
+  return `#${dr.toString(16).padStart(2, "0")}${dg.toString(16).padStart(2, "0")}${db.toString(16).padStart(2, "0")}`;
+}
