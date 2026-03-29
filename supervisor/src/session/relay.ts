@@ -63,10 +63,17 @@ function capturePaneContent(tmuxSessionName: string): string {
  */
 function isAtPrompt(content: string): boolean {
   const lines = content.trim().split("\n");
-  // Look for empty prompt "❯" near the end of output
-  // The prompt appears as a standalone "❯" line between separator lines (────)
+  // Check if Claude Code is at an empty prompt (ready for input)
+  // The prompt "❯" must appear near the end, between separator lines (────)
+  // and there must NOT be any thinking/processing indicators after the last ⏺ response
   for (let i = lines.length - 1; i >= Math.max(0, lines.length - 8); i--) {
     const line = lines[i]?.trim() ?? "";
+    // Thinking/processing indicators mean Claude Code is still working
+    if (line.startsWith("✱") || line.startsWith("✶") || line.startsWith("✻") ||
+        line.startsWith("✢") || line.startsWith("✳") || line.startsWith("+") ||
+        line.includes("Running…") || line.includes("thinking")) {
+      return false;
+    }
     // Empty prompt — Claude Code is ready for input
     if (line === "❯") return true;
   }
@@ -242,7 +249,7 @@ export async function relayMessage(
       if (currentContent !== beforeContent) {
         responseStarted = true;
       } else if (elapsed > RESPONSE_START_TIMEOUT_MS) {
-        cleanupFiles(localFiles);
+        scheduleCleanup(localFiles, 5 * 60_000);
         return {
           text: "",
           chunks: ["⚠️ Claude Code からの応答がタイムアウトしました（開始待ち）。"],
@@ -255,7 +262,9 @@ export async function relayMessage(
     // Response has started — wait for it to complete (back at prompt)
     if (isAtPrompt(currentContent)) {
       const responseText = extractResponse(beforeContent, currentContent, message);
-      cleanupFiles(localFiles);
+      // Don't clean up files immediately — Claude Code may still be reading them
+      // Schedule cleanup after 5 minutes
+      scheduleCleanup(localFiles, 5 * 60_000);
 
       if (!responseText) {
         return {
@@ -273,7 +282,7 @@ export async function relayMessage(
     if (elapsed > RESPONSE_COMPLETE_TIMEOUT_MS) {
       // Try to extract partial response
       const partialText = extractResponse(beforeContent, currentContent, message);
-      cleanupFiles(localFiles);
+      scheduleCleanup(localFiles, 5 * 60_000);
       return {
         text: partialText,
         chunks: formatForDiscord(
@@ -287,12 +296,20 @@ export async function relayMessage(
   }
 }
 
-function cleanupFiles(files: string[]): void {
-  for (const filePath of files) {
-    try {
-      unlinkSync(filePath);
-    } catch {
-      // Ignore cleanup errors
+/**
+ * Schedule file cleanup after a delay.
+ * Claude Code needs time to Read the files via its tool,
+ * so we can't delete them immediately after the response.
+ */
+function scheduleCleanup(files: string[], delayMs: number): void {
+  if (files.length === 0) return;
+  setTimeout(() => {
+    for (const filePath of files) {
+      try {
+        unlinkSync(filePath);
+      } catch {
+        // Ignore cleanup errors
+      }
     }
-  }
+  }, delayMs);
 }
