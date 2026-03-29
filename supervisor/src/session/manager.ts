@@ -19,7 +19,7 @@ import { openTab, markTabStopped } from "./iterm2";
 import { relayMessage, type AttachmentInfo, type RelayResult } from "./relay";
 
 const CLAUDE_PATH = resolve(homedir(), ".local", "bin", "claude");
-const TMUX_PATH = "/opt/homebrew/bin/tmux";
+const TMUX_PATH = process.env.TMUX_PATH ?? "/opt/homebrew/bin/tmux";
 const TMUX_SESSION_PREFIX = "claude-";
 
 export class SessionManager {

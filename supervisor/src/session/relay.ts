@@ -4,7 +4,7 @@ import { homedir } from "os";
 import { mkdirSync, writeFileSync, unlinkSync } from "fs";
 import { formatForDiscord } from "./output-formatter";
 
-const TMUX_PATH = "/opt/homebrew/bin/tmux";
+const TMUX_PATH = process.env.TMUX_PATH ?? "/opt/homebrew/bin/tmux";
 const ATTACHMENT_DIR = resolve(homedir(), "claude-hub", "tmp", "attachments");
 
 /** How long to wait for Claude Code to start responding (ms) */
@@ -61,7 +61,7 @@ function capturePaneContent(tmuxSessionName: string): string {
  * Check if Claude Code is at the prompt (ready for input).
  * Detects the "❯" prompt character at the start of a line.
  */
-function isAtPrompt(content: string): boolean {
+export function isAtPrompt(content: string): boolean {
   const lines = content.trim().split("\n");
   // Check if Claude Code is at an empty prompt (ready for input)
   // The prompt "❯" must appear near the end, between separator lines (────)
@@ -98,7 +98,7 @@ function isAtPrompt(content: string): boolean {
  *   status bar...                          ← status info
  * ```
  */
-function extractResponse(
+export function extractResponse(
   _beforeContent: string,
   afterContent: string,
   inputMessage: string

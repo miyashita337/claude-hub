@@ -2,7 +2,7 @@ import { Database } from "bun:sqlite";
 import { resolve } from "path";
 import { homedir } from "os";
 
-const DB_PATH = resolve(homedir(), "claude-hub", "supervisor", "sessions.db");
+const DB_PATH = process.env.SUPERVISOR_DB_PATH ?? resolve(homedir(), "claude-hub", "supervisor", "sessions.db");
 
 let db: Database;
 

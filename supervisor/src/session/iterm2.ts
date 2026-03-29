@@ -99,7 +99,7 @@ export interface OpenTabOptions {
   projectDir: string;
 }
 
-const TMUX_PATH = "/opt/homebrew/bin/tmux";
+const TMUX_PATH = process.env.TMUX_PATH ?? "/opt/homebrew/bin/tmux";
 
 export function openTab(opts: OpenTabOptions): void {
   if (!isItermRunning()) {
