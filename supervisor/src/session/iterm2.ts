@@ -91,3 +91,86 @@ export function dimColor(hexColor: string): string {
   const db = Math.round(b * 0.5);
   return `#${dr.toString(16).padStart(2, "0")}${dg.toString(16).padStart(2, "0")}${db.toString(16).padStart(2, "0")}`;
 }
+
+export interface OpenTabOptions {
+  tmuxSessionName: string;
+  channelName: string;
+  projectDir: string;
+}
+
+export function openTab(opts: OpenTabOptions): void {
+  if (!isItermRunning()) {
+    console.log(
+      `[iTerm2] iTerm2 is not running, skipping tab creation for ${opts.channelName}`
+    );
+    return;
+  }
+
+  const color = resolveColor(basename(opts.projectDir));
+  const hex = color.replace("#", "");
+  const r = parseInt(hex.slice(0, 2), 16) * 257;
+  const g = parseInt(hex.slice(2, 4), 16) * 257;
+  const b = parseInt(hex.slice(4, 6), 16) * 257;
+
+  const script = [
+    'tell application "iTerm2"',
+    "  tell current window",
+    "    create tab with default profile",
+    "    tell current session",
+    `      write text "tmux attach -t ${opts.tmuxSessionName}"`,
+    `      set name to "${opts.channelName} (running)"`,
+    `      set background color to {${r}, ${g}, ${b}}`,
+    "    end tell",
+    "  end tell",
+    "end tell",
+  ].join("\n");
+
+  try {
+    execSync(`osascript -e '${script.replace(/'/g, "'\\''")}'`, {
+      timeout: 5000,
+    });
+    console.log(`[iTerm2] Opened tab for ${opts.channelName}`);
+  } catch (err) {
+    console.error(
+      `[iTerm2] Failed to open tab for ${opts.channelName}:`,
+      err
+    );
+  }
+}
+
+export function markTabStopped(channelName: string): void {
+  if (!isItermRunning()) {
+    return;
+  }
+
+  const tabName = `${channelName} (running)`;
+  const newName = `${channelName} (stopped)`;
+
+  const script = [
+    'tell application "iTerm2"',
+    "  repeat with w in windows",
+    "    repeat with t in tabs of w",
+    "      try",
+    `        if name of current session of t is "${tabName}" then`,
+    "          tell current session of t",
+    `            set name to "${newName}"`,
+    "          end tell",
+    "        end if",
+    "      end try",
+    "    end repeat",
+    "  end repeat",
+    "end tell",
+  ].join("\n");
+
+  try {
+    execSync(`osascript -e '${script.replace(/'/g, "'\\''")}'`, {
+      timeout: 5000,
+    });
+    console.log(`[iTerm2] Marked tab stopped for ${channelName}`);
+  } catch (err) {
+    console.error(
+      `[iTerm2] Failed to mark tab stopped for ${channelName}:`,
+      err
+    );
+  }
+}
