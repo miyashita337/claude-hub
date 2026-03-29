@@ -99,12 +99,44 @@ export interface OpenTabOptions {
   projectDir: string;
 }
 
+const TMUX_PATH = "/opt/homebrew/bin/tmux";
+
 export function openTab(opts: OpenTabOptions): void {
   if (!isItermRunning()) {
     console.log(
       `[iTerm2] iTerm2 is not running, skipping tab creation for ${opts.channelName}`
     );
     return;
+  }
+
+  // Set tmux window name so it persists after attach
+  const tabTitle = `${opts.channelName} (running)`;
+  try {
+    execSync(
+      `${TMUX_PATH} rename-window -t "${opts.tmuxSessionName}" "${tabTitle}"`,
+      { timeout: 3000 }
+    );
+    // Disable automatic-rename so tmux doesn't overwrite our title
+    execSync(
+      `${TMUX_PATH} set-option -t "${opts.tmuxSessionName}" automatic-rename off`,
+      { timeout: 3000 }
+    );
+    // Enable set-titles so tmux pushes the window name to iTerm2's tab title
+    execSync(
+      `${TMUX_PATH} set-option -t "${opts.tmuxSessionName}" set-titles on`,
+      { timeout: 3000 }
+    );
+    execSync(
+      `${TMUX_PATH} set-option -t "${opts.tmuxSessionName}" set-titles-string "#{window_name}"`,
+      { timeout: 3000 }
+    );
+    // Set pane title as well
+    execSync(
+      `${TMUX_PATH} select-pane -t "${opts.tmuxSessionName}" -T "${tabTitle}"`,
+      { timeout: 3000 }
+    );
+  } catch {
+    // tmux session may have already exited
   }
 
   const color = resolveColor(basename(opts.projectDir));
@@ -118,8 +150,8 @@ export function openTab(opts: OpenTabOptions): void {
     "  tell current window",
     "    create tab with default profile",
     "    tell current session",
-    `      write text "tmux attach -t ${opts.tmuxSessionName}"`,
-    `      set name to "${opts.channelName} (running)"`,
+    `      write text "${TMUX_PATH} attach -t ${opts.tmuxSessionName}"`,
+    `      set name to "${tabTitle}"`,
     `      set background color to {${r}, ${g}, ${b}}`,
     "    end tell",
     "  end tell",
@@ -140,13 +172,25 @@ export function openTab(opts: OpenTabOptions): void {
 }
 
 export function markTabStopped(channelName: string): void {
+  const tabName = `${channelName} (running)`;
+  const newName = `${channelName} (stopped)`;
+  const tmuxName = `claude-${channelName}`;
+
+  // Update tmux window name if session still exists
+  try {
+    execSync(
+      `${TMUX_PATH} rename-window -t "${tmuxName}" "${newName}" 2>/dev/null`,
+      { timeout: 3000 }
+    );
+  } catch {
+    // tmux session already dead, that's fine
+  }
+
   if (!isItermRunning()) {
     return;
   }
 
-  const tabName = `${channelName} (running)`;
-  const newName = `${channelName} (stopped)`;
-
+  // Also update iTerm2 tab name via AppleScript
   const script = [
     'tell application "iTerm2"',
     "  repeat with w in windows",

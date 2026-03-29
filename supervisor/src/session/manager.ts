@@ -177,11 +177,14 @@ export class SessionManager {
       `[SessionManager] Started ${config.channelName} via tmux (PID: ${pid}, session: ${tmuxName})`
     );
 
-    openTab({
-      tmuxSessionName: tmuxName,
-      channelName: config.channelName,
-      projectDir: config.dir,
-    });
+    // Open iTerm2 tab asynchronously (non-blocking, failure is safe)
+    setTimeout(() => {
+      openTab({
+        tmuxSessionName: tmuxName,
+        channelName: config.channelName,
+        projectDir: config.dir,
+      });
+    }, 0);
 
     return info;
   }
@@ -278,11 +281,13 @@ export class SessionManager {
       `[SessionManager] Resumed ${config.channelName} via tmux (PID: ${pid}, session: ${tmuxName})`
     );
 
-    openTab({
-      tmuxSessionName: tmuxName,
-      channelName: config.channelName,
-      projectDir: config.dir,
-    });
+    setTimeout(() => {
+      openTab({
+        tmuxSessionName: tmuxName,
+        channelName: config.channelName,
+        projectDir: config.dir,
+      });
+    }, 0);
 
     return info;
   }
