@@ -59,9 +59,10 @@ describe("SessionManager (thread-based)", () => {
     manager.start(config, "thread-to-stop");
 
     expect(manager.has("thread-to-stop")).toBe(true);
+    // stop() waits GRACEFUL_KILL_TIMEOUT_MS (15s), so increase test timeout
     await manager.stop("thread-to-stop", "manual");
     expect(manager.has("thread-to-stop")).toBe(false);
-  });
+  }, 20_000);
 
   test("stop() throws for nonexistent thread", async () => {
     await expect(
@@ -103,11 +104,7 @@ describe("SessionManager (thread-based)", () => {
     );
   });
 
-  test("hasChannel returns true when channel has running sessions", () => {
-    const config = CHANNEL_MAP.get("oci-develop")!;
-    expect(manager.hasChannel("oci-develop")).toBe(false);
-
-    manager.start(config, "thread-ch");
-    expect(manager.hasChannel("oci-develop")).toBe(true);
+  test("listRunningByChannel returns empty when no sessions for channel", () => {
+    expect(manager.listRunningByChannel("oci-develop")).toHaveLength(0);
   });
 });

@@ -1,21 +1,18 @@
-import { spawn } from "child_process";
+import { execSync } from "child_process";
 import { resolve } from "path";
 import { homedir } from "os";
-import { existsSync, mkdirSync, writeFileSync, unlinkSync } from "fs";
-import { formatForDiscord, parseStreamJsonOutput } from "./output-formatter";
-import { updateSessionClaudeId } from "../infra/db";
+import { mkdirSync, writeFileSync, unlinkSync } from "fs";
+import { formatForDiscord } from "./output-formatter";
 
-const CLAUDE_PATH = resolve(homedir(), ".local", "bin", "claude");
+const TMUX_PATH = "/opt/homebrew/bin/tmux";
 const ATTACHMENT_DIR = resolve(homedir(), "claude-hub", "tmp", "attachments");
-const RELAY_TIMEOUT_MS = 5 * 60 * 1000; // 5 minutes max per message
 
-export interface RelayOptions {
-  sessionId: string;
-  projectDir: string;
-  claudeSessionId?: string;
-  message: string;
-  attachments?: AttachmentInfo[];
-}
+/** How long to wait for Claude Code to start responding (ms) */
+const RESPONSE_START_TIMEOUT_MS = 60_000; // 1 minute
+/** How long to wait for Claude Code to finish responding after it starts (ms) */
+const RESPONSE_COMPLETE_TIMEOUT_MS = 5 * 60_000; // 5 minutes
+/** Polling interval for capture-pane (ms) */
+const POLL_INTERVAL_MS = 2_000;
 
 export interface AttachmentInfo {
   url: string;
@@ -26,13 +23,11 @@ export interface AttachmentInfo {
 export interface RelayResult {
   text: string;
   chunks: string[];
-  claudeSessionId?: string;
   error?: string;
 }
 
 /**
  * Download a Discord attachment to a local temp file.
- * Returns the local file path.
  */
 async function downloadAttachment(attachment: AttachmentInfo): Promise<string> {
   mkdirSync(ATTACHMENT_DIR, { recursive: true });
@@ -49,13 +44,120 @@ async function downloadAttachment(attachment: AttachmentInfo): Promise<string> {
 }
 
 /**
- * Run claude -p with the given message and return the result.
+ * Capture the current tmux pane content.
  */
-export async function relayMessage(options: RelayOptions): Promise<RelayResult> {
-  const { sessionId, projectDir, claudeSessionId, message, attachments } = options;
+function capturePaneContent(tmuxSessionName: string): string {
+  try {
+    return execSync(
+      `${TMUX_PATH} capture-pane -t "${tmuxSessionName}" -p -S -200`,
+      { encoding: "utf8", timeout: 5000 }
+    );
+  } catch {
+    return "";
+  }
+}
 
-  // Download attachments to local files
+/**
+ * Check if Claude Code is at the prompt (ready for input).
+ * Detects the "❯" prompt character at the start of a line.
+ */
+function isAtPrompt(content: string): boolean {
+  const lines = content.trim().split("\n");
+  // Check last few non-empty lines for the prompt
+  for (let i = lines.length - 1; i >= Math.max(0, lines.length - 5); i--) {
+    const line = lines[i]?.trim() ?? "";
+    if (line === "❯" || line.startsWith("❯ ")) {
+      if (line === "❯") return true;
+    }
+  }
+  return false;
+}
+
+/**
+ * Extract Claude Code's response from capture-pane output.
+ * Looks for content between our input and the next prompt.
+ */
+function extractResponse(
+  beforeContent: string,
+  afterContent: string,
+  inputMessage: string
+): string {
+  // Find new content that appeared after sending the message
+  const beforeLines = beforeContent.split("\n");
+  const afterLines = afterContent.split("\n");
+
+  // Find where our input appears in the after content
+  let inputLineIdx = -1;
+  const inputFirstLine = inputMessage.slice(0, 60); // First part of our message
+  for (let i = 0; i < afterLines.length; i++) {
+    if (afterLines[i]?.includes(inputFirstLine)) {
+      inputLineIdx = i;
+      break;
+    }
+  }
+
+  if (inputLineIdx === -1) {
+    // Couldn't find our input, try to extract everything new
+    return extractNewContent(beforeLines, afterLines);
+  }
+
+  // Extract content between our input and the next prompt
+  const responseLines: string[] = [];
+  let foundResponse = false;
+  for (let i = inputLineIdx + 1; i < afterLines.length; i++) {
+    const line = afterLines[i] ?? "";
+    const trimmed = line.trim();
+
+    // Skip the horizontal rule separators
+    if (trimmed.match(/^[─━]{10,}$/)) {
+      if (foundResponse) break; // End of response section
+      continue;
+    }
+
+    // Stop at the next prompt
+    if (trimmed === "❯") break;
+
+    // Skip empty lines at the start
+    if (!foundResponse && trimmed === "") continue;
+
+    // Skip lines that are part of the status bar
+    if (trimmed.includes("bypass permissions") || trimmed.includes("ctx")) continue;
+    if (trimmed.includes("⏵⏵")) continue;
+
+    // Skip the "Read N file" tool usage indicator
+    if (trimmed.match(/^Read \d+ files?/)) continue;
+
+    // Collect response content
+    // Remove the "⏺ " prefix that Claude Code adds
+    const cleaned = line.replace(/^\s*⏺\s?/, "").replace(/^\s*⎿\s*/, "  ");
+    if (cleaned.trim() || foundResponse) {
+      foundResponse = true;
+      responseLines.push(cleaned);
+    }
+  }
+
+  return responseLines.join("\n").trim();
+}
+
+function extractNewContent(beforeLines: string[], afterLines: string[]): string {
+  // Simple diff: find lines in after that weren't in before
+  const beforeSet = new Set(beforeLines.map((l) => l.trim()));
+  const newLines = afterLines.filter((l) => !beforeSet.has(l.trim()) && l.trim());
+  return newLines.join("\n").trim();
+}
+
+/**
+ * Send a message to Claude Code via tmux send-keys and capture the response.
+ */
+export async function relayMessage(
+  tmuxSessionName: string,
+  message: string,
+  attachments?: AttachmentInfo[]
+): Promise<RelayResult> {
+  // Download attachments and build the message
   const localFiles: string[] = [];
+  let fullMessage = message;
+
   if (attachments?.length) {
     for (const att of attachments) {
       try {
@@ -65,126 +167,119 @@ export async function relayMessage(options: RelayOptions): Promise<RelayResult> 
         console.error(`[Relay] Failed to download attachment ${att.filename}:`, err);
       }
     }
+
+    if (localFiles.length > 0) {
+      const imageInstructions = localFiles
+        .map((f) => `Read the image at ${f}`)
+        .join(", and ");
+      fullMessage = `${imageInstructions}. ${message}`;
+    }
   }
 
-  // Build claude -p arguments
-  const args: string[] = [
-    "-p",
-    message,
-    "--output-format", "json",
-    "--dangerously-skip-permissions",
-  ];
+  // Capture the pane content BEFORE sending
+  const beforeContent = capturePaneContent(tmuxSessionName);
 
-  // Add --resume if we have a previous session ID
-  if (claudeSessionId) {
-    args.push("--resume", claudeSessionId);
+  // Check if Claude Code is at prompt
+  if (!isAtPrompt(beforeContent)) {
+    // Claude Code might be busy. Wait a bit and check again.
+    await new Promise((r) => setTimeout(r, 3000));
+    const retryContent = capturePaneContent(tmuxSessionName);
+    if (!isAtPrompt(retryContent)) {
+      return {
+        text: "",
+        chunks: ["⚠️ Claude Code は現在処理中です。しばらく待ってから再度お試しください。"],
+        error: "Claude Code is busy",
+      };
+    }
   }
 
-  // Add file arguments for attachments
-  for (const filePath of localFiles) {
-    args.push("--file", filePath);
+  // Send the message via tmux send-keys
+  // Escape special characters for tmux
+  const escaped = fullMessage
+    .replace(/\\/g, "\\\\")
+    .replace(/"/g, '\\"')
+    .replace(/\$/g, "\\$")
+    .replace(/`/g, "\\`");
+
+  try {
+    execSync(
+      `${TMUX_PATH} send-keys -t "${tmuxSessionName}" "${escaped}" Enter`,
+      { timeout: 5000 }
+    );
+  } catch (err) {
+    return {
+      text: "",
+      chunks: [`⚠️ Claude Code へのメッセージ送信に失敗: ${err}`],
+      error: String(err),
+    };
   }
 
-  return new Promise<RelayResult>((resolvePromise) => {
-    const proc = spawn(CLAUDE_PATH, args, {
-      cwd: projectDir,
-      env: {
-        ...process.env,
-        PATH: `${resolve(homedir(), ".local/bin")}:${resolve(homedir(), ".bun/bin")}:/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin`,
-      },
-      stdio: ["pipe", "pipe", "pipe"],
-    });
+  // Poll for response
+  let responseStarted = false;
+  const startTime = Date.now();
 
-    let stdout = "";
-    let stderr = "";
+  while (true) {
+    await new Promise((r) => setTimeout(r, POLL_INTERVAL_MS));
 
-    proc.stdout.on("data", (data: Buffer) => {
-      stdout += data.toString();
-    });
+    const currentContent = capturePaneContent(tmuxSessionName);
+    const elapsed = Date.now() - startTime;
 
-    proc.stderr.on("data", (data: Buffer) => {
-      stderr += data.toString();
-    });
-
-    // Timeout watchdog
-    const timeout = setTimeout(() => {
-      console.error(`[Relay] Timeout after ${RELAY_TIMEOUT_MS / 1000}s, killing process`);
-      proc.kill("SIGKILL");
-    }, RELAY_TIMEOUT_MS);
-
-    proc.on("close", (code) => {
-      clearTimeout(timeout);
-
-      // Clean up downloaded attachments
-      for (const filePath of localFiles) {
-        try {
-          unlinkSync(filePath);
-        } catch {
-          // Ignore cleanup errors
-        }
-      }
-
-      if (code !== 0 && !stdout) {
-        const errorMsg = stderr || `claude -p exited with code ${code}`;
-        console.error(`[Relay] Error: ${errorMsg}`);
-        resolvePromise({
+    // Check if response has started (content changed from before)
+    if (!responseStarted) {
+      if (currentContent !== beforeContent) {
+        responseStarted = true;
+      } else if (elapsed > RESPONSE_START_TIMEOUT_MS) {
+        cleanupFiles(localFiles);
+        return {
           text: "",
-          chunks: [`⚠️ Claude Code エラー:\n\`\`\`\n${errorMsg.slice(0, 1500)}\n\`\`\``],
-          error: errorMsg,
-        });
-        return;
+          chunks: ["⚠️ Claude Code からの応答がタイムアウトしました（開始待ち）。"],
+          error: "Response start timeout",
+        };
       }
+      continue;
+    }
 
-      // Parse the JSON output
-      let resultText = "";
-      let newClaudeSessionId: string | undefined;
+    // Response has started — wait for it to complete (back at prompt)
+    if (isAtPrompt(currentContent)) {
+      const responseText = extractResponse(beforeContent, currentContent, message);
+      cleanupFiles(localFiles);
 
-      try {
-        const parsed = JSON.parse(stdout);
-        resultText = parsed.result || "";
-        newClaudeSessionId = parsed.session_id;
-      } catch {
-        // Fallback: try stream-json parsing
-        resultText = parseStreamJsonOutput(stdout);
-      }
-
-      // Save claude_session_id for future --resume
-      if (newClaudeSessionId) {
-        try {
-          updateSessionClaudeId(sessionId, newClaudeSessionId);
-        } catch (err) {
-          console.error("[Relay] Failed to save claude session ID:", err);
-        }
-      }
-
-      if (!resultText) {
-        resolvePromise({
+      if (!responseText) {
+        return {
           text: "",
           chunks: ["（応答なし）"],
-          claudeSessionId: newClaudeSessionId,
-        });
-        return;
+        };
       }
 
-      const chunks = formatForDiscord(resultText);
-      resolvePromise({
-        text: resultText,
-        chunks,
-        claudeSessionId: newClaudeSessionId,
-      });
-    });
+      return {
+        text: responseText,
+        chunks: formatForDiscord(responseText),
+      };
+    }
 
-    proc.on("error", (err) => {
-      clearTimeout(timeout);
-      console.error("[Relay] Process error:", err);
-      resolvePromise({
-        text: "",
-        chunks: [`⚠️ Claude Code 起動エラー: ${err.message}`],
-        error: err.message,
-      });
-    });
+    if (elapsed > RESPONSE_COMPLETE_TIMEOUT_MS) {
+      // Try to extract partial response
+      const partialText = extractResponse(beforeContent, currentContent, message);
+      cleanupFiles(localFiles);
+      return {
+        text: partialText,
+        chunks: formatForDiscord(
+          partialText
+            ? `${partialText}\n\n⚠️ （応答がタイムアウトしました。上記は途中までの結果です）`
+            : "⚠️ Claude Code からの応答がタイムアウトしました。"
+        ),
+        error: "Response complete timeout",
+      };
+    }
+  }
+}
 
-    // Close stdin immediately (we pass message via args)
-    proc.stdin.end();
-  });
+function cleanupFiles(files: string[]): void {
+  for (const filePath of files) {
+    try {
+      unlinkSync(filePath);
+    } catch {
+      // Ignore cleanup errors
+    }
+  }
 }

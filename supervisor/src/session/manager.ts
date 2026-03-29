@@ -1,3 +1,4 @@
+import { execSync } from "child_process";
 import { randomUUID } from "crypto";
 import { existsSync, mkdirSync } from "fs";
 import { resolve } from "path";
@@ -6,16 +7,20 @@ import type { SessionInfo, StopReason } from "./types";
 import type { ChannelConfig } from "../config/channels";
 import {
   MAX_SESSIONS,
+  GRACEFUL_KILL_TIMEOUT_MS,
 } from "../config/channels";
 import {
   insertSession,
   updateSessionStatus,
   updateSessionActivity,
   getRunningSessions,
-  getLastSessionByThread,
-  getRunningSessionsByChannel,
 } from "../infra/db";
+import { openTab, markTabStopped } from "./iterm2";
 import { relayMessage, type AttachmentInfo, type RelayResult } from "./relay";
+
+const CLAUDE_PATH = resolve(homedir(), ".local", "bin", "claude");
+const TMUX_PATH = "/opt/homebrew/bin/tmux";
+const TMUX_SESSION_PREFIX = "claude-";
 
 export class SessionManager {
   /** Map<threadId, SessionInfo> — one session per thread */
@@ -31,15 +36,6 @@ export class SessionManager {
 
   has(threadId: string): boolean {
     return this.sessions.has(threadId);
-  }
-
-  hasChannel(channelName: string): boolean {
-    for (const session of this.sessions.values()) {
-      if (session.channelName === channelName && session.status === "running") {
-        return true;
-      }
-    }
-    return false;
   }
 
   get(threadId: string): SessionInfo | undefined {
@@ -60,8 +56,35 @@ export class SessionManager {
     );
   }
 
+  private tmuxSessionName(threadId: string): string {
+    // Use a short prefix + first 8 chars of threadId for tmux session name
+    return `${TMUX_SESSION_PREFIX}${threadId.slice(0, 12)}`;
+  }
+
+  private getTmuxPid(sessionName: string): number | null {
+    try {
+      const output = execSync(
+        `${TMUX_PATH} list-panes -t "${sessionName}" -F "#{pane_pid}" 2>/dev/null`,
+        { encoding: "utf8" }
+      ).trim();
+      const pid = parseInt(output.split("\n")[0] ?? "", 10);
+      return isNaN(pid) ? null : pid;
+    } catch {
+      return null;
+    }
+  }
+
+  private isTmuxSessionAlive(sessionName: string): boolean {
+    try {
+      execSync(`${TMUX_PATH} has-session -t "${sessionName}" 2>/dev/null`);
+      return true;
+    } catch {
+      return false;
+    }
+  }
+
   /**
-   * Start a new session. Returns SessionInfo (threadId must be set by caller after thread creation).
+   * Start a new session with tmux + iTerm2 + thread.
    */
   start(config: ChannelConfig, threadId: string): SessionInfo {
     if (this.sessions.size >= MAX_SESSIONS) {
@@ -79,15 +102,50 @@ export class SessionManager {
     }
 
     const sessionId = randomUUID();
-    const now = new Date();
+    const tmuxName = this.tmuxSessionName(threadId);
 
+    // Kill existing tmux session if any
+    try {
+      execSync(`${TMUX_PATH} kill-session -t "${tmuxName}" 2>/dev/null`);
+    } catch {
+      // No existing session
+    }
+
+    // Build the claude command — unset ANTHROPIC_API_KEY to use Claude Max subscription
+    const claudeCmd = [
+      "unset ANTHROPIC_API_KEY",
+      `export PATH="${resolve(homedir(), ".local/bin")}:${resolve(homedir(), ".bun/bin")}:/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin"`,
+      `cd "${config.dir}"`,
+      `exec ${CLAUDE_PATH} --dangerously-skip-permissions --name "${config.channelName}"`,
+    ].join(" && ");
+
+    // Launch via tmux (provides a real TTY)
+    execSync(
+      `${TMUX_PATH} new-session -d -s "${tmuxName}" '${claudeCmd}'`
+    );
+
+    // Wait briefly for process to start
+    let pid: number | null = null;
+    for (let i = 0; i < 5; i++) {
+      pid = this.getTmuxPid(tmuxName);
+      if (pid) break;
+      execSync("sleep 0.5");
+    }
+
+    if (!pid) {
+      throw new Error(
+        "Claude Code の起動に失敗しました（tmuxセッションのPID取得失敗）"
+      );
+    }
+
+    const now = new Date();
     const info: SessionInfo = {
       id: sessionId,
       channelName: config.channelName,
       threadId,
       projectDir: config.dir,
-      pid: 0, // No persistent process in -p mode
-      process: null as unknown as any,
+      pid,
+      process: null as unknown as any, // tmux manages the process
       startedAt: now,
       lastActivityAt: now,
       status: "running",
@@ -100,22 +158,34 @@ export class SessionManager {
       channel_name: config.channelName,
       thread_id: threadId,
       project_dir: config.dir,
-      pid: null,
+      pid,
       claude_session_id: null,
       started_at: now.toISOString(),
       last_activity_at: now.toISOString(),
       status: "running",
     });
 
+    // Monitor tmux session for exit
+    this.watchTmuxSession(threadId, tmuxName, sessionId);
+
     console.log(
-      `[SessionManager] Started session ${sessionId} for ${config.channelName} in thread ${threadId}`
+      `[SessionManager] Started ${config.channelName} via tmux (PID: ${pid}, tmux: ${tmuxName}, thread: ${threadId})`
     );
+
+    // Open iTerm2 tab asynchronously (non-blocking, failure is safe)
+    setTimeout(() => {
+      openTab({
+        tmuxSessionName: tmuxName,
+        channelName: config.channelName,
+        projectDir: config.dir,
+      });
+    }, 0);
 
     return info;
   }
 
   /**
-   * Send a message to the Claude Code session and get the response.
+   * Send a message to the Claude Code session via tmux and get the response.
    */
   async sendMessage(
     threadId: string,
@@ -131,20 +201,18 @@ export class SessionManager {
     session.lastActivityAt = new Date();
     updateSessionActivity(session.id);
 
-    const result = await relayMessage({
-      sessionId: session.id,
-      projectDir: session.projectDir,
-      claudeSessionId: session.claudeSessionId,
-      message,
-      attachments,
-    });
+    const tmuxName = this.tmuxSessionName(threadId);
 
-    // Save claude session ID for future --resume
-    if (result.claudeSessionId && !session.claudeSessionId) {
-      session.claudeSessionId = result.claudeSessionId;
+    // Check tmux session is alive
+    if (!this.isTmuxSessionAlive(tmuxName)) {
+      return {
+        text: "",
+        chunks: ["⚠️ Claude Code セッションが終了しています。`/session start` で再起動してください。"],
+        error: "tmux session dead",
+      };
     }
 
-    return result;
+    return relayMessage(tmuxName, message, attachments);
   }
 
   async stop(
@@ -157,12 +225,33 @@ export class SessionManager {
     }
 
     session.status = "stopping";
+    const tmuxName = this.tmuxSessionName(threadId);
 
     console.log(
-      `[SessionManager] Stopping session in thread ${threadId} (reason: ${reason})`
+      `[SessionManager] Stopping ${session.channelName} in thread ${threadId} (reason: ${reason})`
     );
 
+    // Send SIGTERM to the claude process
+    try {
+      process.kill(session.pid, "SIGTERM");
+    } catch {
+      // Process already dead
+    }
+
+    // Wait for graceful shutdown, then force kill tmux session
+    await new Promise<void>((resolve) => {
+      setTimeout(() => {
+        try {
+          execSync(`${TMUX_PATH} kill-session -t "${tmuxName}" 2>/dev/null`);
+        } catch {
+          // Already dead
+        }
+        resolve();
+      }, GRACEFUL_KILL_TIMEOUT_MS);
+    });
+
     this.sessions.delete(threadId);
+    markTabStopped(session.channelName);
     updateSessionStatus(session.id, "stopped", reason);
   }
 
@@ -185,11 +274,43 @@ export class SessionManager {
     console.log("[SessionManager] All sessions stopped.");
   }
 
+  private watchTmuxSession(
+    threadId: string,
+    tmuxName: string,
+    sessionId: string
+  ): void {
+    const interval = setInterval(() => {
+      if (!this.isTmuxSessionAlive(tmuxName)) {
+        const session = this.sessions.get(threadId);
+        console.log(
+          `[SessionManager] tmux session ${tmuxName} exited`
+        );
+        this.sessions.delete(threadId);
+        if (session) {
+          markTabStopped(session.channelName);
+        }
+        updateSessionStatus(sessionId, "stopped", "tmux_exited");
+        clearInterval(interval);
+      }
+    }, 10_000); // Check every 10 seconds
+  }
+
   private recoverFromDb(): void {
     const rows = getRunningSessions();
     for (const row of rows) {
-      // Mark all previously running sessions as stopped on restart
-      // (no persistent process to clean up in -p mode)
+      if (row.thread_id) {
+        const tmuxName = this.tmuxSessionName(row.thread_id);
+        if (this.isTmuxSessionAlive(tmuxName)) {
+          console.log(
+            `[SessionManager] Found running tmux session ${tmuxName}, killing (supervisor restart)`
+          );
+          try {
+            execSync(`${TMUX_PATH} kill-session -t "${tmuxName}" 2>/dev/null`);
+          } catch {
+            // ignore
+          }
+        }
+      }
       updateSessionStatus(row.id, "stopped", "supervisor_restart");
     }
   }
