@@ -1,0 +1,22 @@
+# Environment
+.env
+.env.*
+
+# Dependencies
+node_modules/
+
+# Logs
+logs/
+*.log
+
+# Runtime
+pids/
+
+# OS
+.DS_Store
+
+# Screenshots (local only)
+screenshots/
+
+# Claude Code local state
+.claude/
