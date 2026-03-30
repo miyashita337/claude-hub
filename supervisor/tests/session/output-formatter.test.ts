@@ -67,6 +67,23 @@ describe("formatForDiscord", () => {
     const result = formatForDiscord("");
     expect(result).toEqual([""]);
   });
+
+  test("wraps bare markdown tables in code fences", () => {
+    const text = "Here is a table:\n| Name | Value |\n|---|---|\n| foo | bar |\n\nDone.";
+    const result = formatForDiscord(text);
+    const joined = result.join("");
+    expect(joined).toContain("```\n| Name | Value |");
+    expect(joined).toContain("| foo | bar |\n```");
+  });
+
+  test("does not double-wrap tables already in code fences", () => {
+    const text = "```\n| A | B |\n|---|---|\n| 1 | 2 |\n```";
+    const result = formatForDiscord(text);
+    const joined = result.join("");
+    // Should have exactly 2 code fences (open + close)
+    const fences = joined.match(/```/g) || [];
+    expect(fences.length).toBe(2);
+  });
 });
 
 describe("parseStreamJsonOutput", () => {

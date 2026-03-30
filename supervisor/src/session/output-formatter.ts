@@ -4,10 +4,60 @@ const CODE_FENCE = "```";
 const SAFE_LIMIT = DISCORD_MAX_LENGTH - 20;
 
 /**
+ * Wrap bare Markdown tables in code fences so Discord renders them as
+ * <pre><code> blocks (required for discord-markdown-enhancer detection).
+ */
+function wrapTablesInCodeFences(text: string): string {
+  const lines = text.split("\n");
+  const result: string[] = [];
+  let inCodeBlock = false;
+  let tableLines: string[] = [];
+
+  const flushTable = () => {
+    if (tableLines.length >= 3) {
+      result.push("```");
+      result.push(...tableLines);
+      result.push("```");
+    } else {
+      result.push(...tableLines);
+    }
+    tableLines = [];
+  };
+
+  const isTableRow = (line: string) => /^\s*\|(.+\|)+\s*$/.test(line);
+  const isSeparator = (line: string) => /^\s*\|(\s*:?-+:?\s*\|)+\s*$/.test(line);
+
+  for (const line of lines) {
+    if (line.trim().startsWith("```")) {
+      if (tableLines.length > 0) flushTable();
+      inCodeBlock = !inCodeBlock;
+      result.push(line);
+      continue;
+    }
+
+    if (inCodeBlock) {
+      result.push(line);
+      continue;
+    }
+
+    if (isTableRow(line) || isSeparator(line)) {
+      tableLines.push(line);
+    } else {
+      if (tableLines.length > 0) flushTable();
+      result.push(line);
+    }
+  }
+
+  if (tableLines.length > 0) flushTable();
+  return result.join("\n");
+}
+
+/**
  * Split Claude Code output into Discord-safe message chunks.
  * Respects code block boundaries (``` ... ```) and avoids splitting inside them.
  */
 export function formatForDiscord(text: string): string[] {
+  text = wrapTablesInCodeFences(text);
   if (text.length <= DISCORD_MAX_LENGTH) {
     return [text];
   }
