@@ -8,9 +8,9 @@ const TMUX_PATH = process.env.TMUX_PATH ?? "/opt/homebrew/bin/tmux";
 const ATTACHMENT_DIR = resolve(homedir(), "claude-hub", "tmp", "attachments");
 
 /** How long to wait for Claude Code to start responding (ms) */
-const RESPONSE_START_TIMEOUT_MS = 60_000; // 1 minute
-/** How long to wait for Claude Code to finish responding after it starts (ms) */
-const RESPONSE_COMPLETE_TIMEOUT_MS = 5 * 60_000; // 5 minutes
+const RESPONSE_START_TIMEOUT_MS = 60_000;
+/** How long to wait for Claude Code to finish responding (ms) */
+const RESPONSE_COMPLETE_TIMEOUT_MS = 5 * 60_000;
 /** Polling interval for capture-pane (ms) */
 const POLL_INTERVAL_MS = 2_000;
 
@@ -59,22 +59,25 @@ function capturePaneContent(tmuxSessionName: string): string {
 
 /**
  * Check if Claude Code is at the prompt (ready for input).
- * Detects the "❯" prompt character at the start of a line.
+ *
+ * Scans the last 8 lines for:
+ * - "❯" alone = at prompt (ready)
+ * - Thinking indicators (✱ ✶ ✻ ✢ ✳ + Running…) = still processing
  */
 export function isAtPrompt(content: string): boolean {
   const lines = content.trim().split("\n");
-  // Check if Claude Code is at an empty prompt (ready for input)
-  // The prompt "❯" must appear near the end, between separator lines (────)
-  // and there must NOT be any thinking/processing indicators after the last ⏺ response
   for (let i = lines.length - 1; i >= Math.max(0, lines.length - 8); i--) {
     const line = lines[i]?.trim() ?? "";
-    // Thinking/processing indicators mean Claude Code is still working
-    if (line.startsWith("✱") || line.startsWith("✶") || line.startsWith("✻") ||
-        line.startsWith("✢") || line.startsWith("✳") || line.startsWith("+") ||
-        line.includes("Running…") || line.includes("thinking")) {
+
+    // Thinking/processing indicators = still working
+    if (
+      line.startsWith("✱") || line.startsWith("✶") || line.startsWith("✻") ||
+      line.startsWith("✢") || line.startsWith("✳") || line.startsWith("+") ||
+      line.includes("Running…") || line.includes("thinking")
+    ) {
       return false;
     }
-    // Empty prompt — Claude Code is ready for input
+
     if (line === "❯") return true;
   }
   return false;
@@ -83,20 +86,9 @@ export function isAtPrompt(content: string): boolean {
 /**
  * Extract Claude Code's response from capture-pane output.
  *
- * tmux capture-pane output format:
- * ```
- * ❯ <user input>
- *
- *   Read N file(s) (ctrl+o to expand)     ← optional tool use
- *
- * ⏺ <response text>                       ← main response (may span multiple lines)
- *   <continuation>
- *
- * ─────────────────────                    ← separator
- * ❯                                        ← next prompt (empty = ready)
- * ─────────────────────                    ← separator
- *   status bar...                          ← status info
- * ```
+ * Strategy: Find the LAST ⏺ block that contains actual text response
+ * (not tool invocations like ⏺ Bash(...) or ⏺ Read(...)).
+ * Also collects tool result summaries from ⎿ lines.
  */
 export function extractResponse(
   _beforeContent: string,
@@ -105,65 +97,100 @@ export function extractResponse(
 ): string {
   const afterLines = afterContent.split("\n");
 
-  // Find where our input appears
+  // Find where our input appears — search for first 30 chars of the message
+  // (relay may prepend "Read the image at..." so we also try the original)
   let inputLineIdx = -1;
-  const inputFirstWords = inputMessage.slice(0, 50);
-  for (let i = 0; i < afterLines.length; i++) {
-    if (afterLines[i]?.includes(inputFirstWords)) {
-      inputLineIdx = i;
-      break;
+  const searchTerms = [
+    inputMessage.slice(0, 40),
+    inputMessage.slice(0, 20),
+  ];
+
+  for (const term of searchTerms) {
+    if (!term) continue;
+    for (let i = 0; i < afterLines.length; i++) {
+      if (afterLines[i]?.includes(term)) {
+        inputLineIdx = i;
+        break;
+      }
     }
+    if (inputLineIdx !== -1) break;
   }
 
   if (inputLineIdx === -1) return "";
 
-  // Find the response block: lines starting with ⏺ or indented continuation
-  const responseLines: string[] = [];
-  let inResponse = false;
+  // Collect ALL ⏺ blocks after our input, then return the last "text" block
+  const blocks: { type: "text" | "tool"; content: string }[] = [];
+  let currentBlock: string[] = [];
+  let currentType: "text" | "tool" = "text";
+  let inBlock = false;
 
   for (let i = inputLineIdx + 1; i < afterLines.length; i++) {
     const line = afterLines[i] ?? "";
     const trimmed = line.trim();
 
-    // Stop at separator line followed by empty prompt
+    // Stop at final prompt
+    if (trimmed === "❯") {
+      if (inBlock && currentBlock.length > 0) {
+        blocks.push({ type: currentType, content: currentBlock.join("\n").trim() });
+      }
+      break;
+    }
+
+    // Stop at separator (────) only if we have content
     if (trimmed.match(/^[─━]{10,}$/)) {
-      if (inResponse) break;
+      if (inBlock && currentBlock.length > 0) {
+        blocks.push({ type: currentType, content: currentBlock.join("\n").trim() });
+        currentBlock = [];
+        inBlock = false;
+      }
       continue;
     }
 
-    // Stop at empty prompt
-    if (trimmed === "❯") break;
-
-    // Skip status bar lines
+    // Skip noise
     if (trimmed.includes("⏵⏵") || trimmed.includes("bypass permissions")) continue;
     if (trimmed.match(/^\S.*\|.*ctx/)) continue;
-
-    // Skip tool use indicators
-    if (trimmed.match(/^Read \d+ files?/)) continue;
+    if (trimmed.match(/^Read \d+ files?\s/)) continue;
     if (trimmed.includes("ctrl+o to expand")) continue;
+    if (trimmed.includes("ctrl+b ctrl+b")) continue;
+    if (trimmed.startsWith("✱") || trimmed.startsWith("✶") ||
+        trimmed.startsWith("✻") || trimmed.startsWith("✢") ||
+        trimmed.startsWith("✳")) continue;
 
-    // Skip thinking/choreography indicators (✱)
-    if (trimmed.startsWith("✱")) continue;
-
-    // Detect response start (⏺ prefix)
+    // New ⏺ block
     if (trimmed.startsWith("⏺")) {
-      inResponse = true;
+      // Save previous block
+      if (inBlock && currentBlock.length > 0) {
+        blocks.push({ type: currentType, content: currentBlock.join("\n").trim() });
+      }
+
       const text = line.replace(/^\s*⏺\s?/, "");
-      responseLines.push(text);
+      // Detect tool invocations: ⏺ Bash(...), ⏺ Read(...), ⏺ Write(...), etc.
+      const isToolCall = /^(Bash|Read|Write|Edit|Glob|Grep|Agent|Skill)\(/.test(text.trim());
+      currentType = isToolCall ? "tool" : "text";
+      currentBlock = [text];
+      inBlock = true;
       continue;
     }
 
-    // Continuation lines (indented text after ⏺)
-    if (inResponse) {
-      // Tool result lines (⎿ prefix)
+    // Continuation lines
+    if (inBlock) {
       const cleaned = line.replace(/^\s*⎿\s*/, "  ");
-      if (cleaned.trim() || responseLines.length > 0) {
-        responseLines.push(cleaned);
-      }
+      currentBlock.push(cleaned);
     }
   }
 
-  return responseLines.join("\n").trim();
+  // Find the last text block (the actual response to the user)
+  const textBlocks = blocks.filter((b) => b.type === "text");
+  if (textBlocks.length > 0) {
+    return textBlocks[textBlocks.length - 1]!.content;
+  }
+
+  // Fallback: if only tool blocks, summarize them
+  if (blocks.length > 0) {
+    return blocks.map((b) => b.content).join("\n\n");
+  }
+
+  return "";
 }
 
 /**
@@ -196,12 +223,11 @@ export async function relayMessage(
     }
   }
 
-  // Capture the pane content BEFORE sending
+  // Capture pane BEFORE sending
   const beforeContent = capturePaneContent(tmuxSessionName);
 
   // Check if Claude Code is at prompt
   if (!isAtPrompt(beforeContent)) {
-    // Claude Code might be busy. Wait a bit and check again.
     await new Promise((r) => setTimeout(r, 3000));
     const retryContent = capturePaneContent(tmuxSessionName);
     if (!isAtPrompt(retryContent)) {
@@ -213,8 +239,7 @@ export async function relayMessage(
     }
   }
 
-  // Send the message via tmux send-keys
-  // Escape special characters for tmux
+  // Escape special characters for tmux send-keys
   const escaped = fullMessage
     .replace(/\\/g, "\\\\")
     .replace(/"/g, '\\"')
@@ -244,7 +269,7 @@ export async function relayMessage(
     const currentContent = capturePaneContent(tmuxSessionName);
     const elapsed = Date.now() - startTime;
 
-    // Check if response has started (content changed from before)
+    // Check if response has started (content changed)
     if (!responseStarted) {
       if (currentContent !== beforeContent) {
         responseStarted = true;
@@ -259,14 +284,21 @@ export async function relayMessage(
       continue;
     }
 
-    // Response has started — wait for it to complete (back at prompt)
+    // Response started — wait for completion (back at prompt)
     if (isAtPrompt(currentContent)) {
+      // Use the ORIGINAL message for search (before image path prepend)
       const responseText = extractResponse(beforeContent, currentContent, message);
-      // Don't clean up files immediately — Claude Code may still be reading them
-      // Schedule cleanup after 5 minutes
       scheduleCleanup(localFiles, 5 * 60_000);
 
       if (!responseText) {
+        // Fallback: try with the full message (including image paths)
+        const fallbackText = extractResponse(beforeContent, currentContent, fullMessage);
+        if (fallbackText) {
+          return {
+            text: fallbackText,
+            chunks: formatForDiscord(fallbackText),
+          };
+        }
         return {
           text: "",
           chunks: ["（応答なし）"],
@@ -280,7 +312,6 @@ export async function relayMessage(
     }
 
     if (elapsed > RESPONSE_COMPLETE_TIMEOUT_MS) {
-      // Try to extract partial response
       const partialText = extractResponse(beforeContent, currentContent, message);
       scheduleCleanup(localFiles, 5 * 60_000);
       return {
@@ -298,8 +329,6 @@ export async function relayMessage(
 
 /**
  * Schedule file cleanup after a delay.
- * Claude Code needs time to Read the files via its tool,
- * so we can't delete them immediately after the response.
  */
 function scheduleCleanup(files: string[], delayMs: number): void {
   if (files.length === 0) return;
@@ -308,7 +337,7 @@ function scheduleCleanup(files: string[], delayMs: number): void {
       try {
         unlinkSync(filePath);
       } catch {
-        // Ignore cleanup errors
+        // Ignore
       }
     }
   }, delayMs);

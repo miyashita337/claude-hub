@@ -3,7 +3,6 @@ import { isAtPrompt, extractResponse } from "../../src/session/relay";
 
 describe("isAtPrompt", () => {
   test("returns true for bare prompt at end", () => {
-    // Real tmux capture format: separator lines surround the prompt
     const content = [
       "⏺ Some response text",
       "",
@@ -19,8 +18,7 @@ describe("isAtPrompt", () => {
     expect(isAtPrompt("response\n❯")).toBe(true);
   });
 
-  test("returns false when thinking indicator is at end (no prompt yet)", () => {
-    // During processing, ✱ appears at end — no ❯ prompt yet
+  test("returns false when thinking indicator is at end", () => {
     expect(isAtPrompt("❯ my input\n\n✱ Thinking...")).toBe(false);
   });
 
@@ -33,18 +31,16 @@ describe("isAtPrompt", () => {
   });
 
   test("returns false for prompt with input text only", () => {
-    // ❯ followed by text = input line, not empty prompt
-    const content = "❯ my input message\n\n⏺ response";
-    expect(isAtPrompt(content)).toBe(false);
+    expect(isAtPrompt("❯ my input message\n\n⏺ response")).toBe(false);
   });
 
-  test("returns false for + indicator at end (thinking)", () => {
+  test("returns false for + indicator at end", () => {
     expect(isAtPrompt("❯ my input\n\n+ Frosting...")).toBe(false);
   });
 });
 
 describe("extractResponse", () => {
-  test("extracts text after ⏺ between input and separator", () => {
+  test("extracts simple text response", () => {
     const content = [
       "❯ hello",
       "",
@@ -57,7 +53,7 @@ describe("extractResponse", () => {
     expect(result).toContain("Hello! How can I help you?");
   });
 
-  test("extracts single-line response", () => {
+  test("extracts single-line response (pwd)", () => {
     const content = [
       "❯ pwd",
       "",
@@ -70,19 +66,38 @@ describe("extractResponse", () => {
     expect(result).toContain("/Users/harieshokunin/oci_develop");
   });
 
-  test("skips tool-use indicator lines", () => {
+  test("extracts last text block when tool calls precede it", () => {
     const content = [
-      "❯ read the image",
+      "❯ do something",
       "",
-      "  Read 1 file (ctrl+o to expand)",
+      "⏺ Bash(ls -la)",
+      "  ⎿  file1.txt",
+      "     file2.txt",
       "",
-      "⏺ This is a test image with red border.",
+      "⏺ Here are the files in the directory.",
       "",
       "──────────────────────────",
       "❯",
     ].join("\n");
-    const result = extractResponse("", content, "read the image");
-    expect(result).toContain("This is a test image with red border.");
+    const result = extractResponse("", content, "do something");
+    expect(result).toContain("Here are the files");
+    expect(result).not.toContain("Bash(ls");
+  });
+
+  test("extracts response after Read tool", () => {
+    const content = [
+      "❯ Read the image at /tmp/image.png. describe it",
+      "",
+      "  Read 1 file (ctrl+o to expand)",
+      "",
+      "⏺ This is a test image with a red border.",
+      "",
+      "──────────────────────────",
+      "❯",
+    ].join("\n");
+    // Search with the original Discord message, not the relay-modified one
+    const result = extractResponse("", content, "describe it");
+    expect(result).toContain("This is a test image with a red border.");
   });
 
   test("skips thinking indicators", () => {
@@ -106,20 +121,55 @@ describe("extractResponse", () => {
     expect(result).toBe("");
   });
 
-  test("handles tool execution lines starting with ⏺ Bash", () => {
+  test("handles complex multi-tool response", () => {
     const content = [
-      "❯ do something",
+      "❯ analyze this code",
       "",
-      "⏺ Bash(ls -la)",
-      "  ⎿  file1.txt",
-      "     file2.txt",
+      "⏺ Read(src/main.ts)",
+      "  ⎿  const x = 1;",
       "",
-      "⏺ Here are the files in the directory.",
+      "⏺ Bash(bun test)",
+      "  ⎿  3 pass, 0 fail",
+      "",
+      "⏺ The code looks good. All 3 tests pass and the implementation is clean.",
       "",
       "──────────────────────────",
       "❯",
     ].join("\n");
-    const result = extractResponse("", content, "do something");
-    expect(result).toContain("Here are the files");
+    const result = extractResponse("", content, "analyze this code");
+    expect(result).toContain("The code looks good");
+    expect(result).not.toContain("Read(src/main.ts)");
+    expect(result).not.toContain("Bash(bun test)");
+  });
+
+  test("handles multi-line text response", () => {
+    const content = [
+      "❯ explain",
+      "",
+      "⏺ Line one of the explanation.",
+      "  Line two continues here.",
+      "  Line three wraps up.",
+      "",
+      "──────────────────────────",
+      "❯",
+    ].join("\n");
+    const result = extractResponse("", content, "explain");
+    expect(result).toContain("Line one");
+    expect(result).toContain("Line two");
+    expect(result).toContain("Line three");
+  });
+
+  test("uses shorter search term as fallback", () => {
+    const content = [
+      "❯ Read the image at /tmp/att.png. describe this",
+      "",
+      "⏺ It's a red circle.",
+      "",
+      "──────────────────────────",
+      "❯",
+    ].join("\n");
+    // Original message was "describe this" but relay prepended image path
+    const result = extractResponse("", content, "describe this");
+    expect(result).toContain("It's a red circle.");
   });
 });
