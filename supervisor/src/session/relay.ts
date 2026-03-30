@@ -49,7 +49,7 @@ async function downloadAttachment(attachment: AttachmentInfo): Promise<string> {
 function capturePaneContent(tmuxSessionName: string): string {
   try {
     return execSync(
-      `${TMUX_PATH} capture-pane -t "${tmuxSessionName}" -p -S -200`,
+      `${TMUX_PATH} capture-pane -t "${tmuxSessionName}" -p -S -`,
       { encoding: "utf8", timeout: 5000 }
     );
   } catch {
@@ -167,15 +167,18 @@ export function extractResponse(
       continue;
     }
 
-    // Skip noise
+    // Skip noise (Claude Code UI elements)
     if (trimmed.includes("⏵⏵") || trimmed.includes("bypass permissions")) continue;
     if (trimmed.match(/^\S.*\|.*ctx/)) continue;
     if (trimmed.match(/^Read \d+ files?\s/)) continue;
     if (trimmed.includes("ctrl+o to expand")) continue;
     if (trimmed.includes("ctrl+b ctrl+b")) continue;
+    if (trimmed.startsWith("Tip:")) continue;
+    if (trimmed.includes("Baked for") || trimmed.includes("Brewed for")) continue;
     if (trimmed.startsWith("✱") || trimmed.startsWith("✶") ||
         trimmed.startsWith("✻") || trimmed.startsWith("✢") ||
-        trimmed.startsWith("✳")) continue;
+        trimmed.startsWith("✳") || trimmed.startsWith("✽") ||
+        trimmed.startsWith("✹") || trimmed.startsWith("✷")) continue;
 
     // New ⏺ block
     if (trimmed.startsWith("⏺")) {
@@ -307,8 +310,14 @@ export async function relayMessage(
 
     // Response started — wait for completion (back at prompt)
     if (isAtPrompt(currentContent)) {
+      // Wait a moment for any final output to settle, then re-capture
+      await new Promise((r) => setTimeout(r, 1000));
+      const finalContent = capturePaneContent(tmuxSessionName);
+
       // Use the ORIGINAL message for search (before image path prepend)
-      const responseText = extractResponse(beforeContent, currentContent, message);
+      const responseText = extractResponse(beforeContent, finalContent, message);
+      console.log(`[Relay] isAtPrompt=true, extracting response for: "${message.slice(0, 50)}"`);
+      console.log(`[Relay] Extracted response (${responseText.length} chars): "${responseText.slice(0, 100)}"`);
       scheduleCleanup(localFiles, 5 * 60_000);
 
       if (!responseText) {
