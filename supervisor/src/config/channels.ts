@@ -24,7 +24,7 @@ export const CHANNEL_MAP = new Map<string, ChannelConfig>([
     "convert-service",
     {
       channelName: "convert-service",
-      dir: resolve(home, "convert_service"),
+      dir: resolve(home, "convert-service"),
       displayName: "Convert Service",
       botTokenEnvKey: "CONVERT_SERVICE_BOT_TOKEN",
     },
@@ -33,7 +33,7 @@ export const CHANNEL_MAP = new Map<string, ChannelConfig>([
     "segment-anything",
     {
       channelName: "segment-anything",
-      dir: resolve(home, "segment_anything"),
+      dir: resolve(home, "segment-anything"),
       displayName: "Segment Anything",
       botTokenEnvKey: "SEGMENT_ANYTHING_BOT_TOKEN",
     },
