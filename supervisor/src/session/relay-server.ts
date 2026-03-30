@@ -22,7 +22,7 @@ export function startRelayServer(): void {
 
   server = Bun.serve({
     port: 0,
-    fetch(req) {
+    async fetch(req) {
       const url = new URL(req.url);
 
       if (url.pathname === "/health" && req.method === "GET") {
@@ -38,7 +38,8 @@ export function startRelayServer(): void {
           return new Response("Not found", { status: 404 });
         }
 
-        return req.json().then((body: Record<string, unknown>) => {
+        try {
+          const body = await req.json() as Record<string, unknown>;
           const text =
             typeof body.text === "string"
               ? body.text
@@ -54,7 +55,9 @@ export function startRelayServer(): void {
           pendingRequests.delete(threadId);
 
           return new Response("ok", { status: 200 });
-        });
+        } catch {
+          return new Response("Invalid JSON", { status: 400 });
+        }
       }
 
       return new Response("Not found", { status: 404 });
@@ -98,6 +101,7 @@ export function cancelRelay(threadId: string): void {
   const pending = pendingRequests.get(threadId);
   if (pending) {
     clearTimeout(pending.timer);
+    pending.resolve({ text: "", chunks: [], error: "Cancelled" });
     pendingRequests.delete(threadId);
   }
 }
