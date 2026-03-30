@@ -212,7 +212,7 @@ export class SessionManager {
       };
     }
 
-    return relayMessage(tmuxName, message, attachments);
+    return relayMessage(tmuxName, threadId, message, { attachments });
   }
 
   async stop(
