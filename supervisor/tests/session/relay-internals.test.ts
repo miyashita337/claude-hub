@@ -34,6 +34,17 @@ describe("isAtPrompt", () => {
     expect(isAtPrompt("❯ my input message\n\n⏺ response")).toBe(false);
   });
 
+  test("returns false during permission dialog", () => {
+    const content = [
+      "Do you want to proceed?",
+      "❯ 1. Yes",
+      "  2. No",
+      "",
+      "Esc to cancel",
+    ].join("\n");
+    expect(isAtPrompt(content)).toBe(false);
+  });
+
   test("returns false for + indicator at end", () => {
     expect(isAtPrompt("❯ my input\n\n+ Frosting...")).toBe(false);
   });

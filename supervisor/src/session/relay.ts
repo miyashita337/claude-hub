@@ -66,6 +66,9 @@ function capturePaneContent(tmuxSessionName: string): string {
  */
 export function isAtPrompt(content: string): boolean {
   const lines = content.trim().split("\n");
+
+  // Find "❯" near the end — must be surrounded by separator lines (────)
+  // to distinguish from mid-response prompts
   for (let i = lines.length - 1; i >= Math.max(0, lines.length - 8); i--) {
     const line = lines[i]?.trim() ?? "";
 
@@ -78,7 +81,25 @@ export function isAtPrompt(content: string): boolean {
       return false;
     }
 
-    if (line === "❯") return true;
+    // Permission dialog indicators = still waiting for user input
+    if (line.startsWith("❯ 1.") || line.startsWith("❯ 2.") || line.startsWith("❯ 3.")) {
+      return false;
+    }
+    if (line.includes("Do you want to") || line.includes("Esc to cancel")) {
+      return false;
+    }
+
+    // Empty prompt with separator above = Claude Code is ready
+    if (line === "❯") {
+      // Verify separator line exists nearby (within 2 lines above)
+      for (let j = i - 1; j >= Math.max(0, i - 2); j--) {
+        const aboveLine = lines[j]?.trim() ?? "";
+        if (aboveLine.match(/^[─━]{10,}$/)) return true;
+      }
+      // Also accept if ❯ is on the last non-empty line (fallback)
+      const remaining = lines.slice(i + 1).filter(l => l.trim());
+      if (remaining.length <= 2) return true;
+    }
   }
   return false;
 }
