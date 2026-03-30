@@ -31,7 +31,8 @@ export class ResourceMonitor {
   }
 
   private async check(): Promise<void> {
-    for (const [name, session] of this.sessionManager.entries()) {
+    for (const [threadId, session] of this.sessionManager.entries()) {
+      if (!session.pid) continue;
       try {
         const { stdout } = await execAsync(`ps -o rss= -p ${session.pid}`);
         const rssKB = parseInt(stdout.trim(), 10);
@@ -40,9 +41,9 @@ export class ResourceMonitor {
         const rssMB = rssKB / 1024;
         if (rssMB > MAX_MEMORY_PER_SESSION_MB) {
           console.error(
-            `[ResourceMonitor] ${name} (PID ${session.pid}) exceeded memory limit: ${rssMB.toFixed(0)}MB > ${MAX_MEMORY_PER_SESSION_MB}MB`
+            `[ResourceMonitor] ${session.channelName} (PID ${session.pid}) exceeded memory limit: ${rssMB.toFixed(0)}MB > ${MAX_MEMORY_PER_SESSION_MB}MB`
           );
-          await this.sessionManager.stop(name, "resource_limit");
+          await this.sessionManager.stop(threadId, "resource_limit");
         }
       } catch {
         // Process might be dead, SessionManager will handle cleanup

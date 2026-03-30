@@ -2,7 +2,7 @@ import { Database } from "bun:sqlite";
 import { resolve } from "path";
 import { homedir } from "os";
 
-const DB_PATH = resolve(homedir(), "claude-hub", "supervisor", "sessions.db");
+const DB_PATH = process.env.SUPERVISOR_DB_PATH ?? resolve(homedir(), "claude-hub", "supervisor", "sessions.db");
 
 let db: Database;
 
@@ -14,6 +14,7 @@ export function getDb(): Database {
       CREATE TABLE IF NOT EXISTS sessions (
         id TEXT PRIMARY KEY,
         channel_name TEXT NOT NULL,
+        thread_id TEXT,
         project_dir TEXT NOT NULL,
         pid INTEGER,
         claude_session_id TEXT,
@@ -23,6 +24,12 @@ export function getDb(): Database {
         stopped_reason TEXT
       )
     `);
+    // Migration: add thread_id if missing (for existing DBs)
+    try {
+      db.exec(`ALTER TABLE sessions ADD COLUMN thread_id TEXT`);
+    } catch {
+      // Column already exists
+    }
   }
   return db;
 }
@@ -30,6 +37,7 @@ export function getDb(): Database {
 export interface SessionRow {
   id: string;
   channel_name: string;
+  thread_id: string | null;
   project_dir: string;
   pid: number | null;
   claude_session_id: string | null;
@@ -42,11 +50,12 @@ export interface SessionRow {
 export function insertSession(row: Omit<SessionRow, "stopped_reason">): void {
   const db = getDb();
   db.prepare(
-    `INSERT INTO sessions (id, channel_name, project_dir, pid, claude_session_id, started_at, last_activity_at, status)
-     VALUES (?, ?, ?, ?, ?, ?, ?, ?)`
+    `INSERT INTO sessions (id, channel_name, thread_id, project_dir, pid, claude_session_id, started_at, last_activity_at, status)
+     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`
   ).run(
     row.id,
     row.channel_name,
+    row.thread_id,
     row.project_dir,
     row.pid,
     row.claude_session_id,
@@ -65,6 +74,16 @@ export function updateSessionStatus(
   db.prepare(
     `UPDATE sessions SET status = ?, stopped_reason = ? WHERE id = ?`
   ).run(status, reason ?? null, id);
+}
+
+export function updateSessionClaudeId(
+  id: string,
+  claudeSessionId: string
+): void {
+  const db = getDb();
+  db.prepare(
+    `UPDATE sessions SET claude_session_id = ? WHERE id = ?`
+  ).run(claudeSessionId, id);
 }
 
 export function updateSessionActivity(id: string): void {
@@ -91,6 +110,17 @@ export function getRunningSessionByChannel(
     .get(channelName) as SessionRow | undefined;
 }
 
+export function getRunningSessionByThread(
+  threadId: string
+): SessionRow | undefined {
+  const db = getDb();
+  return db
+    .prepare(
+      `SELECT * FROM sessions WHERE thread_id = ? AND status = 'running' ORDER BY started_at DESC LIMIT 1`
+    )
+    .get(threadId) as SessionRow | undefined;
+}
+
 export function getRunningSessions(): SessionRow[] {
   const db = getDb();
   return db
@@ -107,4 +137,26 @@ export function getLastSessionByChannel(
       `SELECT * FROM sessions WHERE channel_name = ? ORDER BY started_at DESC LIMIT 1`
     )
     .get(channelName) as SessionRow | undefined;
+}
+
+export function getLastSessionByThread(
+  threadId: string
+): SessionRow | undefined {
+  const db = getDb();
+  return db
+    .prepare(
+      `SELECT * FROM sessions WHERE thread_id = ? ORDER BY started_at DESC LIMIT 1`
+    )
+    .get(threadId) as SessionRow | undefined;
+}
+
+export function getRunningSessionsByChannel(
+  channelName: string
+): SessionRow[] {
+  const db = getDb();
+  return db
+    .prepare(
+      `SELECT * FROM sessions WHERE channel_name = ? AND status = 'running' ORDER BY started_at`
+    )
+    .all(channelName) as SessionRow[];
 }

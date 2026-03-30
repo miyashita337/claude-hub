@@ -3,6 +3,7 @@ import type { ChildProcess } from "child_process";
 export interface SessionInfo {
   id: string;
   channelName: string;
+  threadId: string;
   projectDir: string;
   pid: number;
   process: ChildProcess;
