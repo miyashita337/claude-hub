@@ -17,6 +17,11 @@ import {
 } from "../infra/db";
 import { openTab, markTabStopped } from "./iterm2";
 import { relayMessage, type AttachmentInfo, type RelayResult } from "./relay";
+import {
+  startRelayServer,
+  stopRelayServer,
+  getRelayPort,
+} from "./relay-server";
 
 const CLAUDE_PATH = resolve(homedir(), ".local", "bin", "claude");
 const TMUX_PATH = process.env.TMUX_PATH ?? "/opt/homebrew/bin/tmux";
@@ -27,6 +32,7 @@ export class SessionManager {
   private sessions = new Map<string, SessionInfo>();
 
   constructor() {
+    startRelayServer();
     this.recoverFromDb();
   }
 
@@ -112,9 +118,11 @@ export class SessionManager {
     }
 
     // Build the claude command — unset ANTHROPIC_API_KEY to use Claude Max subscription
+    const relayUrl = `http://localhost:${getRelayPort()}/relay/${threadId}`;
     const claudeCmd = [
       "unset ANTHROPIC_API_KEY",
       `export PATH="${resolve(homedir(), ".local/bin")}:${resolve(homedir(), ".bun/bin")}:/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin"`,
+      `export SUPERVISOR_RELAY_URL="${relayUrl}"`,
       `cd "${config.dir}"`,
       `exec ${CLAUDE_PATH} --dangerously-skip-permissions --name "${config.channelName}"`,
     ].join(" && ");
@@ -271,6 +279,7 @@ export class SessionManager {
       )
     );
     await Promise.allSettled(promises);
+    stopRelayServer();
     console.log("[SessionManager] All sessions stopped.");
   }
 
