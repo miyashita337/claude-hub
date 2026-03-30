@@ -13,4 +13,4 @@ export interface SessionInfo {
   status: "running" | "stopping";
 }
 
-export type StopReason = "manual" | "idle_timeout" | "resource_limit" | "error";
+export type StopReason = "manual" | "idle_timeout" | "resource_limit" | "error" | "tmux_exited" | "supervisor_restart";

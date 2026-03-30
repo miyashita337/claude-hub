@@ -2,7 +2,7 @@ import { execSync } from "child_process";
 import { resolve } from "path";
 import { homedir } from "os";
 import { mkdirSync, writeFileSync, unlinkSync } from "fs";
-import { waitForRelay } from "./relay-server";
+import { waitForRelay, type RelayResult } from "./relay-server";
 
 const TMUX_PATH = process.env.TMUX_PATH ?? "/opt/homebrew/bin/tmux";
 const ATTACHMENT_DIR = resolve(homedir(), "claude-hub", "tmp", "attachments");
@@ -16,7 +16,7 @@ export interface AttachmentInfo {
   contentType: string;
 }
 
-// Re-export RelayResult from relay-server for consumers
+// Re-export RelayResult for consumers
 export type { RelayResult } from "./relay-server";
 
 /**
@@ -45,7 +45,7 @@ export async function relayMessage(
   threadId: string,
   message: string,
   options?: { attachments?: AttachmentInfo[] }
-): Promise<import("./relay-server").RelayResult> {
+): Promise<RelayResult> {
   // 1. Download attachments
   const localFiles: string[] = [];
   let fullMessage = message;
@@ -73,7 +73,8 @@ export async function relayMessage(
     .replace(/\\/g, "\\\\")
     .replace(/"/g, '\\"')
     .replace(/\$/g, "\\$")
-    .replace(/`/g, "\\`");
+    .replace(/`/g, "\\`")
+    .replace(/\n/g, " ");
 
   try {
     execSync(

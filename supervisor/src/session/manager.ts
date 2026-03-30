@@ -21,6 +21,7 @@ import {
   startRelayServer,
   stopRelayServer,
   getRelayPort,
+  cancelRelay,
 } from "./relay-server";
 
 const CLAUDE_PATH = resolve(homedir(), ".local", "bin", "claude");
@@ -233,6 +234,7 @@ export class SessionManager {
     }
 
     session.status = "stopping";
+    cancelRelay(threadId);
     const tmuxName = this.tmuxSessionName(threadId);
 
     console.log(

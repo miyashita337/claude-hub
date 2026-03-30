@@ -90,7 +90,7 @@ export function waitForRelay(
   return new Promise<RelayResult>((resolve) => {
     const timer = setTimeout(() => {
       pendingRequests.delete(threadId);
-      resolve({ text: "", chunks: [], error: "Response timeout" });
+      resolve({ text: "", chunks: ["⚠️ Claude Code からの応答がタイムアウトしました。"], error: "Response timeout" });
     }, timeoutMs);
 
     pendingRequests.set(threadId, { resolve, timer });
