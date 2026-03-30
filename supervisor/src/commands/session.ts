@@ -223,6 +223,7 @@ async function handleList(
       value:
         `📁 \`${session.projectDir}\`\n` +
         `🧵 スレッド: <#${session.threadId}>\n` +
+        (session.claudeSessionId ? `🔑 Session: \`${session.claudeSessionId.slice(0, 8)}...\`\n` : "") +
         `⏱️ 稼働: ${uptime} | 無操作: ${idle}`,
       inline: false,
     });

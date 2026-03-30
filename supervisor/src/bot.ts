@@ -14,6 +14,7 @@ import { ResourceMonitor } from "./session/resource-monitor";
 import { createSessionCommand, createSessionHandler } from "./commands/session";
 import { CHANNEL_MAP } from "./config/channels";
 import type { AttachmentInfo } from "./session/relay";
+import { updateSessionClaudeId } from "./infra/db";
 
 export async function startBot(token: string): Promise<void> {
   const client = new Client({
@@ -123,6 +124,7 @@ export async function startBot(token: string): Promise<void> {
     }
 
     // Relay to Claude Code
+    console.log(`[Bot] Relaying message in thread ${threadId}: "${messageText.slice(0, 50)}"`);
     try {
       const result = await sessionManager.sendMessage(
         threadId,
@@ -130,10 +132,23 @@ export async function startBot(token: string): Promise<void> {
         attachments
       );
 
+      console.log(`[Bot] Got ${result.chunks.length} chunks, error: ${result.error ?? "none"}`);
+
+      // Save Claude session ID on first response
+      if (result.claudeSessionId) {
+        const session = sessionManager.get(threadId);
+        if (session && !session.claudeSessionId) {
+          session.claudeSessionId = result.claudeSessionId;
+          updateSessionClaudeId(session.id, result.claudeSessionId);
+        }
+      }
+
       // Send response chunks to the thread
       for (const chunk of result.chunks) {
         if (chunk.trim()) {
+          console.log(`[Bot] Sending chunk (${chunk.length} chars) to thread`);
           await thread.send(chunk);
+          console.log(`[Bot] Chunk sent successfully`);
         }
       }
     } catch (err) {
