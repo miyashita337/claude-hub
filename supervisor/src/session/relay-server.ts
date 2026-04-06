@@ -123,6 +123,14 @@ export function waitForRelay(
   threadId: string,
   timeoutMs: number
 ): Promise<RelayResult> {
+  const existing = pendingRequests.get(threadId);
+  if (existing) {
+    console.warn(`[relay-server] WARNING: overwriting pending request for thread ${threadId}. This means a second message was sent before the first finished.`);
+    clearTimeout(existing.timer);
+    existing.resolve({ text: "", chunks: ["⚠️ 前のメッセージの処理中に新しいメッセージが送信されました。"], error: "Superseded by new message" });
+    pendingRequests.delete(threadId);
+  }
+
   return new Promise<RelayResult>((resolve) => {
     const timer = setTimeout(() => {
       pendingRequests.delete(threadId);
