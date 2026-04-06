@@ -15,6 +15,7 @@ import { createSessionCommand, createSessionHandler } from "./commands/session";
 import { CHANNEL_MAP } from "./config/channels";
 import type { AttachmentInfo } from "./session/relay";
 import { updateSessionClaudeId } from "./infra/db";
+import { onProgress } from "./session/relay-server";
 
 export async function startBot(token: string): Promise<void> {
   const client = new Client({
@@ -55,6 +56,18 @@ export async function startBot(token: string): Promise<void> {
 
     reaper.start();
     resourceMonitor.start();
+
+    // Register progress callback to send tool progress to Discord threads
+    onProgress(async (event) => {
+      try {
+        const channel = await client.channels.fetch(event.threadId);
+        if (channel?.isThread()) {
+          await channel.send(`🔧 \`${event.tool}\` ${event.message}`);
+        }
+      } catch (err) {
+        console.error(`[Bot] Progress send error for thread ${event.threadId}:`, err);
+      }
+    });
   });
 
   // Handle slash commands
