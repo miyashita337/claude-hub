@@ -7,6 +7,14 @@ export interface RelayResult {
   error?: string;
 }
 
+export interface ProgressEvent {
+  threadId: string;
+  tool: string;
+  message: string;
+}
+
+type ProgressCallback = (event: ProgressEvent) => void;
+
 interface PendingRequest {
   resolve: (result: RelayResult) => void;
   timer: ReturnType<typeof setTimeout>;
@@ -16,6 +24,11 @@ const pendingRequests = new Map<string, PendingRequest>();
 
 let server: ReturnType<typeof Bun.serve> | null = null;
 let relayPort = 0;
+let progressCallback: ProgressCallback | null = null;
+
+export function onProgress(callback: ProgressCallback): void {
+  progressCallback = callback;
+}
 
 export function startRelayServer(): void {
   if (server) return;
@@ -27,6 +40,23 @@ export function startRelayServer(): void {
 
       if (url.pathname === "/health" && req.method === "GET") {
         return new Response("ok", { status: 200 });
+      }
+
+      // Progress endpoint: PostToolUse hook sends tool progress here
+      const progressMatch = url.pathname.match(/^\/progress\/(.+)$/);
+      if (progressMatch && req.method === "POST") {
+        const threadId = progressMatch[1];
+        try {
+          const body = await req.json() as Record<string, unknown>;
+          const tool = typeof body.tool === "string" ? body.tool : "unknown";
+          const message = typeof body.message === "string" ? body.message : "";
+          if (progressCallback && message) {
+            progressCallback({ threadId, tool, message });
+          }
+          return new Response("ok", { status: 200 });
+        } catch {
+          return new Response("Invalid JSON", { status: 400 });
+        }
       }
 
       const relayMatch = url.pathname.match(/^\/relay\/(.+)$/);
