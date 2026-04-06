@@ -46,6 +46,9 @@ export function startRelayServer(): void {
       const progressMatch = url.pathname.match(/^\/progress\/(.+)$/);
       if (progressMatch && req.method === "POST") {
         const threadId = progressMatch[1];
+        if (!threadId) {
+          return new Response("Invalid thread ID", { status: 400 });
+        }
         try {
           const body = await req.json() as Record<string, unknown>;
           const tool = typeof body.tool === "string" ? body.tool : "unknown";
@@ -62,6 +65,9 @@ export function startRelayServer(): void {
       const relayMatch = url.pathname.match(/^\/relay\/(.+)$/);
       if (relayMatch && req.method === "POST") {
         const threadId = relayMatch[1];
+        if (!threadId) {
+          return new Response("Invalid thread ID", { status: 400 });
+        }
         const pending = pendingRequests.get(threadId);
 
         if (!pending) {
@@ -94,7 +100,7 @@ export function startRelayServer(): void {
     },
   });
 
-  relayPort = server.port;
+  relayPort = server.port ?? 0;
   console.log(`[relay-server] started on port ${relayPort}`);
 }
 

@@ -8,13 +8,13 @@ if [ -z "$SUPERVISOR_RELAY_URL" ]; then
 fi
 
 # Extract thread ID from relay URL: http://localhost:PORT/relay/THREAD_ID
-THREAD_ID=$(echo "$SUPERVISOR_RELAY_URL" | sed 's|.*/relay/||')
+THREAD_ID="${SUPERVISOR_RELAY_URL##*/relay/}"
 if [ -z "$THREAD_ID" ]; then
   exit 0
 fi
 
 # Build progress URL from relay URL
-PROGRESS_URL=$(echo "$SUPERVISOR_RELAY_URL" | sed "s|/relay/|/progress/|")
+PROGRESS_URL="${SUPERVISOR_RELAY_URL/\/relay\//\/progress\/}"
 
 INPUT=$(cat)
 TOOL_NAME=$(echo "$INPUT" | jq -r '.tool_name // "unknown"')
@@ -35,9 +35,11 @@ case "$TOOL_NAME" in
     ;;
 esac
 
+jq -n --arg tool "$TOOL_NAME" --arg message "$MESSAGE" \
+  '{"tool": $tool, "message": $message}' | \
 curl -s -X POST "$PROGRESS_URL" \
   -H "Content-Type: application/json" \
-  -d "{\"tool\": \"$TOOL_NAME\", \"message\": \"$MESSAGE\"}" \
+  -d @- \
   --max-time 3 \
   > /dev/null 2>&1
 
