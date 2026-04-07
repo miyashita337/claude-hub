@@ -156,7 +156,9 @@ export async function startBot(token: string): Promise<void> {
       }
 
       // Relay to Claude Code
-      console.log(`[Bot] Relaying message in thread ${threadId}: "${messageText.slice(0, 50)}"`);
+      console.log(
+        `[Bot] Relaying message in thread ${threadId} (${messageText.length} chars, ${attachments.length} attachments)`
+      );
       try {
         const result = await sessionManager.sendMessage(
           threadId,
