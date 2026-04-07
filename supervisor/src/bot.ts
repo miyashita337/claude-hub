@@ -27,6 +27,21 @@ export async function startBot(token: string): Promise<void> {
   });
 
   const sessionManager = new SessionManager();
+
+  // Per-thread message queue: ensures only one message is relayed at a time per thread.
+  // Without this, concurrent messages overwrite the pending relay request and responses are lost.
+  const threadQueues = new Map<string, Promise<void>>();
+
+  function enqueueForThread(threadId: string, task: () => Promise<void>): void {
+    const prev = threadQueues.get(threadId) ?? Promise.resolve();
+    const next = prev.then(task, task);
+    threadQueues.set(threadId, next);
+    next.finally(() => {
+      if (threadQueues.get(threadId) === next) {
+        threadQueues.delete(threadId);
+      }
+    });
+  }
   const reaper = new Reaper(sessionManager, client);
   const resourceMonitor = new ResourceMonitor(sessionManager);
   const sessionHandler = createSessionHandler(sessionManager);
@@ -144,47 +159,54 @@ export async function startBot(token: string): Promise<void> {
     }
     if (!messageText) return;
 
-    // Show typing indicator
-    try {
-      await thread.sendTyping();
-    } catch {
-      // Ignore typing errors
-    }
-
-    // Relay to Claude Code
-    console.log(`[Bot] Relaying message in thread ${threadId}: "${messageText.slice(0, 50)}"`);
-    try {
-      const result = await sessionManager.sendMessage(
-        threadId,
-        messageText,
-        attachments
-      );
-
-      console.log(`[Bot] Got ${result.chunks.length} chunks, error: ${result.error ?? "none"}`);
-
-      // Save Claude session ID on first response
-      if (result.claudeSessionId) {
-        const session = sessionManager.get(threadId);
-        if (session && !session.claudeSessionId) {
-          session.claudeSessionId = result.claudeSessionId;
-          updateSessionClaudeId(session.id, result.claudeSessionId);
-        }
+    // Enqueue to prevent concurrent relay for the same thread.
+    // Without this, the second message overwrites the first's pending request
+    // in relay-server and the first response is lost.
+    enqueueForThread(threadId, async () => {
+      // Show typing indicator
+      try {
+        await thread.sendTyping();
+      } catch {
+        // Ignore typing errors
       }
 
-      // Send response chunks to the thread
-      for (const chunk of result.chunks) {
-        if (chunk.trim()) {
-          console.log(`[Bot] Sending chunk (${chunk.length} chars) to thread`);
-          await thread.send(chunk);
-          console.log(`[Bot] Chunk sent successfully`);
-        }
-      }
-    } catch (err) {
-      console.error(`[Bot] Relay error in thread ${threadId}:`, err);
-      await thread.send(
-        `⚠️ Claude Code への中継中にエラーが発生しました: ${err instanceof Error ? err.message : String(err)}`
+      // Relay to Claude Code
+      console.log(
+        `[Bot] Relaying message in thread ${threadId} (${messageText.length} chars, ${attachments.length} attachments)`
       );
-    }
+      try {
+        const result = await sessionManager.sendMessage(
+          threadId,
+          messageText,
+          attachments
+        );
+
+        console.log(`[Bot] Got ${result.chunks.length} chunks, error: ${result.error ?? "none"}`);
+
+        // Save Claude session ID on first response
+        if (result.claudeSessionId) {
+          const session = sessionManager.get(threadId);
+          if (session && !session.claudeSessionId) {
+            session.claudeSessionId = result.claudeSessionId;
+            updateSessionClaudeId(session.id, result.claudeSessionId);
+          }
+        }
+
+        // Send response chunks to the thread
+        for (const chunk of result.chunks) {
+          if (chunk.trim()) {
+            console.log(`[Bot] Sending chunk (${chunk.length} chars) to thread`);
+            await thread.send(chunk);
+            console.log(`[Bot] Chunk sent successfully`);
+          }
+        }
+      } catch (err) {
+        console.error(`[Bot] Relay error in thread ${threadId}:`, err);
+        await thread.send(
+          `⚠️ Claude Code への中継中にエラーが発生しました: ${err instanceof Error ? err.message : String(err)}`
+        );
+      }
+    });
   });
 
   // Graceful shutdown
