@@ -70,6 +70,22 @@ test("collectAttachableFiles tolerates non-existent paths", () => {
   expect(oversizeWarnings).toEqual([]);
 });
 
+test("collectAttachableFiles rejects path traversal outside projectDir", () => {
+  const outside = resolve(tmp, "..", `fa-outside-${Date.now()}.md`);
+  writeFileSync(outside, "secret");
+  try {
+    const rel = `../${outside.split("/").pop()}`;
+    const { files } = collectAttachableFiles(
+      [rel, "output/articles/note.md"],
+      tmp
+    );
+    expect(files.length).toBe(1);
+    expect(files[0]?.displayName).toBe("note.md");
+  } finally {
+    rmSync(outside, { force: true });
+  }
+});
+
 test("collectAttachableFiles caps at 10 files", () => {
   const dir = resolve(tmp, "many");
   mkdirSync(dir, { recursive: true });

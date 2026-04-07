@@ -1,5 +1,5 @@
 import { statSync } from "fs";
-import { isAbsolute, resolve } from "path";
+import { basename, isAbsolute, relative, resolve } from "path";
 
 const MAX_FILE_SIZE = 8 * 1024 * 1024; // 8MB (Discord default upload limit)
 const MAX_FILES = 10; // Discord per-message attachment cap
@@ -51,11 +51,18 @@ export function collectAttachableFiles(
   const files: AttachableFile[] = [];
   const oversizeWarnings: string[] = [];
   const seen = new Set<string>();
+  const normalizedProjectDir = resolve(projectDir);
 
   for (const p of paths) {
     if (files.length >= MAX_FILES) break;
 
-    const abs = isAbsolute(p) ? p : resolve(projectDir, p);
+    const abs = isAbsolute(p) ? resolve(p) : resolve(normalizedProjectDir, p);
+
+    // Containment guard: reject paths that escape projectDir (prevents
+    // Claude-supplied paths like "../../../etc/passwd" from being attached).
+    const rel = relative(normalizedProjectDir, abs);
+    if (rel.startsWith("..") || isAbsolute(rel)) continue;
+
     if (seen.has(abs)) continue;
     seen.add(abs);
 
@@ -75,7 +82,7 @@ export function collectAttachableFiles(
 
     files.push({
       absPath: abs,
-      displayName: abs.split("/").pop() ?? "file",
+      displayName: basename(abs) || "file",
       size: stat.size,
     });
   }
