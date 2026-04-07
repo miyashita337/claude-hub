@@ -76,6 +76,18 @@ export const CHANNEL_MAP = new Map<string, ChannelConfig>([
   ],
 ]);
 
+// Meta-dependency guard: claude-hub must never be managed by Channel-Supervisor itself.
+// If Supervisor crashes while managing its own repo, the Discord recovery path is lost.
+// claude-hub maintenance must go through the claudeHubExit bot (--channels direct mode).
+// See docs/bot-operations.md for details.
+if (CHANNEL_MAP.has("claude-hub")) {
+  throw new Error(
+    "FATAL: claude-hub must NOT be in CHANNEL_MAP. " +
+      "Use the claudeHubExit bot for claude-hub maintenance instead. " +
+      "See docs/bot-operations.md for the rationale (meta-dependency prevention).",
+  );
+}
+
 export const MAX_SESSIONS = 10;
 export const IDLE_TIMEOUT_MS = 7 * 24 * 60 * 60 * 1000; // 7 days
 export const IDLE_CHECK_INTERVAL_MS = 60 * 60 * 1000; // 1 hour
