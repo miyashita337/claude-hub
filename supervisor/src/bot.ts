@@ -16,6 +16,10 @@ import { CHANNEL_MAP } from "./config/channels";
 import type { AttachmentInfo } from "./session/relay";
 import { updateSessionClaudeId } from "./infra/db";
 import { onProgress } from "./session/relay-server";
+import {
+  extractFilePaths,
+  collectAttachableFiles,
+} from "./session/file-attacher";
 
 export async function startBot(token: string): Promise<void> {
   const client = new Client({
@@ -199,6 +203,38 @@ export async function startBot(token: string): Promise<void> {
             await thread.send(chunk);
             console.log(`[Bot] Chunk sent successfully`);
           }
+        }
+
+        // Attach generated files referenced in the response text
+        try {
+          const session = sessionManager.get(threadId);
+          if (session && result.text) {
+            const paths = extractFilePaths(result.text);
+            const { files, oversizeWarnings } = collectAttachableFiles(
+              paths,
+              session.projectDir
+            );
+            if (files.length > 0) {
+              console.log(
+                `[Bot] Attaching ${files.length} file(s) to thread ${threadId}`
+              );
+              await thread.send({
+                content: `📎 生成ファイル (${files.length})`,
+                files: files.map((f) => ({
+                  attachment: f.absPath,
+                  name: f.displayName,
+                })),
+              });
+            }
+            if (oversizeWarnings.length > 0) {
+              await thread.send(oversizeWarnings.join("\n"));
+            }
+          }
+        } catch (attachErr) {
+          console.error(
+            `[Bot] File attachment error in thread ${threadId}:`,
+            attachErr
+          );
         }
       } catch (err) {
         console.error(`[Bot] Relay error in thread ${threadId}:`, err);
