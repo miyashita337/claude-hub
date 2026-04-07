@@ -70,22 +70,37 @@ export async function startBot(token: string): Promise<void> {
     });
   });
 
-  // Handle slash commands
-  client.on(Events.InteractionCreate, async (interaction: Interaction) => {
+  // Safe reply helper: never throws. Used in error paths where the interaction may
+  // already be stale (Mac sleep/wake can expire the 3-second initial-response token).
+  async function safeReplyError(
+    interaction: Interaction,
+    err: unknown
+  ): Promise<void> {
     if (!interaction.isChatInputCommand()) return;
-    if (interaction.commandName !== "session") return;
-
+    const content = `❌ エラーが発生しました: ${err instanceof Error ? err.message : String(err)}`;
     try {
-      await sessionHandler(interaction);
-    } catch (err) {
-      console.error("[Bot] Command error:", err);
-      const content = `❌ エラーが発生しました: ${err instanceof Error ? err.message : String(err)}`;
       if (interaction.deferred || interaction.replied) {
         await interaction.editReply({ content });
       } else {
         await interaction.reply({ content, flags: 64 });
       }
+    } catch (replyErr) {
+      // Interaction token may be expired or already acknowledged. Log and swallow
+      // rather than letting this bubble up as an unhandled rejection.
+      console.error("[Bot] safeReplyError: failed to notify user:", replyErr);
     }
+  }
+
+  // Handle slash commands
+  client.on(Events.InteractionCreate, (interaction: Interaction) => {
+    if (!interaction.isChatInputCommand()) return;
+    if (interaction.commandName !== "session") return;
+
+    // Explicit .catch() ensures the async chain can never leak an unhandled rejection.
+    sessionHandler(interaction).catch(async (err) => {
+      console.error("[Bot] Command error:", err);
+      await safeReplyError(interaction, err);
+    });
   });
 
   // Message relay: thread messages → Claude Code → thread reply

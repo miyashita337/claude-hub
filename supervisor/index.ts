@@ -1,5 +1,24 @@
 import { startBot } from "./src/bot";
 
+// Global safety net: prevent process crash from unhandled rejections and uncaught exceptions.
+// The supervisor must stay alive even if a Discord interaction fails or an async handler throws.
+// See Issue #21: Mac sleep/wake causes stale Discord interaction tokens which throw
+// "Interaction has already been acknowledged" from async paths that aren't otherwise caught.
+process.on("unhandledRejection", (reason, promise) => {
+  console.error("[Supervisor] Unhandled promise rejection:", reason);
+  if (reason instanceof Error && reason.stack) {
+    console.error(reason.stack);
+  }
+  console.error("[Supervisor] Promise:", promise);
+});
+
+process.on("uncaughtException", (err) => {
+  console.error("[Supervisor] Uncaught exception:", err);
+  if (err.stack) {
+    console.error(err.stack);
+  }
+});
+
 const token = process.env.SUPERVISOR_BOT_TOKEN;
 
 if (!token) {
