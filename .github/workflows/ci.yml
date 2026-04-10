@@ -66,11 +66,20 @@ jobs:
           SUPERVISOR_DB_PATH: ":memory:"
           TMUX_PATH: /usr/bin/tmux
         run: |
-          bun test tests/session/output-formatter.test.ts \
+          bun test --coverage --coverage-reporter=lcov \
+                   tests/session/output-formatter.test.ts \
                    tests/session/relay.test.ts \
                    tests/session/relay-server.test.ts \
                    tests/hooks/stop-relay.test.ts \
                    tests/infra/db.test.ts
+
+      - name: Upload coverage to Codecov
+        if: always()
+        uses: codecov/codecov-action@v5
+        with:
+          files: supervisor/coverage/lcov.info
+          flags: unit-tests
+          fail_ci_if_error: false
 
   # Local-only tests (require tmux/Claude CLI or local config):
   #   manager.test.ts  — tmux + Claude Code CLI
