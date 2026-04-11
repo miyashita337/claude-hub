@@ -267,18 +267,37 @@ export async function startBot(token: string): Promise<void> {
 const VIVE_READING_URL = process.env.VIVE_READING_WEBHOOK_URL ?? "http://localhost:3456/api/webhook";
 
 function forwardToViveReading(threadId: string, channel: string, text: string): void {
-  if (!text?.trim()) return;
-  fetch(VIVE_READING_URL, {
-    method: "POST",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({
-      source: "discord",
-      channel,
-      author: "Claude",
-      content: text,
-    }),
-  }).catch((err) => {
-    // Fire-and-forget: don't let TTS webhook failure affect Discord delivery
-    console.warn(`[Bot] vive-reading webhook failed (non-blocking): ${err.message}`);
-  });
+  try {
+    if (!text?.trim()) return;
+
+    // Strip code blocks before sending to TTS — reading raw code aloud hurts quality
+    const cleanedText = text.replace(/```[\s\S]*?```/g, "(コードブロック省略)").trim();
+    if (!cleanedText) return;
+
+    fetch(VIVE_READING_URL, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        source: "discord",
+        channel,
+        author: "Claude",
+        content: cleanedText,
+      }),
+    })
+      .then(async (res) => {
+        if (!res.ok) {
+          const body = await res.text().catch(() => "");
+          throw new Error(`HTTP ${res.status}${body ? `: ${body.slice(0, 200)}` : ""}`);
+        }
+      })
+      .catch((err: unknown) => {
+        // Fire-and-forget: don't let TTS webhook failure affect Discord delivery
+        const msg = err instanceof Error ? err.message : String(err);
+        console.warn(`[Bot] vive-reading webhook failed for thread ${threadId} (async): ${msg}`);
+      });
+  } catch (err) {
+    // Guard against synchronous exceptions (e.g., malformed URL) — still fire-and-forget
+    const msg = err instanceof Error ? err.message : String(err);
+    console.warn(`[Bot] vive-reading webhook failed for thread ${threadId} (sync): ${msg}`);
+  }
 }
