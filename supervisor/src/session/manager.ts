@@ -120,10 +120,12 @@ export class SessionManager {
 
     // Build the claude command — unset ANTHROPIC_API_KEY to use Claude Max subscription
     const relayUrl = `http://localhost:${getRelayPort()}/relay/${threadId}`;
+
     const claudeCmd = [
       "unset ANTHROPIC_API_KEY",
       `export PATH="${resolve(homedir(), ".local/bin")}:${resolve(homedir(), ".bun/bin")}:/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin"`,
       `export SUPERVISOR_RELAY_URL="${relayUrl}"`,
+      `printf "%s" "${relayUrl}" > "${config.dir}/.supervisor-relay-url"`,
       `cd "${config.dir}"`,
       `exec ${CLAUDE_PATH} --dangerously-skip-permissions --name "${config.channelName}"`,
     ].join(" && ");
