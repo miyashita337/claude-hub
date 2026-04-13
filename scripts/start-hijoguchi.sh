@@ -14,7 +14,7 @@ SESSION=claudeHubExit
 CLAUDE_HUB_DIR="$HOME/claude-hub"
 LOG_DIR="$CLAUDE_HUB_DIR/logs"
 CLAUDE_BIN="$HOME/.local/bin/claude"
-TMUX_BIN="/opt/homebrew/bin/tmux"
+TMUX_BIN="${TMUX_PATH:-/opt/homebrew/bin/tmux}"
 BACKOFF_SEC=5
 
 mkdir -p "$LOG_DIR"

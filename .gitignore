@@ -19,5 +19,11 @@ pids/
 # Screenshots (local only)
 screenshots/
 
+# Generated plist (contains local paths; regenerate via scripts/install-hijoguchi.sh)
+com.claude-hub.hijoguchi.plist
+
+# Supervisor relay URL marker files
+.supervisor-relay-url
+
 # Claude Code local state
 .claude/

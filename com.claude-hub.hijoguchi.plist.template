@@ -10,18 +10,18 @@
     <array>
         <string>/usr/bin/caffeinate</string>
         <string>-dimsu</string>
-        <string>/Users/harieshokunin/claude-hub/scripts/start-hijoguchi.sh</string>
+        <string>__HOME__/claude-hub/scripts/start-hijoguchi.sh</string>
     </array>
 
     <key>WorkingDirectory</key>
-    <string>/Users/harieshokunin/claude-hub</string>
+    <string>__HOME__/claude-hub</string>
 
     <key>EnvironmentVariables</key>
     <dict>
         <key>PATH</key>
-        <string>/Users/harieshokunin/.local/bin:/Users/harieshokunin/.bun/bin:/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin</string>
+        <string>__HOME__/.local/bin:__HOME__/.bun/bin:/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin</string>
         <key>HOME</key>
-        <string>/Users/harieshokunin</string>
+        <string>__HOME__</string>
     </dict>
 
     <key>KeepAlive</key>
@@ -34,9 +34,9 @@
     <integer>15</integer>
 
     <key>StandardOutPath</key>
-    <string>/Users/harieshokunin/claude-hub/logs/hijoguchi.stdout.log</string>
+    <string>__HOME__/claude-hub/logs/hijoguchi.stdout.log</string>
     <key>StandardErrorPath</key>
-    <string>/Users/harieshokunin/claude-hub/logs/hijoguchi.stderr.log</string>
+    <string>__HOME__/claude-hub/logs/hijoguchi.stderr.log</string>
 
     <key>RunAtLoad</key>
     <true/>
