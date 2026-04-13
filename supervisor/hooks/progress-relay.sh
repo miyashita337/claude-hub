@@ -75,7 +75,7 @@ case "$TOOL_NAME" in
     TARGET=$(echo "$INPUT" | jq -r '.tool_input.query // ""')
     ;;
   *)
-    TARGET=""
+    TARGET="(実行完了)"
     ;;
 esac
 

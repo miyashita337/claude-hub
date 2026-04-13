@@ -88,22 +88,20 @@ describe("manager.ts .supervisor-relay-url write", () => {
 
     // The tmux command string should include writing the relay URL file
     expect(managerSource).toMatch(/\.supervisor-relay-url/);
-    // Check for the printf pattern that writes the relay URL
+    // Check for the printf pattern that writes the relay URL (double-quoted for tmux safety)
     expect(managerSource).toMatch(
-      /printf\s+'%s'\s+.*\.supervisor-relay-url/
+      /printf\s+"%s"\s+.*\.supervisor-relay-url/
     );
   });
 
-  test("start() also writes relay URL via writeFileSync", () => {
+  test("start() does NOT use writeFileSync (printf in tmux is sufficient)", () => {
     const managerSource = readFileSync(
       resolve(import.meta.dir, "../../src/session/manager.ts"),
       "utf8"
     );
 
-    // Verify the Node.js writeFileSync call for the relay URL file
-    // The variable and the filename string are on separate lines, so check both exist
-    expect(managerSource).toMatch(/relayUrlFile.*\.supervisor-relay-url/);
-    expect(managerSource).toMatch(/writeFileSync\(relayUrlFile/);
+    // writeFileSync for relay URL should have been removed
+    expect(managerSource).not.toMatch(/writeFileSync\(relayUrlFile/);
   });
 });
 
@@ -178,8 +176,42 @@ describe("progress-relay.sh tool message extraction", () => {
     expect(result!.message).toBe("[code-reviewer] Code review");
   });
 
-  test("Unknown tool: curl is NOT called (skip)", async () => {
+  test("Unknown tool: sends fallback message", async () => {
     const result = await runHookAndGetMessage("Unknown", {});
-    expect(result).toBeNull();
+    expect(result).not.toBeNull();
+    expect(result!.tool).toBe("Unknown");
+    expect(result!.message).toBe("(実行完了)");
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Test 4: bash -n syntax check on the tmux command string from manager.ts
+// ---------------------------------------------------------------------------
+describe("manager.ts tmux command syntax", () => {
+  test("claudeCmd assembled by start() is valid bash syntax", async () => {
+    // Reconstruct the same command shape that manager.ts builds at runtime,
+    // substituting concrete dummy values for the TypeScript template expressions.
+    const claudeCmd = [
+      "unset ANTHROPIC_API_KEY",
+      'export PATH="/tmp/.local/bin:/tmp/.bun/bin:/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin"',
+      'export SUPERVISOR_RELAY_URL="http://localhost:12345/relay/thread-abc"',
+      'printf "%s" "http://localhost:12345/relay/thread-abc" > "/tmp/project/.supervisor-relay-url"',
+      'cd "/tmp/project"',
+      'exec /tmp/claude --dangerously-skip-permissions --name "my-channel"',
+    ].join(" && ");
+
+    // Verify this matches the structure in the source
+    const managerSource = readFileSync(
+      resolve(import.meta.dir, "../../src/session/manager.ts"),
+      "utf8"
+    );
+    // Ensure printf uses double quotes (not single) for tmux compatibility
+    expect(managerSource).toMatch(/printf "%s"/);
+    // Ensure the join pattern is " && "
+    expect(managerSource).toMatch(/\.join\(" && "\)/);
+
+    // Run bash -n to check syntax (no execution, just parse)
+    const result = await $`bash -n -c ${claudeCmd}`.quiet().nothrow();
+    expect(result.exitCode).toBe(0);
   });
 });

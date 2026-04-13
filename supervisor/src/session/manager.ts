@@ -1,6 +1,6 @@
 import { execSync } from "child_process";
 import { randomUUID } from "crypto";
-import { existsSync, mkdirSync, writeFileSync } from "fs";
+import { existsSync, mkdirSync } from "fs";
 import { resolve } from "path";
 import { homedir } from "os";
 import type { SessionInfo, StopReason } from "./types";
@@ -121,17 +121,11 @@ export class SessionManager {
     // Build the claude command — unset ANTHROPIC_API_KEY to use Claude Max subscription
     const relayUrl = `http://localhost:${getRelayPort()}/relay/${threadId}`;
 
-    // Write relay URL to a file in the project dir so PostToolUse hooks can read it.
-    // Claude Code hooks don't inherit custom env vars from the parent shell,
-    // so we pass the relay URL via filesystem instead.
-    const relayUrlFile = resolve(config.dir, ".supervisor-relay-url");
-    writeFileSync(relayUrlFile, relayUrl, "utf8");
-
     const claudeCmd = [
       "unset ANTHROPIC_API_KEY",
       `export PATH="${resolve(homedir(), ".local/bin")}:${resolve(homedir(), ".bun/bin")}:/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin"`,
       `export SUPERVISOR_RELAY_URL="${relayUrl}"`,
-      `printf '%s' "${relayUrl}" > "${config.dir}/.supervisor-relay-url"`,
+      `printf "%s" "${relayUrl}" > "${config.dir}/.supervisor-relay-url"`,
       `cd "${config.dir}"`,
       `exec ${CLAUDE_PATH} --dangerously-skip-permissions --name "${config.channelName}"`,
     ].join(" && ");
