@@ -1,4 +1,4 @@
-import { execSync } from "child_process";
+import { execSync, execFileSync } from "child_process";
 import { resolve } from "path";
 import { homedir } from "os";
 import { mkdirSync, writeFileSync, unlinkSync } from "fs";
@@ -68,17 +68,27 @@ export async function relayMessage(
     }
   }
 
-  // 2. Escape and send via tmux send-keys
-  const escaped = fullMessage
-    .replace(/\\/g, "\\\\")
-    .replace(/"/g, '\\"')
-    .replace(/\$/g, "\\$")
-    .replace(/`/g, "\\`")
-    .replace(/\n/g, " ");
+  // 2. Send via tmux send-keys using execFileSync (argv array, no shell).
+  // We issue the input and the submit as two separate calls:
+  //   (a) `send-keys -l <literal>` — tmux forwards the bytes verbatim.
+  //       Argv-based invocation avoids shell-escape hazards (backticks, $,
+  //       quotes, backslashes) that corrupted long messages in earlier builds.
+  //   (b) A brief delay, then `send-keys C-m` — Claude Code's ink-based TUI
+  //       occasionally drops `Enter` sent in the same call when the input is
+  //       long, leaving the message typed but un-submitted (issue #32).
+  const literalText = fullMessage.replace(/\n/g, " ");
 
   try {
-    execSync(
-      `${TMUX_PATH} send-keys -t "${tmuxSessionName}" "${escaped}" Enter`,
+    execFileSync(
+      TMUX_PATH,
+      ["send-keys", "-t", tmuxSessionName, "-l", literalText],
+      { timeout: 5000 }
+    );
+    // Small pause so the TUI finishes ingesting the text before Enter.
+    await new Promise((r) => setTimeout(r, 100));
+    execFileSync(
+      TMUX_PATH,
+      ["send-keys", "-t", tmuxSessionName, "C-m"],
       { timeout: 5000 }
     );
   } catch (err) {
