@@ -13,7 +13,14 @@ export interface ProgressEvent {
   message: string;
 }
 
+export interface LateResponseEvent {
+  threadId: string;
+  chunks: string[];
+  text: string;
+}
+
 type ProgressCallback = (event: ProgressEvent) => void;
+type LateResponseCallback = (event: LateResponseEvent) => void;
 
 interface PendingRequest {
   resolve: (result: RelayResult) => void;
@@ -25,9 +32,14 @@ const pendingRequests = new Map<string, PendingRequest>();
 let server: ReturnType<typeof Bun.serve> | null = null;
 let relayPort = 0;
 let progressCallback: ProgressCallback | null = null;
+let lateResponseCallback: LateResponseCallback | null = null;
 
 export function onProgress(callback: ProgressCallback): void {
   progressCallback = callback;
+}
+
+export function onLateResponse(callback: LateResponseCallback): void {
+  lateResponseCallback = callback;
 }
 
 export function startRelayServer(): void {
@@ -68,32 +80,44 @@ export function startRelayServer(): void {
         if (!threadId) {
           return new Response("Invalid thread ID", { status: 400 });
         }
-        const pending = pendingRequests.get(threadId);
-
-        if (!pending) {
-          return new Response("Not found", { status: 404 });
-        }
-
+        let body: Record<string, unknown>;
         try {
-          const body = await req.json() as Record<string, unknown>;
-          const text =
-            typeof body.text === "string"
-              ? body.text
-              : typeof body.last_assistant_message === "string"
-                ? body.last_assistant_message
-                : "";
-          const sessionId =
-            typeof body.session_id === "string" ? body.session_id : undefined;
-          const chunks = formatForDiscord(text);
-
-          clearTimeout(pending.timer);
-          pending.resolve({ text, chunks, claudeSessionId: sessionId });
-          pendingRequests.delete(threadId);
-
-          return new Response("ok", { status: 200 });
+          body = await req.json() as Record<string, unknown>;
         } catch {
           return new Response("Invalid JSON", { status: 400 });
         }
+
+        const text =
+          typeof body.text === "string"
+            ? body.text
+            : typeof body.last_assistant_message === "string"
+              ? body.last_assistant_message
+              : "";
+        const sessionId =
+          typeof body.session_id === "string" ? body.session_id : undefined;
+        const chunks = formatForDiscord(text);
+
+        const pending = pendingRequests.get(threadId);
+        if (pending) {
+          clearTimeout(pending.timer);
+          pending.resolve({ text, chunks, claudeSessionId: sessionId });
+          pendingRequests.delete(threadId);
+          return new Response("ok", { status: 200 });
+        }
+
+        // Late-arriving Stop event (e.g., Monitor completion split the turn
+        // into a second assistant message after the first already resolved).
+        // Forward to Discord as a follow-up message so responses aren't lost.
+        if (text && lateResponseCallback) {
+          try {
+            lateResponseCallback({ threadId, chunks, text });
+          } catch (err) {
+            console.error("[relay-server] lateResponseCallback error:", err);
+          }
+          return new Response("forwarded", { status: 202 });
+        }
+
+        return new Response("Not found", { status: 404 });
       }
 
       return new Response("Not found", { status: 404 });
@@ -117,6 +141,8 @@ export function stopRelayServer(): void {
   server.stop(true);
   server = null;
   relayPort = 0;
+  progressCallback = null;
+  lateResponseCallback = null;
 }
 
 export function waitForRelay(

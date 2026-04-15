@@ -4,6 +4,8 @@ import {
   stopRelayServer,
   waitForRelay,
   getRelayPort,
+  onLateResponse,
+  type LateResponseEvent,
 } from "../../src/session/relay-server";
 
 describe("relay-server", () => {
@@ -69,6 +71,52 @@ describe("relay-server", () => {
     } catch {
       expect(true).toBe(true);
     }
+  });
+
+  test("late-arriving POST invokes onLateResponse callback (202) instead of dropping", async () => {
+    startRelayServer();
+    const port = getRelayPort();
+
+    const received: LateResponseEvent[] = [];
+    onLateResponse((event) => received.push(event));
+
+    // Simulate Monitor pattern: first Stop POST resolves the pending request
+    const promise = waitForRelay("thread-monitor", 5000);
+    await fetch(`http://localhost:${port}/relay/thread-monitor`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ text: "Script is running in the background." }),
+    });
+    await promise;
+
+    // Second Stop POST arrives after Monitor completes and Claude produces
+    // the real answer — must be forwarded, not dropped as 404.
+    const res = await fetch(`http://localhost:${port}/relay/thread-monitor`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ text: "18 件の下書きがあります。" }),
+    });
+
+    expect(res.status).toBe(202);
+    expect(received.length).toBe(1);
+    const late = received[0]!;
+    expect(late.threadId).toBe("thread-monitor");
+    expect(late.text).toBe("18 件の下書きがあります。");
+    expect(late.chunks.length).toBeGreaterThanOrEqual(1);
+  });
+
+  test("POST with empty text and no pending returns 404 even with late handler", async () => {
+    startRelayServer();
+    const port = getRelayPort();
+
+    onLateResponse(() => {});
+
+    const res = await fetch(`http://localhost:${port}/relay/orphan-thread`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ text: "" }),
+    });
+    expect(res.status).toBe(404);
   });
 
   test("multiple threads can wait concurrently", async () => {

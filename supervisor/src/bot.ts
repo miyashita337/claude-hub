@@ -15,7 +15,7 @@ import { createSessionCommand, createSessionHandler } from "./commands/session";
 import { CHANNEL_MAP } from "./config/channels";
 import type { AttachmentInfo } from "./session/relay";
 import { updateSessionClaudeId } from "./infra/db";
-import { onProgress } from "./session/relay-server";
+import { onProgress, onLateResponse } from "./session/relay-server";
 import {
   extractFilePaths,
   collectAttachableFiles,
@@ -85,6 +85,27 @@ export async function startBot(token: string): Promise<void> {
         }
       } catch (err) {
         console.error(`[Bot] Progress send error for thread ${event.threadId}:`, err);
+      }
+    });
+
+    // Register late-response callback: when a Stop hook POST arrives after
+    // the initial relay already resolved (e.g. Monitor/background-task split
+    // a single user turn into multiple assistant turns), forward the follow-up
+    // text directly to the Discord thread so it isn't dropped.
+    onLateResponse(async (event) => {
+      try {
+        const channel = await client.channels.fetch(event.threadId);
+        if (!channel?.isThread()) return;
+        console.log(
+          `[Bot] Late response for thread ${event.threadId} (${event.chunks.length} chunks, ${event.text.length} chars)`
+        );
+        for (const chunk of event.chunks) {
+          if (chunk.trim()) {
+            await channel.send(chunk);
+          }
+        }
+      } catch (err) {
+        console.error(`[Bot] Late response send error for thread ${event.threadId}:`, err);
       }
     });
   });
