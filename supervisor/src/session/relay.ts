@@ -37,6 +37,29 @@ async function downloadAttachment(attachment: AttachmentInfo): Promise<string> {
 }
 
 /**
+ * Run `tmux send-keys -t <sessionName> <args...>` with a short retry budget.
+ *
+ * tmux can ETIMEDOUT on transient server stalls (observed after a previous
+ * relay hit Response timeout — the pane or server ends up briefly busy).
+ * We retry once after a 250ms pause so a flaky moment doesn't surface to
+ * the user as a `send-keys` failure.
+ */
+function tmuxSend(sessionName: string, extraArgs: string[]): void {
+  const args = ["send-keys", "-t", sessionName, ...extraArgs];
+  const PER_CALL_TIMEOUT = 7000;
+  try {
+    execFileSync(TMUX_PATH, args, { timeout: PER_CALL_TIMEOUT });
+    return;
+  } catch (err) {
+    const code = (err as NodeJS.ErrnoException).code;
+    if (code !== "ETIMEDOUT") throw err;
+    // Give tmux a breather and try one more time.
+    execSync("sleep 0.25");
+    execFileSync(TMUX_PATH, args, { timeout: PER_CALL_TIMEOUT });
+  }
+}
+
+/**
  * Send a message to Claude Code via tmux send-keys and wait for
  * the response via HTTP relay (Stop hook POST).
  */
@@ -76,21 +99,18 @@ export async function relayMessage(
   //   (b) A brief delay, then `send-keys C-m` — Claude Code's ink-based TUI
   //       occasionally drops `Enter` sent in the same call when the input is
   //       long, leaving the message typed but un-submitted (issue #32).
+  //
+  // tmux server can transiently stall — typically right after a relay timed
+  // out — so each send-keys call is wrapped in a short retry. Total budget
+  // per call: 15s (tmuxSend covers transient lock waits without making the
+  // overall latency unbearable).
   const literalText = fullMessage.replace(/\n/g, " ");
 
   try {
-    execFileSync(
-      TMUX_PATH,
-      ["send-keys", "-t", tmuxSessionName, "-l", literalText],
-      { timeout: 5000 }
-    );
+    tmuxSend(tmuxSessionName, ["-l", literalText]);
     // Small pause so the TUI finishes ingesting the text before Enter.
     await new Promise((r) => setTimeout(r, 100));
-    execFileSync(
-      TMUX_PATH,
-      ["send-keys", "-t", tmuxSessionName, "C-m"],
-      { timeout: 5000 }
-    );
+    tmuxSend(tmuxSessionName, ["C-m"]);
   } catch (err) {
     scheduleCleanup(localFiles, 5 * 60_000);
     return {
