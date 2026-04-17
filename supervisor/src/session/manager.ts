@@ -134,6 +134,10 @@ export class SessionManager {
     execSync(
       `${TMUX_PATH} new-session -d -s "${tmuxName}" '${claudeCmd}'`
     );
+    // Limit scroll buffer for claude sessions (prevents iTerm2 freeze on heavy TUI output)
+    try {
+      execSync(`${TMUX_PATH} set-option -t "${tmuxName}" history-limit 10000`, { timeout: 3000 });
+    } catch { /* session may have already exited */ }
 
     // Wait briefly for process to start
     let pid: number | null = null;

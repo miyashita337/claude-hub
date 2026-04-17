@@ -150,7 +150,7 @@ export function openTab(opts: OpenTabOptions): void {
     "  tell current window",
     "    create tab with default profile",
     "    tell current session",
-    `      write text "${TMUX_PATH} attach -t ${opts.tmuxSessionName}"`,
+    `      write text "${TMUX_PATH} attach -t ${opts.tmuxSessionName} \\\\; copy-mode"`,
     `      set name to "${tabTitle}"`,
     `      set background color to {${r}, ${g}, ${b}}`,
     "    end tell",
