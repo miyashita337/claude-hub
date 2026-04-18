@@ -53,9 +53,9 @@ PATTERNS=(
     'ghp_[A-Za-z0-9]{20,}'
     'ghs_[A-Za-z0-9]{20,}'
     '[A-Za-z0-9_-]{24,}\.[A-Za-z0-9_-]{6}\.[A-Za-z0-9_-]{27,}'
-    'team-salary/src/'
-    'team-salary/secrets/'
-    'team-salary/.env'
+    'team[-_]salary/src/'
+    'team[-_]salary/secrets/'
+    'team[-_]salary/\.env'
 )
 
 hit_count=0
@@ -75,12 +75,30 @@ for f in "${targets[@]}"; do
     # from -n but dropping the full line content. This prevents secrets (Discord
     # tokens, API keys, Authorization headers) from leaking into CI build logs
     # when the audit FAILs — reviewers need to look at the quarantined file.
-    while IFS= read -r match; do
-        lineno="${match%%:*}"
-        hit_count=$((hit_count + 1))
-        hit_lines+=("$(basename "$f"):${lineno}")
-        file_hit=1
-    done < <(grep -noE "${grep_args[@]}" "$f" 2>/dev/null || true)
+    #
+    # We explicitly distinguish grep exit 1 (no match) from exit >=2 (regex
+    # syntax error, I/O error, permission denied) — a silent `|| true` would
+    # let a broken pattern or unreadable file fool the audit into reporting
+    # PASS. Fail-closed on anything other than clean no-match.
+    set +e
+    grep_output="$(grep -noE "${grep_args[@]}" "$f" 2>/dev/null)"
+    grep_status=$?
+    set -e
+
+    if [[ $grep_status -gt 1 ]]; then
+        echo "grep failed (exit ${grep_status}) while scanning $(basename "$f"); aborting audit" >&2
+        exit 2
+    fi
+
+    if [[ -n "$grep_output" ]]; then
+        while IFS= read -r match; do
+            lineno="${match%%:*}"
+            hit_count=$((hit_count + 1))
+            hit_lines+=("$(basename "$f"):${lineno}")
+            file_hit=1
+        done <<< "$grep_output"
+    fi
+
     if [[ $file_hit -eq 1 ]]; then
         hit_files+=("$f")
     fi
@@ -106,6 +124,12 @@ echo "inspect the quarantined file directly for details." >&2
 mkdir -p "$QUARANTINE_DIR"
 for f in "${hit_files[@]}"; do
     dest="${QUARANTINE_DIR}/$(basename "$f")"
+    # Refuse to overwrite an existing quarantined file — the earlier file is
+    # forensic evidence that must not be silently clobbered by a re-run.
+    if [[ -e "$dest" ]]; then
+        echo "quarantine destination already exists: $(basename "$dest"); refusing to overwrite" >&2
+        exit 1
+    fi
     mv "$f" "$dest"
     echo "quarantined: $(basename "$f") -> quarantine/" >&2
 done
