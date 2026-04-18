@@ -276,7 +276,7 @@ export async function startBot(token: string): Promise<void> {
         console.error(`[Bot] Relay error in thread ${threadId}:`, err);
         try {
           await thread.send(
-            `⚠️ Claude Code への中継中にエラーが発生しました: ${err instanceof Error ? err.message : String(err)}`
+            `⚠️ Claude Code への中継中にエラーが発生しました: ${(err instanceof Error ? err.message : String(err)).slice(0, 1900)}`
           );
         } catch (sendErr) {
           console.error(`[Bot] Failed to send error notification to thread ${threadId}:`, sendErr);
