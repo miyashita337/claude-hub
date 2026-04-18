@@ -8,29 +8,20 @@ import { test, expect, describe } from "bun:test";
  */
 
 describe("markTabStopped non-blocking (#27)", () => {
-  test("markTabStopped is async (returns Promise)", async () => {
+  test("markTabStopped returns void (fire-and-forget)", async () => {
     const { markTabStopped } = await import("../../src/session/iterm2");
     const result = markTabStopped("nonexistent-channel");
-    // After fix, markTabStopped should return a Promise (or void for fire-and-forget)
-    // The key assertion: it should NOT block the event loop
-    // We verify by checking it completes without throwing
-    if (result instanceof Promise) {
-      await result;
-    }
-    expect(true).toBe(true);
+    // fire-and-forget: returns void, no Promise to await
+    expect(result).toBeUndefined();
   });
 
   test("markTabStopped does not block event loop for >100ms", async () => {
     const { markTabStopped } = await import("../../src/session/iterm2");
     const start = Date.now();
-    const result = markTabStopped("nonexistent-channel");
+    markTabStopped("nonexistent-channel");
     const syncElapsed = Date.now() - start;
-    // After fix: the function should return immediately (<100ms)
-    // Before fix: execSync blocks for at least the osascript execution time
-    if (result instanceof Promise) {
-      await result;
-    }
-    // The synchronous portion should be fast (spawn is non-blocking)
+    // After fix: spawn is non-blocking, should return immediately (<100ms)
+    // Before fix: execSync blocks for the osascript execution time
     expect(syncElapsed).toBeLessThan(100);
   });
 });
