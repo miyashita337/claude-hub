@@ -122,6 +122,11 @@ export async function relayMessage(
   const literalText = fullMessage.replace(/\n/g, " ");
 
   try {
+    // Clear any modal state (error dialogs, confirmation prompts) in Claude
+    // Code's Ink TUI before sending input. Without this, text sent via
+    // send-keys silently disappears when the TUI is in a modal state (#33).
+    await tmuxSend(tmuxSessionName, ["Escape"]);
+    await new Promise((r) => setTimeout(r, 50));
     await tmuxSend(tmuxSessionName, ["-l", literalText]);
     // Small pause so the TUI finishes ingesting the text before Enter.
     await new Promise((r) => setTimeout(r, 100));
