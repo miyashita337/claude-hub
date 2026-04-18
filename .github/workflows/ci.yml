@@ -70,6 +70,8 @@ jobs:
                    tests/session/output-formatter.test.ts \
                    tests/session/relay.test.ts \
                    tests/session/relay-server.test.ts \
+                   tests/session/queue-resilience.test.ts \
+                   tests/commands/session-interaction.test.ts \
                    tests/hooks/stop-relay.test.ts \
                    tests/infra/db.test.ts
 
