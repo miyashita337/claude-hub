@@ -1,4 +1,4 @@
-import { execSync, execFileSync } from "child_process";
+import { execFileSync } from "child_process";
 import { resolve } from "path";
 import { homedir } from "os";
 import { mkdirSync, writeFileSync, unlinkSync } from "fs";
@@ -44,18 +44,33 @@ async function downloadAttachment(attachment: AttachmentInfo): Promise<string> {
  * We retry once after a 250ms pause so a flaky moment doesn't surface to
  * the user as a `send-keys` failure.
  */
-function tmuxSend(sessionName: string, extraArgs: string[]): void {
+/** Summarize an execFileSync error without leaking message content from spawnargs. */
+function summarizeExecError(err: unknown): { code?: string; status?: number; signal?: string } {
+  const e = err as NodeJS.ErrnoException & { status?: number; signal?: string };
+  return { code: e.code, status: e.status, signal: e.signal };
+}
+
+async function tmuxSend(sessionName: string, extraArgs: string[]): Promise<void> {
   const args = ["send-keys", "-t", sessionName, ...extraArgs];
   const PER_CALL_TIMEOUT = 7000;
   try {
     execFileSync(TMUX_PATH, args, { timeout: PER_CALL_TIMEOUT });
     return;
   } catch (err) {
-    const code = (err as NodeJS.ErrnoException).code;
-    if (code !== "ETIMEDOUT") throw err;
-    // Give tmux a breather and try one more time.
-    execSync("sleep 0.25");
-    execFileSync(TMUX_PATH, args, { timeout: PER_CALL_TIMEOUT });
+    const summary = summarizeExecError(err);
+    if (summary.code !== "ETIMEDOUT") {
+      console.error(`[Relay] tmux send-keys failed:`, summary);
+      throw err;
+    }
+    // Give tmux a breather and try one more time (non-blocking).
+    console.warn(`[Relay] tmux send-keys ETIMEDOUT for ${sessionName}, retrying...`);
+    await new Promise((r) => setTimeout(r, 250));
+    try {
+      execFileSync(TMUX_PATH, args, { timeout: PER_CALL_TIMEOUT });
+    } catch (retryErr) {
+      console.error(`[Relay] tmux send-keys retry also failed for ${sessionName}:`, summarizeExecError(retryErr));
+      throw retryErr;
+    }
   }
 }
 
@@ -107,10 +122,10 @@ export async function relayMessage(
   const literalText = fullMessage.replace(/\n/g, " ");
 
   try {
-    tmuxSend(tmuxSessionName, ["-l", literalText]);
+    await tmuxSend(tmuxSessionName, ["-l", literalText]);
     // Small pause so the TUI finishes ingesting the text before Enter.
     await new Promise((r) => setTimeout(r, 100));
-    tmuxSend(tmuxSessionName, ["C-m"]);
+    await tmuxSend(tmuxSessionName, ["C-m"]);
   } catch (err) {
     scheduleCleanup(localFiles, 5 * 60_000);
     return {

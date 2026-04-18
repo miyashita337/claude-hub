@@ -38,7 +38,17 @@ export async function startBot(token: string): Promise<void> {
 
   function enqueueForThread(threadId: string, task: () => Promise<void>): void {
     const prev = threadQueues.get(threadId) ?? Promise.resolve();
-    const next = prev.then(task, task);
+    // Wrap task in try-catch to prevent unhandled rejections from breaking
+    // the promise chain. Without this, one failed relay permanently blocks
+    // all subsequent messages for this thread (#41).
+    const safeTask = async () => {
+      try {
+        await task();
+      } catch (err) {
+        console.error(`[Bot] Unhandled error in thread queue ${threadId}:`, err);
+      }
+    };
+    const next = prev.then(safeTask, safeTask);
     threadQueues.set(threadId, next);
     next.finally(() => {
       if (threadQueues.get(threadId) === next) {
@@ -162,7 +172,9 @@ export async function startBot(token: string): Promise<void> {
 
     // Check if this thread has an active session
     if (!sessionManager.has(threadId)) {
-      return; // Not a session thread, ignore
+      // Log when a message arrives for a thread that once had a session (helps debug #41)
+      console.debug(`[Bot] Ignoring message in thread ${threadId} (no active session)`);
+      return;
     }
 
     const thread = message.channel as ThreadChannel;
@@ -262,9 +274,13 @@ export async function startBot(token: string): Promise<void> {
         }
       } catch (err) {
         console.error(`[Bot] Relay error in thread ${threadId}:`, err);
-        await thread.send(
-          `⚠️ Claude Code への中継中にエラーが発生しました: ${err instanceof Error ? err.message : String(err)}`
-        );
+        try {
+          await thread.send(
+            `⚠️ Claude Code への中継中にエラーが発生しました: ${(err instanceof Error ? err.message : String(err)).slice(0, 1900)}`
+          );
+        } catch (sendErr) {
+          console.error(`[Bot] Failed to send error notification to thread ${threadId}:`, sendErr);
+        }
       }
     });
   });
