@@ -201,41 +201,50 @@ async function handleList(
   interaction: ChatInputCommandInteraction,
   sessionManager: SessionManager
 ): Promise<void> {
-  const sessions = sessionManager.listRunning();
+  try {
+    const sessions = sessionManager.listRunning();
 
-  if (sessions.length === 0) {
-    await interaction.reply({
-      content: "ℹ️ 稼働中のセッションはありません。",
-      flags: 64,
-    });
-    return;
+    if (sessions.length === 0) {
+      await interaction.reply({
+        content: "ℹ️ 稼働中のセッションはありません。",
+        flags: 64,
+      });
+      return;
+    }
+
+    const embed = new EmbedBuilder()
+      .setTitle(`📊 稼働中セッション (${sessions.length}/${MAX_SESSIONS})`)
+      .setColor(0x5865f2)
+      .setTimestamp();
+
+    for (const session of sessions) {
+      const uptime = formatUptime(
+        Date.now() - session.startedAt.getTime()
+      );
+      const idle = formatUptime(
+        Date.now() - session.lastActivityAt.getTime()
+      );
+
+      embed.addFields({
+        name: `#${session.channelName}`,
+        value:
+          `📁 \`${session.projectDir}\`\n` +
+          `🧵 スレッド: <#${session.threadId}>\n` +
+          (session.claudeSessionId ? `🔑 Session: \`${session.claudeSessionId}\`\n` : "") +
+          `⏱️ 稼働: ${uptime} | 無操作: ${idle}`,
+        inline: false,
+      });
+    }
+
+    await interaction.reply({ embeds: [embed] });
+  } catch (err) {
+    const msg = `❌ セッション一覧の取得に失敗: ${err instanceof Error ? err.message : String(err)}`;
+    if (interaction.deferred || interaction.replied) {
+      await interaction.editReply({ content: msg });
+    } else {
+      await interaction.reply({ content: msg, flags: 64 });
+    }
   }
-
-  const embed = new EmbedBuilder()
-    .setTitle(`📊 稼働中セッション (${sessions.length}/${MAX_SESSIONS})`)
-    .setColor(0x5865f2)
-    .setTimestamp();
-
-  for (const session of sessions) {
-    const uptime = formatUptime(
-      Date.now() - session.startedAt.getTime()
-    );
-    const idle = formatUptime(
-      Date.now() - session.lastActivityAt.getTime()
-    );
-
-    embed.addFields({
-      name: `#${session.channelName}`,
-      value:
-        `📁 \`${session.projectDir}\`\n` +
-        `🧵 スレッド: <#${session.threadId}>\n` +
-        (session.claudeSessionId ? `🔑 Session: \`${session.claudeSessionId}\`\n` : "") +
-        `⏱️ 稼働: ${uptime} | 無操作: ${idle}`,
-      inline: false,
-    });
-  }
-
-  await interaction.reply({ embeds: [embed] });
 }
 
 function formatUptime(ms: number): string {
