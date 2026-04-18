@@ -28,8 +28,8 @@ mkdir -p "${LOG_DIR}"
 # Guard: abort if the system-prompt file is missing. Without this the claude
 # invocation would silently pass `--append-system-prompt ""` and behaviour
 # would drift from what S3 defines.
-if [ ! -f "${SYSTEM_PROMPT_FILE}" ]; then
-  echo "[hijoguchi] ERROR: system-prompt file not found: ${SYSTEM_PROMPT_FILE}" >&2
+if [ ! -r "${SYSTEM_PROMPT_FILE}" ]; then
+  echo "[hijoguchi] ERROR: system-prompt file not readable: ${SYSTEM_PROMPT_FILE}" >&2
   exit 1
 fi
 
@@ -45,8 +45,17 @@ while true; do
   "${TMUX_BIN}" kill-session -t "${SESSION}" 2>/dev/null
 
   echo "[hijoguchi] starting tmux session '${SESSION}' at $(date)"
-  "${TMUX_BIN}" new-session -d -s "${SESSION}" -c "${CLAUDE_HUB_DIR}" \
-    "${CLAUDE_BIN} --channels plugin:discord@claude-plugins-official --dangerously-skip-permissions --append-system-prompt \"\$(cat \"${SYSTEM_PROMPT_FILE}\")\""
+  # Read the prompt in the parent shell and escape every argument with %q so
+  # the string handed to tmux's child shell re-parses back to the exact same
+  # argv — prompt content with $VAR, backticks, or quotes cannot leak into
+  # command evaluation, and CLAUDE_BIN paths with spaces remain intact.
+  SYSTEM_PROMPT_CONTENT="$(cat "${SYSTEM_PROMPT_FILE}")"
+  CLAUDE_CMD=$(printf '%q ' \
+    "${CLAUDE_BIN}" \
+    --channels plugin:discord@claude-plugins-official \
+    --dangerously-skip-permissions \
+    --append-system-prompt "${SYSTEM_PROMPT_CONTENT}")
+  "${TMUX_BIN}" new-session -d -s "${SESSION}" -c "${CLAUDE_HUB_DIR}" "${CLAUDE_CMD}"
 
   # Verify the session actually came up (AC-2). If not, log and back off.
   sleep "${TMUX_VERIFY_SLEEP_SEC}"
