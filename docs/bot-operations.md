@@ -59,16 +59,16 @@ claudeHubExit Bot は `~/.claude/channels/discord/access.json` で access 制御
 | 種類 | channel | `requireMention` | `allowFrom` |
 |---|---|---|---|
 | Primary | `#claude-hub-hijoguchi` (`1487701062205964329`) | `false` | `[]`（全員通す。通常運用チャンネルのため） |
-| Non-primary | team-salary ほか 8 外部プロジェクト用 group | `true` | `["596802737950294036"]`（owner のみ） |
+| Non-primary | team-salary ほか計 7 つの外部プロジェクト用 group | `true` | `["596802737950294036"]`（owner のみ） |
 
 ### 意図
 
 - **Primary**: claude-hub の保守チャンネル。常時やり取りが発生するため mention 不要で allowFrom も空
-- **Non-primary**: 他プロジェクト thread。基本 Channel-Supervisor が担当するため claudeHubExit は普段応答しないが、Supervisor 障害時に owner が mention して問い合わせる経路として残す。非 owner からの mention は silent drop される（`server.ts:287-288`）
+- **Non-primary**: 他プロジェクト thread。基本 Channel-Supervisor が担当するため claudeHubExit は普段応答しないが、Supervisor 障害時に owner が mention して問い合わせる経路として残す。非 owner からの mention は silent drop される
 
 ### 反映
 
-access.json は `gate()` 内で毎メッセージ `loadAccess()` される（`server.ts:237`）ため、編集は即反映。Bot 再起動不要。
+access.json は毎メッセージ読み込まれるため、編集は即反映。Bot 再起動不要。
 
 ### 変更手順
 
