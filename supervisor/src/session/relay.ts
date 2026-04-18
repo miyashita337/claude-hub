@@ -52,10 +52,19 @@ function tmuxSend(sessionName: string, extraArgs: string[]): void {
     return;
   } catch (err) {
     const code = (err as NodeJS.ErrnoException).code;
-    if (code !== "ETIMEDOUT") throw err;
+    if (code !== "ETIMEDOUT") {
+      console.error(`[Relay] tmux send-keys failed (code=${code}):`, err);
+      throw err;
+    }
     // Give tmux a breather and try one more time.
+    console.warn(`[Relay] tmux send-keys ETIMEDOUT for ${sessionName}, retrying...`);
     execSync("sleep 0.25");
-    execFileSync(TMUX_PATH, args, { timeout: PER_CALL_TIMEOUT });
+    try {
+      execFileSync(TMUX_PATH, args, { timeout: PER_CALL_TIMEOUT });
+    } catch (retryErr) {
+      console.error(`[Relay] tmux send-keys retry also failed for ${sessionName}:`, retryErr);
+      throw retryErr;
+    }
   }
 }
 
