@@ -1,4 +1,4 @@
-import { execSync } from "child_process";
+import { execSync, spawn } from "child_process";
 import { readFileSync } from "fs";
 import { resolve, basename } from "path";
 import { homedir } from "os";
@@ -176,21 +176,17 @@ export function markTabStopped(channelName: string): void {
   const newName = `${channelName} (stopped)`;
   const tmuxName = `claude-${channelName}`;
 
-  // Update tmux window name if session still exists
-  try {
-    execSync(
-      `${TMUX_PATH} rename-window -t "${tmuxName}" "${newName}" 2>/dev/null`,
-      { timeout: 3000 }
-    );
-  } catch {
-    // tmux session already dead, that's fine
-  }
+  // Update tmux window name if session still exists (fire-and-forget)
+  const renameProc = spawn(TMUX_PATH, ["rename-window", "-t", tmuxName, newName], {
+    stdio: "ignore",
+  });
+  setTimeout(() => renameProc.kill("SIGKILL"), 3000);
 
   if (!isItermRunning()) {
     return;
   }
 
-  // Also update iTerm2 tab name via AppleScript
+  // Also update iTerm2 tab name via AppleScript (fire-and-forget, non-blocking)
   const script = [
     'tell application "iTerm2"',
     "  repeat with w in windows",
@@ -207,15 +203,15 @@ export function markTabStopped(channelName: string): void {
     "end tell",
   ].join("\n");
 
-  try {
-    execSync(`osascript -e '${script.replace(/'/g, "'\\''")}'`, {
-      timeout: 5000,
-    });
-    console.log(`[iTerm2] Marked tab stopped for ${channelName}`);
-  } catch (err) {
-    console.error(
-      `[iTerm2] Failed to mark tab stopped for ${channelName}:`,
-      err
-    );
-  }
+  const osascriptProc = spawn("osascript", ["-e", script], {
+    stdio: "ignore",
+  });
+  osascriptProc.on("exit", (code) => {
+    if (code === 0) {
+      console.log(`[iTerm2] Marked tab stopped for ${channelName}`);
+    } else {
+      console.error(`[iTerm2] Failed to mark tab stopped for ${channelName} (exit ${code})`);
+    }
+  });
+  setTimeout(() => osascriptProc.kill("SIGKILL"), 5000);
 }

@@ -130,9 +130,12 @@ async function handleStart(
       content: `✅ セッションをスレッドで起動しました → ${thread}`,
     });
   } catch (err) {
-    await interaction.editReply({
-      content: `❌ セッション起動に失敗: ${err instanceof Error ? err.message : String(err)}`,
-    });
+    const msg = `❌ セッション起動に失敗: ${err instanceof Error ? err.message : String(err)}`;
+    if (interaction.deferred || interaction.replied) {
+      await interaction.editReply({ content: msg });
+    } else {
+      await interaction.reply({ content: msg, flags: 64 });
+    }
   }
 }
 
@@ -185,9 +188,12 @@ async function handleStop(
       content: "🛑 セッションを停止しました。スレッドをアーカイブします。",
     });
   } catch (err) {
-    await interaction.editReply({
-      content: `❌ セッション停止に失敗: ${err instanceof Error ? err.message : String(err)}`,
-    });
+    const msg = `❌ セッション停止に失敗: ${err instanceof Error ? err.message : String(err)}`;
+    if (interaction.deferred || interaction.replied) {
+      await interaction.editReply({ content: msg });
+    } else {
+      await interaction.reply({ content: msg, flags: 64 });
+    }
   }
 }
 
