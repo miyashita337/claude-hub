@@ -120,8 +120,14 @@ t13_enforce_env_omits_skip_flag() {
 
 # AC-1 fail-closed: any non-"1" value (typos, empty, "true", etc.) falls
 # into enforce mode so a malformed plist can't accidentally reinstate bypass.
+# Empty-string is the most regression-prone case (Bash `:-` vs `-` expansion)
+# so it gets its own explicit assertion.
 t14_unknown_env_omits_skip_flag() {
   ! HIJOGUCHI_PRINT_ARGV=1 CLAUDE_HUB_UNSAFE_SKIP_PERMISSIONS=true \
+      bash "${TARGET}" 2>/dev/null \
+    | grep -Fxq -- '--dangerously-skip-permissions' \
+    && \
+  ! HIJOGUCHI_PRINT_ARGV=1 CLAUDE_HUB_UNSAFE_SKIP_PERMISSIONS= \
       bash "${TARGET}" 2>/dev/null \
     | grep -Fxq -- '--dangerously-skip-permissions'
 }

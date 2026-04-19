@@ -37,7 +37,10 @@ TMUX_VERIFY_SLEEP_SEC=1
 # rules in .claude/settings.json (auto-loaded from CWD). Any value other than
 # exactly "1" is treated as "enforce" — fail-closed so typos don't silently
 # reinstate bypass.
-CLAUDE_HUB_UNSAFE_SKIP_PERMISSIONS="${CLAUDE_HUB_UNSAFE_SKIP_PERMISSIONS:-1}"
+# NOTE: `-` (not `:-`) so an empty string stays empty and lands in enforce,
+# rather than being silently upgraded to "1". Only an unset variable gets
+# the legacy default.
+CLAUDE_HUB_UNSAFE_SKIP_PERMISSIONS="${CLAUDE_HUB_UNSAFE_SKIP_PERMISSIONS-1}"
 
 # Guard: abort if the system-prompt file is missing. Without this the claude
 # invocation would silently pass `--append-system-prompt ""` and behaviour
