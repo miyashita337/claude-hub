@@ -30,6 +30,15 @@ HIJOGUCHI_BOT_MENTION="${HIJOGUCHI_BOT_MENTION:-<@1487717424173416538>}"
 # tmux new-session -d returns after the server has recorded the session.
 TMUX_VERIFY_SLEEP_SEC=1
 
+# Phase 1 migration (Issue #53): gate --dangerously-skip-permissions behind an
+# env var so we can flip to strict permissions mode in Phase 2 without another
+# code change. Default "1" preserves current behaviour during rollout;
+# operators can set to "0" in the launchd plist to exercise the allow/deny
+# rules in .claude/settings.json (auto-loaded from CWD). Any value other than
+# exactly "1" is treated as "enforce" — fail-closed so typos don't silently
+# reinstate bypass.
+CLAUDE_HUB_UNSAFE_SKIP_PERMISSIONS="${CLAUDE_HUB_UNSAFE_SKIP_PERMISSIONS:-1}"
+
 # Guard: abort if the system-prompt file is missing. Without this the claude
 # invocation would silently pass `--append-system-prompt ""` and behaviour
 # would drift from what S3 defines.
@@ -64,8 +73,58 @@ if [ "${HIJOGUCHI_RENDER_ONLY:-0}" = "1" ]; then
   exit 0
 fi
 
-# Create log dir only for real launches. Deferred past render-only so tests
-# don't create directories as a side effect of `HIJOGUCHI_RENDER_ONLY=1`.
+# Build the claude argv once — SYSTEM_PROMPT_CONTENT is invariant across
+# restarts and the permission-mode branch is based on an env var, so the
+# argv doesn't need to be recomputed on every loop iteration. Hoisting it
+# up also lets HIJOGUCHI_PRINT_ARGV exit before any mkdir / tmux side effect.
+#
+# In unsafe-skip mode (env=1, current default) we pass --dangerously-skip-
+# permissions for backward compat. In enforce mode (env=0) we drop it and
+# let claude fall back to the allow/deny rules in .claude/settings.json —
+# that file is auto-loaded because tmux new-session runs with
+# -c "${CLAUDE_HUB_DIR}". Either way, log the chosen mode to stderr so
+# launchd captures the active policy in hijoguchi.stderr.log (AC-4).
+CLAUDE_ARGV=(
+  "${CLAUDE_BIN}"
+  --channels plugin:discord@claude-plugins-official
+)
+if [ "${CLAUDE_HUB_UNSAFE_SKIP_PERMISSIONS}" = "1" ]; then
+  echo "[hijoguchi] permission_mode=unsafe_skip (legacy; set CLAUDE_HUB_UNSAFE_SKIP_PERMISSIONS=0 to enforce)" >&2
+  CLAUDE_ARGV+=(--dangerously-skip-permissions)
+else
+  echo "[hijoguchi] permission_mode=enforce (using .claude/settings.json allow/deny rules)" >&2
+fi
+CLAUDE_ARGV+=(--append-system-prompt "${SYSTEM_PROMPT_CONTENT}")
+
+# Dry-run: print the argv (one arg per line) and exit. Used by tests to
+# verify the permission-mode conditional (AC-1) without starting tmux or
+# creating the log directory. The --append-system-prompt value is redacted
+# because the rendered prompt embeds channel / bot IDs — safe to store in
+# source but not safe to paste into bug reports or CI logs.
+if [ "${HIJOGUCHI_PRINT_ARGV:-0}" = "1" ]; then
+  _redact_next=0
+  for _arg in "${CLAUDE_ARGV[@]}"; do
+    if [ "${_redact_next}" = "1" ]; then
+      printf '[REDACTED]\n'
+      _redact_next=0
+    elif [ "${_arg}" = "--append-system-prompt" ]; then
+      printf '%s\n' "${_arg}"
+      _redact_next=1
+    else
+      printf '%s\n' "${_arg}"
+    fi
+  done
+  exit 0
+fi
+
+# Escape every argument with %q so the string handed to tmux's child shell
+# re-parses back to the exact same argv — prompt content with $VAR, backticks,
+# or quotes cannot leak into command evaluation, and CLAUDE_BIN paths with
+# spaces remain intact.
+CLAUDE_CMD=$(printf '%q ' "${CLAUDE_ARGV[@]}")
+
+# Create log dir only for real launches. Deferred past render-only / print-argv
+# so tests don't create directories as a side effect.
 mkdir -p "${LOG_DIR}"
 
 # Clean shutdown on SIGTERM from launchd
@@ -78,15 +137,6 @@ while true; do
   "${TMUX_BIN}" kill-session -t "${SESSION}" 2>/dev/null
 
   echo "[hijoguchi] starting tmux session '${SESSION}' at $(date)" >&2
-  # Escape every argument with %q so the string handed to tmux's child shell
-  # re-parses back to the exact same argv — prompt content with $VAR, backticks,
-  # or quotes cannot leak into command evaluation, and CLAUDE_BIN paths with
-  # spaces remain intact. SYSTEM_PROMPT_CONTENT is rendered once above.
-  CLAUDE_CMD=$(printf '%q ' \
-    "${CLAUDE_BIN}" \
-    --channels plugin:discord@claude-plugins-official \
-    --dangerously-skip-permissions \
-    --append-system-prompt "${SYSTEM_PROMPT_CONTENT}")
   "${TMUX_BIN}" new-session -d -s "${SESSION}" -c "${CLAUDE_HUB_DIR}" "${CLAUDE_CMD}"
 
   # Verify the session actually came up (AC-2). If not, log and back off.
