@@ -18,8 +18,9 @@ Issue #13 で評価した 20 通り（A-T）のうち、以下の **A + B + G** 
 | Discord → Claude Code 入力 | `tmux send-keys` で stdin 注入 | `src/session/relay.ts` |
 | Claude Code → Discord 応答 | **Stop hook → HTTP POST → Supervisor relay-server** | `hooks/stop-relay.sh` + `src/session/relay-server.ts` |
 | 中間進捗表示 | **PostToolUse hook → HTTP POST → Supervisor `/progress`** | `hooks/progress-relay.sh` |
-| パーミッションデッドロック回避 | **PermissionRequest hook で自動承認** | `hooks/auto-approve-permission.sh` + `--dangerously-skip-permissions` の env ガード (#53) |
-| 画像添付 | Discord 画像を `/tmp` に DL → `--file` で渡す | `src/session/file-attacher.ts` |
+| パーミッションデッドロック回避 | **PermissionRequest hook で自動承認** + Supervisor セッションは `--dangerously-skip-permissions` を常時付与（`manager.ts:130`） | `hooks/auto-approve-permission.sh` + `src/session/manager.ts` |
+| 画像添付 (Discord → Claude) | Discord 画像を `~/claude-hub/tmp/attachments` に DL → メッセージ本文先頭に `Read the image at <path>` を連結して `tmux send-keys` で注入 | `src/session/relay.ts` (`downloadAttachment` + `relayMessage`) |
+| ファイル添付 (Claude → Discord) | Claude の応答からファイルパスを抽出し Discord にアップロード | `src/session/file-attacher.ts` |
 
 ## メッセージフロー
 
@@ -30,6 +31,7 @@ Issue #13 で評価した 20 通り（A-T）のうち、以下の **A + B + G** 
   ├─ DB に threadId + tmuxSessionName 登録
   └─ tmux new-session で Claude Code 起動
        env: SUPERVISOR_RELAY_URL=http://localhost:PORT/relay/{threadId}
+       args: --dangerously-skip-permissions --name <channelName>
        hook: Stop / PostToolUse / PermissionRequest
 
 スレッド内メッセージ受信
@@ -76,7 +78,8 @@ Issue #13 で評価した Phase 1 PoC の最終判定:
 
 ## セキュリティ境界（S3/S7/S8/S9 で確定）
 
-- `--dangerously-skip-permissions` は env var (`CLAUDE_HUB_DANGEROUSLY_SKIP_PERMISSIONS=1`) 条件分岐。デフォルト OFF (#53)
+- Supervisor 配下の Claude Code セッション (`manager.ts:130`) は `--dangerously-skip-permissions` を常時付与。PermissionRequest hook (`hooks/auto-approve-permission.sh`) がデッドロック防止を担う
+- `scripts/start-hijoguchi.sh` (`claudeHubExit` bot) のみ `CLAUDE_HUB_UNSAFE_SKIP_PERMISSIONS` 環境変数で `--dangerously-skip-permissions` を条件分岐。Phase 1 は default=1（現状）、Phase 2 で default=0 に切替予定 (#53)。`.claude/settings.json` の `permissions.allow`/`deny` が運用ポリシーの single source
 - `protect-config.sh` で Write/Edit の機密パス（`.env`, `access.json` 等）をブロック (#54)
 - `prompt-title-check.py` に構造化 JSON ログ出力 (#55)
 - `access.json allowFrom` でチャンネル単位のアクセス制御 (#47)
