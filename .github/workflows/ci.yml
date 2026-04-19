@@ -73,7 +73,8 @@ jobs:
                    tests/session/queue-resilience.test.ts \
                    tests/commands/session-interaction.test.ts \
                    tests/hooks/stop-relay.test.ts \
-                   tests/infra/db.test.ts
+                   tests/infra/db.test.ts \
+                   tests/hijoguchi-routing/p0.test.ts
 
       - name: Upload coverage to Codecov
         if: always()
@@ -82,6 +83,21 @@ jobs:
           files: supervisor/coverage/lcov.info
           flags: unit-tests
           fail_ci_if_error: false
+
+  routing-tests:
+    name: Routing Tests (S5 #51)
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: .
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Run start-hijoguchi template-render tests (#49 AC-4)
+        run: bash scripts/test-start-hijoguchi.sh
+
+      - name: Run routing matrix (25 cases, P0×12 gating)
+        run: bash scripts/test-hijoguchi-routing.sh
 
   # Local-only tests (require tmux/Claude CLI or local config):
   #   manager.test.ts  — tmux + Claude Code CLI
