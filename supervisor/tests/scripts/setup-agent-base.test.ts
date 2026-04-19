@@ -3,7 +3,7 @@
 import { test, expect, describe, beforeEach, afterEach } from "bun:test";
 import { $ } from "bun";
 import { resolve } from "path";
-import { mkdtempSync, rmSync, readFileSync, existsSync, mkdirSync } from "fs";
+import { mkdtempSync, rmSync, readFileSync, writeFileSync, existsSync, mkdirSync, statSync } from "fs";
 import { tmpdir } from "os";
 
 const SCRIPT_PATH = resolve(import.meta.dir, "../../../scripts/setup-agent-base.sh");
@@ -65,5 +65,41 @@ describe("setup-agent-base.sh", () => {
     // `&` による background 実行 + セッションブロック回避のためのリダイレクト
     expect(cmd).toContain("setup-agent-base.sh");
     expect(cmd.trimEnd().endsWith("&")).toBe(true);
+  });
+
+  test("script never embeds GH_TOKEN in the clone URL (ps/leak guard)", () => {
+    // `https://x-access-token:${GH_TOKEN}@...` の URL 埋め込み書き方が
+    // 戻っていないことを静的に検証（base64 経由なら OK）
+    const src = readFileSync(SCRIPT_PATH, "utf8");
+    expect(src).not.toMatch(/https:\/\/x-access-token:\$\{?GH_TOKEN/);
+    // 代わりに http.extraheader 経由で認証していることを確認
+    expect(src).toContain("GIT_CONFIG_KEY_0='http.https://github.com/.extraheader'");
+  });
+
+  test("log file is rotated to .1 when it exceeds the size threshold", async () => {
+    const home = mkdtempSync(resolve(tmpdir(), "setup-agent-base-"));
+    tmpHomes.push(home);
+    const logDir = resolve(home, ".claude/logs");
+    const logFile = resolve(logDir, "setup-agent-base.log");
+    mkdirSync(logDir, { recursive: true });
+    // 閾値を 100 byte に下げ、それ以上の既存ログを置く
+    const bigLog = "x".repeat(200);
+    writeFileSync(logFile, bigLog, "utf8");
+    const r = await run(
+      { CLAUDE_CODE_REMOTE: "", GH_TOKEN: "", SETUP_AGENT_BASE_LOG_MAX_BYTES: "100" },
+      home,
+    );
+    expect(r.exitCode).toBe(0);
+    expect(existsSync(resolve(logDir, "setup-agent-base.log.1"))).toBe(true);
+    // 新規ログには skip 行のみ、古い `xxx...` は入っていない
+    const newLog = readFileSync(logFile, "utf8");
+    expect(newLog).toContain("step: skip");
+    expect(newLog).not.toContain(bigLog);
+  });
+
+  test("backup name includes PID to avoid same-second collisions", () => {
+    const src = readFileSync(SCRIPT_PATH, "utf8");
+    // `.bak.<timestamp>.$$` パターン（PID 付き）になっていること
+    expect(src).toMatch(/\.bak\.\$\(date -u \+%Y%m%d%H%M%S\)\.\$\$/);
   });
 });
