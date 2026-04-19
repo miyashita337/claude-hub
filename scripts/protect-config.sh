@@ -24,22 +24,37 @@ if [ -n "${CLAUDE_SKIP_PROTECT:-}" ]; then
 fi
 
 if [ -n "${SUPERVISOR_RELAY_URL:-}" ]; then
-  # Loopback-only allowlist. Anything else (public DNS, LAN IP, other schemes)
-  # is treated as a relay-redirection attempt.
+  # Loopback-only allowlist. The optional trailing segment accepts any of
+  # "/path", "?query", or "#fragment" so valid localhost URLs with query
+  # parameters (e.g. `http://localhost:3000?token=x`) are not rejected.
+  # Anything else (public DNS, LAN IP, other schemes) is treated as a
+  # relay-redirection attempt.
   if ! printf '%s' "${SUPERVISOR_RELAY_URL}" \
-      | grep -qE '^(https?|wss?)://(localhost|127\.0\.0\.1|\[::1\])(:[0-9]+)?(/.*)?$'; then
+      | grep -qE '^(https?|wss?)://(localhost|127\.0\.0\.1|\[::1\])(:[0-9]+)?([/?#].*)?$'; then
     echo "[protect-config] BLOCKED: SUPERVISOR_RELAY_URL is not a loopback URL: ${SUPERVISOR_RELAY_URL}" >&2
-    echo "[protect-config] Allowed schemes/hosts: (http|https|ws|wss)://(localhost|127.0.0.1|[::1])[:port][/path]" >&2
+    echo "[protect-config] Allowed: (http|https|ws|wss)://(localhost|127.0.0.1|[::1])[:port][/path|?query|#frag]" >&2
     exit 2
   fi
 fi
 
-# --- config-file protection (original behaviour) --------------------------
+# --- config-file protection -----------------------------------------------
 
 INPUT=$(cat)
 
-if ! command -v jq &> /dev/null; then
+# Empty stdin: nothing to inspect. Treat as pass-through so manual `bash
+# scripts/protect-config.sh` with no input (e.g. env-guard-only invocations)
+# doesn't trip jq on older versions that error on empty input.
+if [ -z "${INPUT}" ]; then
   exit 0
+fi
+
+# jq is required to parse hook input. Fail-closed (exit 2) rather than
+# fail-open (exit 0) so a missing dependency can't silently disable protection
+# for the tracked linter/formatter config files.
+if ! command -v jq &> /dev/null; then
+  echo "[protect-config] BLOCKED: jq is required but not found on PATH." >&2
+  echo "[protect-config] Install jq (e.g. 'brew install jq') to use this hook." >&2
+  exit 2
 fi
 
 TOOL_NAME=$(printf '%s' "${INPUT}" | jq -r '.tool_name // empty')
@@ -89,7 +104,7 @@ done
 # tsconfig.json: block disabling strict mode (new files still allowed)
 if [ "${BASENAME}" = "tsconfig.json" ] && [ "${TOOL_NAME}" = "Edit" ]; then
   OLD_STRING=$(printf '%s' "${INPUT}" | jq -r '.tool_input.old_string // empty')
-  if printf '%s' "${OLD_STRING}" | grep -qiE '"strict":\s*true'; then
+  if printf '%s' "${OLD_STRING}" | grep -qiE '"strict":[[:space:]]*true'; then
     echo "[protect-config] BLOCKED: Disabling strict mode in tsconfig.json is not allowed." >&2
     exit 2
   fi
