@@ -84,7 +84,7 @@
         "hooks": [
           {
             "type": "command",
-            "command": "\"$CLAUDE_PROJECT_DIR\"/scripts/setup-agent-base.sh"
+            "command": "nohup \"$CLAUDE_PROJECT_DIR\"/scripts/setup-agent-base.sh </dev/null >/dev/null 2>&1 &"
           }
         ]
       }
