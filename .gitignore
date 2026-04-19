@@ -25,5 +25,9 @@ com.claude-hub.hijoguchi.plist
 # Supervisor relay URL marker files
 .supervisor-relay-url
 
-# Claude Code local state
-.claude/
+# Claude Code local state.
+# Track the project-level permissions policy so the hijoguchi Bot loads a
+# consistent allow/deny set across clones (Issue #53). Local overrides go
+# in .claude/settings.local.json which stays ignored via the glob below.
+.claude/*
+!.claude/settings.json
