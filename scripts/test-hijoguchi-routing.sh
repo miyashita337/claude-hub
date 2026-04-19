@@ -104,6 +104,21 @@ pass=0
 fail=0
 skip=0
 
+# Tracked temp paths (files + dirs) cleaned on any exit path. Using a
+# script-level EXIT trap — not per-function RETURN traps — so a premature
+# `set -u` / unexpected-error exit still removes the temp artefacts.
+# Each entry is either a file (rm -f) or a directory (rm -rf); passing both
+# forms to `rm -rf --` is safe.
+TMP_PATHS=()
+cleanup_tmp_paths() {
+  local p
+  for p in "${TMP_PATHS[@]:-}"; do
+    [ -n "${p:-}" ] && rm -rf -- "$p" 2>/dev/null || true
+  done
+}
+trap cleanup_tmp_paths EXIT
+track_tmp() { TMP_PATHS+=("$1"); }
+
 # Render the prompt once with default env; reused by read-only assertions.
 render_default() {
   HIJOGUCHI_RENDER_ONLY=1 bash "${TARGET}" 2>&1
@@ -185,8 +200,7 @@ P0_10_missing_prompt_fails() {
 
 P0_11_unresolved_token_fails() {
   local tmpfile; tmpfile="$(mktemp)"
-  # shellcheck disable=SC2064
-  trap "rm -f '${tmpfile}'" RETURN
+  track_tmp "${tmpfile}"
   printf 'chan=%s\n' '{{UNKNOWN_TOKEN_P011}}' > "${tmpfile}"
   ! HIJOGUCHI_RENDER_ONLY=1 SYSTEM_PROMPT_FILE="${tmpfile}" \
       bash "${TARGET}" >/dev/null 2>&1
@@ -252,8 +266,7 @@ P2_01_render_only_no_log_dir_side_effect() {
   # Run render-only in an isolated HOME so any accidental mkdir -p of
   # ~/claude-hub/logs shows up as an empty temp directory.
   local tmphome; tmphome="$(mktemp -d)"
-  # shellcheck disable=SC2064
-  trap "rm -rf '${tmphome}'" RETURN
+  track_tmp "${tmphome}"
   HOME="${tmphome}" HIJOGUCHI_RENDER_ONLY=1 \
     SYSTEM_PROMPT_FILE="${PROMPT_FILE}" bash "${TARGET}" >/dev/null 2>&1
   # logs/ dir must NOT have been created under the fake HOME.
