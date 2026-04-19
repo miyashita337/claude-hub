@@ -24,7 +24,7 @@ Issue #13 で評価した 20 通り（A-T）のうち、以下の **A + B + G** 
 
 ## メッセージフロー
 
-```
+```text
 /session start (Discord Slash)
   ├─ Supervisor: Bun.serve() で HTTP relay 起動 (localhost:PORT)
   ├─ Discord スレッド作成
