@@ -76,5 +76,18 @@
       "Read(//**/id_rsa*)",
       "Read(//**/id_ed25519*)"
     ]
+  },
+  "hooks": {
+    "SessionStart": [
+      {
+        "matcher": "startup|resume",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "\"$CLAUDE_PROJECT_DIR\"/scripts/setup-agent-base.sh"
+          }
+        ]
+      }
+    ]
   }
 }
