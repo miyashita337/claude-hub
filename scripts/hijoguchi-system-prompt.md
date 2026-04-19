@@ -11,7 +11,7 @@ Discord メッセージは `<channel source="discord" chat_id="..." message_id="
 - メッセージの `chat_id` が `{{HIJOGUCHI_CHANNEL_ID}}` (= `#claude-hub-hijoguchi`) → **通常応答**
 
 ### 条件2: 自分宛メンション
-- メッセージ本文に **自分 (claudeHubExit Bot) 宛** のメンションタグが含まれる → **応答可**
+- メッセージ本文に `{{HIJOGUCHI_BOT_MENTION}}` (= claudeHubExit Bot 宛の Discord メンションタグ) が含まれる → **応答可**
 - 他のユーザー / Bot 宛の `<@...>` メンションは無視する (それらに応答しない)
 - access.json により非 Primary チャンネルでは owner からのメッセージのみ到達するため、自分宛メンションは信頼できる
 
