@@ -110,6 +110,42 @@ t8_rw006_braced_vars() {
     'exit(/\$[A-Za-z_][A-Za-z0-9_]*[^\x00-\x7f]/ ? 0 : 1)' "${TARGET}"
 }
 
+# Write-tool regression: any Write of tsconfig.json is blocked. Without this
+# the full-file rewrite could drop strict mode silently (bypassing the Edit
+# check on old_string). Legitimate tweaks must go through Edit.
+t9_write_tsconfig_blocked() {
+  local out rc input
+  input='{"tool_name":"Write","tool_input":{"file_path":"/repo/tsconfig.json","content":"{\"compilerOptions\":{\"target\":\"ES2022\"}}"}}'
+  out=$(printf '%s' "${input}" | bash "${TARGET}" 2>&1) && rc=0 || rc=$?
+  [ "${rc}" -eq 2 ] && echo "${out}" | grep -Fq 'tsconfig.json'
+}
+
+# Write of pyproject.toml with [tool.ruff*] in new content is blocked.
+t10_write_pyproject_ruff_blocked() {
+  local out rc input
+  input='{"tool_name":"Write","tool_input":{"file_path":"/repo/pyproject.toml","content":"[tool.ruff]\nline-length = 100"}}'
+  out=$(printf '%s' "${input}" | bash "${TARGET}" 2>&1) && rc=0 || rc=$?
+  [ "${rc}" -eq 2 ] && echo "${out}" | grep -Fq '[tool.ruff]'
+}
+
+# Edit path still works (regression). Keeps the legacy old_string check honest.
+t11_edit_tsconfig_strict_still_blocked() {
+  local out rc input
+  input='{"tool_name":"Edit","tool_input":{"file_path":"/repo/tsconfig.json","old_string":"\"strict\": true"}}'
+  out=$(printf '%s' "${input}" | bash "${TARGET}" 2>&1) && rc=0 || rc=$?
+  [ "${rc}" -eq 2 ] && echo "${out}" | grep -Fq 'strict mode in tsconfig.json'
+}
+
+# Write of pyproject.toml WITHOUT [tool.ruff] (e.g. only [project] metadata)
+# must pass through — we only want to block ruff-config writes, not all
+# pyproject.toml edits.
+t12_write_pyproject_benign_allowed() {
+  local rc input
+  input='{"tool_name":"Write","tool_input":{"file_path":"/repo/pyproject.toml","content":"[project]\nname=\"x\""}}'
+  printf '%s' "${input}" | bash "${TARGET}" >/dev/null 2>&1 && rc=0 || rc=$?
+  [ "${rc}" -eq 0 ]
+}
+
 run "T1 syntax check (AC-3)"                     t1_syntax_check
 run "T2 CLAUDE_SKIP_PROTECT rejected (AC-2)"     t2_skip_protect_rejected
 run "T2b any non-empty value rejected"           t2b_skip_protect_any_value
@@ -122,6 +158,10 @@ run "T5 log line on block (AC-4)"                t5_guard_logs_on_block
 run "T6 env guard precedes stdin parse"          t6_env_guard_fast_fail
 run "T7 no env → pass-through"                   t7_passthrough_no_env
 run "T8 no bare \$VAR before non-ASCII"          t8_rw006_braced_vars
+run "T9 Write tsconfig blocked (any content)"    t9_write_tsconfig_blocked
+run "T10 Write pyproject ruff blocked"           t10_write_pyproject_ruff_blocked
+run "T11 Edit tsconfig strict still blocked"     t11_edit_tsconfig_strict_still_blocked
+run "T12 Write pyproject w/o ruff allowed"       t12_write_pyproject_benign_allowed
 
 if [ "${fail}" -eq 0 ]; then
   echo "ALL TESTS PASSED"

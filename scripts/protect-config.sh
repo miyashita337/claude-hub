@@ -101,19 +101,48 @@ for protected in "${PROTECTED_FILES[@]}"; do
   fi
 done
 
-# tsconfig.json: block disabling strict mode (new files still allowed)
-if [ "${BASENAME}" = "tsconfig.json" ] && [ "${TOOL_NAME}" = "Edit" ]; then
-  OLD_STRING=$(printf '%s' "${INPUT}" | jq -r '.tool_input.old_string // empty')
-  if printf '%s' "${OLD_STRING}" | grep -qiE '"strict":[[:space:]]*true'; then
-    echo "[protect-config] BLOCKED: Disabling strict mode in tsconfig.json is not allowed." >&2
-    exit 2
-  fi
+# tsconfig.json guards.
+#   Edit : block if `old_string` contains `"strict": true` — the edit is
+#          removing/replacing the strict flag, i.e. disabling strict mode.
+#   Write: block any full-file rewrite. Whether the new content keeps or drops
+#          `strict` can't be judged without reading the existing file; blocking
+#          the rewrite entirely is the conservative choice. Legitimate tweaks
+#          should go through Edit, which keeps the strict-removal guard intact.
+if [ "${BASENAME}" = "tsconfig.json" ]; then
+  case "${TOOL_NAME}" in
+    Edit)
+      OLD_STRING=$(printf '%s' "${INPUT}" | jq -r '.tool_input.old_string // empty')
+      if printf '%s' "${OLD_STRING}" | grep -qiE '"strict":[[:space:]]*true'; then
+        echo "[protect-config] BLOCKED: Disabling strict mode in tsconfig.json is not allowed." >&2
+        exit 2
+      fi
+      ;;
+    Write)
+      echo "[protect-config] BLOCKED: Full rewrite of tsconfig.json is not allowed." >&2
+      echo "[protect-config] Use Edit for scoped changes so the strict-mode guard can evaluate the diff." >&2
+      exit 2
+      ;;
+  esac
 fi
 
-# pyproject.toml: block edits to [tool.ruff*] sections
-if [ "${BASENAME}" = "pyproject.toml" ] && [ "${TOOL_NAME}" = "Edit" ]; then
-  OLD_STRING=$(printf '%s' "${INPUT}" | jq -r '.tool_input.old_string // empty')
-  if printf '%s' "${OLD_STRING}" | grep -qiE '\[tool\.ruff'; then
+# pyproject.toml guards.
+#   Edit : block if `old_string` contains `[tool.ruff` — modifying ruff config.
+#   Write: block if `content` contains `[tool.ruff` — new file declares ruff
+#          config (could be adding, removing, or modifying it). Conservative
+#          but keeps the "don't touch ruff config via this hook" invariant.
+if [ "${BASENAME}" = "pyproject.toml" ]; then
+  case "${TOOL_NAME}" in
+    Edit)
+      PAYLOAD=$(printf '%s' "${INPUT}" | jq -r '.tool_input.old_string // empty')
+      ;;
+    Write)
+      PAYLOAD=$(printf '%s' "${INPUT}" | jq -r '.tool_input.content // empty')
+      ;;
+    *)
+      PAYLOAD=''
+      ;;
+  esac
+  if printf '%s' "${PAYLOAD}" | grep -qiE '\[tool\.ruff'; then
     echo "[protect-config] BLOCKED: Modifying [tool.ruff] config in pyproject.toml is not allowed." >&2
     echo "[protect-config] Fix the code to satisfy ruff rules instead." >&2
     exit 2
