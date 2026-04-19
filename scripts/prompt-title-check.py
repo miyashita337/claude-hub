@@ -48,7 +48,7 @@ def count_user_messages(transcript_path: str) -> int:
                     continue
                 try:
                     entry = json.loads(line)
-                    if entry.get("type") == "user":
+                    if isinstance(entry, dict) and entry.get("type") == "user":
                         count += 1
                 except json.JSONDecodeError as e:
                     log_warn(
@@ -60,7 +60,7 @@ def count_user_messages(transcript_path: str) -> int:
                         },
                     )
                     continue
-    except (FileNotFoundError, PermissionError) as e:
+    except OSError as e:
         log_warn(
             "transcript_read_error",
             {
@@ -73,10 +73,17 @@ def count_user_messages(transcript_path: str) -> int:
 
 
 def main():
-    data = json.load(sys.stdin)
-    session_id = data.get("session_id", "")
-    transcript_path = data.get("transcript_path", "")
-    prompt = data.get("prompt", "")
+    try:
+        data = json.load(sys.stdin)
+    except (json.JSONDecodeError, ValueError) as e:
+        log_warn("stdin_parse_error", {"error": str(e)})
+        return
+    if not isinstance(data, dict):
+        log_warn("stdin_shape_error", {"error_type": type(data).__name__})
+        return
+    session_id = data.get("session_id") or ""
+    transcript_path = data.get("transcript_path") or ""
+    prompt = data.get("prompt") or ""
 
     if not session_id:
         return
