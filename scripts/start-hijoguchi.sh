@@ -19,11 +19,16 @@ BACKOFF_SEC=5
 # System-prompt file for `claude --append-system-prompt`. Overridable via env
 # so tests / alt deploys can swap it. S3 (#49) populates the real content.
 SYSTEM_PROMPT_FILE="${SYSTEM_PROMPT_FILE:-${CLAUDE_HUB_DIR}/scripts/hijoguchi-system-prompt.md}"
+# Template placeholders injected into the system-prompt. Keeping IDs out of the
+# prompt source (AC-4 / #49) means the prompt .md is agnostic of deployment;
+# production IDs live here as defaults so launchd needs no extra env wiring.
+# Override via env vars for tests / alt deploys. Full fail-closed (no default)
+# requires plist env-var plumbing — tracked as follow-up hardening Issue.
+HIJOGUCHI_CHANNEL_ID="${HIJOGUCHI_CHANNEL_ID:-1487701062205964329}"
+HIJOGUCHI_BOT_MENTION="${HIJOGUCHI_BOT_MENTION:-<@1487717424173416538>}"
 # Wait before checking the freshly-created tmux session. Short is fine because
 # tmux new-session -d returns after the server has recorded the session.
 TMUX_VERIFY_SLEEP_SEC=1
-
-mkdir -p "${LOG_DIR}"
 
 # Guard: abort if the system-prompt file is missing. Without this the claude
 # invocation would silently pass `--append-system-prompt ""` and behaviour
@@ -33,23 +38,50 @@ if [ ! -r "${SYSTEM_PROMPT_FILE}" ]; then
   exit 1
 fi
 
-echo "[hijoguchi] system_prompt_file=${SYSTEM_PROMPT_FILE}"
+echo "[hijoguchi] system_prompt_file=${SYSTEM_PROMPT_FILE}" >&2
+
+# Render the prompt once (AC-4 template expansion). Re-reading per restart is
+# unnecessary — the launchd wrapper re-execs this script on crash anyway.
+SYSTEM_PROMPT_CONTENT="$(cat "${SYSTEM_PROMPT_FILE}")"
+# NOTE: `\{\{` escapes are REQUIRED — without them bash interprets the pattern
+# as brace expansion and collapses it to a literal `}}`, silently producing a
+# broken prompt. See PR #62 review discussion.
+SYSTEM_PROMPT_CONTENT="${SYSTEM_PROMPT_CONTENT//\{\{HIJOGUCHI_CHANNEL_ID\}\}/${HIJOGUCHI_CHANNEL_ID}}"
+SYSTEM_PROMPT_CONTENT="${SYSTEM_PROMPT_CONTENT//\{\{HIJOGUCHI_BOT_MENTION\}\}/${HIJOGUCHI_BOT_MENTION}}"
+
+# Fail closed on unresolved tokens so a renamed placeholder can't silently ship
+# the literal "{{FOO}}" into Claude's context. Matches `{{UPPER_SNAKE_OR_DIGIT}}`
+# so tokens like `{{CHANNEL_ID_1}}` are also caught.
+if [[ "${SYSTEM_PROMPT_CONTENT}" =~ \{\{[A-Z][A-Z0-9_]*\}\} ]]; then
+  echo "[hijoguchi] ERROR: unresolved template token in rendered prompt: ${BASH_REMATCH[0]}" >&2
+  exit 1
+fi
+
+# Dry-run: render and print the prompt, then exit. Used by tests (AC-4).
+# Kept before any filesystem side effects so render-only stdout stays clean.
+if [ "${HIJOGUCHI_RENDER_ONLY:-0}" = "1" ]; then
+  printf '%s\n' "${SYSTEM_PROMPT_CONTENT}"
+  exit 0
+fi
+
+# Create log dir only for real launches. Deferred past render-only so tests
+# don't create directories as a side effect of `HIJOGUCHI_RENDER_ONLY=1`.
+mkdir -p "${LOG_DIR}"
 
 # Clean shutdown on SIGTERM from launchd
-trap 'echo "[hijoguchi] SIGTERM received, killing tmux session"; "${TMUX_BIN}" kill-session -t "${SESSION}" 2>/dev/null; exit 0' TERM INT
+trap 'echo "[hijoguchi] SIGTERM received, killing tmux session" >&2; "${TMUX_BIN}" kill-session -t "${SESSION}" 2>/dev/null; exit 0' TERM INT
 
-echo "[hijoguchi] watchdog starting at $(date)"
+echo "[hijoguchi] watchdog starting at $(date)" >&2
 
 while true; do
   # Ensure no stale session
   "${TMUX_BIN}" kill-session -t "${SESSION}" 2>/dev/null
 
-  echo "[hijoguchi] starting tmux session '${SESSION}' at $(date)"
-  # Read the prompt in the parent shell and escape every argument with %q so
-  # the string handed to tmux's child shell re-parses back to the exact same
-  # argv — prompt content with $VAR, backticks, or quotes cannot leak into
-  # command evaluation, and CLAUDE_BIN paths with spaces remain intact.
-  SYSTEM_PROMPT_CONTENT="$(cat "${SYSTEM_PROMPT_FILE}")"
+  echo "[hijoguchi] starting tmux session '${SESSION}' at $(date)" >&2
+  # Escape every argument with %q so the string handed to tmux's child shell
+  # re-parses back to the exact same argv — prompt content with $VAR, backticks,
+  # or quotes cannot leak into command evaluation, and CLAUDE_BIN paths with
+  # spaces remain intact. SYSTEM_PROMPT_CONTENT is rendered once above.
   CLAUDE_CMD=$(printf '%q ' \
     "${CLAUDE_BIN}" \
     --channels plugin:discord@claude-plugins-official \
@@ -64,13 +96,13 @@ while true; do
     sleep "${BACKOFF_SEC}"
     continue
   fi
-  echo "[hijoguchi] tmux session verified: ${SESSION}"
+  echo "[hijoguchi] tmux session verified: ${SESSION}" >&2
 
   # Block while the session exists
   while "${TMUX_BIN}" has-session -t "${SESSION}" 2>/dev/null; do
     sleep 10
   done
 
-  echo "[hijoguchi] session '${SESSION}' ended at $(date), backing off ${BACKOFF_SEC}s"
+  echo "[hijoguchi] session '${SESSION}' ended at $(date), backing off ${BACKOFF_SEC}s" >&2
   sleep "${BACKOFF_SEC}"
 done
