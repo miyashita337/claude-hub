@@ -99,6 +99,45 @@ jobs:
       - name: Run routing matrix (25 cases, P0×12 gating)
         run: bash scripts/test-hijoguchi-routing.sh
 
+  # E2E verification of the Discord ↔ Supervisor ↔ Claude Code relay chain.
+  # Covers AC-4/5/6/7 hermetically (tmux + mock claude + relay-server HTTP).
+  # AC-1/2/3 require a live Discord bot token and are documented as manual
+  # verification in the PR description. See tests/e2e/ac-verification.test.ts.
+  # This job MUST run on every push / PR so that AC-7 (hyphen + Japanese
+  # payload) regressions are caught before merge — see Issue #73.
+  e2e-tests:
+    name: E2E Tests (AC-1..AC-7)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install tmux
+        run: sudo apt-get update && sudo apt-get install -y tmux
+
+      - uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: latest
+
+      - name: Cache dependencies
+        uses: actions/cache@v4
+        with:
+          path: |
+            supervisor/node_modules
+            ~/.bun/install/cache
+          key: bun-${{ runner.os }}-${{ hashFiles('supervisor/bun.lock', 'supervisor/package.json') }}
+          restore-keys: bun-${{ runner.os }}-
+
+      - name: Install dependencies
+        run: bun install --frozen-lockfile
+        working-directory: supervisor
+
+      - name: Run AC E2E verification
+        env:
+          SUPERVISOR_DB_PATH: ":memory:"
+          TMUX_PATH: /usr/bin/tmux
+        run: bun test tests/e2e/ac-verification.test.ts tests/session/relay.test.ts
+        working-directory: supervisor
+
   # Local-only tests (require tmux/Claude CLI or local config):
   #   manager.test.ts  — tmux + Claude Code CLI
   #   iterm2.test.ts   — ~/.claude/scripts/project-colors.json
