@@ -50,7 +50,52 @@ function summarizeExecError(err: unknown): { code?: string; status?: number; sig
   return { code: e.code, status: e.status, signal: e.signal };
 }
 
-async function tmuxSend(sessionName: string, extraArgs: string[]): Promise<void> {
+function getExecStderr(err: unknown): string {
+  const e = err as { stderr?: Buffer | string };
+  if (!e.stderr) return "";
+  return typeof e.stderr === "string" ? e.stderr : e.stderr.toString();
+}
+
+/**
+ * If the tmux pane is currently in copy-mode (or any other mode), exit it so
+ * the subsequent `send-keys -l` reaches the application instead of being
+ * consumed as a mode command. Best-effort / fail-open: any error is logged but
+ * not thrown — the caller may still attempt send-keys, and a genuinely dead
+ * pane will surface a clearer error from the next call.
+ *
+ * See Issue #73: tmux pane copy-mode stuck → send-keys silent drop + `not in a mode`.
+ */
+export async function ensurePaneNotInMode(sessionName: string): Promise<void> {
+  let mode: string;
+  try {
+    mode = execFileSync(
+      TMUX_PATH,
+      ["display-message", "-t", sessionName, "-p", "#{pane_in_mode}"],
+      { timeout: 2000 }
+    ).toString().trim();
+  } catch (err) {
+    console.warn(
+      `[Relay] pane_in_mode check failed for ${sessionName}:`,
+      summarizeExecError(err)
+    );
+    return;
+  }
+  if (mode !== "1") return;
+  console.warn(`[Relay] pane ${sessionName} in copy-mode, cancelling before send-keys`);
+  try {
+    execFileSync(TMUX_PATH, ["send-keys", "-t", sessionName, "-X", "cancel"], {
+      timeout: 2000,
+    });
+  } catch (err) {
+    // Pane may have exited mode between check and cancel — safe to ignore.
+    console.warn(
+      `[Relay] cancel after mode detection failed for ${sessionName}:`,
+      summarizeExecError(err)
+    );
+  }
+}
+
+export async function tmuxSend(sessionName: string, extraArgs: string[]): Promise<void> {
   const args = ["send-keys", "-t", sessionName, ...extraArgs];
   const PER_CALL_TIMEOUT = 7000;
   try {
@@ -58,17 +103,26 @@ async function tmuxSend(sessionName: string, extraArgs: string[]): Promise<void>
     return;
   } catch (err) {
     const summary = summarizeExecError(err);
-    if (summary.code !== "ETIMEDOUT") {
+    const stderr = getExecStderr(err);
+    const isModeErr = /not in a mode/i.test(stderr);
+    if (summary.code !== "ETIMEDOUT" && !isModeErr) {
       console.error(`[Relay] tmux send-keys failed:`, summary);
       throw err;
     }
-    // Give tmux a breather and try one more time (non-blocking).
-    console.warn(`[Relay] tmux send-keys ETIMEDOUT for ${sessionName}, retrying...`);
+    // Transient: tmux briefly stalled (ETIMEDOUT) OR pane was in copy-mode
+    // (`not in a mode`). Exit any stuck mode and try once more.
+    console.warn(
+      `[Relay] tmux send-keys transient error for ${sessionName} (${isModeErr ? "not-in-a-mode" : summary.code}), recovering...`
+    );
+    await ensurePaneNotInMode(sessionName);
     await new Promise((r) => setTimeout(r, 250));
     try {
       execFileSync(TMUX_PATH, args, { timeout: PER_CALL_TIMEOUT });
     } catch (retryErr) {
-      console.error(`[Relay] tmux send-keys retry also failed for ${sessionName}:`, summarizeExecError(retryErr));
+      console.error(
+        `[Relay] tmux send-keys retry also failed for ${sessionName}:`,
+        summarizeExecError(retryErr)
+      );
       throw retryErr;
     }
   }
@@ -122,6 +176,10 @@ export async function relayMessage(
   const literalText = fullMessage.replace(/\n/g, " ");
 
   try {
+    // Exit any stuck tmux mode (copy-mode, view-mode) BEFORE any send-keys.
+    // A pane in copy-mode consumes keys as mode commands and silently drops
+    // the payload or yields `not in a mode` on the retry path (Issue #73).
+    await ensurePaneNotInMode(tmuxSessionName);
     // Clear any modal state (error dialogs, confirmation prompts) in Claude
     // Code's Ink TUI before sending input. Without this, text sent via
     // send-keys silently disappears when the TUI is in a modal state (#33).
