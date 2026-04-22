@@ -74,6 +74,42 @@ export const CHANNEL_MAP = new Map<string, ChannelConfig>([
       botTokenEnvKey: "OCI_DEVELOP_BOT_TOKEN",
     },
   ],
+  [
+    "agent-base",
+    {
+      channelName: "agent-base",
+      dir: resolve(home, "agent-base"),
+      displayName: "Agent Base",
+      botTokenEnvKey: "AGENT_BASE_BOT_TOKEN",
+    },
+  ],
+  [
+    "openclaw-rpi5-ops",
+    {
+      channelName: "openclaw-rpi5-ops",
+      dir: resolve(home, "openclaw-rpi5-ops"),
+      displayName: "Openclaw Rpi5 Ops",
+      botTokenEnvKey: "OPENCLAW_RPI5_OPS_BOT_TOKEN",
+    },
+  ],
+  [
+    "vive-reading",
+    {
+      channelName: "vive-reading",
+      dir: resolve(home, "vive-reading"),
+      displayName: "Vive Reading",
+      botTokenEnvKey: "VIVE_READING_BOT_TOKEN",
+    },
+  ],
+  [
+    "video-qa",
+    {
+      channelName: "video-qa",
+      dir: resolve(home, "agent-base/video-qa"),
+      displayName: "Video QA",
+      botTokenEnvKey: "VIDEO_QA_BOT_TOKEN",
+    },
+  ],
 ]);
 
 // Meta-dependency guard: claude-hub must never be managed by Channel-Supervisor itself.

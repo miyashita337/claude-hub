@@ -31,3 +31,6 @@ com.claude-hub.hijoguchi.plist
 # in .claude/settings.local.json which stays ignored via the glob below.
 .claude/*
 !.claude/settings.json
+
+# Superpowers skill local state (personal / per-clone brainstorm / plans)
+.superpowers/
