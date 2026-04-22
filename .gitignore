@@ -24,6 +24,6 @@ com.claude-hub.hijoguchi.plist
 
 # Supervisor relay URL marker files
 .supervisor-relay-url
-
+.superpowers/
 # Claude Code local state
 .claude/
