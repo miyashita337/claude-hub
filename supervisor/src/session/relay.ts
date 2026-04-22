@@ -59,9 +59,9 @@ function getExecStderr(err: unknown): string {
 /**
  * If the tmux pane is currently in copy-mode (or any other mode), exit it so
  * the subsequent `send-keys -l` reaches the application instead of being
- * consumed as a mode command. Fail-closed: any error is logged but not thrown —
- * the caller may still attempt send-keys, and a genuinely dead pane will
- * surface a clearer error from the next call.
+ * consumed as a mode command. Best-effort / fail-open: any error is logged but
+ * not thrown — the caller may still attempt send-keys, and a genuinely dead
+ * pane will surface a clearer error from the next call.
  *
  * See Issue #73: tmux pane copy-mode stuck → send-keys silent drop + `not in a mode`.
  */
