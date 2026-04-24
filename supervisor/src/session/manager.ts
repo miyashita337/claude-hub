@@ -23,9 +23,9 @@ import {
   getRelayPort,
   cancelRelay,
 } from "./relay-server";
+import { TMUX_CMD, ensureSocketConfigured } from "./tmux";
 
 const CLAUDE_PATH = resolve(homedir(), ".local", "bin", "claude");
-const TMUX_PATH = process.env.TMUX_PATH ?? "/opt/homebrew/bin/tmux";
 const TMUX_SESSION_PREFIX = "claude-";
 
 export class SessionManager {
@@ -33,6 +33,7 @@ export class SessionManager {
   private sessions = new Map<string, SessionInfo>();
 
   constructor() {
+    ensureSocketConfigured();
     startRelayServer();
     this.recoverFromDb();
   }
@@ -71,7 +72,7 @@ export class SessionManager {
   private getTmuxPid(sessionName: string): number | null {
     try {
       const output = execSync(
-        `${TMUX_PATH} list-panes -t "${sessionName}" -F "#{pane_pid}" 2>/dev/null`,
+        `${TMUX_CMD} list-panes -t "${sessionName}" -F "#{pane_pid}" 2>/dev/null`,
         { encoding: "utf8" }
       ).trim();
       const pid = parseInt(output.split("\n")[0] ?? "", 10);
@@ -83,7 +84,7 @@ export class SessionManager {
 
   private isTmuxSessionAlive(sessionName: string): boolean {
     try {
-      execSync(`${TMUX_PATH} has-session -t "${sessionName}" 2>/dev/null`);
+      execSync(`${TMUX_CMD} has-session -t "${sessionName}" 2>/dev/null`);
       return true;
     } catch {
       return false;
@@ -113,7 +114,7 @@ export class SessionManager {
 
     // Kill existing tmux session if any
     try {
-      execSync(`${TMUX_PATH} kill-session -t "${tmuxName}" 2>/dev/null`);
+      execSync(`${TMUX_CMD} kill-session -t "${tmuxName}" 2>/dev/null`);
     } catch {
       // No existing session
     }
@@ -130,14 +131,14 @@ export class SessionManager {
       `exec ${CLAUDE_PATH} --dangerously-skip-permissions --name "${config.channelName}"`,
     ].join(" && ");
 
-    // Launch via tmux (provides a real TTY)
+    // Launch via tmux (provides a real TTY). Uses Supervisor's dedicated
+    // -L claude-hub socket (see ./tmux.ts) so user config is not inherited.
     execSync(
-      `${TMUX_PATH} new-session -d -s "${tmuxName}" '${claudeCmd}'`
+      `${TMUX_CMD} new-session -d -s "${tmuxName}" '${claudeCmd}'`
     );
-    // Limit scroll buffer for claude sessions (prevents iTerm2 freeze on heavy TUI output)
-    try {
-      execSync(`${TMUX_PATH} set-option -t "${tmuxName}" history-limit 10000`, { timeout: 3000 });
-    } catch { /* session may have already exited */ }
+    // Apply server-wide options now that the server is definitely running.
+    // The constructor's eager call is a no-op before the first new-session.
+    ensureSocketConfigured();
 
     // Wait briefly for process to start
     let pid: number | null = null;
@@ -258,7 +259,7 @@ export class SessionManager {
     await new Promise<void>((resolve) => {
       setTimeout(() => {
         try {
-          execSync(`${TMUX_PATH} kill-session -t "${tmuxName}" 2>/dev/null`);
+          execSync(`${TMUX_CMD} kill-session -t "${tmuxName}" 2>/dev/null`);
         } catch {
           // Already dead
         }
@@ -267,7 +268,7 @@ export class SessionManager {
     });
 
     this.sessions.delete(threadId);
-    markTabStopped(session.channelName);
+    markTabStopped(session.channelName, tmuxName);
     updateSessionStatus(session.id, "stopped", reason);
   }
 
@@ -304,7 +305,7 @@ export class SessionManager {
         );
         this.sessions.delete(threadId);
         if (session) {
-          markTabStopped(session.channelName);
+          markTabStopped(session.channelName, tmuxName);
         }
         updateSessionStatus(sessionId, "stopped", "tmux_exited");
         clearInterval(interval);
@@ -322,7 +323,7 @@ export class SessionManager {
             `[SessionManager] Found running tmux session ${tmuxName}, killing (supervisor restart)`
           );
           try {
-            execSync(`${TMUX_PATH} kill-session -t "${tmuxName}" 2>/dev/null`);
+            execSync(`${TMUX_CMD} kill-session -t "${tmuxName}" 2>/dev/null`);
           } catch {
             // ignore
           }

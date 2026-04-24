@@ -16,6 +16,7 @@ import {
   getRelayPort,
 } from "../../src/session/relay-server";
 import { tmuxSend, ensurePaneNotInMode } from "../../src/session/relay";
+import { TMUX_ARGS, ensureSocketConfigured } from "../../src/session/tmux";
 
 /**
  * End-to-end AC verification for the Discord ↔ Supervisor ↔ Claude Code
@@ -66,7 +67,7 @@ function makeName(tag: string): string {
 }
 
 function capturePane(session: string): string {
-  return execFileSync(TMUX_PATH, ["capture-pane", "-p", "-t", session], {
+  return execFileSync(TMUX_PATH, [...TMUX_ARGS, "capture-pane", "-p", "-t", session], {
     timeout: TMUX_OP_TIMEOUT,
   }).toString();
 }
@@ -74,14 +75,14 @@ function capturePane(session: string): string {
 function startPaneWithSleep(name: string): void {
   execFileSync(
     TMUX_PATH,
-    ["new-session", "-d", "-s", name, "-x", "500", "-y", "40", "sleep", "600"],
+    [...TMUX_ARGS, "new-session", "-d", "-s", name, "-x", "500", "-y", "40", "sleep", "600"],
     { timeout: TMUX_OP_TIMEOUT }
   );
 }
 
 function killPane(name: string): void {
   try {
-    execFileSync(TMUX_PATH, ["kill-session", "-t", name], {
+    execFileSync(TMUX_PATH, [...TMUX_ARGS, "kill-session", "-t", name], {
       timeout: TMUX_OP_TIMEOUT,
     });
   } catch {
@@ -92,10 +93,11 @@ function killPane(name: string): void {
 beforeAll(() => {
   if (hasTmux) {
     try {
-      execFileSync(TMUX_PATH, ["start-server"], { timeout: TMUX_OP_TIMEOUT });
+      execFileSync(TMUX_PATH, [...TMUX_ARGS, "start-server"], { timeout: TMUX_OP_TIMEOUT });
     } catch {
       /* new-session will start the server on demand */
     }
+    ensureSocketConfigured();
   }
   startRelayServer();
 });
@@ -137,7 +139,7 @@ describe("AC E2E verification (Issue #73)", () => {
     try {
       const list = execFileSync(
         TMUX_PATH,
-        ["list-sessions", "-F", "#{session_name}"],
+        [...TMUX_ARGS, "list-sessions", "-F", "#{session_name}"],
         { timeout: TMUX_OP_TIMEOUT }
       ).toString();
       expect(list.split("\n")).toContain(name);
@@ -166,6 +168,7 @@ done
     execFileSync(
       TMUX_PATH,
       [
+        ...TMUX_ARGS,
         "new-session",
         "-d",
         "-s",
@@ -229,12 +232,12 @@ done
     const name = makeName("ac7b");
     startPaneWithSleep(name);
     try {
-      execFileSync(TMUX_PATH, ["copy-mode", "-t", name], {
+      execFileSync(TMUX_PATH, [...TMUX_ARGS, "copy-mode", "-t", name], {
         timeout: TMUX_OP_TIMEOUT,
       });
       const modeOut = execFileSync(
         TMUX_PATH,
-        ["display-message", "-t", name, "-p", "#{pane_in_mode}"],
+        [...TMUX_ARGS, "display-message", "-t", name, "-p", "#{pane_in_mode}"],
         { timeout: TMUX_OP_TIMEOUT }
       )
         .toString()
@@ -248,7 +251,7 @@ done
 
       const finalMode = execFileSync(
         TMUX_PATH,
-        ["display-message", "-t", name, "-p", "#{pane_in_mode}"],
+        [...TMUX_ARGS, "display-message", "-t", name, "-p", "#{pane_in_mode}"],
         { timeout: TMUX_OP_TIMEOUT }
       )
         .toString()
