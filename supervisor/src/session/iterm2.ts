@@ -3,6 +3,7 @@ import { readFileSync } from "fs";
 import { resolve, basename } from "path";
 import { homedir } from "os";
 import { createHash } from "crypto";
+import { TMUX_PATH, TMUX_ARGS, TMUX_CMD } from "./tmux";
 
 const PROJECT_COLORS_PATH = resolve(
   homedir(),
@@ -99,8 +100,6 @@ export interface OpenTabOptions {
   projectDir: string;
 }
 
-const TMUX_PATH = process.env.TMUX_PATH ?? "/opt/homebrew/bin/tmux";
-
 export function openTab(opts: OpenTabOptions): void {
   if (!isItermRunning()) {
     console.log(
@@ -113,26 +112,26 @@ export function openTab(opts: OpenTabOptions): void {
   const tabTitle = `${opts.channelName} (running)`;
   try {
     execSync(
-      `${TMUX_PATH} rename-window -t "${opts.tmuxSessionName}" "${tabTitle}"`,
+      `${TMUX_CMD} rename-window -t "${opts.tmuxSessionName}" "${tabTitle}"`,
       { timeout: 3000 }
     );
     // Disable automatic-rename so tmux doesn't overwrite our title
     execSync(
-      `${TMUX_PATH} set-option -t "${opts.tmuxSessionName}" automatic-rename off`,
+      `${TMUX_CMD} set-option -t "${opts.tmuxSessionName}" automatic-rename off`,
       { timeout: 3000 }
     );
     // Enable set-titles so tmux pushes the window name to iTerm2's tab title
     execSync(
-      `${TMUX_PATH} set-option -t "${opts.tmuxSessionName}" set-titles on`,
+      `${TMUX_CMD} set-option -t "${opts.tmuxSessionName}" set-titles on`,
       { timeout: 3000 }
     );
     execSync(
-      `${TMUX_PATH} set-option -t "${opts.tmuxSessionName}" set-titles-string "#{window_name}"`,
+      `${TMUX_CMD} set-option -t "${opts.tmuxSessionName}" set-titles-string "#{window_name}"`,
       { timeout: 3000 }
     );
     // Set pane title as well
     execSync(
-      `${TMUX_PATH} select-pane -t "${opts.tmuxSessionName}" -T "${tabTitle}"`,
+      `${TMUX_CMD} select-pane -t "${opts.tmuxSessionName}" -T "${tabTitle}"`,
       { timeout: 3000 }
     );
   } catch {
@@ -145,12 +144,19 @@ export function openTab(opts: OpenTabOptions): void {
   const g = parseInt(hex.slice(2, 4), 16) * 257;
   const b = parseInt(hex.slice(4, 6), 16) * 257;
 
+  // NOTE: previously the attach command was `tmux attach ... \; copy-mode` to
+  // prevent accidental keystrokes from going to Claude Code (commit 8987e85).
+  // That forced every pane to start in copy-mode, which combined with
+  // ~/.tmux.conf's WheelUpPane binding created the silent-drop race
+  // documented in Issue #73. With Supervisor's dedicated socket (mouse off
+  // + mode-keys emacs) the accidental-input risk is already mitigated, so
+  // we no longer enter copy-mode on attach.
   const script = [
     'tell application "iTerm2"',
     "  tell current window",
     "    create tab with default profile",
     "    tell current session",
-    `      write text "${TMUX_PATH} attach -t ${opts.tmuxSessionName} \\\\; copy-mode"`,
+    `      write text "${TMUX_CMD} attach -t ${opts.tmuxSessionName}"`,
     `      set name to "${tabTitle}"`,
     `      set background color to {${r}, ${g}, ${b}}`,
     "    end tell",
@@ -177,7 +183,7 @@ export function markTabStopped(channelName: string): void {
   const tmuxName = `claude-${channelName}`;
 
   // Update tmux window name if session still exists (fire-and-forget)
-  const renameProc = spawn(TMUX_PATH, ["rename-window", "-t", tmuxName, newName], {
+  const renameProc = spawn(TMUX_PATH, [...TMUX_ARGS, "rename-window", "-t", tmuxName, newName], {
     stdio: "ignore",
   });
   setTimeout(() => renameProc.kill("SIGKILL"), 3000);

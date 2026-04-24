@@ -3,8 +3,8 @@ import { resolve } from "path";
 import { homedir } from "os";
 import { mkdirSync, writeFileSync, unlinkSync } from "fs";
 import { waitForRelay, type RelayResult } from "./relay-server";
+import { TMUX_PATH, TMUX_ARGS } from "./tmux";
 
-const TMUX_PATH = process.env.TMUX_PATH ?? "/opt/homebrew/bin/tmux";
 const ATTACHMENT_DIR = resolve(homedir(), "claude-hub", "tmp", "attachments");
 
 /** How long to wait for Claude Code Stop hook to fire (ms) */
@@ -70,7 +70,7 @@ export async function ensurePaneNotInMode(sessionName: string): Promise<void> {
   try {
     mode = execFileSync(
       TMUX_PATH,
-      ["display-message", "-t", sessionName, "-p", "#{pane_in_mode}"],
+      [...TMUX_ARGS, "display-message", "-t", sessionName, "-p", "#{pane_in_mode}"],
       { timeout: 2000 }
     ).toString().trim();
   } catch (err) {
@@ -83,7 +83,7 @@ export async function ensurePaneNotInMode(sessionName: string): Promise<void> {
   if (mode !== "1") return;
   console.warn(`[Relay] pane ${sessionName} in copy-mode, cancelling before send-keys`);
   try {
-    execFileSync(TMUX_PATH, ["send-keys", "-t", sessionName, "-X", "cancel"], {
+    execFileSync(TMUX_PATH, [...TMUX_ARGS, "send-keys", "-t", sessionName, "-X", "cancel"], {
       timeout: 2000,
     });
   } catch (err) {
@@ -96,7 +96,7 @@ export async function ensurePaneNotInMode(sessionName: string): Promise<void> {
 }
 
 export async function tmuxSend(sessionName: string, extraArgs: string[]): Promise<void> {
-  const args = ["send-keys", "-t", sessionName, ...extraArgs];
+  const args = [...TMUX_ARGS, "send-keys", "-t", sessionName, ...extraArgs];
   const PER_CALL_TIMEOUT = 7000;
   try {
     execFileSync(TMUX_PATH, args, { timeout: PER_CALL_TIMEOUT });
