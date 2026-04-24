@@ -268,7 +268,7 @@ export class SessionManager {
     });
 
     this.sessions.delete(threadId);
-    markTabStopped(session.channelName);
+    markTabStopped(session.channelName, tmuxName);
     updateSessionStatus(session.id, "stopped", reason);
   }
 
@@ -305,7 +305,7 @@ export class SessionManager {
         );
         this.sessions.delete(threadId);
         if (session) {
-          markTabStopped(session.channelName);
+          markTabStopped(session.channelName, tmuxName);
         }
         updateSessionStatus(sessionId, "stopped", "tmux_exited");
         clearInterval(interval);

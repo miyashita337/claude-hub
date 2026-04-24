@@ -177,10 +177,14 @@ export function openTab(opts: OpenTabOptions): void {
   }
 }
 
-export function markTabStopped(channelName: string): void {
+export function markTabStopped(channelName: string, tmuxSessionName?: string): void {
   const tabName = `${channelName} (running)`;
   const newName = `${channelName} (stopped)`;
-  const tmuxName = `claude-${channelName}`;
+  // The actual tmux session name is `claude-${threadId.slice(0,12)}` (see
+  // SessionManager.tmuxSessionName). Callers that know the threadId should
+  // pass the resolved name so `rename-window` actually targets the session.
+  // The fallback exists for legacy callers without a threadId in scope.
+  const tmuxName = tmuxSessionName ?? `claude-${channelName}`;
 
   // Update tmux window name if session still exists (fire-and-forget)
   const renameProc = spawn(TMUX_PATH, [...TMUX_ARGS, "rename-window", "-t", tmuxName, newName], {
