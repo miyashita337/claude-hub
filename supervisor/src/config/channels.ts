@@ -5,7 +5,6 @@ export interface ChannelConfig {
   channelName: string;
   dir: string;
   displayName: string;
-  botTokenEnvKey: string; // .env key for this channel's DISCORD_BOT_TOKEN
 }
 
 const home = homedir();
@@ -17,7 +16,6 @@ export const CHANNEL_MAP = new Map<string, ChannelConfig>([
       channelName: "team-salary",
       dir: resolve(home, "team_salary"),
       displayName: "Team Salary",
-      botTokenEnvKey: "TEAM_SALARY_BOT_TOKEN",
     },
   ],
   [
@@ -26,7 +24,6 @@ export const CHANNEL_MAP = new Map<string, ChannelConfig>([
       channelName: "convert-service",
       dir: resolve(home, "convert-service"),
       displayName: "Convert Service",
-      botTokenEnvKey: "CONVERT_SERVICE_BOT_TOKEN",
     },
   ],
   [
@@ -35,7 +32,6 @@ export const CHANNEL_MAP = new Map<string, ChannelConfig>([
       channelName: "segment-anything",
       dir: resolve(home, "segment-anything"),
       displayName: "Segment Anything",
-      botTokenEnvKey: "SEGMENT_ANYTHING_BOT_TOKEN",
     },
   ],
   [
@@ -44,7 +40,6 @@ export const CHANNEL_MAP = new Map<string, ChannelConfig>([
       channelName: "claude-context-manager",
       dir: resolve(home, "claude-context-manager"),
       displayName: "Claude Context Manager",
-      botTokenEnvKey: "CLAUDE_CONTEXT_MANAGER_BOT_TOKEN",
     },
   ],
   [
@@ -53,7 +48,6 @@ export const CHANNEL_MAP = new Map<string, ChannelConfig>([
       channelName: "dev-tool",
       dir: resolve(home, "dev_tool"),
       displayName: "Dev Tool",
-      botTokenEnvKey: "DEV_TOOL_BOT_TOKEN",
     },
   ],
   [
@@ -62,7 +56,6 @@ export const CHANNEL_MAP = new Map<string, ChannelConfig>([
       channelName: "obsidian-img-annotator",
       dir: resolve(home, "obsidian_img_annotator"),
       displayName: "Obsidian Img Annotator",
-      botTokenEnvKey: "OBSIDIAN_IMG_ANNOTATOR_BOT_TOKEN",
     },
   ],
   [
@@ -71,7 +64,6 @@ export const CHANNEL_MAP = new Map<string, ChannelConfig>([
       channelName: "oci-develop",
       dir: resolve(home, "oci_develop"),
       displayName: "OCI Develop",
-      botTokenEnvKey: "OCI_DEVELOP_BOT_TOKEN",
     },
   ],
   [
@@ -80,7 +72,6 @@ export const CHANNEL_MAP = new Map<string, ChannelConfig>([
       channelName: "agent-base",
       dir: resolve(home, "agent-base"),
       displayName: "Agent Base",
-      botTokenEnvKey: "AGENT_BASE_BOT_TOKEN",
     },
   ],
   [
@@ -89,7 +80,6 @@ export const CHANNEL_MAP = new Map<string, ChannelConfig>([
       channelName: "openclaw-rpi5-ops",
       dir: resolve(home, "openclaw-rpi5-ops"),
       displayName: "Openclaw Rpi5 Ops",
-      botTokenEnvKey: "OPENCLAW_RPI5_OPS_BOT_TOKEN",
     },
   ],
   [
@@ -98,7 +88,6 @@ export const CHANNEL_MAP = new Map<string, ChannelConfig>([
       channelName: "vive-reading",
       dir: resolve(home, "vive-reading"),
       displayName: "Vive Reading",
-      botTokenEnvKey: "VIVE_READING_BOT_TOKEN",
     },
   ],
   [
@@ -107,7 +96,6 @@ export const CHANNEL_MAP = new Map<string, ChannelConfig>([
       channelName: "video-qa",
       dir: resolve(home, "agent-base/video-qa"),
       displayName: "Video QA",
-      botTokenEnvKey: "VIDEO_QA_BOT_TOKEN",
     },
   ],
 ]);

@@ -32,7 +32,6 @@ function makeChannelConfig(overrides: Partial<ChannelConfig> = {}): ChannelConfi
     channelName: "test-channel",
     dir,
     displayName: "Test Channel",
-    botTokenEnvKey: "TEST_BOT_TOKEN",
     ...overrides,
   };
 }
