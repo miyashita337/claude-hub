@@ -120,16 +120,24 @@ describe("manager.ts relay URL write", () => {
     expect(managerSource).not.toMatch(/writeFileSync\(relayUrlFile/);
   });
 
-  test("relayUrlFilePath sanitises cwd into $XDG_RUNTIME_DIR/claude-hub-supervisor/<sanitised>.relay-url", async () => {
-    const { relayUrlFilePath } = await import("../../src/session/manager");
-    const result = relayUrlFilePath("/Users/x/team_salary");
-    // Default to /tmp when XDG_RUNTIME_DIR is unset
-    expect(result).toMatch(
-      /\/claude-hub-supervisor\/Users_x_team_salary\.relay-url$/
-    );
+  test("relayUrlFilePath sanitises cwd and falls back to /tmp/claude-hub-supervisor-<USER> when XDG unset", async () => {
+    const originalXdg = process.env.XDG_RUNTIME_DIR;
+    const originalUser = process.env.USER;
+    delete process.env.XDG_RUNTIME_DIR;
+    process.env.USER = "alice";
+    try {
+      const { relayUrlFilePath } = await import("../../src/session/manager");
+      expect(relayUrlFilePath("/Users/x/team_salary")).toBe(
+        "/tmp/claude-hub-supervisor-alice/Users_x_team_salary.relay-url"
+      );
+    } finally {
+      if (originalXdg !== undefined) process.env.XDG_RUNTIME_DIR = originalXdg;
+      if (originalUser !== undefined) process.env.USER = originalUser;
+      else delete process.env.USER;
+    }
   });
 
-  test("relayUrlFilePath honours XDG_RUNTIME_DIR when set", async () => {
+  test("relayUrlFilePath honours XDG_RUNTIME_DIR when set (per-user dir by spec)", async () => {
     const original = process.env.XDG_RUNTIME_DIR;
     process.env.XDG_RUNTIME_DIR = "/run/user/501";
     try {
@@ -145,6 +153,24 @@ describe("manager.ts relay URL write", () => {
         delete process.env.XDG_RUNTIME_DIR;
       }
     }
+  });
+
+  test("relayUrlFilePath sanitises shell-unsafe characters (defensive)", async () => {
+    const { relayUrlFilePath } = await import("../../src/session/manager");
+    // double-quotes / spaces / backticks must become `_` so the resulting path
+    // cannot break the printf > "${file}" tmux command
+    const result = relayUrlFilePath('/Users/x/dir"with spaces`');
+    expect(result).toMatch(/Users_x_dir_with_spaces_\.relay-url$/);
+    expect(result).not.toContain('"');
+    expect(result).not.toContain("`");
+    expect(result).not.toContain(" ");
+  });
+
+  test("relayUrlFilePath strips multiple leading slashes (matches TS regex /^\\/+/)", async () => {
+    const { relayUrlFilePath } = await import("../../src/session/manager");
+    expect(relayUrlFilePath("///Users/x/foo")).toMatch(
+      /\/Users_x_foo\.relay-url$/
+    );
   });
 });
 
@@ -238,8 +264,8 @@ describe("manager.ts tmux command syntax", () => {
       "unset ANTHROPIC_API_KEY",
       'export PATH="/tmp/.local/bin:/tmp/.bun/bin:/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin"',
       'export SUPERVISOR_RELAY_URL="http://localhost:12345/relay/thread-abc"',
-      'mkdir -p "/tmp/claude-hub-supervisor"',
-      'printf "%s" "http://localhost:12345/relay/thread-abc" > "/tmp/claude-hub-supervisor/tmp_project.relay-url"',
+      'mkdir -p "/tmp/claude-hub-supervisor-alice"',
+      'printf "%s" "http://localhost:12345/relay/thread-abc" > "/tmp/claude-hub-supervisor-alice/tmp_project.relay-url"',
       'cd "/tmp/project"',
       'exec /tmp/claude --dangerously-skip-permissions --name "my-channel"',
     ].join(" && ");

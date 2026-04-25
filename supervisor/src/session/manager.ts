@@ -26,10 +26,16 @@ const TMUX_SESSION_PREFIX = "claude-";
 
 /**
  * Compute the runtime-dir path that holds the relay URL for a given project
- * cwd. Sanitises by stripping the leading `/` and replacing the remaining
- * slashes with underscores so each session's URL lives in its own file:
+ * cwd. Sanitises by stripping every leading `/` and replacing any character
+ * outside `[A-Za-z0-9._-]` with `_`, so each session's URL lives in its own
+ * file and the path is shell-safe even if `projectDir` contains quotes:
  *
- *   /Users/x/team_salary  →  ${RUNTIME_DIR}/claude-hub-supervisor/Users_x_team_salary.relay-url
+ *   /Users/x/team_salary  →  ${RUNTIME_DIR}/Users_x_team_salary.relay-url
+ *
+ * `XDG_RUNTIME_DIR` is per-user by spec (`/run/user/$UID`), so when present
+ * we just append `claude-hub-supervisor`. When absent (typical macOS) we fall
+ * back to `/tmp/claude-hub-supervisor-<USER>` to avoid multi-user mkdir
+ * collisions on shared `/tmp`.
  *
  * The same scheme is mirrored in `supervisor/hooks/progress-relay.sh`. If you
  * change the layout here, update the hook and its tests as well.
@@ -37,9 +43,15 @@ const TMUX_SESSION_PREFIX = "claude-";
  * Issue #88: keeps the file out of every project repo.
  */
 export function relayUrlFilePath(projectDir: string): string {
-  const runtimeDir = process.env.XDG_RUNTIME_DIR || "/tmp";
-  const sanitised = projectDir.replace(/^\/+/, "").replace(/\//g, "_");
-  return `${runtimeDir}/claude-hub-supervisor/${sanitised}.relay-url`;
+  const fromXdg = process.env.XDG_RUNTIME_DIR;
+  const user = process.env.USER || "default";
+  const runtimeDir = fromXdg
+    ? `${fromXdg}/claude-hub-supervisor`
+    : `/tmp/claude-hub-supervisor-${user}`;
+  const sanitised = projectDir
+    .replace(/^\/+/, "")
+    .replace(/[^A-Za-z0-9._-]/g, "_");
+  return `${runtimeDir}/${sanitised}.relay-url`;
 }
 
 export interface SessionManagerOptions {
