@@ -26,10 +26,9 @@ describe("ensureSocketConfigured unhappy-path (#85)", () => {
     ensureSocketConfigured();
 
     expect(warnSpy).toHaveBeenCalledTimes(1);
-    expect(warnSpy.mock.calls[0][0]).toBe(
-      "[tmux] ensureSocketConfigured failed:",
-    );
-    expect(warnSpy.mock.calls[0][1]).toBeInstanceOf(Error);
+    const firstCall = warnSpy.mock.calls[0]!;
+    expect(firstCall[0]).toBe("[tmux] ensureSocketConfigured failed:");
+    expect(firstCall[1]).toBeInstanceOf(Error);
 
     warnSpy.mockRestore();
   });
@@ -95,7 +94,7 @@ describe("ensureSocketConfigured unhappy-path (#85)", () => {
 
     ensureSocketConfigured();
 
-    expect(warnSpy.mock.calls[0][1]).toBe(customError);
+    expect(warnSpy.mock.calls[0]![1]).toBe(customError);
 
     warnSpy.mockRestore();
   });
@@ -109,7 +108,7 @@ describe("ensureSocketConfigured unhappy-path (#85)", () => {
     ensureSocketConfigured();
 
     expect(warnSpy).toHaveBeenCalledTimes(1);
-    expect(warnSpy.mock.calls[0][1]).toBe("permission denied raw string");
+    expect(warnSpy.mock.calls[0]![1]).toBe("permission denied raw string");
 
     warnSpy.mockRestore();
   });
