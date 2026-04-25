@@ -1,6 +1,6 @@
 import { execSync } from "child_process";
 import { randomUUID } from "crypto";
-import { existsSync, mkdirSync } from "fs";
+import { existsSync } from "fs";
 import { resolve } from "path";
 import { homedir } from "os";
 import type { SessionInfo, StopReason } from "./types";
@@ -15,26 +15,51 @@ import {
   updateSessionActivity,
   getRunningSessions,
 } from "../infra/db";
-import { openTab, markTabStopped } from "./iterm2";
 import { relayMessage, type AttachmentInfo, type RelayResult } from "./relay";
 import {
-  startRelayServer,
-  stopRelayServer,
-  getRelayPort,
-  cancelRelay,
-} from "./relay-server";
-import { TMUX_CMD, ensureSocketConfigured } from "./tmux";
+  realSessionEffects,
+  type SessionEffects,
+} from "./adapters";
 
 const CLAUDE_PATH = resolve(homedir(), ".local", "bin", "claude");
 const TMUX_SESSION_PREFIX = "claude-";
 
+export interface SessionManagerOptions {
+  /**
+   * Inject side-effect adapters for tmux / iTerm2 / relay-server / process
+   * signals. Tests pass fakes from {@link ./adapters-fake} so unit tests do
+   * not spawn real tmux sessions or iTerm2 tabs (Issue #61). Production
+   * leaves this undefined to use {@link realSessionEffects}.
+   */
+  effects?: Partial<SessionEffects>;
+  /**
+   * Override the graceful-kill wait so tests don't pay the production 15s
+   * delay before kill-session. Defaults to {@link GRACEFUL_KILL_TIMEOUT_MS}.
+   */
+  gracefulKillTimeoutMs?: number;
+}
+
 export class SessionManager {
   /** Map<threadId, SessionInfo> — one session per thread */
   private sessions = new Map<string, SessionInfo>();
+  /** Map<threadId, intervalHandle> — watchdogs to clear on stop/shutdown */
+  private watchers = new Map<string, ReturnType<typeof setInterval>>();
+  private readonly effects: SessionEffects;
+  private readonly gracefulKillTimeoutMs: number;
 
-  constructor() {
-    ensureSocketConfigured();
-    startRelayServer();
+  constructor(options: SessionManagerOptions = {}) {
+    this.effects = {
+      tmux: options.effects?.tmux ?? realSessionEffects.tmux,
+      iterm2: options.effects?.iterm2 ?? realSessionEffects.iterm2,
+      relayServer:
+        options.effects?.relayServer ?? realSessionEffects.relayServer,
+      process: options.effects?.process ?? realSessionEffects.process,
+    };
+    this.gracefulKillTimeoutMs =
+      options.gracefulKillTimeoutMs ?? GRACEFUL_KILL_TIMEOUT_MS;
+
+    this.effects.tmux.ensureSocketConfigured();
+    this.effects.relayServer.start();
     this.recoverFromDb();
   }
 
@@ -69,28 +94,6 @@ export class SessionManager {
     return `${TMUX_SESSION_PREFIX}${threadId.slice(0, 12)}`;
   }
 
-  private getTmuxPid(sessionName: string): number | null {
-    try {
-      const output = execSync(
-        `${TMUX_CMD} list-panes -t "${sessionName}" -F "#{pane_pid}" 2>/dev/null`,
-        { encoding: "utf8" }
-      ).trim();
-      const pid = parseInt(output.split("\n")[0] ?? "", 10);
-      return isNaN(pid) ? null : pid;
-    } catch {
-      return null;
-    }
-  }
-
-  private isTmuxSessionAlive(sessionName: string): boolean {
-    try {
-      execSync(`${TMUX_CMD} has-session -t "${sessionName}" 2>/dev/null`);
-      return true;
-    } catch {
-      return false;
-    }
-  }
-
   /**
    * Start a new session with tmux + iTerm2 + thread.
    */
@@ -113,14 +116,10 @@ export class SessionManager {
     const tmuxName = this.tmuxSessionName(threadId);
 
     // Kill existing tmux session if any
-    try {
-      execSync(`${TMUX_CMD} kill-session -t "${tmuxName}" 2>/dev/null`);
-    } catch {
-      // No existing session
-    }
+    this.effects.tmux.killSession(tmuxName);
 
     // Build the claude command — unset ANTHROPIC_API_KEY to use Claude Max subscription
-    const relayUrl = `http://localhost:${getRelayPort()}/relay/${threadId}`;
+    const relayUrl = `http://localhost:${this.effects.relayServer.getPort()}/relay/${threadId}`;
 
     const claudeCmd = [
       "unset ANTHROPIC_API_KEY",
@@ -133,17 +132,15 @@ export class SessionManager {
 
     // Launch via tmux (provides a real TTY). Uses Supervisor's dedicated
     // -L claude-hub socket (see ./tmux.ts) so user config is not inherited.
-    execSync(
-      `${TMUX_CMD} new-session -d -s "${tmuxName}" '${claudeCmd}'`
-    );
+    this.effects.tmux.newSession(tmuxName, claudeCmd);
     // Apply server-wide options now that the server is definitely running.
     // The constructor's eager call is a no-op before the first new-session.
-    ensureSocketConfigured();
+    this.effects.tmux.ensureSocketConfigured();
 
     // Wait briefly for process to start
     let pid: number | null = null;
     for (let i = 0; i < 5; i++) {
-      pid = this.getTmuxPid(tmuxName);
+      pid = this.effects.tmux.getPid(tmuxName);
       if (pid) break;
       execSync("sleep 0.5");
     }
@@ -190,7 +187,7 @@ export class SessionManager {
 
     // Open iTerm2 tab asynchronously (non-blocking, failure is safe)
     setTimeout(() => {
-      openTab({
+      this.effects.iterm2.openTab({
         tmuxSessionName: tmuxName,
         channelName: config.channelName,
         projectDir: config.dir,
@@ -220,7 +217,7 @@ export class SessionManager {
     const tmuxName = this.tmuxSessionName(threadId);
 
     // Check tmux session is alive
-    if (!this.isTmuxSessionAlive(tmuxName)) {
+    if (!this.effects.tmux.hasSession(tmuxName)) {
       return {
         text: "",
         chunks: ["⚠️ Claude Code セッションが終了しています。`/session start` で再起動してください。"],
@@ -241,7 +238,7 @@ export class SessionManager {
     }
 
     session.status = "stopping";
-    cancelRelay(threadId);
+    this.effects.relayServer.cancel(threadId);
     const tmuxName = this.tmuxSessionName(threadId);
 
     console.log(
@@ -250,7 +247,7 @@ export class SessionManager {
 
     // Send SIGTERM to the claude process
     try {
-      process.kill(session.pid, "SIGTERM");
+      this.effects.process.kill(session.pid, "SIGTERM");
     } catch {
       // Process already dead
     }
@@ -258,17 +255,14 @@ export class SessionManager {
     // Wait for graceful shutdown, then force kill tmux session
     await new Promise<void>((resolve) => {
       setTimeout(() => {
-        try {
-          execSync(`${TMUX_CMD} kill-session -t "${tmuxName}" 2>/dev/null`);
-        } catch {
-          // Already dead
-        }
+        this.effects.tmux.killSession(tmuxName);
         resolve();
-      }, GRACEFUL_KILL_TIMEOUT_MS);
+      }, this.gracefulKillTimeoutMs);
     });
 
+    this.clearWatcher(threadId);
     this.sessions.delete(threadId);
-    markTabStopped(session.channelName, tmuxName);
+    this.effects.iterm2.markTabStopped(session.channelName, tmuxName);
     updateSessionStatus(session.id, "stopped", reason);
   }
 
@@ -288,8 +282,21 @@ export class SessionManager {
       )
     );
     await Promise.allSettled(promises);
-    stopRelayServer();
+    // Clear any remaining watchers (defensive — stop() already clears them).
+    for (const handle of this.watchers.values()) {
+      clearInterval(handle);
+    }
+    this.watchers.clear();
+    this.effects.relayServer.stop();
     console.log("[SessionManager] All sessions stopped.");
+  }
+
+  private clearWatcher(threadId: string): void {
+    const handle = this.watchers.get(threadId);
+    if (handle) {
+      clearInterval(handle);
+      this.watchers.delete(threadId);
+    }
   }
 
   private watchTmuxSession(
@@ -298,19 +305,20 @@ export class SessionManager {
     sessionId: string
   ): void {
     const interval = setInterval(() => {
-      if (!this.isTmuxSessionAlive(tmuxName)) {
+      if (!this.effects.tmux.hasSession(tmuxName)) {
         const session = this.sessions.get(threadId);
         console.log(
           `[SessionManager] tmux session ${tmuxName} exited`
         );
         this.sessions.delete(threadId);
         if (session) {
-          markTabStopped(session.channelName, tmuxName);
+          this.effects.iterm2.markTabStopped(session.channelName, tmuxName);
         }
         updateSessionStatus(sessionId, "stopped", "tmux_exited");
-        clearInterval(interval);
+        this.clearWatcher(threadId);
       }
     }, 10_000); // Check every 10 seconds
+    this.watchers.set(threadId, interval);
   }
 
   private recoverFromDb(): void {
@@ -318,15 +326,11 @@ export class SessionManager {
     for (const row of rows) {
       if (row.thread_id) {
         const tmuxName = this.tmuxSessionName(row.thread_id);
-        if (this.isTmuxSessionAlive(tmuxName)) {
+        if (this.effects.tmux.hasSession(tmuxName)) {
           console.log(
             `[SessionManager] Found running tmux session ${tmuxName}, killing (supervisor restart)`
           );
-          try {
-            execSync(`${TMUX_CMD} kill-session -t "${tmuxName}" 2>/dev/null`);
-          } catch {
-            // ignore
-          }
+          this.effects.tmux.killSession(tmuxName);
         }
       }
       updateSessionStatus(row.id, "stopped", "supervisor_restart");
