@@ -2,8 +2,15 @@
 # Claude Code PostToolUse hook: sends tool progress to Supervisor's HTTP relay.
 # Called with JSON on stdin containing tool_name, tool_input, cwd, etc.
 #
-# Relay URL is read from $CWD/.supervisor-relay-url (written by SessionManager).
-# Claude Code hooks don't inherit custom env vars, so we use filesystem.
+# Relay URL is read from a runtime-dir file keyed by the sanitised cwd, written
+# by SessionManager.start (see supervisor/src/session/manager.ts
+# relayUrlFilePath). Claude Code hooks don't inherit custom env vars, so we
+# fall back to the filesystem. Layout (Issue #88):
+#
+#   ${XDG_RUNTIME_DIR:-/tmp}/claude-hub-supervisor/<sanitised-cwd>.relay-url
+#
+# where <sanitised-cwd> is the absolute cwd with the leading `/` stripped and
+# the remaining `/` replaced by `_` (matches the TS helper exactly).
 #
 # Sends: { tool, message } where message is a short human-readable target
 # extracted from tool_input (e.g., "pgrep -fl claude" for Bash).
@@ -17,7 +24,11 @@ if [ -z "$CWD" ]; then
   exit 0
 fi
 
-RELAY_URL_FILE="${CWD}/.supervisor-relay-url"
+# Sanitise the cwd to match relayUrlFilePath() in manager.ts
+SANITISED="${CWD#/}"
+SANITISED="${SANITISED//\//_}"
+RUNTIME_DIR="${XDG_RUNTIME_DIR:-/tmp}"
+RELAY_URL_FILE="${RUNTIME_DIR}/claude-hub-supervisor/${SANITISED}.relay-url"
 if [ ! -f "$RELAY_URL_FILE" ]; then
   exit 0
 fi

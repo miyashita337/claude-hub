@@ -24,6 +24,24 @@ import {
 const CLAUDE_PATH = resolve(homedir(), ".local", "bin", "claude");
 const TMUX_SESSION_PREFIX = "claude-";
 
+/**
+ * Compute the runtime-dir path that holds the relay URL for a given project
+ * cwd. Sanitises by stripping the leading `/` and replacing the remaining
+ * slashes with underscores so each session's URL lives in its own file:
+ *
+ *   /Users/x/team_salary  →  ${RUNTIME_DIR}/claude-hub-supervisor/Users_x_team_salary.relay-url
+ *
+ * The same scheme is mirrored in `supervisor/hooks/progress-relay.sh`. If you
+ * change the layout here, update the hook and its tests as well.
+ *
+ * Issue #88: keeps the file out of every project repo.
+ */
+export function relayUrlFilePath(projectDir: string): string {
+  const runtimeDir = process.env.XDG_RUNTIME_DIR || "/tmp";
+  const sanitised = projectDir.replace(/^\/+/, "").replace(/\//g, "_");
+  return `${runtimeDir}/claude-hub-supervisor/${sanitised}.relay-url`;
+}
+
 export interface SessionManagerOptions {
   /**
    * Inject side-effect adapters for tmux / iTerm2 / relay-server / process
@@ -121,11 +139,19 @@ export class SessionManager {
     // Build the claude command — unset ANTHROPIC_API_KEY to use Claude Max subscription
     const relayUrl = `http://localhost:${this.effects.relayServer.getPort()}/relay/${threadId}`;
 
+    // Relay URL is written to a runtime-dir file keyed by the project cwd so
+    // that progress-relay.sh (PostToolUse hook) can locate it from $CWD without
+    // dropping `.supervisor-relay-url` into every project repo (Issue #88).
+    // The hook applies the same sanitisation logic to its `$CWD` payload.
+    const relayUrlFile = relayUrlFilePath(config.dir);
+    const relayUrlDir = relayUrlFile.replace(/\/[^/]+$/, "");
+
     const claudeCmd = [
       "unset ANTHROPIC_API_KEY",
       `export PATH="${resolve(homedir(), ".local/bin")}:${resolve(homedir(), ".bun/bin")}:/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin"`,
       `export SUPERVISOR_RELAY_URL="${relayUrl}"`,
-      `printf "%s" "${relayUrl}" > "${config.dir}/.supervisor-relay-url"`,
+      `mkdir -p "${relayUrlDir}"`,
+      `printf "%s" "${relayUrl}" > "${relayUrlFile}"`,
       `cd "${config.dir}"`,
       `exec ${CLAUDE_PATH} --dangerously-skip-permissions --name "${config.channelName}"`,
     ].join(" && ");

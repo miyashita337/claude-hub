@@ -13,7 +13,18 @@ const HOOK_PATH = resolve(import.meta.dir, "../../hooks/progress-relay.sh");
  */
 function setupTestEnv(relayUrl: string) {
   const dir = mkdtempSync(resolve(tmpdir(), "progress-relay-test-"));
-  writeFileSync(resolve(dir, ".supervisor-relay-url"), relayUrl, "utf8");
+
+  // Issue #88: relay URL file lives in $XDG_RUNTIME_DIR/claude-hub-supervisor/
+  // keyed by sanitised cwd, NOT inside the project dir.
+  const runtimeDir = mkdtempSync(resolve(tmpdir(), "progress-relay-runtime-"));
+  const sanitisedCwd = dir.replace(/^\/+/, "").replace(/\//g, "_");
+  const relayDir = resolve(runtimeDir, "claude-hub-supervisor");
+  mkdirSync(relayDir, { recursive: true });
+  writeFileSync(
+    resolve(relayDir, `${sanitisedCwd}.relay-url`),
+    relayUrl,
+    "utf8",
+  );
 
   // Mock curl: writes all args to a file, reads stdin -d @- and writes it too
   const mockBinDir = resolve(dir, "mock-bin");
@@ -36,11 +47,12 @@ done
   const mockCurlPath = resolve(mockBinDir, "curl");
   writeFileSync(mockCurlPath, mockCurl, { mode: 0o755 });
 
-  return { dir, curlArgsFile, curlStdinFile, mockBinDir };
+  return { dir, curlArgsFile, curlStdinFile, mockBinDir, runtimeDir };
 }
 
-function cleanup(dir: string) {
-  rmSync(dir, { recursive: true, force: true });
+function cleanup(env: ReturnType<typeof setupTestEnv>) {
+  rmSync(env.dir, { recursive: true, force: true });
+  rmSync(env.runtimeDir, { recursive: true, force: true });
 }
 
 function makeInput(toolName: string, toolInput: Record<string, unknown>, cwd: string): string {
@@ -58,13 +70,13 @@ describe("progress-relay.sh URL replacement", () => {
   });
 
   afterEach(() => {
-    cleanup(env.dir);
+    cleanup(env);
   });
 
   test("PROGRESS_URL has no backslash-escaped slashes", async () => {
     const input = makeInput("Bash", { command: "echo test" }, env.dir);
 
-    await $`echo ${input} | PATH=${env.mockBinDir}:$PATH bash ${HOOK_PATH}`
+    await $`echo ${input} | PATH=${env.mockBinDir}:$PATH XDG_RUNTIME_DIR=${env.runtimeDir} bash ${HOOK_PATH}`
       .quiet()
       .nothrow();
 
@@ -77,21 +89,25 @@ describe("progress-relay.sh URL replacement", () => {
 });
 
 // ---------------------------------------------------------------------------
-// Test 2: Static analysis — manager.ts writes .supervisor-relay-url
+// Test 2: Static analysis — manager.ts writes the relay URL file via
+// relayUrlFilePath() helper (Issue #88: file lives in $XDG_RUNTIME_DIR, not
+// in the project repo).
 // ---------------------------------------------------------------------------
-describe("manager.ts .supervisor-relay-url write", () => {
-  test("start() contains printf to .supervisor-relay-url in tmux command", () => {
+describe("manager.ts relay URL write", () => {
+  test("start() contains printf to the relayUrlFilePath result in tmux command", () => {
     const managerSource = readFileSync(
       resolve(import.meta.dir, "../../src/session/manager.ts"),
       "utf8"
     );
 
-    // The tmux command string should include writing the relay URL file
-    expect(managerSource).toMatch(/\.supervisor-relay-url/);
+    // The tmux command string should reference the helper-derived file path
+    expect(managerSource).toMatch(/relayUrlFile/);
     // Check for the printf pattern that writes the relay URL (double-quoted for tmux safety)
     expect(managerSource).toMatch(
-      /printf\s+"%s"\s+.*\.supervisor-relay-url/
+      /printf\s+"%s"\s+"\$\{relayUrl\}"\s+>\s+"\$\{relayUrlFile\}"/
     );
+    // mkdir -p must precede the printf so the runtime dir exists
+    expect(managerSource).toMatch(/mkdir\s+-p\s+"\$\{relayUrlDir\}"/);
   });
 
   test("start() does NOT use writeFileSync (printf in tmux is sufficient)", () => {
@@ -102,6 +118,33 @@ describe("manager.ts .supervisor-relay-url write", () => {
 
     // writeFileSync for relay URL should have been removed
     expect(managerSource).not.toMatch(/writeFileSync\(relayUrlFile/);
+  });
+
+  test("relayUrlFilePath sanitises cwd into $XDG_RUNTIME_DIR/claude-hub-supervisor/<sanitised>.relay-url", async () => {
+    const { relayUrlFilePath } = await import("../../src/session/manager");
+    const result = relayUrlFilePath("/Users/x/team_salary");
+    // Default to /tmp when XDG_RUNTIME_DIR is unset
+    expect(result).toMatch(
+      /\/claude-hub-supervisor\/Users_x_team_salary\.relay-url$/
+    );
+  });
+
+  test("relayUrlFilePath honours XDG_RUNTIME_DIR when set", async () => {
+    const original = process.env.XDG_RUNTIME_DIR;
+    process.env.XDG_RUNTIME_DIR = "/run/user/501";
+    try {
+      const { relayUrlFilePath } = await import("../../src/session/manager");
+      const result = relayUrlFilePath("/Users/x/agent-base");
+      expect(result).toBe(
+        "/run/user/501/claude-hub-supervisor/Users_x_agent-base.relay-url"
+      );
+    } finally {
+      if (original !== undefined) {
+        process.env.XDG_RUNTIME_DIR = original;
+      } else {
+        delete process.env.XDG_RUNTIME_DIR;
+      }
+    }
   });
 });
 
@@ -116,7 +159,7 @@ describe("progress-relay.sh tool message extraction", () => {
   });
 
   afterEach(() => {
-    cleanup(env.dir);
+    cleanup(env);
   });
 
   async function runHookAndGetMessage(
@@ -125,7 +168,7 @@ describe("progress-relay.sh tool message extraction", () => {
   ): Promise<{ tool: string; message: string } | null> {
     const input = makeInput(toolName, toolInput, env.dir);
 
-    await $`echo ${input} | PATH=${env.mockBinDir}:$PATH bash ${HOOK_PATH}`
+    await $`echo ${input} | PATH=${env.mockBinDir}:$PATH XDG_RUNTIME_DIR=${env.runtimeDir} bash ${HOOK_PATH}`
       .quiet()
       .nothrow();
 
@@ -195,7 +238,8 @@ describe("manager.ts tmux command syntax", () => {
       "unset ANTHROPIC_API_KEY",
       'export PATH="/tmp/.local/bin:/tmp/.bun/bin:/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin"',
       'export SUPERVISOR_RELAY_URL="http://localhost:12345/relay/thread-abc"',
-      'printf "%s" "http://localhost:12345/relay/thread-abc" > "/tmp/project/.supervisor-relay-url"',
+      'mkdir -p "/tmp/claude-hub-supervisor"',
+      'printf "%s" "http://localhost:12345/relay/thread-abc" > "/tmp/claude-hub-supervisor/tmp_project.relay-url"',
       'cd "/tmp/project"',
       'exec /tmp/claude --dangerously-skip-permissions --name "my-channel"',
     ].join(" && ");
