@@ -20,6 +20,10 @@ import {
   extractFilePaths,
   collectAttachableFiles,
 } from "./session/file-attacher";
+import {
+  looksLikeSlashCommand,
+  stripLeadingSlash,
+} from "./session/slash-prefix";
 
 export async function startBot(token: string): Promise<void> {
   const client = new Client({
@@ -195,6 +199,27 @@ export async function startBot(token: string): Promise<void> {
       messageText = "添付ファイルを確認してください。";
     }
     if (!messageText) return;
+
+    // Slash-prefix stripping: `/hanle-review XXX` → `hanle-review XXX`. Without
+    // this, Claude Code's Ink TUI enters its slash-command picker on `/`, and
+    // for a typo it stays open silently, hanging the per-thread relay queue
+    // until RELAY_TIMEOUT_MS — the bot looks idle to the user (Issue #86).
+    // Paths like `/usr/bin/ls` are intentionally not matched by
+    // looksLikeSlashCommand and pass through unchanged.
+    if (looksLikeSlashCommand(messageText)) {
+      const original = messageText;
+      messageText = stripLeadingSlash(messageText);
+      console.log(
+        `[Bot] Stripped slash prefix in thread ${threadId}: "${original.slice(0, 80)}" → "${messageText.slice(0, 80)}"`
+      );
+      try {
+        await thread.send(
+          `ℹ️ \`/\` 始まりの入力は Claude Code TUI のスラッシュピッカーで詰まる現象を避けるため \`/\` を除去して送信します（自然言語として処理されます。Issue #86）。`
+        );
+      } catch {
+        // Don't let the heads-up notification block the actual relay
+      }
+    }
 
     // Enqueue to prevent concurrent relay for the same thread.
     // Without this, the second message overwrites the first's pending request
