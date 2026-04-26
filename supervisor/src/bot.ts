@@ -209,8 +209,12 @@ export async function startBot(token: string): Promise<void> {
     if (looksLikeSlashCommand(messageText)) {
       const original = messageText;
       messageText = stripLeadingSlash(messageText);
+      // Log only the leading token (the slash command name) and the message
+      // length to mirror other relay logs (L246) and avoid leaking the
+      // user-supplied argument body through stdout (PR #115 nitpick — PII).
+      const firstToken = original.split(/\s/, 1)[0] ?? "";
       console.log(
-        `[Bot] Stripped slash prefix in thread ${threadId}: "${original.slice(0, 80)}" → "${messageText.slice(0, 80)}"`
+        `[Bot] Stripped slash prefix in thread ${threadId} (token="${firstToken.slice(0, 32)}", len=${original.length})`
       );
       // Fire-and-forget: do NOT await. Awaiting Discord's send ACK before the
       // enqueueForThread call below would let a later message in the same

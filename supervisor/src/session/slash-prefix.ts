@@ -26,5 +26,7 @@ export function looksLikeSlashCommand(text: string): boolean {
 }
 
 export function stripLeadingSlash(text: string): string {
-  return looksLikeSlashCommand(text) ? text.replace(/^\//, "") : text;
+  // looksLikeSlashCommand guarantees a leading `/`, so slice(1) is a
+  // direct char-drop without the cost of a regex compile (PR #115 nitpick).
+  return looksLikeSlashCommand(text) ? text.slice(1) : text;
 }

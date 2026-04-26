@@ -20,6 +20,8 @@ describe("looksLikeSlashCommand", () => {
     ["/help me", true],
     ["/h", true], // single letter command
     ["/abc_under-score123", true],
+    ["/help\n続き", true], // \s newline boundary (PR #115 nitpick)
+    ["/help\targ", true], // \s tab boundary (PR #115 nitpick)
   ])("matches `%s` → %s (slash-command shape)", (input, expected) => {
     expect(looksLikeSlashCommand(input)).toBe(expected);
   });
@@ -79,5 +81,13 @@ describe("stripLeadingSlash", () => {
     expect(stripLeadingSlash("/handle-reviews and /foo")).toBe(
       "handle-reviews and /foo",
     );
+  });
+
+  test("preserves trailing newline after stripping (PR #115 nitpick)", () => {
+    expect(stripLeadingSlash("/help\n続き")).toBe("help\n続き");
+  });
+
+  test("preserves trailing tab after stripping (PR #115 nitpick)", () => {
+    expect(stripLeadingSlash("/help\targ")).toBe("help\targ");
   });
 });
