@@ -68,6 +68,14 @@ PROMPT_FILE="${SCRIPT_DIR}/hijoguchi-system-prompt.md"
 # Pin the prompt file so tests don't pick up a stale copy from ~/claude-hub.
 export SYSTEM_PROMPT_FILE="${PROMPT_FILE}"
 
+# Default test env: Issue #63 made HIJOGUCHI_CHANNEL_ID and
+# HIJOGUCHI_BOT_MENTION required (fail-closed). Subtests that don't override
+# inherit these so the script reaches its render path. Sentinel values are
+# distinct from the legacy production ID so accidental leaks into source/docs
+# are easy to spot.
+export HIJOGUCHI_CHANNEL_ID="${HIJOGUCHI_CHANNEL_ID:-TEST_CHANNEL_DEFAULT_999}"
+export HIJOGUCHI_BOT_MENTION="${HIJOGUCHI_BOT_MENTION:-<@TEST_BOT_DEFAULT_888>}"
+
 # --- Argument parsing ---
 PRIORITY="all"
 while [ $# -gt 0 ]; do

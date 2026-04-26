@@ -21,11 +21,21 @@ BACKOFF_SEC=5
 SYSTEM_PROMPT_FILE="${SYSTEM_PROMPT_FILE:-${CLAUDE_HUB_DIR}/scripts/hijoguchi-system-prompt.md}"
 # Template placeholders injected into the system-prompt. Keeping IDs out of the
 # prompt source (AC-4 / #49) means the prompt .md is agnostic of deployment;
-# production IDs live here as defaults so launchd needs no extra env wiring.
-# Override via env vars for tests / alt deploys. Full fail-closed (no default)
-# requires plist env-var plumbing — tracked as follow-up hardening Issue.
-HIJOGUCHI_CHANNEL_ID="${HIJOGUCHI_CHANNEL_ID:-1487701062205964329}"
-HIJOGUCHI_BOT_MENTION="${HIJOGUCHI_BOT_MENTION:-<@1487717424173416538>}"
+# every deployment must inject its own IDs via launchd plist
+# `EnvironmentVariables` (see docs/bot-operations.md). Issue #63 removed the
+# previous production-ID defaults so a missing/typo'd plist entry can no
+# longer silently route to the legacy production channel — fail-closed.
+HIJOGUCHI_CHANNEL_ID="${HIJOGUCHI_CHANNEL_ID:-}"
+HIJOGUCHI_BOT_MENTION="${HIJOGUCHI_BOT_MENTION:-}"
+
+if [ -z "${HIJOGUCHI_CHANNEL_ID}" ]; then
+  echo "[hijoguchi] ERROR: HIJOGUCHI_CHANNEL_ID is required. Inject via launchd plist EnvironmentVariables; see docs/bot-operations.md (Issue #63 fail-closed)." >&2
+  exit 1
+fi
+if [ -z "${HIJOGUCHI_BOT_MENTION}" ]; then
+  echo "[hijoguchi] ERROR: HIJOGUCHI_BOT_MENTION is required. Inject via launchd plist EnvironmentVariables; see docs/bot-operations.md (Issue #63 fail-closed)." >&2
+  exit 1
+fi
 # Wait before checking the freshly-created tmux session. Short is fine because
 # tmux new-session -d returns after the server has recorded the session.
 TMUX_VERIFY_SLEEP_SEC=1

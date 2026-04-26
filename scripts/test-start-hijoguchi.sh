@@ -17,6 +17,14 @@ PROMPT_FILE="${SCRIPT_DIR}/hijoguchi-system-prompt.md"
 # checkout. Individual tests can still override by re-exporting.
 export SYSTEM_PROMPT_FILE="${PROMPT_FILE}"
 
+# Default test env: Issue #63 made HIJOGUCHI_CHANNEL_ID and
+# HIJOGUCHI_BOT_MENTION required (fail-closed). Tests that don't specifically
+# exercise the unset path inherit these so the script reaches its render path.
+# Use sentinel values that don't collide with the historical production ID so
+# accidental leaks into source/docs are easier to spot.
+export HIJOGUCHI_CHANNEL_ID="${HIJOGUCHI_CHANNEL_ID:-TEST_CHANNEL_DEFAULT_999}"
+export HIJOGUCHI_BOT_MENTION="${HIJOGUCHI_BOT_MENTION:-<@TEST_BOT_DEFAULT_888>}"
+
 fail=0
 run() {
   local name="$1"; shift
@@ -24,7 +32,9 @@ run() {
 }
 
 t1_channel_id_expanded() {
-  HIJOGUCHI_RENDER_ONLY=1 bash "${TARGET}" 2>&1 | grep -Fq '1487701062205964329'
+  # After #63 the script no longer carries a production-ID default; the test
+  # asserts the env-injected sentinel reaches the rendered prompt instead.
+  HIJOGUCHI_RENDER_ONLY=1 bash "${TARGET}" 2>&1 | grep -Fq "${HIJOGUCHI_CHANNEL_ID}"
 }
 
 t2_no_residual_tokens() {
@@ -52,7 +62,10 @@ t5_missing_prompt_fails() {
 }
 
 t6_source_no_hardcoded_id() {
-  ! grep -Fq '1487701062205964329' "${PROMPT_FILE}"
+  # Two-fold guarantee after #63: prompt fixture stays placeholder-only AND
+  # start-hijoguchi.sh no longer carries the production channel ID as default.
+  ! grep -Fq '1487701062205964329' "${PROMPT_FILE}" && \
+    ! grep -Fq '1487701062205964329' "${TARGET}"
 }
 
 t7_source_has_placeholder() {
@@ -194,6 +207,46 @@ t20_settings_deny_covers_bypass_vectors() {
     grep -Fq '"Bash(curl:*)"' "${settings}"
 }
 
+# Issue #63 fail-closed: the script must abort with a non-zero exit code when
+# either env var is unset, even when the prompt file and other state are fine.
+# Without this, a typo'd or missing plist EnvironmentVariables silently routes
+# to whatever default lived in source — exactly the silent-degrade hazard #63
+# closes.
+t21_unset_channel_id_fails() {
+  ! env -u HIJOGUCHI_CHANNEL_ID HIJOGUCHI_BOT_MENTION='<@TEST>' \
+      HIJOGUCHI_RENDER_ONLY=1 SYSTEM_PROMPT_FILE="${PROMPT_FILE}" \
+      bash "${TARGET}" >/dev/null 2>&1
+}
+
+t22_unset_channel_id_logs_error() {
+  env -u HIJOGUCHI_CHANNEL_ID HIJOGUCHI_BOT_MENTION='<@TEST>' \
+    HIJOGUCHI_RENDER_ONLY=1 SYSTEM_PROMPT_FILE="${PROMPT_FILE}" \
+    bash "${TARGET}" 2>&1 >/dev/null \
+    | grep -Fq 'HIJOGUCHI_CHANNEL_ID is required'
+}
+
+t23_unset_bot_mention_fails() {
+  ! env -u HIJOGUCHI_BOT_MENTION HIJOGUCHI_CHANNEL_ID='TEST_CHAN' \
+      HIJOGUCHI_RENDER_ONLY=1 SYSTEM_PROMPT_FILE="${PROMPT_FILE}" \
+      bash "${TARGET}" >/dev/null 2>&1
+}
+
+t24_unset_bot_mention_logs_error() {
+  env -u HIJOGUCHI_BOT_MENTION HIJOGUCHI_CHANNEL_ID='TEST_CHAN' \
+    HIJOGUCHI_RENDER_ONLY=1 SYSTEM_PROMPT_FILE="${PROMPT_FILE}" \
+    bash "${TARGET}" 2>&1 >/dev/null \
+    | grep -Fq 'HIJOGUCHI_BOT_MENTION is required'
+}
+
+# Empty string is treated as unset (matches `:-` expansion). A plist that
+# defines the var but leaves the value blank must NOT silently render a
+# `chat_id=""` rule.
+t25_empty_channel_id_fails() {
+  ! HIJOGUCHI_CHANNEL_ID='' HIJOGUCHI_BOT_MENTION='<@TEST>' \
+      HIJOGUCHI_RENDER_ONLY=1 SYSTEM_PROMPT_FILE="${PROMPT_FILE}" \
+      bash "${TARGET}" >/dev/null 2>&1
+}
+
 run "T1 channel ID expanded"          t1_channel_id_expanded
 run "T2 no residual {{}} tokens"      t2_no_residual_tokens
 run "T3 env override works"           t3_env_override
@@ -214,6 +267,11 @@ run "T17 settings.json has allow/deny" t17_settings_has_allow_and_deny
 run "T18 skip flag single occurrence" t18_single_flag_occurrence
 run "T19 print-argv redacts prompt"   t19_print_argv_redacts_prompt
 run "T20 settings deny covers bypass" t20_settings_deny_covers_bypass_vectors
+run "T21 unset CHANNEL_ID exits 1"    t21_unset_channel_id_fails
+run "T22 unset CHANNEL_ID logs error" t22_unset_channel_id_logs_error
+run "T23 unset BOT_MENTION exits 1"   t23_unset_bot_mention_fails
+run "T24 unset BOT_MENTION logs error" t24_unset_bot_mention_logs_error
+run "T25 empty CHANNEL_ID exits 1"    t25_empty_channel_id_fails
 
 if [ "${fail}" -eq 0 ]; then
   echo "ALL TESTS PASSED"
