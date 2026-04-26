@@ -212,13 +212,22 @@ export async function startBot(token: string): Promise<void> {
       console.log(
         `[Bot] Stripped slash prefix in thread ${threadId}: "${original.slice(0, 80)}" → "${messageText.slice(0, 80)}"`
       );
-      try {
-        await thread.send(
+      // Fire-and-forget: do NOT await. Awaiting Discord's send ACK before the
+      // enqueueForThread call below would let a later message in the same
+      // thread race past this notification's latency and enter the queue
+      // first, breaking message ordering (gemini-code-assist review on PR
+      // #115). The notification is purely informational; the queue must
+      // observe the original arrival order.
+      thread
+        .send(
           `ℹ️ \`/\` 始まりの入力は Claude Code TUI のスラッシュピッカーで詰まる現象を避けるため \`/\` を除去して送信します（自然言語として処理されます。Issue #86）。`
-        );
-      } catch {
-        // Don't let the heads-up notification block the actual relay
-      }
+        )
+        .catch((err: unknown) => {
+          console.warn(
+            `[Bot] Failed to post slash-strip notice to thread ${threadId}:`,
+            err
+          );
+        });
     }
 
     // Enqueue to prevent concurrent relay for the same thread.
