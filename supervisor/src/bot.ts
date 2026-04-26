@@ -238,12 +238,32 @@ export async function startBot(token: string): Promise<void> {
     // Without this, the second message overwrites the first's pending request
     // in relay-server and the first response is lost.
     enqueueForThread(threadId, async () => {
-      // Show typing indicator
+      // Processing indicator (Issue #7): react ⏳ + refresh sendTyping every 5s.
+      // Discord's typing indicator times out after ~10s so a single call masks
+      // long-running relays as "idle" — refresh it on an interval until the
+      // relay completes, then swap ⏳ for ✅ (success) or ⚠️ (failure).
+      let reactedHourglass = false;
+      try {
+        await message.react("⏳");
+        reactedHourglass = true;
+      } catch (err) {
+        console.warn(
+          `[Bot] Failed to react ⏳ in thread ${threadId}:`,
+          err
+        );
+      }
       try {
         await thread.sendTyping();
       } catch {
         // Ignore typing errors
       }
+      const typingInterval = setInterval(() => {
+        thread.sendTyping().catch(() => {
+          // Best-effort during long relay; transient API errors are non-fatal.
+        });
+      }, 5000);
+
+      let relaySucceeded = false;
 
       // Relay to Claude Code
       console.log(
@@ -310,6 +330,10 @@ export async function startBot(token: string): Promise<void> {
             attachErr
           );
         }
+
+        // File-attach failures don't downgrade relay success — the chunks
+        // were already delivered and the user has the substantive response.
+        relaySucceeded = true;
       } catch (err) {
         console.error(`[Bot] Relay error in thread ${threadId}:`, err);
         try {
@@ -318,6 +342,31 @@ export async function startBot(token: string): Promise<void> {
           );
         } catch (sendErr) {
           console.error(`[Bot] Failed to send error notification to thread ${threadId}:`, sendErr);
+        }
+      } finally {
+        clearInterval(typingInterval);
+        if (reactedHourglass) {
+          try {
+            const me = client.user;
+            if (me) {
+              await message.reactions.cache
+                .get("⏳")
+                ?.users.remove(me.id);
+            }
+          } catch (err) {
+            console.warn(
+              `[Bot] Failed to remove ⏳ reaction in thread ${threadId}:`,
+              err
+            );
+          }
+        }
+        try {
+          await message.react(relaySucceeded ? "✅" : "⚠️");
+        } catch (err) {
+          console.warn(
+            `[Bot] Failed to react ${relaySucceeded ? "✅" : "⚠️"} in thread ${threadId}:`,
+            err
+          );
         }
       }
     });
