@@ -20,6 +20,10 @@ import {
   extractFilePaths,
   collectAttachableFiles,
 } from "./session/file-attacher";
+import {
+  looksLikeSlashCommand,
+  stripLeadingSlash,
+} from "./session/slash-prefix";
 
 export async function startBot(token: string): Promise<void> {
   const client = new Client({
@@ -195,6 +199,40 @@ export async function startBot(token: string): Promise<void> {
       messageText = "添付ファイルを確認してください。";
     }
     if (!messageText) return;
+
+    // Slash-prefix stripping: `/hanle-review XXX` → `hanle-review XXX`. Without
+    // this, Claude Code's Ink TUI enters its slash-command picker on `/`, and
+    // for a typo it stays open silently, hanging the per-thread relay queue
+    // until RELAY_TIMEOUT_MS — the bot looks idle to the user (Issue #86).
+    // Paths like `/usr/bin/ls` are intentionally not matched by
+    // looksLikeSlashCommand and pass through unchanged.
+    if (looksLikeSlashCommand(messageText)) {
+      const original = messageText;
+      messageText = stripLeadingSlash(messageText);
+      // Log only the leading token (the slash command name) and the message
+      // length to mirror other relay logs (L246) and avoid leaking the
+      // user-supplied argument body through stdout (PR #115 nitpick — PII).
+      const firstToken = original.split(/\s/, 1)[0] ?? "";
+      console.log(
+        `[Bot] Stripped slash prefix in thread ${threadId} (token="${firstToken.slice(0, 32)}", len=${original.length})`
+      );
+      // Fire-and-forget: do NOT await. Awaiting Discord's send ACK before the
+      // enqueueForThread call below would let a later message in the same
+      // thread race past this notification's latency and enter the queue
+      // first, breaking message ordering (gemini-code-assist review on PR
+      // #115). The notification is purely informational; the queue must
+      // observe the original arrival order.
+      thread
+        .send(
+          `ℹ️ \`/\` 始まりの入力は Claude Code TUI のスラッシュピッカーで詰まる現象を避けるため \`/\` を除去して送信します（自然言語として処理されます。Issue #86）。`
+        )
+        .catch((err: unknown) => {
+          console.warn(
+            `[Bot] Failed to post slash-strip notice to thread ${threadId}:`,
+            err
+          );
+        });
+    }
 
     // Enqueue to prevent concurrent relay for the same thread.
     // Without this, the second message overwrites the first's pending request
