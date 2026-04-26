@@ -24,6 +24,36 @@ import {
 const CLAUDE_PATH = resolve(homedir(), ".local", "bin", "claude");
 const TMUX_SESSION_PREFIX = "claude-";
 
+/**
+ * Compute the runtime-dir path that holds the relay URL for a given project
+ * cwd. Sanitises by stripping every leading `/` and replacing any character
+ * outside `[A-Za-z0-9._-]` with `_`, so each session's URL lives in its own
+ * file and the path is shell-safe even if `projectDir` contains quotes:
+ *
+ *   /Users/x/team_salary  →  ${RUNTIME_DIR}/Users_x_team_salary.relay-url
+ *
+ * `XDG_RUNTIME_DIR` is per-user by spec (`/run/user/$UID`), so when present
+ * we just append `claude-hub-supervisor`. When absent (typical macOS) we fall
+ * back to `/tmp/claude-hub-supervisor-<USER>` to avoid multi-user mkdir
+ * collisions on shared `/tmp`.
+ *
+ * The same scheme is mirrored in `supervisor/hooks/progress-relay.sh`. If you
+ * change the layout here, update the hook and its tests as well.
+ *
+ * Issue #88: keeps the file out of every project repo.
+ */
+export function relayUrlFilePath(projectDir: string): string {
+  const fromXdg = process.env.XDG_RUNTIME_DIR;
+  const user = process.env.USER || "default";
+  const runtimeDir = fromXdg
+    ? `${fromXdg}/claude-hub-supervisor`
+    : `/tmp/claude-hub-supervisor-${user}`;
+  const sanitised = projectDir
+    .replace(/^\/+/, "")
+    .replace(/[^A-Za-z0-9._-]/g, "_");
+  return `${runtimeDir}/${sanitised}.relay-url`;
+}
+
 export interface SessionManagerOptions {
   /**
    * Inject side-effect adapters for tmux / iTerm2 / relay-server / process
@@ -121,11 +151,19 @@ export class SessionManager {
     // Build the claude command — unset ANTHROPIC_API_KEY to use Claude Max subscription
     const relayUrl = `http://localhost:${this.effects.relayServer.getPort()}/relay/${threadId}`;
 
+    // Relay URL is written to a runtime-dir file keyed by the project cwd so
+    // that progress-relay.sh (PostToolUse hook) can locate it from $CWD without
+    // dropping `.supervisor-relay-url` into every project repo (Issue #88).
+    // The hook applies the same sanitisation logic to its `$CWD` payload.
+    const relayUrlFile = relayUrlFilePath(config.dir);
+    const relayUrlDir = relayUrlFile.replace(/\/[^/]+$/, "");
+
     const claudeCmd = [
       "unset ANTHROPIC_API_KEY",
       `export PATH="${resolve(homedir(), ".local/bin")}:${resolve(homedir(), ".bun/bin")}:/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin"`,
       `export SUPERVISOR_RELAY_URL="${relayUrl}"`,
-      `printf "%s" "${relayUrl}" > "${config.dir}/.supervisor-relay-url"`,
+      `mkdir -p "${relayUrlDir}"`,
+      `printf "%s" "${relayUrl}" > "${relayUrlFile}"`,
       `cd "${config.dir}"`,
       `exec ${CLAUDE_PATH} --dangerously-skip-permissions --name "${config.channelName}"`,
     ].join(" && ");

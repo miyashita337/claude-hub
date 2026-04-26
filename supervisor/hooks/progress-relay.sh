@@ -2,8 +2,17 @@
 # Claude Code PostToolUse hook: sends tool progress to Supervisor's HTTP relay.
 # Called with JSON on stdin containing tool_name, tool_input, cwd, etc.
 #
-# Relay URL is read from $CWD/.supervisor-relay-url (written by SessionManager).
-# Claude Code hooks don't inherit custom env vars, so we use filesystem.
+# Relay URL is read from a runtime-dir file keyed by the sanitised cwd, written
+# by SessionManager.start (see supervisor/src/session/manager.ts
+# relayUrlFilePath). Claude Code hooks don't inherit custom env vars, so we
+# fall back to the filesystem. Layout (Issue #88):
+#
+#   $XDG_RUNTIME_DIR set: ${XDG_RUNTIME_DIR}/claude-hub-supervisor/<sanitised-cwd>.relay-url
+#   $XDG_RUNTIME_DIR unset (typical macOS): /tmp/claude-hub-supervisor-<USER>/<sanitised-cwd>.relay-url
+#
+# <sanitised-cwd> is the absolute cwd with all leading `/` stripped and any
+# non-`[A-Za-z0-9._-]` character replaced by `_`. The sanitisation must match
+# `relayUrlFilePath()` in manager.ts exactly.
 #
 # Sends: { tool, message } where message is a short human-readable target
 # extracted from tool_input (e.g., "pgrep -fl claude" for Bash).
@@ -17,7 +26,16 @@ if [ -z "$CWD" ]; then
   exit 0
 fi
 
-RELAY_URL_FILE="${CWD}/.supervisor-relay-url"
+# Sanitise the cwd to match relayUrlFilePath() in manager.ts
+# - strip ALL leading slashes (TS: replace(/^\/+/, ""))
+# - replace any non-[A-Za-z0-9._-] with `_` (TS: replace(/[^A-Za-z0-9._-]/g, "_"))
+SANITISED=$(printf '%s' "$CWD" | sed -e 's|^/*||' -e 's|[^A-Za-z0-9._-]|_|g')
+if [ -n "$XDG_RUNTIME_DIR" ]; then
+  RUNTIME_DIR="${XDG_RUNTIME_DIR}/claude-hub-supervisor"
+else
+  RUNTIME_DIR="/tmp/claude-hub-supervisor-${USER:-default}"
+fi
+RELAY_URL_FILE="${RUNTIME_DIR}/${SANITISED}.relay-url"
 if [ ! -f "$RELAY_URL_FILE" ]; then
   exit 0
 fi
