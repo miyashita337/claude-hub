@@ -1,7 +1,7 @@
 import { execSync } from "child_process";
 import { randomUUID } from "crypto";
-import { existsSync } from "fs";
-import { resolve } from "path";
+import { existsSync, unlinkSync } from "fs";
+import { dirname, resolve } from "path";
 import { homedir } from "os";
 import type { SessionInfo, StopReason } from "./types";
 import type { ChannelConfig } from "../config/channels";
@@ -156,7 +156,22 @@ export class SessionManager {
     // dropping `.supervisor-relay-url` into every project repo (Issue #88).
     // The hook applies the same sanitisation logic to its `$CWD` payload.
     const relayUrlFile = relayUrlFilePath(config.dir);
-    const relayUrlDir = relayUrlFile.replace(/\/[^/]+$/, "");
+    const relayUrlDir = dirname(relayUrlFile);
+
+    // Best-effort cleanup of any stale relay-url file from a prior session for
+    // this project. Without this, a Supervisor restart can leave a file pointing
+    // at a dead relay port; PostToolUse hooks would then POST to a stale URL
+    // and silently time out (curl --max-time 3 in progress-relay.sh).
+    try {
+      unlinkSync(relayUrlFile);
+    } catch (err) {
+      if ((err as NodeJS.ErrnoException).code !== "ENOENT") {
+        console.warn(
+          `[SessionManager] Failed to unlink stale relay-url ${relayUrlFile}:`,
+          err
+        );
+      }
+    }
 
     const claudeCmd = [
       "unset ANTHROPIC_API_KEY",
