@@ -25,6 +25,7 @@ import {
   stripLeadingSlash,
 } from "./session/slash-prefix";
 import { ProgressBuffer } from "./session/progress-buffer";
+import { formatForDiscord } from "./session/output-formatter";
 
 export async function startBot(token: string): Promise<void> {
   const client = new Client({
