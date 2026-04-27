@@ -333,7 +333,8 @@ export async function startBot(token: string): Promise<void> {
 
         // File-attach failures don't downgrade relay success — the chunks
         // were already delivered and the user has the substantive response.
-        relaySucceeded = true;
+        relaySucceeded = !result.error;
+
       } catch (err) {
         console.error(`[Bot] Relay error in thread ${threadId}:`, err);
         try {
