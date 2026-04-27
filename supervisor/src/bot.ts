@@ -24,6 +24,8 @@ import {
   looksLikeSlashCommand,
   stripLeadingSlash,
 } from "./session/slash-prefix";
+import { ProgressBuffer } from "./session/progress-buffer";
+import { formatForDiscord } from "./session/output-formatter";
 
 export async function startBot(token: string): Promise<void> {
   const client = new Client({
@@ -64,6 +66,34 @@ export async function startBot(token: string): Promise<void> {
   const resourceMonitor = new ResourceMonitor(sessionManager);
   const sessionHandler = createSessionHandler(sessionManager);
 
+  // Per-thread progress buffer (Issue #119): coalesce PostToolUse events
+  // within a 2-second window so tool-heavy turns don't trip Discord's
+  // 5-msg/5-sec rate limit. The buffer fetches the channel and sends the
+  // batched body at flush time.
+  const progressBuffer = new ProgressBuffer({
+    intervalMs: 2000,
+    onFlush: async (threadId, entries) => {
+      try {
+        const channel = await client.channels.fetch(threadId);
+        if (!channel?.isThread()) return;
+        const lines = entries.map((e) => `🔧 \`${e.tool}\`: ${e.message}`);
+        const body =
+          lines.length === 1 ? lines[0]! : `🔧 進捗:\n${lines.join("\n")}`;
+        // Coalesced bodies can exceed Discord's 2000-char limit when many
+        // tools fire within the window — chunk via formatForDiscord before
+        // sending so channel.send() doesn't 400.
+        for (const chunk of formatForDiscord(body)) {
+          await channel.send(chunk);
+        }
+      } catch (err) {
+        console.error(
+          `[Bot] Progress flush error for thread ${threadId}:`,
+          err
+        );
+      }
+    },
+  });
+
   // Register slash commands
   client.once(Events.ClientReady, async (readyClient) => {
     console.log(`[Bot] Logged in as ${readyClient.user.tag}`);
@@ -90,16 +120,14 @@ export async function startBot(token: string): Promise<void> {
     reaper.start();
     resourceMonitor.start();
 
-    // Register progress callback to send tool progress to Discord threads
-    onProgress(async (event) => {
-      try {
-        const channel = await client.channels.fetch(event.threadId);
-        if (channel?.isThread()) {
-          await channel.send(`🔧 \`${event.tool}\`: ${event.message}`);
-        }
-      } catch (err) {
-        console.error(`[Bot] Progress send error for thread ${event.threadId}:`, err);
-      }
+    // Register progress callback to send tool progress to Discord threads.
+    // Events are buffered (Issue #119) and flushed every 2s as a single
+    // message per thread to stay under Discord's 5-msg/5-sec rate limit.
+    onProgress((event) => {
+      progressBuffer.add(event.threadId, {
+        tool: event.tool,
+        message: event.message,
+      });
     });
 
     // Register late-response callback: when a Stop hook POST arrives after
@@ -378,6 +406,14 @@ export async function startBot(token: string): Promise<void> {
     console.log("[Bot] Shutdown signal received");
     reaper.stop();
     resourceMonitor.stop();
+    // Drain pending progress buffers before tearing down the Discord client
+    // so in-flight tool events still reach the user (Issue #119).
+    try {
+      await progressBuffer.flushAll();
+    } catch (err) {
+      console.error("[Bot] Progress flushAll error during shutdown:", err);
+    }
+    progressBuffer.close();
     await sessionManager.shutdownAll();
     client.destroy();
     process.exit(0);
