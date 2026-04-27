@@ -47,7 +47,14 @@ export class ProgressBuffer {
     }
     this.buffers.set(threadId, [entry]);
     const t = setTimeout(() => {
-      void this.flush(threadId);
+      // Catch background rejections so a throwing onFlush can't surface as
+      // an unhandledRejection and destabilize the process.
+      this.flush(threadId).catch((err) => {
+        console.error(
+          `[ProgressBuffer] Background flush failed for thread ${threadId}:`,
+          err
+        );
+      });
     }, this.intervalMs);
     this.timers.set(threadId, t);
   }

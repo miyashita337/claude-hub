@@ -79,7 +79,12 @@ export async function startBot(token: string): Promise<void> {
         const lines = entries.map((e) => `🔧 \`${e.tool}\`: ${e.message}`);
         const body =
           lines.length === 1 ? lines[0]! : `🔧 進捗:\n${lines.join("\n")}`;
-        await channel.send(body);
+        // Coalesced bodies can exceed Discord's 2000-char limit when many
+        // tools fire within the window — chunk via formatForDiscord before
+        // sending so channel.send() doesn't 400.
+        for (const chunk of formatForDiscord(body)) {
+          await channel.send(chunk);
+        }
       } catch (err) {
         console.error(
           `[Bot] Progress flush error for thread ${threadId}:`,
