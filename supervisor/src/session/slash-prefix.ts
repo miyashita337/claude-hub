@@ -98,14 +98,27 @@ function defaultLoadUserCommands(): ReadonlySet<string> {
       const cmd = name.slice(0, -3);
       if (cmd) set.add(cmd);
     }
-  } catch {
-    // ENOENT or permission error: treat as empty allowlist. The strip path
-    // will still fire on built-ins that don't appear in this dir, but the
-    // BUILTIN_COMMANDS set above covers that.
+    cachedUserCommands = set;
+    cacheLoadedAt = now;
+    return cachedUserCommands;
+  } catch (err) {
+    const code = (err as NodeJS.ErrnoException).code;
+    if (code === "ENOENT") {
+      // Dir doesn't exist (e.g., before any user command is installed).
+      // Empty allowlist is the right answer; cache it for the TTL window.
+      cachedUserCommands = set;
+      cacheLoadedAt = now;
+      return cachedUserCommands;
+    }
+    // Unexpected error (EACCES, EMFILE, etc.). Don't TTL-cache an empty
+    // result — the next call should retry the read so transient failures
+    // self-heal. Return the previous cache if any, else an empty set
+    // for this single call.
+    console.warn(
+      `[slash-prefix] Failed to read ${dir}: code=${code ?? "unknown"} message=${(err as Error).message ?? "n/a"}`,
+    );
+    return cachedUserCommands ?? set;
   }
-  cachedUserCommands = set;
-  cacheLoadedAt = now;
-  return cachedUserCommands;
 }
 
 /**
