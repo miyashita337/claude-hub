@@ -21,6 +21,7 @@ import {
   collectAttachableFiles,
 } from "./session/file-attacher";
 import {
+  isKnownSlashCommand,
   looksLikeSlashCommand,
   stripLeadingSlash,
 } from "./session/slash-prefix";
@@ -234,7 +235,15 @@ export async function startBot(token: string): Promise<void> {
     // until RELAY_TIMEOUT_MS — the bot looks idle to the user (Issue #86).
     // Paths like `/usr/bin/ls` are intentionally not matched by
     // looksLikeSlashCommand and pass through unchanged.
-    if (looksLikeSlashCommand(messageText)) {
+    //
+    // Issue #86 follow-up: known slash commands (built-ins + ~/.claude/commands)
+    // are now passed through unmodified so legitimate `/save-session` etc. keep
+    // working as actual Claude Code slash commands. Strip only fires on
+    // unknown / typo'd commands.
+    if (
+      looksLikeSlashCommand(messageText) &&
+      !isKnownSlashCommand(messageText)
+    ) {
       const original = messageText;
       messageText = stripLeadingSlash(messageText);
       // Log only the leading token (the slash command name) and the message

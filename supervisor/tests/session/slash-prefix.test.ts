@@ -1,13 +1,18 @@
-import { describe, test, expect } from "bun:test";
+import { describe, test, expect, beforeEach } from "bun:test";
 import {
+  isKnownSlashCommand,
   looksLikeSlashCommand,
   stripLeadingSlash,
+  _resetUserCommandCache,
 } from "../../src/session/slash-prefix";
 
 /**
  * Tests for Issue #86: typo'd slash commands like `/hanle-review` from a
  * Discord message previously hung Claude Code's Ink TUI in its slash-command
  * picker, blocking the per-thread relay queue until RELAY_TIMEOUT_MS.
+ *
+ * Issue #86 follow-up: known commands (built-ins + ~/.claude/commands/) are
+ * passed through unmodified so legitimate slash commands keep working.
  */
 
 describe("looksLikeSlashCommand", () => {
@@ -89,5 +94,88 @@ describe("stripLeadingSlash", () => {
 
   test("preserves trailing tab after stripping (PR #115 nitpick)", () => {
     expect(stripLeadingSlash("/help\targ")).toBe("help\targ");
+  });
+});
+
+describe("isKnownSlashCommand", () => {
+  beforeEach(() => {
+    _resetUserCommandCache();
+  });
+
+  const emptyLoader = () => new Set<string>();
+  const customLoader = () =>
+    new Set(["save-session", "handle-reviews", "pdca", "verify"]);
+
+  test.each([
+    "/help",
+    "/help me",
+    "/clear",
+    "/compact arg",
+    "/init",
+    "/model",
+    "/resume",
+    "/agents",
+    "/save",
+  ])("recognises built-in `%s`", (input) => {
+    expect(isKnownSlashCommand(input, emptyLoader)).toBe(true);
+  });
+
+  test.each([
+    "/save-session",
+    "/save-session foo bar",
+    "/handle-reviews",
+    "/pdca 42",
+    "/verify",
+  ])("recognises user-scope command `%s`", (input) => {
+    expect(isKnownSlashCommand(input, customLoader)).toBe(true);
+  });
+
+  test.each([
+    "/save-sesstion", // typo
+    "/hanle-review", // typo
+    "/totally-unknown",
+    "/foo",
+  ])("treats unknown `%s` as not-known (will be stripped)", (input) => {
+    expect(isKnownSlashCommand(input, customLoader)).toBe(false);
+  });
+
+  test.each([
+    "/usr/bin/ls", // path
+    "", // empty
+    "普通のテキスト", // no slash
+    "何か /handle-reviews", // not at start
+    "/", // bare slash
+    "/123abc", // starts with digit
+  ])("returns false for non-command shape `%s`", (input) => {
+    expect(isKnownSlashCommand(input, customLoader)).toBe(false);
+  });
+
+  test("default loader reads ~/.claude/commands without throwing on missing dir", () => {
+    // Set HOME to a non-existent path so the default loader hits ENOENT.
+    const origHome = process.env.HOME;
+    process.env.HOME = "/tmp/__claude_hub_no_such_dir__";
+    try {
+      _resetUserCommandCache();
+      // Built-ins still recognised even with no user dir.
+      expect(isKnownSlashCommand("/help")).toBe(true);
+      // Unknown still rejected.
+      expect(isKnownSlashCommand("/totally-unknown")).toBe(false);
+    } finally {
+      if (origHome === undefined) {
+        delete process.env.HOME;
+      } else {
+        process.env.HOME = origHome;
+      }
+      _resetUserCommandCache();
+    }
+  });
+
+  test("default loader reads real ~/.claude/commands when present", () => {
+    _resetUserCommandCache();
+    // Smoke test: this exercises the real readdirSync path. We don't assert
+    // a specific command name (machine-dependent), only that the function
+    // returns a boolean without throwing.
+    const result = isKnownSlashCommand("/totally-unknown-XYZ");
+    expect(typeof result).toBe("boolean");
   });
 });
