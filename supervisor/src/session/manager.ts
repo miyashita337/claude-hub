@@ -149,7 +149,10 @@ export class SessionManager {
     this.effects.tmux.killSession(tmuxName);
 
     // Build the claude command — unset ANTHROPIC_API_KEY to use Claude Max subscription
-    const relayUrl = `http://localhost:${this.effects.relayServer.getPort()}/relay/${threadId}`;
+    // encodeURIComponent: Discord thread IDs are numeric today, but encode at
+    // the boundary so any future schema change (or fuzzed input) cannot break
+    // the relay URL parser. relay-server.ts decodes symmetrically on receipt.
+    const relayUrl = `http://localhost:${this.effects.relayServer.getPort()}/relay/${encodeURIComponent(threadId)}`;
 
     // Relay URL is written to a runtime-dir file keyed by the project cwd so
     // that progress-relay.sh (PostToolUse hook) can locate it from $CWD without

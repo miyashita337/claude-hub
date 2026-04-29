@@ -76,9 +76,18 @@ export function startRelayServer(): void {
 
       const relayMatch = url.pathname.match(/^\/relay\/(.+)$/);
       if (relayMatch && req.method === "POST") {
-        const threadId = relayMatch[1];
-        if (!threadId) {
+        const rawThreadId = relayMatch[1];
+        if (!rawThreadId) {
           return new Response("Invalid thread ID", { status: 400 });
+        }
+        // Symmetric to manager.ts which encodeURIComponents threadId.
+        // decodeURIComponent throws URIError on malformed escapes (e.g. `%ZZ`);
+        // treat that as a 400 instead of a 500.
+        let threadId: string;
+        try {
+          threadId = decodeURIComponent(rawThreadId);
+        } catch {
+          return new Response("Invalid thread ID encoding", { status: 400 });
         }
         let body: Record<string, unknown>;
         try {

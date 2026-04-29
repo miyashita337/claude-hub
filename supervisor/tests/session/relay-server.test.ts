@@ -143,4 +143,49 @@ describe("relay-server", () => {
     expect(result1.text).toBe("Response 1");
     expect(result2.text).toBe("Response 2");
   });
+
+  // Issue #98: thread IDs are encoded by manager.ts at URL build time and
+  // must round-trip through relay-server.ts even if they ever contain
+  // characters that would otherwise be ambiguous in a URL path.
+  test.each([
+    ["plain-numeric", "1234567890123456"],
+    ["with-slash", "thread/with/slash"],
+    ["with-question", "thread?with=query"],
+    ["with-hash", "thread#fragment"],
+    ["with-percent", "thread%percent"],
+    ["with-space", "thread with space"],
+    ["with-non-ascii", "スレッドID"],
+  ])("round-trips threadId `%s` through encode/decode", async (_label, threadId) => {
+    startRelayServer();
+    const port = getRelayPort();
+
+    const promise = waitForRelay(threadId, 5000);
+
+    const res = await fetch(
+      `http://localhost:${port}/relay/${encodeURIComponent(threadId)}`,
+      {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ text: `hello ${threadId}`, session_id: "s" }),
+      },
+    );
+    expect(res.status).toBe(200);
+
+    const result = await promise;
+    expect(result.text).toBe(`hello ${threadId}`);
+  });
+
+  test("returns 400 for malformed percent-encoding in URL", async () => {
+    startRelayServer();
+    const port = getRelayPort();
+
+    // `%ZZ` is not a valid percent-escape sequence and decodeURIComponent
+    // throws URIError on it. The server must respond 400, not 500.
+    const res = await fetch(`http://localhost:${port}/relay/%ZZ`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ text: "hi" }),
+    });
+    expect(res.status).toBe(400);
+  });
 });
