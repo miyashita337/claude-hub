@@ -93,9 +93,8 @@ function defaultLoadUserCommands(): ReadonlySet<string> {
   try {
     for (const name of readdirSync(dir)) {
       if (!name.endsWith(".md")) continue;
-      // Skip editor backup files like `foo.md.bak` that share basename with
-      // an active command. We only want the active version.
-      if (name.includes(".bak")) continue;
+      // Skip editor backup files like `foo.bak.md` that might be present.
+      if (name.endsWith(".bak.md")) continue;
       const cmd = name.slice(0, -3);
       if (cmd) set.add(cmd);
     }
