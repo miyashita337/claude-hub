@@ -57,9 +57,19 @@ export function startRelayServer(): void {
       // Progress endpoint: PostToolUse hook sends tool progress here
       const progressMatch = url.pathname.match(/^\/progress\/(.+)$/);
       if (progressMatch && req.method === "POST") {
-        const threadId = progressMatch[1];
-        if (!threadId) {
+        const rawThreadId = progressMatch[1];
+        if (!rawThreadId) {
           return new Response("Invalid thread ID", { status: 400 });
+        }
+        // Symmetric to manager.ts (encodeURIComponent). progress-relay.sh
+        // derives this URL from the same encoded relayUrl, so the threadId
+        // arrives encoded and must be decoded before downstream lookups
+        // (e.g. manager.touchActivity) can find the session.
+        let threadId: string;
+        try {
+          threadId = decodeURIComponent(rawThreadId);
+        } catch {
+          return new Response("Invalid thread ID encoding", { status: 400 });
         }
         try {
           const body = await req.json() as Record<string, unknown>;
@@ -76,9 +86,18 @@ export function startRelayServer(): void {
 
       const relayMatch = url.pathname.match(/^\/relay\/(.+)$/);
       if (relayMatch && req.method === "POST") {
-        const threadId = relayMatch[1];
-        if (!threadId) {
+        const rawThreadId = relayMatch[1];
+        if (!rawThreadId) {
           return new Response("Invalid thread ID", { status: 400 });
+        }
+        // Symmetric to manager.ts which encodeURIComponent's threadId.
+        // decodeURIComponent throws URIError on malformed escapes (e.g. `%ZZ`);
+        // treat that as a 400 instead of a 500.
+        let threadId: string;
+        try {
+          threadId = decodeURIComponent(rawThreadId);
+        } catch {
+          return new Response("Invalid thread ID encoding", { status: 400 });
         }
         let body: Record<string, unknown>;
         try {

@@ -5,7 +5,9 @@ import {
   waitForRelay,
   getRelayPort,
   onLateResponse,
+  onProgress,
   type LateResponseEvent,
+  type ProgressEvent,
 } from "../../src/session/relay-server";
 
 describe("relay-server", () => {
@@ -142,5 +144,93 @@ describe("relay-server", () => {
     const result2 = await promise2;
     expect(result1.text).toBe("Response 1");
     expect(result2.text).toBe("Response 2");
+  });
+
+  // Issue #98: thread IDs are encoded by manager.ts at URL build time and
+  // must round-trip through relay-server.ts even if they ever contain
+  // characters that would otherwise be ambiguous in a URL path.
+  test.each([
+    ["plain-numeric", "1234567890123456"],
+    ["with-slash", "thread/with/slash"],
+    ["with-question", "thread?with=query"],
+    ["with-hash", "thread#fragment"],
+    ["with-percent", "thread%percent"],
+    ["with-space", "thread with space"],
+    ["with-non-ascii", "スレッドID"],
+  ])("round-trips threadId `%s` through encode/decode", async (_label, threadId) => {
+    startRelayServer();
+    const port = getRelayPort();
+
+    const promise = waitForRelay(threadId, 5000);
+
+    const res = await fetch(
+      `http://localhost:${port}/relay/${encodeURIComponent(threadId)}`,
+      {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ text: `hello ${threadId}`, session_id: "s" }),
+      },
+    );
+    expect(res.status).toBe(200);
+
+    const result = await promise;
+    expect(result.text).toBe(`hello ${threadId}`);
+  });
+
+  test("returns 400 for malformed percent-encoding in URL", async () => {
+    startRelayServer();
+    const port = getRelayPort();
+
+    // `%ZZ` is not a valid percent-escape sequence and decodeURIComponent
+    // throws URIError on it. The server must respond 400, not 500.
+    const res = await fetch(`http://localhost:${port}/relay/%ZZ`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ text: "hi" }),
+    });
+    expect(res.status).toBe(400);
+  });
+
+  // Issue #98 / PR #124 review: /progress/ endpoint must apply the same
+  // decodeURIComponent so progress-relay.sh callbacks for special-char
+  // thread IDs reach the right session via manager.touchActivity.
+  test.each([
+    ["plain-numeric", "1234567890123456"],
+    ["with-slash", "thread/with/slash"],
+    ["with-non-ascii", "スレッドID"],
+  ])(
+    "/progress/ round-trips threadId `%s` through encode/decode",
+    async (_label, threadId) => {
+      startRelayServer();
+      const port = getRelayPort();
+
+      const received: ProgressEvent[] = [];
+      onProgress((event) => received.push(event));
+
+      const res = await fetch(
+        `http://localhost:${port}/progress/${encodeURIComponent(threadId)}`,
+        {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ tool: "Bash", message: `running on ${threadId}` }),
+        },
+      );
+      expect(res.status).toBe(200);
+      expect(received.length).toBe(1);
+      expect(received[0]!.threadId).toBe(threadId);
+      expect(received[0]!.message).toBe(`running on ${threadId}`);
+    },
+  );
+
+  test("/progress/ returns 400 for malformed percent-encoding in URL", async () => {
+    startRelayServer();
+    const port = getRelayPort();
+
+    const res = await fetch(`http://localhost:${port}/progress/%ZZ`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ tool: "Bash", message: "hi" }),
+    });
+    expect(res.status).toBe(400);
   });
 });
