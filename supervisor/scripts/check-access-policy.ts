@@ -54,6 +54,21 @@ function readJson(path: string): unknown {
   return JSON.parse(raw);
 }
 
+/**
+ * Narrow `unknown` to a non-null object. Rejects `null`, arrays, and
+ * primitives so subsequent property/key access is type-safe. Throws with
+ * a descriptive message used by the caller's catch.
+ */
+function asObject(
+  value: unknown,
+  context: string,
+): Record<string, unknown> {
+  if (value === null || typeof value !== "object" || Array.isArray(value)) {
+    throw new Error(`${context} must be a JSON object`);
+  }
+  return value as Record<string, unknown>;
+}
+
 function runCiMode(): number {
   if (!existsSync(TEMPLATE_PATH)) {
     console.error(`[check-access-policy] template not found: ${TEMPLATE_PATH}`);
@@ -61,7 +76,7 @@ function runCiMode(): number {
   }
   let template: Record<string, unknown>;
   try {
-    template = readJson(TEMPLATE_PATH) as Record<string, unknown>;
+    template = asObject(readJson(TEMPLATE_PATH), "template");
   } catch (err) {
     console.error(
       `[check-access-policy] failed to parse template: ${(err as Error).message}`,
@@ -131,7 +146,7 @@ function runLocalMode(): number {
   }
   let parsed: AccessJsonShape;
   try {
-    parsed = readJson(ACCESS_JSON_PATH) as AccessJsonShape;
+    parsed = asObject(readJson(ACCESS_JSON_PATH), "access.json") as AccessJsonShape;
   } catch (err) {
     console.error(
       `[check-access-policy] failed to parse access.json: ${(err as Error).message}`,
@@ -139,7 +154,15 @@ function runLocalMode(): number {
     return 2;
   }
 
-  const groups = parsed.groups ?? {};
+  // access.json keeps Discord-ID-keyed channel entries under a `groups`
+  // sub-object (alongside `dmPolicy` / `allowFrom` / `pending`); fall back
+  // to an empty object if absent so the downstream count is 0 rather than
+  // crashing.
+  const groupsRaw = parsed.groups;
+  const groups =
+    groupsRaw && typeof groupsRaw === "object" && !Array.isArray(groupsRaw)
+      ? (groupsRaw as Record<string, unknown>)
+      : {};
   const groupCount = Object.keys(groups).length;
   const channelMapNames = [...CHANNEL_MAP.keys()];
 
