@@ -39,6 +39,12 @@ jobs:
       - name: Type check
         run: bunx tsc --noEmit
 
+      # Issue #100: prevent silent CHANNEL_MAP / access policy drift.
+      # Verifies CHANNEL_MAP keys match examples/access-policy.template.json
+      # (which uses channel names, not real Discord IDs — IDs stay user-local).
+      - name: Check CHANNEL_MAP ↔ access policy template sync
+        run: bun scripts/check-access-policy.ts --ci
+
   unit-test:
     name: Unit Tests
     runs-on: ubuntu-latest
