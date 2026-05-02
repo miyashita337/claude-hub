@@ -41,6 +41,11 @@ export class FakeTmuxAdapter implements TmuxAdapter {
   list(): string[] {
     return Array.from(this.sessions.keys());
   }
+
+  /** Test-only: read the bash command stored for a tmux session. */
+  getCommand(name: string): string | null {
+    return this.sessions.get(name)?.command ?? null;
+  }
 }
 
 export class FakeItermAdapter implements ItermAdapter {
