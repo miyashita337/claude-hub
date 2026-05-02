@@ -227,7 +227,15 @@ t20_settings_deny_covers_bypass_vectors() {
     grep -Fq '"Bash(git push -f:*)"' "${settings}" && \
     # gh CLI surface kept narrow (auth/secret/config remain denied)
     grep -Fq '"Bash(gh auth token:*)"' "${settings}" && \
-    grep -Fq '"Bash(gh secret:*)"' "${settings}"
+    grep -Fq '"Bash(gh secret:*)"' "${settings}" && \
+    # Bash viewer secret-path denies (CodeRabbit CR3 Phase 1.5)
+    grep -Fq '"Bash(cat .env)"' "${settings}" && \
+    grep -Fq '"Bash(cat /Users/*/.aws:*)"' "${settings}" && \
+    grep -Fq '"Bash(cat /Users/*/.ssh:*)"' "${settings}" && \
+    grep -Fq '"Bash(cat *credentials*)"' "${settings}" && \
+    grep -Fq '"Bash(cat *id_rsa*)"' "${settings}" && \
+    grep -Fq '"Bash(head .env)"' "${settings}" && \
+    grep -Fq '"Bash(tail .env)"' "${settings}"
 }
 
 # Issue #63 fail-closed: the script must abort with a non-zero exit code when
