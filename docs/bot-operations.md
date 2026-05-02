@@ -50,6 +50,20 @@ claude-hub プロジェクトで運用している Discord Bot の役割分担�
 - `supervisor/com.channel.supervisor.plist` — launchd plist (caffeinate wrapper 付き)
 - `~/Library/LaunchAgents/com.claude-hub.supervisor.plist` — 実際にロードされている plist
 - `~/claude-hub/logs/supervisor.{stdout,stderr}.log` — supervisor ログ
+- `scripts/list-mcp-load-time.sh` — 各設定での cold-start 計測 (Issue #104 / Epic #101)
+
+## Cold-start プロファイル (Issue #104)
+
+Channel-Supervisor 経由で起動する Claude Code セッションは、デフォルトで以下のフラグを付与する（`supervisor/src/session/manager.ts` の `buildClaudeFlags()`）。
+
+| フラグ | 効果 | 戻し方 |
+|---|---|---|
+| `--no-chrome` | claude-in-chrome 連携を skip。paired Chrome extension の init が省略される | `ChannelConfig.chromeEnabled = true` |
+| `--strict-mcp-config --mcp-config '{"mcpServers":{}}'` | 全ての user-scope MCP server (Notion / Gmail / Google Drive / Google Calendar / Slack / Discord plugin) を起動時にロードしない | `ChannelConfig.mcpProfile = "default"` |
+
+理由: relay 経路では Discord への出力は supervisor が tmux pane の stdout を拾って `discord.js` で送るため、Discord plugin MCP の `reply` / `react` 等は不要。同様に Notion 等の HTTP MCP は relay 自体には関与しない。`--no-chrome` も大半の channel では使わないので default disable。
+
+「lazy load」は Claude Code 公式に仕組みが存在しないため、本実装では「default disable + 必要な channel だけ opt-in」で代替する。設定変更の検証は `bash scripts/list-mcp-load-time.sh --quick` で前後比較できる。
 
 ## Access Policy (claudeHubExit)
 

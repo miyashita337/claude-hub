@@ -25,6 +25,43 @@ const CLAUDE_PATH = resolve(homedir(), ".local", "bin", "claude");
 const TMUX_SESSION_PREFIX = "claude-";
 
 /**
+ * Build the argv for the `claude` invocation in a supervisor session.
+ *
+ * Issue #104 / Epic #101: by default supervisor sessions disable Chrome
+ * integration and skip every user-scope MCP server, reclaiming 10-15s of
+ * cold-start that nothing in the relay path needs. The flags here can be
+ * relaxed per channel via {@link ChannelConfig.chromeEnabled} and
+ * {@link ChannelConfig.mcpProfile}.
+ *
+ * Returned tokens are joined with single-space and embedded in a bash command
+ * string downstream; callers must not append shell metacharacters that would
+ * not survive that round-trip. Single-quoted JSON for `--mcp-config` is safe
+ * because bash treats it as a single literal argument.
+ */
+export function buildClaudeFlags(config: ChannelConfig): string[] {
+  const args = [
+    "--dangerously-skip-permissions",
+    "--name",
+    `"${config.channelName}"`,
+  ];
+
+  if (config.chromeEnabled !== true) {
+    args.push("--no-chrome");
+  }
+
+  const profile = config.mcpProfile ?? "none";
+  if (profile === "none") {
+    args.push(
+      "--strict-mcp-config",
+      "--mcp-config",
+      `'{"mcpServers":{}}'`,
+    );
+  }
+
+  return args;
+}
+
+/**
  * Compute the runtime-dir path that holds the relay URL for a given project
  * cwd. Sanitises by stripping every leading `/` and replacing any character
  * outside `[A-Za-z0-9._-]` with `_`, so each session's URL lives in its own
@@ -174,7 +211,7 @@ export class SessionManager {
       `mkdir -p "${relayUrlDir}"`,
       `printf "%s" "${relayUrl}" > "${relayUrlFile}"`,
       `cd "${config.dir}"`,
-      `exec ${CLAUDE_PATH} --dangerously-skip-permissions --name "${config.channelName}"`,
+      `exec ${CLAUDE_PATH} ${buildClaudeFlags(config).join(" ")}`,
     ].join(" && ");
 
     // Launch via tmux (provides a real TTY). Uses Supervisor's dedicated

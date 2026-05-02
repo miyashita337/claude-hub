@@ -5,6 +5,28 @@ export interface ChannelConfig {
   channelName: string;
   dir: string;
   displayName: string;
+  /**
+   * MCP loading profile for the supervisor session. Issue #104 / Epic #101.
+   *
+   * - `"none"` (default): disable all user-scope MCP servers via
+   *   `--strict-mcp-config --mcp-config '{"mcpServers":{}}'`. Skips ~10-15s of
+   *   HTTP/stdio init for MCPs the relay never uses (Notion, Gmail, GDrive,
+   *   GCal, Slack, Discord plugin). Output→Discord direction goes through the
+   *   stdout relay, not the Discord MCP plugin.
+   * - `"default"`: no `--strict-mcp-config` flag, fall back to whatever is
+   *   configured in `~/.claude.json`. Use only when a channel genuinely needs
+   *   one of those MCPs from inside Claude.
+   *
+   * If you need a curated subset, prefer adding a new profile here over
+   * widening `"default"`.
+   */
+  mcpProfile?: "none" | "default";
+  /**
+   * Enable Claude in Chrome integration. Default `false` (= `--no-chrome`).
+   * The Chrome extension paired connection adds ~5-10s to cold start; only
+   * enable for channels that drive a browser via `mcp__claude-in-chrome__*`.
+   */
+  chromeEnabled?: boolean;
 }
 
 const home = homedir();

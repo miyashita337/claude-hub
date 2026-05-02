@@ -267,7 +267,7 @@ describe("manager.ts tmux command syntax", () => {
       'mkdir -p "/tmp/claude-hub-supervisor-alice"',
       'printf "%s" "http://localhost:12345/relay/thread-abc" > "/tmp/claude-hub-supervisor-alice/tmp_project.relay-url"',
       'cd "/tmp/project"',
-      'exec /tmp/claude --dangerously-skip-permissions --name "my-channel"',
+      `exec /tmp/claude --dangerously-skip-permissions --name "my-channel" --no-chrome --strict-mcp-config --mcp-config '{"mcpServers":{}}'`,
     ].join(" && ");
 
     // Verify this matches the structure in the source

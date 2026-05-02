@@ -8,7 +8,7 @@ import {
 import { mkdirSync } from "fs";
 import { tmpdir } from "os";
 import { resolve } from "path";
-import { SessionManager } from "../../src/session/manager";
+import { SessionManager, buildClaudeFlags } from "../../src/session/manager";
 import {
   createFakeEffects,
   type FakeSessionEffects,
@@ -202,5 +202,92 @@ describe("SessionManager (thread-based)", () => {
     await manager.shutdownAll();
     expect(manager.count()).toBe(0);
     expect(effects.relayServer.stopCalls).toBe(1);
+  });
+
+  // -------------------------------------------------------------------------
+  // Issue #104 / Epic #101: cold-start optimisation flags
+  // -------------------------------------------------------------------------
+  test("default channel disables Chrome and all MCPs in the tmux command", () => {
+    const config = makeChannelConfig({ channelName: "default-flags" });
+    manager.start(config, "th-default");
+
+    const cmd = effects.tmux.getCommand("claude-th-default") ?? "";
+    expect(cmd).toContain("--no-chrome");
+    expect(cmd).toContain("--strict-mcp-config");
+    expect(cmd).toContain(`--mcp-config '{"mcpServers":{}}'`);
+    expect(cmd).toContain(`--name "default-flags"`);
+  });
+
+  test("chromeEnabled=true omits --no-chrome but still strips MCPs", () => {
+    const config = makeChannelConfig({
+      channelName: "chrome-on",
+      chromeEnabled: true,
+    });
+    manager.start(config, "th-chrome");
+
+    const cmd = effects.tmux.getCommand("claude-th-chrome") ?? "";
+    expect(cmd).not.toContain("--no-chrome");
+    expect(cmd).toContain("--strict-mcp-config");
+  });
+
+  test("mcpProfile='default' restores user-scope MCP loading", () => {
+    const config = makeChannelConfig({
+      channelName: "mcp-default",
+      mcpProfile: "default",
+    });
+    manager.start(config, "th-mcp-def");
+
+    const cmd = effects.tmux.getCommand("claude-th-mcp-def") ?? "";
+    expect(cmd).not.toContain("--strict-mcp-config");
+    expect(cmd).not.toContain("--mcp-config");
+    // Chrome stays disabled by default even in this profile.
+    expect(cmd).toContain("--no-chrome");
+  });
+});
+
+describe("buildClaudeFlags()", () => {
+  const baseConfig = {
+    channelName: "test-channel",
+    dir: "/tmp",
+    displayName: "Test",
+  };
+
+  test("default config produces the supervisor 'none' profile flags", () => {
+    const flags = buildClaudeFlags(baseConfig);
+    expect(flags).toEqual([
+      "--dangerously-skip-permissions",
+      "--name",
+      `"test-channel"`,
+      "--no-chrome",
+      "--strict-mcp-config",
+      "--mcp-config",
+      `'{"mcpServers":{}}'`,
+    ]);
+  });
+
+  test("chromeEnabled=true drops --no-chrome", () => {
+    const flags = buildClaudeFlags({ ...baseConfig, chromeEnabled: true });
+    expect(flags).not.toContain("--no-chrome");
+    expect(flags).toContain("--strict-mcp-config");
+  });
+
+  test("mcpProfile='default' drops the strict-mcp-config flags", () => {
+    const flags = buildClaudeFlags({ ...baseConfig, mcpProfile: "default" });
+    expect(flags).not.toContain("--strict-mcp-config");
+    expect(flags).not.toContain("--mcp-config");
+    expect(flags).toContain("--no-chrome");
+  });
+
+  test("both opt-ins simultaneously yield the legacy startup", () => {
+    const flags = buildClaudeFlags({
+      ...baseConfig,
+      chromeEnabled: true,
+      mcpProfile: "default",
+    });
+    expect(flags).toEqual([
+      "--dangerously-skip-permissions",
+      "--name",
+      `"test-channel"`,
+    ]);
   });
 });
