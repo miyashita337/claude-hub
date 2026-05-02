@@ -195,16 +195,47 @@ t19_print_argv_redacts_prompt() {
     ! echo "${out}" | grep -Fq '1487701062205964329'
 }
 
-# settings.json deny covers known bypass vectors (HIGH feedback from the
-# security review). Listed here so a future edit that removes them is
-# caught by the test rather than only surfacing in a Phase 2 review.
+# settings.json deny covers known dangerous vectors. Phase 1.5 (PR #126)
+# moved read-only viewers and runtime invocations (cat / bun / sh / etc)
+# from deny to allow because they were a /pdca workflow bottleneck. The
+# remaining deny set must still cover privilege escalation, irreversible
+# destruction, network exfil, shell injection, and destructive git ops.
+# Listed here so a future edit that drops any of them surfaces in the
+# test rather than only in a manual security review.
 t20_settings_deny_covers_bypass_vectors() {
   local settings="${SCRIPT_DIR}/../.claude/settings.json"
-  grep -Fq '"Bash(cat:*)"' "${settings}" && \
-    grep -Fq '"Bash(bun run:*)"' "${settings}" && \
-    grep -Fq '"Bash(bunx:*)"' "${settings}" && \
-    grep -Fq '"Bash(sh:*)"' "${settings}" && \
-    grep -Fq '"Bash(curl:*)"' "${settings}"
+  # privilege escalation
+  grep -Fq '"Bash(sudo:*)"' "${settings}" && \
+    # irreversible destruction (recursive rm with all uppercase / lowercase variants)
+    grep -Fq '"Bash(rm -rf:*)"' "${settings}" && \
+    grep -Fq '"Bash(rm -Rf:*)"' "${settings}" && \
+    grep -Fq '"Bash(rm -fR:*)"' "${settings}" && \
+    grep -Fq '"Bash(rm -R:*)"' "${settings}" && \
+    grep -Fq '"Bash(dd:*)"' "${settings}" && \
+    grep -Fq '"Bash(mkfs:*)"' "${settings}" && \
+    # network exfil
+    grep -Fq '"Bash(curl:*)"' "${settings}" && \
+    grep -Fq '"Bash(wget:*)"' "${settings}" && \
+    grep -Fq '"Bash(ssh:*)"' "${settings}" && \
+    grep -Fq '"Bash(scp:*)"' "${settings}" && \
+    # shell injection
+    grep -Fq '"Bash(eval:*)"' "${settings}" && \
+    grep -Fq '"Bash(exec:*)"' "${settings}" && \
+    # destructive git
+    grep -Fq '"Bash(git diff --no-index:*)"' "${settings}" && \
+    grep -Fq '"Bash(git push --force:*)"' "${settings}" && \
+    grep -Fq '"Bash(git push -f:*)"' "${settings}" && \
+    # gh CLI surface kept narrow (auth/secret/config remain denied)
+    grep -Fq '"Bash(gh auth token:*)"' "${settings}" && \
+    grep -Fq '"Bash(gh secret:*)"' "${settings}" && \
+    # Bash viewer secret-path denies (CodeRabbit CR3 Phase 1.5)
+    grep -Fq '"Bash(cat .env)"' "${settings}" && \
+    grep -Fq '"Bash(cat /Users/*/.aws:*)"' "${settings}" && \
+    grep -Fq '"Bash(cat /Users/*/.ssh:*)"' "${settings}" && \
+    grep -Fq '"Bash(cat *credentials*)"' "${settings}" && \
+    grep -Fq '"Bash(cat *id_rsa*)"' "${settings}" && \
+    grep -Fq '"Bash(head .env)"' "${settings}" && \
+    grep -Fq '"Bash(tail .env)"' "${settings}"
 }
 
 # Issue #63 fail-closed: the script must abort with a non-zero exit code when
