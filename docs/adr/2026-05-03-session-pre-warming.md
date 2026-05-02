@@ -74,12 +74,14 @@ warm pool 方式は「warm プロセスは project 未確定の状態で起動 �
 
 ### ROI 評価（devils-advocate）
 
-仮に技術的成立性を無視しても、ROI は完全マイナス:
+仮に技術的成立性を無視しても、ROI は完全マイナス（以下の数値は**全て推定**、実機計測は未実施）:
 
-- **節約見込み**: cold start 30s × 想定起動頻度 1-2 件/週（個人開発、1 user）= 30-60s/週
-- **コスト**: claude プロセス常駐 ~200MB × N pool size × 24h × 7 日 = N × 33.6 GB·h/週
-- **比率**: N=2 で 67.2 GB·h/週 vs 60s/週 = 約 4000 倍の不釣り合い
-- **副作用**: MAX_SESSIONS=10 の 20-30% を warm が占有 → 実 session 起動枯渇リスク
+- **節約見込み（推定）**: cold start 30s × 想定起動頻度 1-2 件/週（個人開発、1 user）= 30-60s/週
+- **コスト（推定）**: claude プロセス常駐 ~200MB × N pool size × 24h × 7 日 = N × 33.6 GB·h/週
+- **比率（推定）**: N=2 で 67.2 GB·h/週 vs 60s/週 = 約 4000 倍の不釣り合い
+- **副作用**: `MAX_SESSIONS=10`（`supervisor/src/config/channels.ts` 参照）の 20-30% を warm が占有 → 実 session 起動枯渇リスク
+
+> **推定根拠の注記**: `~200MB/process` は claude TUI の概算値、`1-2 件/週` は本リポジトリ運用者 1 user の主観見積もり。再検証時は (1) `time claude --version` で起動 phase ごとの wallclock、(2) `ps -o rss -p <pid>` で active session の RSS、(3) `gh api .../sessions` 等での実起動頻度ログ集計、を推奨。これらが大きくズレる場合は本 ROI 結論も再評価が必要（ただし主張 1, 3 の技術的不成立は ROI と独立に成立する）。
 
 ## Alternatives Considered
 
@@ -98,17 +100,19 @@ warm pool 方式は「warm プロセスは project 未確定の状態で起動 �
 
 ### 案 Z: Always-On Sessions（**推奨**）
 
-**概要**: 全 11 channel の session を supervisor 起動時に自動 start し、idle でも kill しない。`/session start` は実質 no-op（既に running なら ack のみ）。
+**概要**: 全 channel（現状 `supervisor/src/config/channels.ts` の `CHANNEL_MAP` で 11 件登録）の session を supervisor 起動時に自動 start し、idle でも kill しない。`/session start` は実質 no-op（既に running なら ack のみ）。
 
 | 観点 | 評価 |
 |------|------|
-| 工数 | 中（MAX_SESSIONS 拡張、IDLE_TIMEOUT 無効化、起動時 auto-start ロジック追加） |
+| 工数 | 中（`MAX_SESSIONS` 拡張、`IDLE_TIMEOUT` 無効化フラグ、起動時 auto-start ロジック追加） |
 | 効果 | cold start 完全 0s（pre-bound、cwd/name 確定済） |
-| RAM コスト | 11 channel × ~200MB = 2.2GB（warm pool 案と同程度） |
-| 既存設計改修範囲 | `supervisor/src/config/channels.ts`（`MAX_SESSIONS` 11 へ）、`SessionManager`（auto-start メソッド追加）、`Reaper`（idle kill 無効化 flag） |
-| リスク | 中（resource-monitor.ts の RAM 圧迫時挙動の検証必須、MAX_MEMORY_PER_SESSION_MB との整合） |
+| RAM コスト（推定） | `CHANNEL_MAP.size` × ~200MB = 現状 ~2.2GB。warm pool N=2 案 (~400MB) より約 5x 多いが、pre-bound のため cold start が完全消滅する点が引き換え |
+| 既存設計改修範囲 | `supervisor/src/config/channels.ts`（後述の `MAX_SESSIONS` 拡張）、`SessionManager`（auto-start メソッド追加）、`Reaper`（idle kill 無効化 flag）、`resource-monitor.ts`（常時 N session 占有を踏まえた閾値再設計） |
+| リスク | 中（RAM 圧迫時挙動、`MAX_MEMORY_PER_SESSION_MB` との整合、auto-start spike） |
 
-**判定**: warm pool が抱える cwd/env 制約を**全て回避**しつつ、warm pool と同等の cold start 削減を実現。**最有力**。follow-up Issue で詳細設計。
+**前提条件**: `MAX_SESSIONS` を `CHANNEL_MAP.size` ピッタリ（= 11）に設定すると ad-hoc な新規 thread 起動の余地が消えるため、**`MAX_SESSIONS = CHANNEL_MAP.size + α`（推奨 α=4-9、つまり 15-20）** を採る。この拡張なしに案 Z を採用すると、`commands/session.ts` の `MAX_SESSIONS` チェックで実 session 起動が即枯渇する。
+
+**判定**: warm pool が抱える cwd/env 制約を**全て回避**しつつ、cold start を削減。RAM コストは warm pool N=2 案より大きいが、pre-bound による cold start 完全消滅と「unbound プロセスの紐付けが不可能」という不成立リスクの解消で打ち消される。**最有力**。follow-up Issue で詳細設計（計測条件含む）。
 
 ### 案 W: `/resume` ベースの保存セッション復元
 
