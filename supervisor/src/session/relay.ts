@@ -4,6 +4,7 @@ import { homedir } from "os";
 import { mkdirSync, writeFileSync, unlinkSync } from "fs";
 import { waitForRelay, type RelayResult } from "./relay-server";
 import { TMUX_PATH, TMUX_ARGS } from "./tmux";
+import { createLatencyTracker } from "./latency-logger";
 
 const ATTACHMENT_DIR = resolve(homedir(), "claude-hub", "tmp", "attachments");
 
@@ -160,6 +161,12 @@ export async function relayMessage(
     }
   }
 
+  // Latency tracker: Issue #135 / Epic #101 で高負荷時 70s+ 遅延の dominant
+  // segment を特定するために各 segment の所要 ms を記録。session_id には
+  // tmux session 名 (= supervisor 内で安定識別子) を使う。
+  // 観測機構の失敗は relay 本来の処理を止めない (latency-logger.ts 参照)。
+  const tracker = createLatencyTracker(tmuxSessionName);
+
   // 2. Send via tmux send-keys using execFileSync (argv array, no shell).
   // We issue the input and the submit as two separate calls:
   //   (a) `send-keys -l <literal>` — tmux forwards the bytes verbatim.
@@ -176,6 +183,8 @@ export async function relayMessage(
   const literalText = fullMessage.replace(/\n/g, " ");
 
   try {
+    // Segment (b): tmux 経路 (mode exit + Escape + send-keys -l + C-m)
+    tracker.markStart("b");
     // Exit any stuck tmux mode (copy-mode, view-mode) BEFORE any send-keys.
     // A pane in copy-mode consumes keys as mode commands and silently drops
     // the payload or yields `not in a mode` on the retry path (Issue #73).
@@ -189,7 +198,11 @@ export async function relayMessage(
     // Small pause so the TUI finishes ingesting the text before Enter.
     await new Promise((r) => setTimeout(r, 100));
     await tmuxSend(tmuxSessionName, ["C-m"]);
+    tracker.markEnd("b");
   } catch (err) {
+    tracker.markEnd("b");
+    tracker.setError("b");
+    tracker.flush();
     scheduleCleanup(localFiles, 5 * 60_000);
     return {
       text: "",
@@ -198,8 +211,23 @@ export async function relayMessage(
     };
   }
 
+  // Segment (c): tmux send 完了 → waitForRelay 開始までの隙間 (大体ゼロ、
+  // でも明示的に記録しておくことで設計レビュー時の sanity check になる)
+  tracker.markStart("c");
+  tracker.markEnd("c");
+
   // 3. Wait for Stop hook to POST the response
+  // Segment (d_e_c): claude TUI 受信 + skill/hook init + MCP capability
+  // discovery + Anthropic API 呼出 + Stop hook fire の合計。supervisor から
+  // は内訳を分離できないため 1 まとめで記録 (Issue #135 で「(d)+(e)+(c)」と
+  // して観測する設計と一致)。
+  tracker.markStart("d_e_c");
   const result = await waitForRelay(threadId, RELAY_TIMEOUT_MS);
+  tracker.markEnd("d_e_c");
+  if (result.error) {
+    tracker.setError("d_e_c");
+  }
+  tracker.flush();
 
   scheduleCleanup(localFiles, 5 * 60_000);
   return result;
