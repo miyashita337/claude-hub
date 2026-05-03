@@ -80,21 +80,39 @@ TMP_HOME=$(mktemp -d)
 trap 'rm -rf "$TMP_HOME"' EXIT
 
 # Run claude with given args; print elapsed ms (median of $RUNS runs).
+#
+# Note: claude exit code is non-zero when the API returns is_error=true
+# (e.g., "Credit balance is too low", auth failures, rate limits). In these
+# cases the MCP discovery + auth + initial API round-trip have completed,
+# which is what we want to measure for cold-start. We therefore distinguish
+# "real timeout" (exit 124 from `timeout` cmd) from "API error" (other
+# non-zero exits) and accept the latter as valid measurements with a tag.
 measure() {
   local label="$1"; shift
   local samples=()
+  local api_error_count=0
   local i
   for (( i=1; i<=RUNS; i++ )); do
-    local start_ns end_ns elapsed_ms
+    local start_ns end_ns elapsed_ms rc
     start_ns=$(date +%s%N)
-    if ! timeout "${TIMEOUT_SEC}s" claude --output-format json -p "$PROMPT" "$@" >/dev/null 2>&1; then
-      echo "  WARN: run $i for '$label' failed or timed out" >&2
-      continue
-    fi
+    timeout "${TIMEOUT_SEC}s" claude --output-format json -p "$PROMPT" "$@" >/dev/null 2>&1
+    rc=$?
     end_ns=$(date +%s%N)
     elapsed_ms=$(( (end_ns - start_ns) / 1000000 ))
+    if (( rc == 124 )); then
+      # Real timeout from `timeout` cmd.
+      echo "  WARN: run $i for '$label' timed out (>${TIMEOUT_SEC}s)" >&2
+      continue
+    fi
+    if (( rc != 0 )); then
+      # claude returned non-zero (typically API error like credit balance);
+      # the cold-start work is still complete by this point.
+      api_error_count=$(( api_error_count + 1 ))
+      echo "  run $i: ${elapsed_ms} ms (claude exit=$rc, API error - cold-start still measured)" >&2
+    else
+      echo "  run $i: ${elapsed_ms} ms" >&2
+    fi
     samples+=("$elapsed_ms")
-    echo "  run $i: ${elapsed_ms} ms" >&2
   done
   if (( ${#samples[@]} == 0 )); then
     echo "$label	timeout"
@@ -107,6 +125,9 @@ measure() {
   local mid=$(( n / 2 ))
   local median
   median=$(echo "$sorted" | sed -n "$((mid + 1))p")
+  if (( api_error_count > 0 )); then
+    echo "  NOTE: $api_error_count/${#samples[@]} runs returned API error (cold-start still valid)" >&2
+  fi
   echo "$label	$median"
 }
 
