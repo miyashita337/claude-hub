@@ -110,24 +110,28 @@ measure() {
   echo "$label	$median"
 }
 
-declare -A RESULTS
+# bash 3.2 compat (macOS default): scalar vars instead of associative array.
+# Issue #132 / RW-028 同型: declare -A は bash 4.0+ 専用なので使わない。
+RESULTS_baseline=""
+RESULTS_no_chrome=""
+RESULTS_supervisor=""
 echo "--- Cold-start measurements (median of $RUNS run(s); prompt='$PROMPT') ---"
 
 # Run from a clean cwd (TMP_HOME) so project-scope .mcp.json doesn't skew results.
 cd "$TMP_HOME"
 
 echo "[1/3] baseline (all MCPs + chrome)..."
-RESULTS[baseline]=$(measure "baseline" 2>/dev/null | cut -f2 || echo "timeout")
-echo "  -> ${RESULTS[baseline]} ms"
+RESULTS_baseline=$(measure "baseline" 2>/dev/null | cut -f2 || echo "timeout")
+echo "  -> ${RESULTS_baseline} ms"
 
 echo "[2/3] --no-chrome only..."
-RESULTS[no_chrome]=$(measure "no_chrome" --no-chrome 2>/dev/null | cut -f2 || echo "timeout")
-echo "  -> ${RESULTS[no_chrome]} ms"
+RESULTS_no_chrome=$(measure "no_chrome" --no-chrome 2>/dev/null | cut -f2 || echo "timeout")
+echo "  -> ${RESULTS_no_chrome} ms"
 
 if (( QUICK == 0 )); then
   echo "[3/3] --no-chrome + --strict-mcp-config '{}' (supervisor recommended)..."
-  RESULTS[supervisor]=$(measure "supervisor" --no-chrome --strict-mcp-config --mcp-config '{"mcpServers":{}}' 2>/dev/null | cut -f2 || echo "timeout")
-  echo "  -> ${RESULTS[supervisor]} ms"
+  RESULTS_supervisor=$(measure "supervisor" --no-chrome --strict-mcp-config --mcp-config '{"mcpServers":{}}' 2>/dev/null | cut -f2 || echo "timeout")
+  echo "  -> ${RESULTS_supervisor} ms"
 else
   echo "[3/3] skipped (--quick)"
 fi
@@ -149,10 +153,10 @@ format_ms() {
   fi
 }
 
-printf '%-50s | %-10s | %s\n' "baseline (all MCPs + chrome)" "$(format_ms "${RESULTS[baseline]}")" "loaded"
-printf '%-50s | %-10s | %s\n' "--no-chrome" "$(format_ms "${RESULTS[no_chrome]}")" "chrome=disabled"
+printf '%-50s | %-10s | %s\n' "baseline (all MCPs + chrome)" "$(format_ms "${RESULTS_baseline}")" "loaded"
+printf '%-50s | %-10s | %s\n' "--no-chrome" "$(format_ms "${RESULTS_no_chrome}")" "chrome=disabled"
 if (( QUICK == 0 )); then
-  printf '%-50s | %-10s | %s\n' "--no-chrome + strict-mcp-config '{}'" "$(format_ms "${RESULTS[supervisor]}")" "all=disabled (lazy)"
+  printf '%-50s | %-10s | %s\n' "--no-chrome + strict-mcp-config '{}'" "$(format_ms "${RESULTS_supervisor}")" "all=disabled (lazy)"
 fi
 echo
 
@@ -205,11 +209,11 @@ echo
 #-----------------------------------------------------------------------------
 # 5. Estimated savings
 #-----------------------------------------------------------------------------
-if [[ "${RESULTS[baseline]}" =~ ^[0-9]+$ && "${RESULTS[no_chrome]}" =~ ^[0-9]+$ ]]; then
-  chrome_save=$(( RESULTS[baseline] - RESULTS[no_chrome] ))
+if [[ "${RESULTS_baseline}" =~ ^[0-9]+$ && "${RESULTS_no_chrome}" =~ ^[0-9]+$ ]]; then
+  chrome_save=$(( RESULTS_baseline - RESULTS_no_chrome ))
   echo "Estimated savings from --no-chrome:           ${chrome_save} ms"
 fi
-if (( QUICK == 0 )) && [[ "${RESULTS[baseline]}" =~ ^[0-9]+$ && "${RESULTS[supervisor]}" =~ ^[0-9]+$ ]]; then
-  total_save=$(( RESULTS[baseline] - RESULTS[supervisor] ))
+if (( QUICK == 0 )) && [[ "${RESULTS_baseline}" =~ ^[0-9]+$ && "${RESULTS_supervisor}" =~ ^[0-9]+$ ]]; then
+  total_save=$(( RESULTS_baseline - RESULTS_supervisor ))
   echo "Estimated savings (supervisor 'none' profile): ${total_save} ms"
 fi
