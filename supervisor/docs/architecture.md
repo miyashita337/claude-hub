@@ -81,6 +81,6 @@ Issue #13 で評価した Phase 1 PoC の最終判定:
 - Supervisor 配下の Claude Code セッション (`manager.ts:130`) は `--dangerously-skip-permissions` を常時付与。PermissionRequest hook (`hooks/auto-approve-permission.sh`) がデッドロック防止を担う
 - `scripts/start-hijoguchi.sh` (`claudeHubExit` bot) のみ `CLAUDE_HUB_UNSAFE_SKIP_PERMISSIONS` 環境変数で `--dangerously-skip-permissions` を条件分岐。Phase 1 は default=1（現状）、Phase 2 で default=0 に切替予定 (#53)。`.claude/settings.json` の `permissions.allow`/`deny` が運用ポリシーの single source
 - `protect-config.sh` で Write/Edit の機密パス（`.env`, `access.json` 等）をブロック (#54)
-- `prompt-title-check.py` に構造化 JSON ログ出力 (#55)
+- `prompt-title-check.py` に構造化 JSON ログ出力 (#55) — 実体は `agent-base/scripts/prompt-title-check.py` に移動 (本リポからは dead copy を削除、#44 C 案)
 - `access.json allowFrom` でチャンネル単位のアクセス制御 (#47)
 - `hijoguchi-system-prompt.md` + システムプロンプト固定で `claudeHubExit` bot の応答スコープを制限 (#49)
