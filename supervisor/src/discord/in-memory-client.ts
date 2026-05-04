@@ -31,6 +31,7 @@ export interface InjectThreadMessageInput {
 
 export interface InjectSlashCommandInput {
   commandName: string;
+  subcommand?: string;
   options?: Record<string, string | number | boolean>;
   channelId?: string;
   userId?: string;
@@ -130,8 +131,13 @@ export class InMemoryDiscordClient implements IDiscordClient {
       });
       if (input.onReply) await input.onReply(content, eph);
     };
+    // subcommand is omitted from the object when undefined so callers that
+    // probe with `"subcommand" in cmd` get false (matches the shape the
+    // RealDiscordClient produces — subcommand is only set for SUB_COMMAND
+    // / SUB_COMMAND_GROUP options).
     const cmd: DiscordSlashCommand = {
       commandName: input.commandName,
+      ...(input.subcommand !== undefined ? { subcommand: input.subcommand } : {}),
       options: input.options ?? {},
       channelId: input.channelId ?? "channel_test",
       userId: input.userId ?? "user_test",

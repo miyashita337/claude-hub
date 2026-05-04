@@ -26,7 +26,19 @@ import {
   type SessionEffects,
 } from "./adapters";
 
-const CLAUDE_PATH = resolve(homedir(), ".local", "bin", "claude");
+// Path to the `claude` executable. Override via `SUPERVISOR_CLAUDE_PATH` for
+// E2E tests (e.g. point at supervisor/tests/e2e/fixtures/claude-mock.sh). The
+// env var must be an absolute path under operator control — same trust class
+// as SUPERVISOR_TMUX_SOCKET / SUPERVISOR_RELAY_URL.
+//
+// Read at use-time (not module load) so tests that set the env in beforeAll
+// observe the override even though the module was imported earlier.
+function claudePath(): string {
+  return (
+    process.env.SUPERVISOR_CLAUDE_PATH ??
+    resolve(homedir(), ".local", "bin", "claude")
+  );
+}
 const TMUX_SESSION_PREFIX = "claude-";
 
 /**
@@ -162,7 +174,15 @@ export class SessionManager {
   }
 
   private tmuxSessionName(threadId: string): string {
-    // Use a short prefix + first 8 chars of threadId for tmux session name
+    return SessionManager.tmuxSessionNameFor(threadId);
+  }
+
+  /**
+   * Public, deterministic mapping from threadId → tmux session name.
+   * Exposed so callers (e.g. E2E tests) don't have to recreate the
+   * `claude-<threadId12>` formula and silently break when it changes.
+   */
+  static tmuxSessionNameFor(threadId: string): string {
     return `${TMUX_SESSION_PREFIX}${threadId.slice(0, 12)}`;
   }
 
@@ -216,7 +236,10 @@ export class SessionManager {
       `mkdir -p "${relayUrlDir}"`,
       `printf "%s" "${relayUrl}" > "${relayUrlFile}"`,
       `cd "${config.dir}"`,
-      `exec ${CLAUDE_PATH} ${buildClaudeFlags(config).join(" ")}`,
+      // Quote claudePath() so SUPERVISOR_CLAUDE_PATH values containing spaces
+      // (e.g. test fixture paths under "/Users/Test User/...") don't word-split
+      // when the joined command line is handed to /bin/sh by tmux new-session.
+      `exec "${claudePath()}" ${buildClaudeFlags(config).join(" ")}`,
     ].join(" && ");
 
     // Launch via tmux (provides a real TTY). Uses Supervisor's dedicated
