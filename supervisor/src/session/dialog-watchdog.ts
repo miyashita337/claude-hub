@@ -124,78 +124,96 @@ export function startDialogWatchdog(
   let consecutiveAttempts = 0;
   let heartbeatFired = false;
   let stopped = false;
+  let timer: ReturnType<typeof setTimeout> | null = null;
 
+  // Recursive setTimeout instead of setInterval: each tick is awaited end-to-end
+  // before scheduling the next, so a slow `await onHeartbeat(...)` cannot cause
+  // overlapping ticks. The outer try/catch also prevents an unhandled
+  // PromiseRejection if `capture` / `detectDialog` / `sendKeys` throws
+  // (review: gemini-code-assist on PR #143, comment 3179498219).
   const tick = async (): Promise<void> => {
     if (stopped) return;
-    const pane = capture(tmuxSessionName);
-    const match = detectDialog(pane);
+    try {
+      const pane = capture(tmuxSessionName);
+      const match = detectDialog(pane);
 
-    if (!match) {
-      // Pane is clean — reset attempt counter so a future dialog gets a
-      // fresh budget rather than inheriting old state.
-      lastKind = null;
-      consecutiveAttempts = 0;
-      heartbeatFired = false;
-      return;
-    }
+      if (!match) {
+        // Pane is clean — reset attempt counter so a future dialog gets a
+        // fresh budget rather than inheriting old state.
+        lastKind = null;
+        consecutiveAttempts = 0;
+        heartbeatFired = false;
+        return;
+      }
 
-    if (match.kind !== lastKind) {
-      // New dialog kind detected — reset counter and log once. Repeated
-      // detections of the same kind across ticks share a single log line
-      // unless the kind changes.
-      lastKind = match.kind;
-      consecutiveAttempts = 0;
-      heartbeatFired = false;
-      console.warn(
-        `[Dialog] detected on ${tmuxSessionName}: kind=${match.kind} line=${JSON.stringify(match.line)}`
-      );
-    }
-
-    if (consecutiveAttempts < maxAutoAcceptAttempts) {
-      const keys = AUTO_ACCEPT_KEYS[match.kind];
-      consecutiveAttempts++;
-      console.warn(
-        `[Dialog] auto-accepted: ${match.kind} (attempt ${consecutiveAttempts}/${maxAutoAcceptAttempts}) on ${tmuxSessionName}`
-      );
-      try {
-        sendKeys(tmuxSessionName, keys);
-      } catch (err) {
+      if (match.kind !== lastKind) {
+        // New dialog kind detected — reset counter and log once. Repeated
+        // detections of the same kind across ticks share a single log line
+        // unless the kind changes.
+        lastKind = match.kind;
+        consecutiveAttempts = 0;
+        heartbeatFired = false;
         console.warn(
-          `[Dialog] auto-accept send-keys threw for ${tmuxSessionName}:`,
-          err
+          `[Dialog] detected on ${tmuxSessionName}: kind=${match.kind} line=${JSON.stringify(match.line)}`
         );
       }
-      onAutoAccept?.(match);
-      return;
-    }
 
-    // Auto-accept budget exhausted — fire heartbeat once per dialog and
-    // keep polling (the user may dismiss it manually, after which lastKind
-    // resets via the no-match branch).
-    if (!heartbeatFired) {
-      heartbeatFired = true;
-      console.warn(
-        `[Dialog] user-action-required: ${match.kind} on ${tmuxSessionName} — heartbeat dispatched`
-      );
-      if (onHeartbeat) {
+      if (consecutiveAttempts < maxAutoAcceptAttempts) {
+        const keys = AUTO_ACCEPT_KEYS[match.kind];
+        consecutiveAttempts++;
+        console.warn(
+          `[Dialog] auto-accepted: ${match.kind} (attempt ${consecutiveAttempts}/${maxAutoAcceptAttempts}) on ${tmuxSessionName}`
+        );
         try {
-          await onHeartbeat(match);
+          sendKeys(tmuxSessionName, keys);
         } catch (err) {
-          console.warn(`[Dialog] onHeartbeat threw:`, err);
+          console.warn(
+            `[Dialog] auto-accept send-keys threw for ${tmuxSessionName}:`,
+            err
+          );
         }
+        onAutoAccept?.(match);
+        return;
+      }
+
+      // Auto-accept budget exhausted — fire heartbeat once per dialog and
+      // keep polling (the user may dismiss it manually, after which lastKind
+      // resets via the no-match branch).
+      if (!heartbeatFired) {
+        heartbeatFired = true;
+        console.warn(
+          `[Dialog] user-action-required: ${match.kind} on ${tmuxSessionName} — heartbeat dispatched`
+        );
+        if (onHeartbeat) {
+          try {
+            await onHeartbeat(match);
+          } catch (err) {
+            console.warn(`[Dialog] onHeartbeat threw:`, err);
+          }
+        }
+      }
+    } catch (err) {
+      console.error(
+        `[Dialog] watchdog tick failed for ${tmuxSessionName}:`,
+        err
+      );
+    } finally {
+      if (!stopped) {
+        timer = setTimeout(() => void tick(), pollIntervalMs);
       }
     }
   };
 
-  const handle = setInterval(() => {
-    void tick();
-  }, pollIntervalMs);
+  timer = setTimeout(() => void tick(), pollIntervalMs);
 
   return {
     stop(): void {
       if (stopped) return;
       stopped = true;
-      clearInterval(handle);
+      if (timer) {
+        clearTimeout(timer);
+        timer = null;
+      }
     },
   };
 }
