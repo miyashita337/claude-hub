@@ -28,16 +28,17 @@ import {
 
 // Path to the `claude` executable. Override via `SUPERVISOR_CLAUDE_PATH` for
 // E2E tests (e.g. point at supervisor/tests/e2e/fixtures/claude-mock.sh). The
-// env var must be an absolute path under operator control — same trust class
-// as SUPERVISOR_TMUX_SOCKET / SUPERVISOR_RELAY_URL.
+// env var must be a path under operator control — same trust class as
+// SUPERVISOR_TMUX_SOCKET / SUPERVISOR_RELAY_URL.
 //
 // Read at use-time (not module load) so tests that set the env in beforeAll
-// observe the override even though the module was imported earlier.
+// observe the override even though the module was imported earlier. Pass
+// the env value through `path.resolve` so a relative path doesn't depend
+// on the launching shell's CWD (gemini PR #146 review).
 function claudePath(): string {
-  return (
-    process.env.SUPERVISOR_CLAUDE_PATH ??
-    resolve(homedir(), ".local", "bin", "claude")
-  );
+  const envPath = process.env.SUPERVISOR_CLAUDE_PATH;
+  if (envPath) return resolve(envPath);
+  return resolve(homedir(), ".local", "bin", "claude");
 }
 const TMUX_SESSION_PREFIX = "claude-";
 

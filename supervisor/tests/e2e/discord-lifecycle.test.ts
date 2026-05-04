@@ -22,7 +22,14 @@ import { execFileSync } from "child_process";
 import { resolve, dirname } from "path";
 import { fileURLToPath } from "url";
 import { tmpdir } from "os";
-import { mkdtempSync, rmSync, mkdirSync, writeFileSync, existsSync } from "fs";
+import {
+  mkdtempSync,
+  rmSync,
+  mkdirSync,
+  writeFileSync,
+  existsSync,
+  realpathSync,
+} from "fs";
 import { join } from "path";
 
 import { wireBotHandlers } from "../../src/discord/handler";
@@ -56,13 +63,12 @@ const correctSocket = TMUX_SOCKET === REQUIRED_SOCKET;
 // PR #145 review).
 const envClaudePath = process.env.SUPERVISOR_CLAUDE_PATH;
 const fixtureExists = existsSync(FIXTURE_PATH);
+// Use Node's built-in fs.realpathSync over an external `realpath` binary —
+// no subprocess overhead, no PATH/binary dependency, and identical symlink
+// resolution semantics on all platforms (gemini PR #146 review).
 function realPathOrSelf(p: string): string {
   try {
-    return execFileSync("/usr/bin/env", ["realpath", p], {
-      timeout: 2000,
-    })
-      .toString()
-      .trim();
+    return realpathSync(p);
   } catch {
     return p;
   }
