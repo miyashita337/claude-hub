@@ -193,6 +193,20 @@ export function startRelayServer(): void {
           pendingAsks.delete(threadId);
         }
 
+        // Fast-fail when no subscriber is registered: pending asks would
+        // otherwise sit in the map for the full timeoutMs (~120s) and block the
+        // hook (review: coderabbitai on PR #142, comment 3179499098).
+        const callback = askUserCallback;
+        if (!callback) {
+          return new Response(
+            JSON.stringify({ error: "ask relay unavailable" }),
+            {
+              status: 503,
+              headers: { "Content-Type": "application/json" },
+            },
+          );
+        }
+
         const result = await new Promise<{
           status: 200 | 504 | 499;
           answer?: string;
@@ -207,17 +221,15 @@ export function startRelayServer(): void {
           // resolveAskUser call from the callback always finds the pending
           // request. Wrap in try/catch so a buggy callback can't leave the
           // request hanging.
-          if (askUserCallback) {
-            try {
-              askUserCallback({ threadId, question, options });
-            } catch (err) {
-              console.error("[relay-server] askUserCallback error:", err);
-              const pending = pendingAsks.get(threadId);
-              if (pending) {
-                clearTimeout(pending.timer);
-                pendingAsks.delete(threadId);
-                resolve({ status: 504 });
-              }
+          try {
+            callback({ threadId, question, options });
+          } catch (err) {
+            console.error("[relay-server] askUserCallback error:", err);
+            const pending = pendingAsks.get(threadId);
+            if (pending) {
+              clearTimeout(pending.timer);
+              pendingAsks.delete(threadId);
+              resolve({ status: 504 });
             }
           }
         });

@@ -139,6 +139,47 @@ describe("ask-user-relay.sh — supervisor session active", () => {
   });
 });
 
+describe("ask-user-relay.sh — URL derivation safety", () => {
+  // Regression: bash `${VAR/pat/repl}` would replace the FIRST `relay` token
+  // anywhere in the URL (including the host name or a threadId). Path-segment
+  // sed replacement keeps the substitution scoped to `/relay/` only
+  // (review: gemini-code-assist on PR #142, comment 3179491537).
+  test("only the /relay/ path segment is replaced — host containing 'relay' is preserved", async () => {
+    const env = setupTestEnv({
+      relayUrl: "http://relay.example.com:12345/relay/thread-x",
+      curlOutput: '{"answer":"ok"}',
+    });
+    try {
+      const input = makeInput({ question: "ping" }, env.dir);
+      await runHook(env, input);
+      const curlArgs = readFileSync(env.curlArgsFile, "utf8");
+      expect(curlArgs).toContain(
+        "http://relay.example.com:12345/ask/thread-x",
+      );
+      expect(curlArgs).not.toContain("ask.example.com");
+    } finally {
+      cleanup(env);
+    }
+  });
+
+  test("threadId containing 'relay' is preserved when deriving /ask/ URL", async () => {
+    const env = setupTestEnv({
+      relayUrl: "http://localhost:12345/relay/relay-debug-thread",
+      curlOutput: '{"answer":"ok"}',
+    });
+    try {
+      const input = makeInput({ question: "ping" }, env.dir);
+      await runHook(env, input);
+      const curlArgs = readFileSync(env.curlArgsFile, "utf8");
+      expect(curlArgs).toContain(
+        "http://localhost:12345/ask/relay-debug-thread",
+      );
+    } finally {
+      cleanup(env);
+    }
+  });
+});
+
 describe("ask-user-relay.sh — fallback / safety", () => {
   test("no relay-url file: hook is a no-op (empty stdout, exit 0)", async () => {
     const env = setupTestEnv({}); // no relayUrl written

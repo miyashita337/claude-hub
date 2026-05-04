@@ -46,10 +46,12 @@ if [ -z "$SUPERVISOR_RELAY_URL" ]; then
   exit 0
 fi
 
-# Derive the /ask/ endpoint from the /relay/ URL the manager wrote. Match
-# `progress-relay.sh` style (replace the literal `relay` token) — bash 3.2's
-# pattern replacement does not need slash escaping for path segments.
-ASK_URL="${SUPERVISOR_RELAY_URL/relay/ask}"
+# Derive the /ask/ endpoint from the /relay/ URL the manager wrote. Use sed
+# to scope the substitution to the path segment `/relay/` only — bash's
+# `${VAR/pat/repl}` replaces the FIRST `relay` anywhere in the URL, which would
+# corrupt host names or threadIds containing the literal "relay" (review:
+# gemini-code-assist on PR #142, comment 3179491537).
+ASK_URL=$(printf '%s' "$SUPERVISOR_RELAY_URL" | sed 's|/relay/|/ask/|')
 
 # Extract the question Claude wants to ask. AskUserQuestion's input shape is
 # `{ "question": "..." }`. Some flavours nest it under `prompt`, so accept

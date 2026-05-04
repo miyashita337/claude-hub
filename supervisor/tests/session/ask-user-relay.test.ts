@@ -127,6 +127,27 @@ describe("ask-user-relay (/ask/:threadId)", () => {
     expect(() => resolveAskUser("not-pending", "ignored")).not.toThrow();
   });
 
+  test("POST /ask/:threadId returns 503 immediately when no onAskUser subscriber is registered", async () => {
+    // Regression: without this fast-fail, a hook would block for the full
+    // DEFAULT_ASK_TIMEOUT_MS (~120s) before falling back to TUI behaviour
+    // (review: coderabbitai on PR #142, comment 3179499098).
+    startRelayServer();
+    const port = getRelayPort();
+
+    const started = Date.now();
+    const res = await fetch(`http://localhost:${port}/ask/thread-no-sub`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ question: "Anyone listening?", timeout_ms: 5000 }),
+    });
+    const elapsed = Date.now() - started;
+
+    expect(res.status).toBe(503);
+    expect(elapsed).toBeLessThan(500);
+    const body = (await res.json()) as { error: string };
+    expect(body.error).toBe("ask relay unavailable");
+  });
+
   test.each([
     ["plain-numeric", "1234567890123456"],
     ["with-slash", "thread/with/slash"],
