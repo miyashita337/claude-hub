@@ -22,15 +22,20 @@ SESSION_ID="${CLAUDE_MOCK_SESSION_ID:-mock-session-$$}"
 TEMPLATE="${CLAUDE_MOCK_REPLY_TEMPLATE:-[mock-claude] received: %s}"
 CURL_TIMEOUT="${CLAUDE_MOCK_CURL_TIMEOUT:-5}"
 
+# jq is required: Discord-sourced text can contain arbitrary control
+# characters (tabs, NULs, BEL, etc.). The previous sed-based fallback only
+# escaped backslash / double-quote / newline and produced invalid JSON for
+# anything else (CodeRabbit PR #145 review). We fail loudly instead of
+# emitting broken payloads.
+if ! command -v jq >/dev/null 2>&1; then
+  echo "claude-mock.sh: jq is required for safe JSON encoding (install jq)" >&2
+  exit 127
+fi
+
 # json_escape <text>
-# Emits a JSON-quoted string. Prefers jq when available for correctness;
-# falls back to a minimal sed escaper if jq is missing on the runner.
+# Emits a JSON-quoted string via jq's robust string encoder.
 json_escape() {
-  if command -v jq >/dev/null 2>&1; then
-    printf '%s' "$1" | jq -Rs .
-  else
-    printf '"%s"' "$(printf '%s' "$1" | sed -e 's/\\/\\\\/g' -e 's/"/\\"/g' -e ':a;N;$!ba;s/\n/\\n/g')"
-  fi
+  printf '%s' "$1" | jq -Rs .
 }
 
 while IFS= read -r line; do

@@ -30,6 +30,12 @@ export interface DiscordSendOptions {
 
 export interface DiscordSlashCommand {
   commandName: string;
+  /** Subcommand name when the slash uses subcommands (e.g. `/session start`). */
+  subcommand?: string;
+  /**
+   * Top-level or subcommand options. When `subcommand` is set, these are the
+   * nested options of the subcommand (the discord.js shape `data[0].options`).
+   */
   options: Record<string, string | number | boolean>;
   channelId: string;
   userId: string;

@@ -86,8 +86,21 @@ export class RealDiscordClient implements IDiscordClient {
       // BOOLEAN / NUMBER and complex objects (User, Channel, Role, Attachment)
       // for resolved types. The interface only exposes primitives — gate on
       // typeof so a complex option doesn't sneak through as `[object Object]`.
+      // Subcommand support: when /session start is invoked, data[0] has
+      // type=SUB_COMMAND (1) and the actual options nest inside .options.
+      // SUB_COMMAND_GROUP (2) nests one level deeper but no current command
+      // uses it, so we flatten only one level.
       const opts: Record<string, string | number | boolean> = {};
-      for (const opt of interaction.options.data) {
+      let subcommand: string | undefined;
+      // ApplicationCommandOptionType: 1 = SUB_COMMAND, 2 = SUB_COMMAND_GROUP.
+      const top = interaction.options.data;
+      const subEntry =
+        top.length === 1 && (top[0]!.type === 1 || top[0]!.type === 2)
+          ? top[0]!
+          : undefined;
+      const optionList = subEntry?.options ?? top;
+      if (subEntry) subcommand = subEntry.name;
+      for (const opt of optionList) {
         const v = opt.value;
         if (
           v !== undefined &&
@@ -101,6 +114,7 @@ export class RealDiscordClient implements IDiscordClient {
       }
       const cmd: DiscordSlashCommand = {
         commandName: interaction.commandName,
+        ...(subcommand !== undefined ? { subcommand } : {}),
         options: opts,
         channelId: interaction.channelId ?? "",
         userId: interaction.user.id,
@@ -129,8 +143,11 @@ export class RealDiscordClient implements IDiscordClient {
       throw new Error("RealDiscordClient: cannot start after stop()");
     }
     if (this.started) return;
-    this.started = true;
+    // Mark as started AFTER successful login so a transient auth failure
+    // leaves the client in the un-started state and the caller can retry
+    // (CodeRabbit PR #145 review).
     await this.client.login(this.token);
+    this.started = true;
   }
 
   async stop(): Promise<void> {
@@ -147,7 +164,9 @@ export class RealDiscordClient implements IDiscordClient {
     this.assertRunning();
     const channel = await this.client.channels.fetch(threadId);
     if (!channel?.isThread()) {
-      throw new Error(`RealDiscordClient: thread not found: ${threadId}`);
+      throw new Error(
+        `RealDiscordClient: channel is not a thread or not found: ${threadId}`,
+      );
     }
     if (options.files?.length) {
       await channel.send({
