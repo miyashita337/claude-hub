@@ -5,6 +5,8 @@ import { mkdirSync, writeFileSync, unlinkSync } from "fs";
 import { waitForRelay, type RelayResult } from "./relay-server";
 import { TMUX_PATH, TMUX_ARGS } from "./tmux";
 import { createLatencyTracker } from "./latency-logger";
+import { startDialogWatchdog } from "./dialog-watchdog";
+import type { DialogMatch } from "./dialog-detect";
 
 const ATTACHMENT_DIR = resolve(homedir(), "claude-hub", "tmp", "attachments");
 
@@ -132,12 +134,32 @@ export async function tmuxSend(sessionName: string, extraArgs: string[]): Promis
 /**
  * Send a message to Claude Code via tmux send-keys and wait for
  * the response via HTTP relay (Stop hook POST).
+ *
+ * Issue #57: while waiting for the Stop-hook response, a dialog watchdog
+ * polls the pane every 5s. Dialogs that slip past `--dangerously-skip-
+ * permissions` (Plan mode confirmation, AskUserQuestion, MCP elicitation,
+ * Bash interactive y/n) cause the TUI to stall silently — without
+ * detection the relay simply times out at RELAY_TIMEOUT_MS (5 min). The
+ * watchdog auto-accepts known kinds and, if the dialog persists, fires
+ * `onDialogStuck` so the caller can post a heartbeat to Discord.
  */
+export interface RelayMessageOptions {
+  attachments?: AttachmentInfo[];
+  /**
+   * Called when the watchdog has exhausted its auto-accept budget for a
+   * dialog and the user must intervene manually. The callback typically
+   * posts a `ダイアログ検出: <kind>、手動操作要求` heartbeat to the
+   * Discord thread so the user knows the relay is paused. Errors thrown
+   * by the callback are caught and logged — they never block the relay.
+   */
+  onDialogStuck?: (match: DialogMatch) => void | Promise<void>;
+}
+
 export async function relayMessage(
   tmuxSessionName: string,
   threadId: string,
   message: string,
-  options?: { attachments?: AttachmentInfo[] }
+  options?: RelayMessageOptions
 ): Promise<RelayResult> {
   // 1. Download attachments
   const localFiles: string[] = [];
@@ -222,7 +244,24 @@ export async function relayMessage(
   // は内訳を分離できないため 1 まとめで記録 (Issue #135 で「(d)+(e)+(c)」と
   // して観測する設計と一致)。
   tracker.markStart("d_e_c");
-  const result = await waitForRelay(threadId, RELAY_TIMEOUT_MS);
+
+  // Issue #57: Start the dialog watchdog *during* the wait. Stops in
+  // finally so a thrown error or early return path can never leak the
+  // setInterval handle. onHeartbeat is wired through to the caller; if
+  // they didn't supply onDialogStuck we still log to stderr so the dialog
+  // surfaces in supervisor logs (the Pushover / Discord heartbeat path is
+  // the optional consumer per `rules/general/observability.md`).
+  const watchdog = startDialogWatchdog({
+    tmuxSessionName,
+    onHeartbeat: options?.onDialogStuck,
+  });
+
+  let result: RelayResult;
+  try {
+    result = await waitForRelay(threadId, RELAY_TIMEOUT_MS);
+  } finally {
+    watchdog.stop();
+  }
   tracker.markEnd("d_e_c");
   if (result.error) {
     tracker.setError("d_e_c");

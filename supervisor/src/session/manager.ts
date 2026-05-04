@@ -15,7 +15,12 @@ import {
   updateSessionActivity,
   getRunningSessions,
 } from "../infra/db";
-import { relayMessage, type AttachmentInfo, type RelayResult } from "./relay";
+import {
+  relayMessage,
+  type AttachmentInfo,
+  type RelayResult,
+  type RelayMessageOptions,
+} from "./relay";
 import {
   realSessionEffects,
   type SessionEffects,
@@ -283,11 +288,17 @@ export class SessionManager {
 
   /**
    * Send a message to the Claude Code session via tmux and get the response.
+   *
+   * Issue #57: `onDialogStuck` is forwarded to the relay's dialog watchdog;
+   * if a dialog (Plan / AskUserQuestion / MCP elicitation / Bash y/n) slips
+   * past `--dangerously-skip-permissions` and resists auto-accept, the
+   * callback runs so the Discord layer can post a heartbeat to the thread.
    */
   async sendMessage(
     threadId: string,
     message: string,
-    attachments?: AttachmentInfo[]
+    attachments?: AttachmentInfo[],
+    options?: Pick<RelayMessageOptions, "onDialogStuck">
   ): Promise<RelayResult> {
     const session = this.sessions.get(threadId);
     if (!session) {
@@ -309,7 +320,10 @@ export class SessionManager {
       };
     }
 
-    return relayMessage(tmuxName, threadId, message, { attachments });
+    return relayMessage(tmuxName, threadId, message, {
+      attachments,
+      onDialogStuck: options?.onDialogStuck,
+    });
   }
 
   async stop(
