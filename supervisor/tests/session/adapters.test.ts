@@ -7,35 +7,34 @@ import {
 } from "bun:test";
 
 /**
- * Issue #147 regression test: realTmuxAdapter.newSession must pass `command`
- * to tmux as a single argv element, so any shell metacharacters inside
- * (single quotes, $-expansions, brace expansion seeds) survive intact until
- * tmux's own /bin/sh -c invocation inside the new session.
+ * Issue #147 regression tests: every realTmuxAdapter method must reach tmux
+ * via execFileSync + argv array so neither `command` nor `name` flow through
+ * the calling shell.
  *
  * Pre-fix: `execSync(\`tmux new-session ... '${command}'\`)` re-parsed
  * `command` through the calling shell. A command containing
  * `--mcp-config '{"mcpServers":{}}'` would have its outer single quote
  * pair closed by the inner one, leaking the JSON into bash word-splitting
- * and bricking the claude session immediately on spawn.
+ * and bricking the claude session immediately on spawn (#147).
  *
- * Post-fix: `execFileSync(TMUX_PATH, [..., name, command])` bypasses the
- * shell entirely, so `command` is one argv element verbatim.
+ * killSession / hasSession / getPid also accepted `name` via string
+ * interpolation. PR #148 review (gemini critical) flagged that pattern as
+ * a latent shell-injection vector even though current callers pass numeric
+ * thread-IDs — defence-in-depth, not a current exploit.
+ *
+ * Post-fix: every method uses execFileSync(TMUX_PATH, [..., name, ...])
+ * so user input cannot reach the shell at all.
  */
 
 let execFileCalls: Array<{ file: string; args: readonly string[] }> = [];
+// PR #148 review (gemini medium): mock signature typed directly to avoid
+// `unknown` + type assertion in the body.
 const mockExecFileSync = mock(
-  (file: unknown, args: unknown): Buffer => {
-    execFileCalls.push({
-      file: file as string,
-      args: args as readonly string[],
-    });
+  (file: string, args: readonly string[]): Buffer => {
+    execFileCalls.push({ file, args });
     return Buffer.from("");
   }
 );
-
-// execSync is still used by killSession/hasSession/getPid; keep it mockable
-// so tests don't accidentally shell out.
-const mockExecSync = mock((..._args: unknown[]) => "");
 
 // We re-export the rest of node:child_process untouched so other modules
 // loaded in this test process (e.g. anything importing `spawn`) keep working.
@@ -43,7 +42,6 @@ const realChildProcess = await import("child_process");
 mock.module("child_process", () => ({
   ...realChildProcess,
   execFileSync: mockExecFileSync,
-  execSync: mockExecSync,
 }));
 
 const { realTmuxAdapter } = await import("../../src/session/adapters");
@@ -52,7 +50,6 @@ const { TMUX_PATH, TMUX_ARGS } = await import("../../src/session/tmux");
 beforeEach(() => {
   execFileCalls = [];
   mockExecFileSync.mockClear();
-  mockExecSync.mockClear();
 });
 
 describe("realTmuxAdapter.newSession (#147)", () => {
@@ -93,5 +90,100 @@ describe("realTmuxAdapter.newSession (#147)", () => {
     realTmuxAdapter.newSession("claude-tricky", tricky);
 
     expect(execFileCalls[0]?.args.at(-1)).toBe(tricky);
+  });
+});
+
+describe("realTmuxAdapter.killSession (#148 review)", () => {
+  test("uses execFileSync with name as argv element (no shell)", () => {
+    realTmuxAdapter.killSession("claude-test");
+
+    expect(mockExecFileSync).toHaveBeenCalledTimes(1);
+    expect(execFileCalls[0]?.file).toBe(TMUX_PATH);
+    expect(execFileCalls[0]?.args).toEqual([
+      ...TMUX_ARGS,
+      "kill-session",
+      "-t",
+      "claude-test",
+    ]);
+  });
+
+  test("neutralises shell-metacharacter injection via name", () => {
+    // The gemini review example. With the old execSync template literal
+    // this would have run `reboot` on the host. argv array passing makes
+    // the whole string a single argument to tmux's -t flag.
+    const malicious = `x"; reboot; #`;
+
+    realTmuxAdapter.killSession(malicious);
+
+    expect(execFileCalls[0]?.args.at(-1)).toBe(malicious);
+  });
+});
+
+describe("realTmuxAdapter.hasSession (#148 review)", () => {
+  test("returns true when execFileSync succeeds", () => {
+    expect(realTmuxAdapter.hasSession("claude-test")).toBe(true);
+    expect(execFileCalls[0]?.args).toEqual([
+      ...TMUX_ARGS,
+      "has-session",
+      "-t",
+      "claude-test",
+    ]);
+  });
+
+  test("returns false when execFileSync throws", () => {
+    const throwingMock = mock(
+      (_file: string, _args: readonly string[]): Buffer => {
+        throw new Error("no server running");
+      }
+    );
+    mock.module("child_process", () => ({
+      ...realChildProcess,
+      execFileSync: throwingMock,
+    }));
+
+    // Re-import so the adapter picks up the throwing mock for this test
+    // only; the mock.module call above is scoped to this test's lifetime.
+    return import("../../src/session/adapters").then(({ realTmuxAdapter: a }) => {
+      expect(a.hasSession("missing")).toBe(false);
+
+      // Restore the normal non-throwing mock for subsequent tests.
+      mock.module("child_process", () => ({
+        ...realChildProcess,
+        execFileSync: mockExecFileSync,
+      }));
+    });
+  });
+});
+
+describe("realTmuxAdapter.getPid (#148 review)", () => {
+  test("uses execFileSync and parses pane_pid", () => {
+    const pidMock = mock(
+      (_file: string, _args: readonly string[]): string => "12345\n"
+    );
+    mock.module("child_process", () => ({
+      ...realChildProcess,
+      execFileSync: pidMock,
+    }));
+
+    return import("../../src/session/adapters").then(({ realTmuxAdapter: a }) => {
+      expect(a.getPid("claude-test")).toBe(12345);
+      expect(pidMock).toHaveBeenCalledTimes(1);
+      const [file, args] = pidMock.mock.calls[0] ?? [];
+      expect(file).toBe(TMUX_PATH);
+      expect(args).toEqual([
+        ...TMUX_ARGS,
+        "list-panes",
+        "-t",
+        "claude-test",
+        "-F",
+        "#{pane_pid}",
+      ]);
+
+      // Restore normal mock for the rest of the file.
+      mock.module("child_process", () => ({
+        ...realChildProcess,
+        execFileSync: mockExecFileSync,
+      }));
+    });
   });
 });
