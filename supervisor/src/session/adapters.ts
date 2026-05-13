@@ -1,4 +1,4 @@
-import { execSync } from "child_process";
+import { execFileSync } from "child_process";
 import {
   openTab as realOpenTab,
   markTabStopped as realMarkTabStopped,
@@ -11,7 +11,8 @@ import {
   cancelRelay as realCancelRelay,
 } from "./relay-server";
 import {
-  TMUX_CMD,
+  TMUX_ARGS,
+  TMUX_PATH,
   ensureSocketConfigured as realEnsureSocketConfigured,
 } from "./tmux";
 
@@ -55,28 +56,47 @@ export interface SessionEffects {
 
 export const realTmuxAdapter: TmuxAdapter = {
   newSession(name, command) {
-    execSync(`${TMUX_CMD} new-session -d -s "${name}" '${command}'`);
+    // Issue #147: previous `execSync(\`tmux new-session ... '${command}'\`)`
+    // wrapped the entire command in single quotes. When `command` itself
+    // contained single quotes (e.g. `--mcp-config '{"mcpServers":{}}'` added
+    // in #104), the outer quotes closed prematurely, exposing the inner JSON
+    // to bash word-splitting and quote stripping — claude received malformed
+    // arguments and exited immediately. Using execFileSync with an argv array
+    // avoids shell parsing entirely: tmux receives `command` as a single
+    // argument and invokes /bin/sh -c on it once, inside the new session.
+    execFileSync(TMUX_PATH, [...TMUX_ARGS, "new-session", "-d", "-s", name, command]);
   },
   killSession(name) {
+    // PR #148 review (gemini critical): use execFileSync + argv array so an
+    // attacker-controlled `name` cannot inject shell metacharacters via the
+    // template literal. `stdio: "ignore"` matches the previous `2>/dev/null`
+    // (silence the expected "no session" error).
     try {
-      execSync(`${TMUX_CMD} kill-session -t "${name}" 2>/dev/null`);
+      execFileSync(TMUX_PATH, [...TMUX_ARGS, "kill-session", "-t", name], {
+        stdio: "ignore",
+      });
     } catch {
       // No existing session
     }
   },
   hasSession(name) {
     try {
-      execSync(`${TMUX_CMD} has-session -t "${name}" 2>/dev/null`);
+      execFileSync(TMUX_PATH, [...TMUX_ARGS, "has-session", "-t", name], {
+        stdio: "ignore",
+      });
       return true;
     } catch {
       return false;
     }
   },
   getPid(name) {
+    // stdio: ["ignore", "pipe", "ignore"] — we need stdout to read the pid,
+    // but stderr is discarded just like the previous `2>/dev/null`.
     try {
-      const output = execSync(
-        `${TMUX_CMD} list-panes -t "${name}" -F "#{pane_pid}" 2>/dev/null`,
-        { encoding: "utf8" }
+      const output = execFileSync(
+        TMUX_PATH,
+        [...TMUX_ARGS, "list-panes", "-t", name, "-F", "#{pane_pid}"],
+        { encoding: "utf8", stdio: ["ignore", "pipe", "ignore"] }
       ).trim();
       const pid = parseInt(output.split("\n")[0] ?? "", 10);
       return isNaN(pid) ? null : pid;
