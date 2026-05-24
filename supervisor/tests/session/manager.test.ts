@@ -291,3 +291,104 @@ describe("buildClaudeFlags()", () => {
     ]);
   });
 });
+
+describe("SessionManager worktree integration (#154)", () => {
+  let manager: SessionManager;
+  let effects: FakeSessionEffects;
+  let config: ChannelConfig;
+
+  beforeEach(() => {
+    effects = createFakeEffects();
+    manager = new SessionManager({ effects, gracefulKillTimeoutMs: 0 });
+    config = makeChannelConfig({ channelName: "wt-channel" });
+  });
+
+  afterEach(async () => {
+    await manager.shutdownAll();
+  });
+
+  test("AC-1: start with branch creates a worktree and runs claude there", () => {
+    const session = manager.start(config, "thread-wt", "feature-foo");
+
+    expect(effects.worktree.ensureCalls).toEqual([
+      { mainRepoDir: config.dir, branch: "feature-foo" },
+    ]);
+    const wtPath = `${config.dir}/.claude/worktrees/feature-foo`;
+    expect(session.worktree).toEqual({
+      mainRepoDir: config.dir,
+      path: wtPath,
+      branch: "feature-foo",
+    });
+    expect(session.projectDir).toBe(wtPath);
+
+    // claude is launched with cwd = the worktree path (AC-1 verification).
+    const cmd = effects.tmux.getCommand("claude-thread-wt");
+    expect(cmd).toContain(`cd "${wtPath}"`);
+  });
+
+  test("start without branch keeps legacy behaviour (no worktree)", () => {
+    const session = manager.start(config, "thread-plain");
+
+    expect(session.worktree).toBeUndefined();
+    expect(session.projectDir).toBe(config.dir);
+    expect(effects.worktree.ensureCalls).toHaveLength(0);
+  });
+
+  test("AC-3 / Q4: a pre-existing worktree is reused", () => {
+    const wtPath = `${config.dir}/.claude/worktrees/feature-foo`;
+    effects.worktree.existingPaths.add(wtPath);
+
+    const session = manager.start(config, "thread-reuse", "feature-foo");
+    expect(session.worktree?.path).toBe(wtPath);
+    // ensure() was still consulted (it decides reuse), but no second creation.
+    expect(effects.worktree.ensureCalls).toHaveLength(1);
+  });
+
+  test("AC-5 / Q3: stop removes the worktree (branch preserved)", async () => {
+    const session = manager.start(config, "thread-stop-wt", "feature-foo");
+    const wtPath = session.worktree!.path;
+
+    await manager.stop("thread-stop-wt", "manual");
+
+    expect(effects.worktree.removeCalls).toEqual([
+      { mainRepoDir: config.dir, worktreePath: wtPath },
+    ]);
+  });
+
+  test("stop of a branchless session does not call worktree.remove", async () => {
+    manager.start(config, "thread-plain-stop");
+    await manager.stop("thread-plain-stop", "manual");
+    expect(effects.worktree.removeCalls).toHaveLength(0);
+  });
+
+  test("AC-6: two branches start in parallel as independent worktrees", () => {
+    const a = manager.start(config, "thread-a", "feat-a");
+    const b = manager.start(config, "thread-b", "feat-b");
+
+    expect(a.worktree?.path).toBe(`${config.dir}/.claude/worktrees/feat-a`);
+    expect(b.worktree?.path).toBe(`${config.dir}/.claude/worktrees/feat-b`);
+    expect(manager.count()).toBe(2);
+  });
+
+  test("a worktree creation failure aborts start and propagates", () => {
+    effects.worktree.failOnEnsure = true;
+    expect(() => manager.start(config, "thread-fail", "feature-foo")).toThrow(
+      /git worktree add failed/
+    );
+    // No session registered when worktree setup fails.
+    expect(manager.has("thread-fail")).toBe(false);
+  });
+
+  test("path-traversal / injection branch is rejected before a session starts", () => {
+    // The fake delegates to the real resolveWorktreePath, so the guard fires
+    // through the manager too.
+    expect(() => manager.start(config, "thread-trav", "../../evil")).toThrow(
+      /path traversal/
+    );
+    expect(() => manager.start(config, "thread-inj", 'foo"; id; echo "')).toThrow(
+      /使用できない文字/
+    );
+    expect(manager.has("thread-trav")).toBe(false);
+    expect(manager.has("thread-inj")).toBe(false);
+  });
+});

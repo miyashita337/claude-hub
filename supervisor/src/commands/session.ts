@@ -13,7 +13,18 @@ export function createSessionCommand() {
     .setName("session")
     .setDescription("Claude Code セッション管理")
     .addSubcommand((sub) =>
-      sub.setName("start").setDescription("セッションを起動")
+      sub
+        .setName("start")
+        .setDescription("セッションを起動（作業ブランチ専用の worktree で claude を起動）")
+        // Issue #154: branch is the working branch for this session. Declared
+        // optional at the Discord layer so a missing arg reaches the handler,
+        // which returns a migration hint (the old no-arg form is gone).
+        .addStringOption((opt) =>
+          opt
+            .setName("branch")
+            .setDescription("作業ブランチ名（例: feature-foo）")
+            .setRequired(false)
+        )
     )
     .addSubcommand((sub) =>
       sub
@@ -74,6 +85,19 @@ async function handleStart(
     return;
   }
 
+  // Issue #154 (Q6): branch is required; only an empty/whitespace value is
+  // blocked here — git validates the rest. The old no-arg `/session start` is
+  // gone, so guide the user to the new form.
+  const branch = interaction.options.getString("branch")?.trim() ?? "";
+  if (!branch) {
+    await interaction.reply({
+      content:
+        "❌ branch 引数が必須です。`/session start <branch-name>` が新仕様です（例: `/session start feature-foo`）。",
+      flags: 64,
+    });
+    return;
+  }
+
   if (sessionManager.count() >= MAX_SESSIONS) {
     const sessions = sessionManager.listRunning();
     const oldest = sessions.sort(
@@ -86,6 +110,10 @@ async function handleStart(
   }
 
   await interaction.deferReply();
+
+  // Tracked so a failure after thread creation (e.g. git worktree error) can
+  // clean up the orphan thread instead of leaving a dead "🟢 Session" thread.
+  let createdThread: ThreadChannel | null = null;
 
   try {
     // Count existing sessions in this channel
@@ -113,14 +141,19 @@ async function handleStart(
       name: threadName,
       autoArchiveDuration: 10080, // 7 days
     });
+    createdThread = thread;
 
-    // Start the session with the thread ID
-    const session = sessionManager.start(config, thread.id);
+    // Start the session with the thread ID — runs claude in a per-branch
+    // worktree (Issue #154).
+    const session = sessionManager.start(config, thread.id, branch);
 
     // Post welcome message in the thread
+    const locationLine = session.worktree
+      ? `📁 Worktree: \`${session.worktree.path}\`\n🌿 ブランチ: \`${session.worktree.branch}\``
+      : `📁 ディレクトリ: \`${config.dir}\``;
     await thread.send(
       `✅ **${config.displayName}** のセッションを開始しました\n\n` +
-        `📁 ディレクトリ: \`${config.dir}\`\n` +
+        `${locationLine}\n` +
         `📊 稼働中セッション: ${sessionManager.count()}/${MAX_SESSIONS}\n\n` +
         `このスレッドにメッセージを送信すると、Claude Code に中継されます。\n` +
         `終了するには \`/session stop\` をこのスレッド内で実行してください。`
@@ -130,6 +163,15 @@ async function handleStart(
       content: `✅ セッションをスレッドで起動しました → ${thread}`,
     });
   } catch (err) {
+    // Best-effort: drop the orphan thread so a failed start doesn't leave a
+    // misleading "🟢 Session" thread with no live session behind it.
+    if (createdThread) {
+      try {
+        await createdThread.delete();
+      } catch {
+        // Thread already gone or delete not permitted — nothing to recover.
+      }
+    }
     const msg = `❌ セッション起動に失敗: ${err instanceof Error ? err.message : String(err)}`;
     if (interaction.deferred || interaction.replied) {
       await interaction.editReply({ content: msg });

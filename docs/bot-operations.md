@@ -30,9 +30,12 @@ claude-hub プロジェクトで運用している Discord Bot の役割分担�
 ## 運用シナリオ
 
 ### 通常作業（外部プロジェクト）
-1. Discord サーバの対象チャンネル（例 `#dev-tool`）で `/session start`
+1. Discord サーバの対象チャンネル（例 `#dev-tool`）で `/session start <branch>`（branch 引数は必須。Issue #154）
+   - 指定した branch 専用の git worktree（`<projectDir>/.claude/worktrees/<branch>`）を作成・再利用し、その中で claude を起動する
+   - 既存 branch → checkout で worktree 作成 / 未存在 branch → repo の default branch から派生して新規作成
+   - 同じ branch で再度 `/session start <branch>` すると既存 worktree を再利用（継続作業）
 2. 作成されたスレッドにメッセージを送信 → Channel-Supervisor が Claude Code に中継
-3. 終了時は `/session stop`
+3. 終了時は `/session stop`（worktree は削除されるが branch は repo に保持される）
 
 ### claude-hub 自体の修正
 1. Discord DM の `claudeHubExit` Bot を使用
