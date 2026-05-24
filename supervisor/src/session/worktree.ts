@@ -187,19 +187,34 @@ export const realGitGhRunner: GitGhRunner = {
     } catch {
       // gh unavailable, not authenticated, or repo has no GitHub remote.
     }
-    // Fallback: local origin/HEAD if configured.
+    // Fallback: the default branch of a configured remote's HEAD. Prefer
+    // `origin`, but a fork / multi-remote checkout may name it differently
+    // (e.g. `upstream`), so fall back to the first remote (PR #157 review,
+    // gemini). The gh path above is already fork-safe; this only runs when gh
+    // is unavailable.
     try {
-      const ref = execFileSync(
-        "git",
-        ["-C", mainRepoDir, "symbolic-ref", "--short", "refs/remotes/origin/HEAD"],
-        { encoding: "utf8", stdio: ["ignore", "pipe", "ignore"] },
-      )
+      const remotes = execFileSync("git", ["-C", mainRepoDir, "remote"], {
+        encoding: "utf8",
+        stdio: ["ignore", "pipe", "ignore"],
+      })
         .toString()
-        .trim();
-      const prefix = "origin/";
-      if (ref.startsWith(prefix)) return ref.slice(prefix.length);
+        .split("\n")
+        .map((r) => r.trim())
+        .filter(Boolean);
+      const remote = remotes.includes("origin") ? "origin" : remotes[0];
+      if (remote) {
+        const ref = execFileSync(
+          "git",
+          ["-C", mainRepoDir, "symbolic-ref", "--short", `refs/remotes/${remote}/HEAD`],
+          { encoding: "utf8", stdio: ["ignore", "pipe", "ignore"] },
+        )
+          .toString()
+          .trim();
+        const prefix = `${remote}/`;
+        if (ref.startsWith(prefix)) return ref.slice(prefix.length);
+      }
     } catch {
-      // No origin/HEAD configured.
+      // No remote / no <remote>/HEAD configured.
     }
     return "main";
   },

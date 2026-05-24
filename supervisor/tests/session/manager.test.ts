@@ -361,6 +361,25 @@ describe("SessionManager worktree integration (#154)", () => {
     expect(effects.worktree.removeCalls).toHaveLength(0);
   });
 
+  test("Q4: two sessions share one worktree → only the last stop removes it", async () => {
+    // 同 branch 多重 session (AC-3 / Q4): both sessions reuse the same worktree.
+    const s1 = manager.start(config, "thread-share-1", "feature-foo");
+    const s2 = manager.start(config, "thread-share-2", "feature-foo");
+    expect(s1.worktree!.path).toBe(s2.worktree!.path);
+
+    // Stopping the first must NOT remove the worktree — thread-share-2 still
+    // runs there (regression guard: CodeRabbit Major on PR #157).
+    await manager.stop("thread-share-1", "manual");
+    expect(effects.worktree.removeCalls).toHaveLength(0);
+    expect(effects.worktree.existingPaths.has(s1.worktree!.path)).toBe(true);
+
+    // Stopping the last session removes the now-unreferenced worktree.
+    await manager.stop("thread-share-2", "manual");
+    expect(effects.worktree.removeCalls).toEqual([
+      { mainRepoDir: config.dir, worktreePath: s2.worktree!.path },
+    ]);
+  });
+
   test("AC-6: two branches start in parallel as independent worktrees", () => {
     const a = manager.start(config, "thread-a", "feat-a");
     const b = manager.start(config, "thread-b", "feat-b");

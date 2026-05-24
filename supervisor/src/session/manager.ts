@@ -396,9 +396,28 @@ export class SessionManager {
     updateSessionStatus(session.id, "stopped", reason);
     this.cleanupRelayUrlFile(session.projectDir);
 
-    // Issue #154 (Q3): remove the per-branch worktree on stop; the branch
-    // itself is preserved.
-    this.removeWorktreeBestEffort(session.worktree);
+    // Issue #154 (Q3): remove the per-branch worktree on stop; the branch is
+    // preserved. But Q4 allows multiple sessions to share one worktree (同
+    // branch 多重 session). `this.sessions` no longer contains the current
+    // thread (deleted above), so if any *other* running session still points
+    // at this worktree path, removing it would destroy that live session's
+    // cwd. Only the last session on the worktree removes it (PR #157 review,
+    // CodeRabbit Major).
+    if (session.worktree && !this.isWorktreePathInUse(session.worktree.path)) {
+      this.removeWorktreeBestEffort(session.worktree);
+    } else if (session.worktree) {
+      console.log(
+        `[SessionManager] Worktree ${session.worktree.path} still in use by another session; not removing`
+      );
+    }
+  }
+
+  /** True if a still-running session (other than the one just removed) uses this worktree path. */
+  private isWorktreePathInUse(worktreePath: string): boolean {
+    for (const s of this.sessions.values()) {
+      if (s.worktree?.path === worktreePath) return true;
+    }
+    return false;
   }
 
   /**
