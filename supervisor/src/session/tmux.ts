@@ -65,6 +65,8 @@ export const TMUX_CMD = `${TMUX_PATH} -L ${TMUX_SOCKET}`;
  */
 export function ensureSocketConfigured(): void {
   try {
+    // shell-safe: TMUX_CMD is a module constant and every other token is a
+    // hard-coded literal — no external input is interpolated (RW-045 guard).
     execSync(
       `${TMUX_CMD} set-option -g mouse off \\; ` +
         `set-option -g mode-keys emacs \\; ` +

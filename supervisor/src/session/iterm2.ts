@@ -110,26 +110,32 @@ export function openTab(opts: OpenTabOptions): void {
 
   // Set tmux window name so it persists after attach
   const tabTitle = `${opts.channelName} (running)`;
+  // shell-safe: every interpolation below is non-free-text — TMUX_CMD is a
+  // module constant, tmuxSessionName is `claude-<numeric Discord threadId>`,
+  // and tabTitle is built from channelName (a static CHANNEL_MAP key). No
+  // Discord message content reaches these strings (RW-045 guard, #159).
   try {
+    // shell-safe: TMUX_CMD const + internal session id / static channel name
     execSync(
       `${TMUX_CMD} rename-window -t "${opts.tmuxSessionName}" "${tabTitle}"`,
       { timeout: 3000 }
     );
-    // Disable automatic-rename so tmux doesn't overwrite our title
+    // shell-safe: TMUX_CMD const + internal session id (no free text)
     execSync(
       `${TMUX_CMD} set-option -t "${opts.tmuxSessionName}" automatic-rename off`,
       { timeout: 3000 }
     );
-    // Enable set-titles so tmux pushes the window name to iTerm2's tab title
+    // shell-safe: TMUX_CMD const + internal session id (no free text)
     execSync(
       `${TMUX_CMD} set-option -t "${opts.tmuxSessionName}" set-titles on`,
       { timeout: 3000 }
     );
+    // shell-safe: TMUX_CMD const + internal session id (no free text)
     execSync(
       `${TMUX_CMD} set-option -t "${opts.tmuxSessionName}" set-titles-string "#{window_name}"`,
       { timeout: 3000 }
     );
-    // Set pane title as well
+    // shell-safe: TMUX_CMD const + internal session id / static channel name
     execSync(
       `${TMUX_CMD} select-pane -t "${opts.tmuxSessionName}" -T "${tabTitle}"`,
       { timeout: 3000 }
@@ -165,6 +171,8 @@ export function openTab(opts: OpenTabOptions): void {
   ].join("\n");
 
   try {
+    // shell-safe: the AppleScript is single-quote-escaped (every `'` → `'\''`)
+    // before being wrapped in the outer single-quoted `osascript -e '...'`.
     execSync(`osascript -e '${script.replace(/'/g, "'\\''")}'`, {
       timeout: 5000,
     });
