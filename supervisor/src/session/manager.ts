@@ -126,6 +126,7 @@ export class SessionManager {
       relayServer:
         options.effects?.relayServer ?? realSessionEffects.relayServer,
       process: options.effects?.process ?? realSessionEffects.process,
+      worktree: options.effects?.worktree ?? realSessionEffects.worktree,
     };
     this.gracefulKillTimeoutMs =
       options.gracefulKillTimeoutMs ?? GRACEFUL_KILL_TIMEOUT_MS;
@@ -168,8 +169,13 @@ export class SessionManager {
 
   /**
    * Start a new session with tmux + iTerm2 + thread.
+   *
+   * Issue #154: when `branch` is given the session runs in a dedicated git
+   * worktree under `<config.dir>/.claude/worktrees/<branch>` instead of the
+   * channel's main worktree, isolating its working tree from other sessions on
+   * the same repo. Without a branch the behaviour is unchanged (cwd = config.dir).
    */
-  start(config: ChannelConfig, threadId: string): SessionInfo {
+  start(config: ChannelConfig, threadId: string, branch?: string): SessionInfo {
     if (this.sessions.size >= MAX_SESSIONS) {
       throw new Error(`最大セッション数 (${MAX_SESSIONS}) に達しています`);
     }
@@ -181,6 +187,25 @@ export class SessionManager {
     if (!existsSync(config.dir)) {
       throw new Error(
         `プロジェクトディレクトリが見つかりません: ${config.dir}`
+      );
+    }
+
+    // Issue #154: resolve the effective cwd. With a branch, create/reuse a
+    // worktree (Q1/Q2/Q4 in worktree.ts); failures propagate so the caller can
+    // report them rather than starting claude in the wrong directory.
+    let projectDir = config.dir;
+    let worktree: SessionInfo["worktree"];
+    const trimmedBranch = branch?.trim();
+    if (trimmedBranch) {
+      const result = this.effects.worktree.ensure(config.dir, trimmedBranch);
+      projectDir = result.path;
+      worktree = {
+        mainRepoDir: config.dir,
+        path: result.path,
+        branch: trimmedBranch,
+      };
+      console.log(
+        `[SessionManager] ${result.reused ? "Reusing existing worktree" : "Created worktree"} for branch '${trimmedBranch}': ${result.path}`
       );
     }
 
@@ -200,14 +225,14 @@ export class SessionManager {
     // that progress-relay.sh (PostToolUse hook) can locate it from $CWD without
     // dropping `.supervisor-relay-url` into every project repo (Issue #88).
     // The hook applies the same sanitisation logic to its `$CWD` payload.
-    const relayUrlFile = relayUrlFilePath(config.dir);
+    const relayUrlFile = relayUrlFilePath(projectDir);
     const relayUrlDir = dirname(relayUrlFile);
 
     // Best-effort cleanup of any stale relay-url file from a prior session for
     // this project. Without this, a Supervisor restart can leave a file pointing
     // at a dead relay port; PostToolUse hooks would then POST to a stale URL
     // and silently time out (curl --max-time 3 in progress-relay.sh).
-    this.cleanupRelayUrlFile(config.dir);
+    this.cleanupRelayUrlFile(projectDir);
 
     const claudeCmd = [
       "unset ANTHROPIC_API_KEY",
@@ -215,7 +240,7 @@ export class SessionManager {
       `export SUPERVISOR_RELAY_URL="${relayUrl}"`,
       `mkdir -p "${relayUrlDir}"`,
       `printf "%s" "${relayUrl}" > "${relayUrlFile}"`,
-      `cd "${config.dir}"`,
+      `cd "${projectDir}"`,
       `exec ${CLAUDE_PATH} ${buildClaudeFlags(config).join(" ")}`,
     ].join(" && ");
 
@@ -235,6 +260,12 @@ export class SessionManager {
     }
 
     if (!pid) {
+      // Claude failed to come up. Drop the relay-url file the in-tmux command
+      // may have written so a PostToolUse hook never POSTs to a dead port. The
+      // worktree (if any) is left in place — it is valid and gets reused on the
+      // next `/session start <branch>` (Q4); only an explicit /session stop
+      // removes it (Q3).
+      this.cleanupRelayUrlFile(projectDir);
       throw new Error(
         "Claude Code の起動に失敗しました（tmuxセッションのPID取得失敗）"
       );
@@ -245,12 +276,13 @@ export class SessionManager {
       id: sessionId,
       channelName: config.channelName,
       threadId,
-      projectDir: config.dir,
+      projectDir,
       pid,
       process: null as unknown as any, // tmux manages the process
       startedAt: now,
       lastActivityAt: now,
       status: "running",
+      worktree,
     };
 
     this.sessions.set(threadId, info);
@@ -259,7 +291,7 @@ export class SessionManager {
       id: sessionId,
       channel_name: config.channelName,
       thread_id: threadId,
-      project_dir: config.dir,
+      project_dir: projectDir,
       pid,
       claude_session_id: null,
       started_at: now.toISOString(),
@@ -279,7 +311,7 @@ export class SessionManager {
       this.effects.iterm2.openTab({
         tmuxSessionName: tmuxName,
         channelName: config.channelName,
-        projectDir: config.dir,
+        projectDir,
       });
     }, 0);
 
@@ -363,6 +395,51 @@ export class SessionManager {
     this.effects.iterm2.markTabStopped(session.channelName, tmuxName);
     updateSessionStatus(session.id, "stopped", reason);
     this.cleanupRelayUrlFile(session.projectDir);
+
+    // Issue #154 (Q3): remove the per-branch worktree on stop; the branch is
+    // preserved. But Q4 allows multiple sessions to share one worktree (同
+    // branch 多重 session). `this.sessions` no longer contains the current
+    // thread (deleted above), so if any *other* running session still points
+    // at this worktree path, removing it would destroy that live session's
+    // cwd. Only the last session on the worktree removes it (PR #157 review,
+    // CodeRabbit Major).
+    if (session.worktree && !this.isWorktreePathInUse(session.worktree.path)) {
+      this.removeWorktreeBestEffort(session.worktree);
+    } else if (session.worktree) {
+      console.log(
+        `[SessionManager] Worktree ${session.worktree.path} still in use by another session; not removing`
+      );
+    }
+  }
+
+  /** True if a still-running session (other than the one just removed) uses this worktree path. */
+  private isWorktreePathInUse(worktreePath: string): boolean {
+    for (const s of this.sessions.values()) {
+      if (s.worktree?.path === worktreePath) return true;
+    }
+    return false;
+  }
+
+  /**
+   * Remove a session's worktree, swallowing failures (Issue #154, Q3). A stuck
+   * worktree must never block session teardown, so a removal error is logged
+   * and ignored. No-op when the session had no worktree.
+   */
+  private removeWorktreeBestEffort(
+    worktree: SessionInfo["worktree"]
+  ): void {
+    if (!worktree) return;
+    try {
+      this.effects.worktree.remove(worktree.mainRepoDir, worktree.path);
+      console.log(
+        `[SessionManager] Removed worktree ${worktree.path} (branch '${worktree.branch}' preserved)`
+      );
+    } catch (err) {
+      console.warn(
+        `[SessionManager] Failed to remove worktree ${worktree.path}:`,
+        err
+      );
+    }
   }
 
   touchActivity(threadId: string): void {
@@ -413,6 +490,12 @@ export class SessionManager {
         if (session) {
           this.effects.iterm2.markTabStopped(session.channelName, tmuxName);
           this.cleanupRelayUrlFile(session.projectDir);
+          // Issue #154: the worktree is intentionally NOT removed here. An
+          // unexpected claude exit is not an explicit teardown — removing the
+          // worktree (git worktree remove --force) would discard any
+          // uncommitted work the user did not choose to drop. Only the explicit
+          // /session stop removes it (Q3); until then it is reused on restart
+          // of the same branch (Q4).
         }
         updateSessionStatus(sessionId, "stopped", "tmux_exited");
         this.clearWatcher(threadId);
@@ -434,6 +517,10 @@ export class SessionManager {
         }
       }
       this.cleanupRelayUrlFile(row.project_dir);
+      // Issue #154: worktrees are intentionally left in place on restart. They
+      // are reused on the next `/session start <branch>` (Q4) and force-removing
+      // them here would discard uncommitted work without an explicit teardown.
+      // Only /session stop removes a worktree (Q3).
       updateSessionStatus(row.id, "stopped", "supervisor_restart");
     }
   }

@@ -15,6 +15,12 @@ import {
   TMUX_PATH,
   ensureSocketConfigured as realEnsureSocketConfigured,
 } from "./tmux";
+import {
+  ensureWorktree,
+  removeWorktree,
+  realGitGhRunner,
+  type EnsureWorktreeResult,
+} from "./worktree";
 
 /**
  * Adapters that wrap external side effects (tmux, iTerm2, relay HTTP server,
@@ -47,11 +53,24 @@ export interface ProcessAdapter {
   kill(pid: number, signal: NodeJS.Signals | number): void;
 }
 
+/**
+ * Per-branch git worktree management (Issue #154). Real impl delegates to
+ * {@link ./worktree} with the production git/gh runner; tests inject an
+ * in-memory fake so {@link SessionManager} unit tests never run git.
+ */
+export interface WorktreeAdapter {
+  /** Create or reuse the worktree for `branch` under `mainRepoDir`. */
+  ensure(mainRepoDir: string, branch: string): EnsureWorktreeResult;
+  /** Remove the worktree (branch is preserved). */
+  remove(mainRepoDir: string, worktreePath: string): void;
+}
+
 export interface SessionEffects {
   tmux: TmuxAdapter;
   iterm2: ItermAdapter;
   relayServer: RelayServerAdapter;
   process: ProcessAdapter;
+  worktree: WorktreeAdapter;
 }
 
 export const realTmuxAdapter: TmuxAdapter = {
@@ -131,9 +150,19 @@ export const realProcessAdapter: ProcessAdapter = {
   },
 };
 
+export const realWorktreeAdapter: WorktreeAdapter = {
+  ensure(mainRepoDir, branch) {
+    return ensureWorktree(mainRepoDir, branch, realGitGhRunner);
+  },
+  remove(mainRepoDir, worktreePath) {
+    removeWorktree(mainRepoDir, worktreePath, realGitGhRunner);
+  },
+};
+
 export const realSessionEffects: SessionEffects = {
   tmux: realTmuxAdapter,
   iterm2: realItermAdapter,
   relayServer: realRelayServerAdapter,
   process: realProcessAdapter,
+  worktree: realWorktreeAdapter,
 };

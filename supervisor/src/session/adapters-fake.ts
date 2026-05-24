@@ -4,7 +4,9 @@ import type {
   RelayServerAdapter,
   SessionEffects,
   TmuxAdapter,
+  WorktreeAdapter,
 } from "./adapters";
+import { resolveWorktreePath, type EnsureWorktreeResult } from "./worktree";
 import type { OpenTabOptions } from "./iterm2";
 
 /**
@@ -97,11 +99,39 @@ export class FakeProcessAdapter implements ProcessAdapter {
   }
 }
 
+export class FakeWorktreeAdapter implements WorktreeAdapter {
+  ensureCalls: { mainRepoDir: string; branch: string }[] = [];
+  removeCalls: { mainRepoDir: string; worktreePath: string }[] = [];
+  /** Worktree paths considered already-present (drives the Q4 reuse path). */
+  existingPaths = new Set<string>();
+  /** When set, ensure() throws to simulate a git worktree failure. */
+  failOnEnsure = false;
+
+  ensure(mainRepoDir: string, branch: string): EnsureWorktreeResult {
+    this.ensureCalls.push({ mainRepoDir, branch });
+    if (this.failOnEnsure) {
+      throw new Error("git worktree add failed");
+    }
+    // Use the real path resolver so the traversal / shell-injection guards are
+    // exercised through manager-level tests too (not just worktree.test.ts).
+    const path = resolveWorktreePath(mainRepoDir, branch.trim());
+    const reused = this.existingPaths.has(path);
+    this.existingPaths.add(path);
+    return { path, reused };
+  }
+
+  remove(mainRepoDir: string, worktreePath: string): void {
+    this.removeCalls.push({ mainRepoDir, worktreePath });
+    this.existingPaths.delete(worktreePath);
+  }
+}
+
 export interface FakeSessionEffects extends SessionEffects {
   tmux: FakeTmuxAdapter;
   iterm2: FakeItermAdapter;
   relayServer: FakeRelayServerAdapter;
   process: FakeProcessAdapter;
+  worktree: FakeWorktreeAdapter;
 }
 
 export function createFakeEffects(): FakeSessionEffects {
@@ -110,5 +140,6 @@ export function createFakeEffects(): FakeSessionEffects {
     iterm2: new FakeItermAdapter(),
     relayServer: new FakeRelayServerAdapter(),
     process: new FakeProcessAdapter(),
+    worktree: new FakeWorktreeAdapter(),
   };
 }
