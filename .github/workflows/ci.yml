@@ -84,7 +84,9 @@ jobs:
                    tests/session/relay.test.ts \
                    tests/session/relay-server.test.ts \
                    tests/session/queue-resilience.test.ts \
+                   tests/session/manager-resume.test.ts \
                    tests/commands/session-interaction.test.ts \
+                   tests/commands/session-resume.test.ts \
                    tests/hooks/stop-relay.test.ts \
                    tests/infra/db.test.ts \
                    tests/hijoguchi-routing/p0.test.ts \

@@ -121,6 +121,17 @@ export function getRunningSessionByThread(
     .get(threadId) as SessionRow | undefined;
 }
 
+export function getSessionByClaudeSessionId(
+  claudeSessionId: string
+): SessionRow | undefined {
+  const db = getDb();
+  return db
+    .prepare(
+      `SELECT * FROM sessions WHERE claude_session_id = ? ORDER BY started_at DESC LIMIT 1`
+    )
+    .get(claudeSessionId) as SessionRow | undefined;
+}
+
 export function getRunningSessions(): SessionRow[] {
   const db = getDb();
   return db

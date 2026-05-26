@@ -19,6 +19,12 @@ export class FakeTmuxAdapter implements TmuxAdapter {
   private sessions = new Map<string, { command: string; pid: number }>();
   private pidCounter = 10_000;
   ensureSocketConfiguredCalls = 0;
+  /** Programmable pane buffers returned by capturePane(). */
+  private paneContent = new Map<string, string>();
+  /** Records every sendKeys() call so tests can assert prompt confirmation. */
+  sendKeysCalls: { name: string; keys: string[] }[] = [];
+  /** When set, sendKeys() throws to simulate a failure during prompt confirm. */
+  failOnSendKeys = false;
 
   newSession(name: string, command: string): void {
     this.sessions.set(name, { command, pid: this.pidCounter++ });
@@ -40,6 +46,17 @@ export class FakeTmuxAdapter implements TmuxAdapter {
     this.ensureSocketConfiguredCalls += 1;
   }
 
+  capturePane(name: string): string {
+    return this.paneContent.get(name) ?? "";
+  }
+
+  sendKeys(name: string, keys: string[]): void {
+    this.sendKeysCalls.push({ name, keys });
+    if (this.failOnSendKeys) {
+      throw new Error("sendKeys failed");
+    }
+  }
+
   list(): string[] {
     return Array.from(this.sessions.keys());
   }
@@ -47,6 +64,11 @@ export class FakeTmuxAdapter implements TmuxAdapter {
   /** Test-only: read the bash command stored for a tmux session. */
   getCommand(name: string): string | null {
     return this.sessions.get(name)?.command ?? null;
+  }
+
+  /** Test-only: set what capturePane() returns for a session. */
+  setPaneContent(name: string, content: string): void {
+    this.paneContent.set(name, content);
   }
 }
 
