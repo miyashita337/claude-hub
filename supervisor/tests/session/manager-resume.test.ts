@@ -47,9 +47,9 @@ describe("SessionManager.resumeSession (#161)", () => {
     await manager?.shutdownAll();
   });
 
-  test("builds `claude --resume <id>` with cd into the recorded projectDir", () => {
+  test("builds `claude --resume <id>` with cd into the recorded projectDir", async () => {
     manager = new SessionManager({ effects, gracefulKillTimeoutMs: 0, resumePromptPollAttempts: 0 });
-    const info = manager.resumeSession(
+    const info = await manager.resumeSession(
       makeConfig(projectDir),
       THREAD_ID,
       VALID_ID,
@@ -72,7 +72,7 @@ describe("SessionManager.resumeSession (#161)", () => {
     expect(info.worktree).toBeUndefined();
   });
 
-  test("auto-confirms the resume prompt with Enter when the marker is present", () => {
+  test("auto-confirms the resume prompt with Enter when the marker is present", async () => {
     manager = new SessionManager({
       effects,
       gracefulKillTimeoutMs: 0,
@@ -84,7 +84,7 @@ describe("SessionManager.resumeSession (#161)", () => {
       "Resume from summary (recommended)\n❯ 1. ...\n  2. Resume the full conversation"
     );
 
-    manager.resumeSession(makeConfig(projectDir), THREAD_ID, VALID_ID, projectDir);
+    await manager.resumeSession(makeConfig(projectDir), THREAD_ID, VALID_ID, projectDir);
 
     const confirm = effects.tmux.sendKeysCalls.find(
       (c) => c.name === tmuxName
@@ -93,7 +93,7 @@ describe("SessionManager.resumeSession (#161)", () => {
     expect(confirm!.keys).toEqual(["C-m"]);
   });
 
-  test("does not send keys when no resume prompt appears", () => {
+  test("does not send keys when no resume prompt appears", async () => {
     manager = new SessionManager({
       effects,
       gracefulKillTimeoutMs: 0,
@@ -101,30 +101,30 @@ describe("SessionManager.resumeSession (#161)", () => {
       resumePromptPollIntervalMs: 5,
     });
     // capturePane returns "" (no marker) for the whole poll window.
-    manager.resumeSession(makeConfig(projectDir), THREAD_ID, VALID_ID, projectDir);
+    await manager.resumeSession(makeConfig(projectDir), THREAD_ID, VALID_ID, projectDir);
 
     expect(effects.tmux.sendKeysCalls).toHaveLength(0);
   });
 
-  test("rejects a malformed (non-UUID) session id before launching", () => {
+  test("rejects a malformed (non-UUID) session id before launching", async () => {
     manager = new SessionManager({ effects, gracefulKillTimeoutMs: 0, resumePromptPollAttempts: 0 });
-    expect(() =>
+    await expect(
       manager.resumeSession(
         makeConfig(projectDir),
         THREAD_ID,
         "not-a-uuid; rm -rf /",
         projectDir
       )
-    ).toThrow(/形式が不正/);
+    ).rejects.toThrow(/形式が不正/);
     expect(effects.tmux.list()).toHaveLength(0);
   });
 
-  test("throws when the recorded projectDir no longer exists", () => {
+  test("rejects when the recorded projectDir no longer exists", async () => {
     manager = new SessionManager({ effects, gracefulKillTimeoutMs: 0, resumePromptPollAttempts: 0 });
     const gone = resolve(tmpdir(), `supervisor-resume-gone-${process.pid}`);
     rmSync(gone, { recursive: true, force: true });
-    expect(() =>
+    await expect(
       manager.resumeSession(makeConfig(gone), THREAD_ID, VALID_ID, gone)
-    ).toThrow(/見つかりません/);
+    ).rejects.toThrow(/見つかりません/);
   });
 });

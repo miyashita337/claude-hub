@@ -303,8 +303,14 @@ async function handleResume(
     createdThread = thread;
 
     // Resume in the directory the original session ran in (row.project_dir),
-    // not a worktree — `claude --resume` keys the transcript by cwd.
-    sessionManager.resumeSession(config, thread.id, sessionId, row.project_dir);
+    // not a worktree — `claude --resume` keys the transcript by cwd. Awaited so
+    // the resume prompt is confirmed before the welcome message is posted.
+    await sessionManager.resumeSession(
+      config,
+      thread.id,
+      sessionId,
+      row.project_dir
+    );
 
     await thread.send(
       `♻️ **${config.displayName}** のセッションを復帰しました（resume）\n\n` +

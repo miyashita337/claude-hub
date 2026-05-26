@@ -373,12 +373,12 @@ export class SessionManager {
    * `projectDir` throws so the caller can report it instead of silently
    * starting a fresh conversation.
    */
-  resumeSession(
+  async resumeSession(
     config: ChannelConfig,
     threadId: string,
     claudeSessionId: string,
     projectDir: string
-  ): SessionInfo {
+  ): Promise<SessionInfo> {
     if (this.sessions.size >= MAX_SESSIONS) {
       throw new Error(`最大セッション数 (${MAX_SESSIONS}) に達しています`);
     }
@@ -444,7 +444,9 @@ export class SessionManager {
     }
 
     // Auto-confirm the interactive "Resume from summary" prompt if it appears.
-    this.confirmResumePromptIfPresent(tmuxName);
+    // Awaited (not fire-and-forget) so the session is registered only AFTER the
+    // TUI reaches its normal input prompt — see the ordering note below.
+    await this.confirmResumePromptIfPresent(tmuxName);
 
     const now = new Date();
     const info: SessionInfo = {
@@ -496,18 +498,25 @@ export class SessionManager {
    * default highlighted option with Enter. Marker-based rather than a fixed
    * sleep (RW-025/027): if the marker never appears the session resumed without
    * a prompt and we proceed without sending stray keys.
+   *
+   * The wait between polls uses an awaited `setTimeout`, not a synchronous
+   * `execSync("sleep")`, so the single-process Discord bot's event loop stays
+   * free while polling (PR #162 review: a synchronous sleep would block all
+   * other channels' relays for up to ~6s). The caller awaits this method, so
+   * the non-blocking change does NOT weaken the ordering guarantee — the
+   * session is still registered only after the prompt is confirmed, so a
+   * relayed message can never race the prompt picker (#86 / RW-019 class bug).
    */
-  private confirmResumePromptIfPresent(tmuxName: string): void {
-    const seconds = this.resumePromptPollIntervalMs / 1000;
+  private async confirmResumePromptIfPresent(tmuxName: string): Promise<void> {
     for (let i = 0; i < this.resumePromptPollAttempts; i++) {
       const pane = this.effects.tmux.capturePane(tmuxName);
       if (RESUME_PROMPT_RE.test(pane)) {
         this.effects.tmux.sendKeys(tmuxName, ["C-m"]);
         return;
       }
-      // shell-safe: `seconds` is an internal number (intervalMs / 1000), never
-      // user input, so it cannot carry shell metacharacters.
-      execSync(`sleep ${seconds}`);
+      await new Promise((resolve) =>
+        setTimeout(resolve, this.resumePromptPollIntervalMs)
+      );
     }
   }
 
