@@ -507,10 +507,14 @@ export class SessionManager {
   }
 
   /**
-   * Poll the pane for Claude Code's "Resume from summary" prompt and accept the
-   * default highlighted option with Enter. Marker-based rather than a fixed
+   * Poll the pane for Claude Code's "Resume from summary" prompt and select
+   * option 2 "Resume full session as-is" (Down then Enter). The picker
+   * highlights option 1 "Resume from summary (recommended)" by default, but we
+   * always want the full conversation, not a summary (Issue #163), so we move
+   * the selection down one before confirming. Marker-based rather than a fixed
    * sleep (RW-025/027): if the marker never appears the session resumed without
-   * a prompt and we proceed without sending stray keys.
+   * a prompt (a non-compacted session resumes full directly) and we proceed
+   * without sending stray keys.
    *
    * The wait between polls uses an awaited `setTimeout`, not a synchronous
    * `execSync("sleep")`, so the single-process Discord bot's event loop stays
@@ -524,7 +528,9 @@ export class SessionManager {
     for (let i = 0; i < this.resumePromptPollAttempts; i++) {
       const pane = this.effects.tmux.capturePane(tmuxName);
       if (RESUME_PROMPT_RE.test(pane)) {
-        this.effects.tmux.sendKeys(tmuxName, ["C-m"]);
+        // Down moves from option 1 (summary, highlighted) to option 2 (full
+        // session as-is); C-m confirms. See Issue #163.
+        this.effects.tmux.sendKeys(tmuxName, ["Down", "C-m"]);
         return;
       }
       await new Promise((resolve) =>

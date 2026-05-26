@@ -72,7 +72,7 @@ describe("SessionManager.resumeSession (#161)", () => {
     expect(info.worktree).toBeUndefined();
   });
 
-  test("auto-confirms the resume prompt with Enter when the marker is present", async () => {
+  test("selects option 2 'Resume full session as-is' (Down + Enter) when the marker is present (#163)", async () => {
     manager = new SessionManager({
       effects,
       gracefulKillTimeoutMs: 0,
@@ -81,7 +81,7 @@ describe("SessionManager.resumeSession (#161)", () => {
     // The pane shows Claude's interactive resume prompt on first capture.
     effects.tmux.setPaneContent(
       tmuxName,
-      "Resume from summary (recommended)\n❯ 1. ...\n  2. Resume the full conversation"
+      "Resume from summary (recommended)\n❯ 1. ...\n  2. Resume full session as-is"
     );
 
     await manager.resumeSession(makeConfig(projectDir), THREAD_ID, VALID_ID, projectDir);
@@ -90,7 +90,9 @@ describe("SessionManager.resumeSession (#161)", () => {
       (c) => c.name === tmuxName
     );
     expect(confirm).toBeDefined();
-    expect(confirm!.keys).toEqual(["C-m"]);
+    // Down moves from the highlighted option 1 (summary) to option 2 (full),
+    // then Enter confirms — we always want the full session (Issue #163).
+    expect(confirm!.keys).toEqual(["Down", "C-m"]);
   });
 
   test("does not send keys when no resume prompt appears", async () => {
