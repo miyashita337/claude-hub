@@ -33,6 +33,19 @@ export function createSessionCommand() {
     )
     .addSubcommand((sub) =>
       sub.setName("list").setDescription("稼働中セッション一覧")
+    )
+    .addSubcommand((sub) =>
+      sub
+        .setName("resume")
+        .setDescription("停止済みセッションを会話履歴付きで復帰（新スレッドで起動）")
+        // Issue #161: session_id is required. Declared optional at the Discord
+        // layer so a missing arg reaches the handler, which returns a usage hint.
+        .addStringOption((opt) =>
+          opt
+            .setName("session_id")
+            .setDescription("復帰する claude session id（/session list で確認できる UUID）")
+            .setRequired(false)
+        )
     );
 }
 
@@ -49,6 +62,9 @@ export function createSessionHandler(sessionManager: SessionManager) {
         break;
       case "list":
         await handleList(interaction, sessionManager);
+        break;
+      case "resume":
+        await handleResume(interaction, sessionManager);
         break;
     }
   };
@@ -173,6 +189,144 @@ async function handleStart(
       }
     }
     const msg = `❌ セッション起動に失敗: ${err instanceof Error ? err.message : String(err)}`;
+    if (interaction.deferred || interaction.replied) {
+      await interaction.editReply({ content: msg });
+    } else {
+      await interaction.reply({ content: msg, flags: 64 });
+    }
+  }
+}
+
+async function handleResume(
+  interaction: ChatInputCommandInteraction,
+  sessionManager: SessionManager
+): Promise<void> {
+  // Issue #161: resume a stopped session by its claude session id, in a new
+  // thread, with full relay wiring. Invoked from the project's channel (same
+  // channel-scoping rule as `start`).
+  const channel = interaction.channel;
+  if (!channel) {
+    await interaction.reply({
+      content: "❌ チャンネル情報を取得できません。",
+      flags: 64,
+    });
+    return;
+  }
+
+  let channelName: string = "";
+  if (channel.isThread() && channel.parent) {
+    channelName = channel.parent.name ?? "";
+  } else if ("name" in channel && typeof channel.name === "string") {
+    channelName = channel.name;
+  }
+
+  const config = CHANNEL_MAP.get(channelName);
+  if (!config) {
+    await interaction.reply({
+      content: `❌ このチャンネル (${channelName}) は未登録です。\n登録済みチャンネル: ${Array.from(CHANNEL_MAP.keys()).join(", ")}`,
+      flags: 64,
+    });
+    return;
+  }
+
+  const sessionId = interaction.options.getString("session_id")?.trim() ?? "";
+  if (!sessionId) {
+    await interaction.reply({
+      content:
+        "❌ session_id が必須です。`/session resume <session_id>` で実行してください（`/session list` で UUID を確認できます）。",
+      flags: 64,
+    });
+    return;
+  }
+
+  const row = sessionManager.findResumableSession(sessionId);
+  if (!row) {
+    await interaction.reply({
+      content: `❌ session_id が見つかりません: \`${sessionId}\``,
+      flags: 64,
+    });
+    return;
+  }
+  if (row.channel_name !== channelName) {
+    await interaction.reply({
+      content: `❌ この session は別チャンネル (\`${row.channel_name}\`) のものです。そのチャンネルで実行してください。`,
+      flags: 64,
+    });
+    return;
+  }
+  if (row.status === "running") {
+    await interaction.reply({
+      content: "⚠️ この session は既に稼働中です。`/session list` で確認してください。",
+      flags: 64,
+    });
+    return;
+  }
+
+  if (sessionManager.count() >= MAX_SESSIONS) {
+    await interaction.reply({
+      content: `⚠️ 最大セッション数 (${MAX_SESSIONS}) に達しています。\n古いセッションのスレッドで \`/session stop\` を実行してください。`,
+      flags: 64,
+    });
+    return;
+  }
+
+  await interaction.deferReply();
+
+  let createdThread: ThreadChannel | null = null;
+  try {
+    const existingSessions = sessionManager.listRunningByChannel(channelName);
+    const sessionNum = existingSessions.length + 1;
+    const threadName =
+      sessionNum > 1
+        ? `♻️ Resume: ${config.displayName} (${sessionNum})`
+        : `♻️ Resume: ${config.displayName}`;
+
+    const parentChannel =
+      channel.isThread() && channel.parent ? channel.parent : channel;
+
+    if (
+      !parentChannel.isTextBased() ||
+      parentChannel.isDMBased() ||
+      !("threads" in parentChannel)
+    ) {
+      await interaction.editReply({
+        content: "❌ このチャンネルではスレッドを作成できません。",
+      });
+      return;
+    }
+
+    const textChannel = parentChannel as import("discord.js").TextChannel;
+    const thread = await textChannel.threads.create({
+      name: threadName,
+      autoArchiveDuration: 10080, // 7 days
+    });
+    createdThread = thread;
+
+    // Resume in the directory the original session ran in (row.project_dir),
+    // not a worktree — `claude --resume` keys the transcript by cwd.
+    sessionManager.resumeSession(config, thread.id, sessionId, row.project_dir);
+
+    await thread.send(
+      `♻️ **${config.displayName}** のセッションを復帰しました（resume）\n\n` +
+        `📁 ディレクトリ: \`${row.project_dir}\`\n` +
+        `🔑 Claude session: \`${sessionId}\`\n` +
+        `📊 稼働中セッション: ${sessionManager.count()}/${MAX_SESSIONS}\n\n` +
+        `前回の会話を引き継いで再開します。このスレッドにメッセージを送信すると中継されます。\n` +
+        `終了するには \`/session stop\` をこのスレッド内で実行してください。`
+    );
+
+    await interaction.editReply({
+      content: `✅ セッションを復帰しました → ${thread}`,
+    });
+  } catch (err) {
+    if (createdThread) {
+      try {
+        await createdThread.delete();
+      } catch {
+        // Thread already gone or delete not permitted — nothing to recover.
+      }
+    }
+    const msg = `❌ セッション復帰に失敗: ${err instanceof Error ? err.message : String(err)}`;
     if (interaction.deferred || interaction.replied) {
       await interaction.editReply({ content: msg });
     } else {

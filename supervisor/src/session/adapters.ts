@@ -35,6 +35,18 @@ export interface TmuxAdapter {
   hasSession(name: string): boolean;
   getPid(name: string): number | null;
   ensureSocketConfigured(): void;
+  /**
+   * Capture the visible pane content (`tmux capture-pane -p`). Returns "" on
+   * error. Used by the resume flow (Issue #161) to detect Claude Code's
+   * interactive "Resume from summary" prompt so it can be auto-confirmed.
+   */
+  capturePane(name: string): string;
+  /**
+   * Send raw keys to the pane (`tmux send-keys -t <name> <keys...>`).
+   * Best-effort: a transient failure is swallowed (the caller's poll loop
+   * retries or proceeds). Used to confirm the resume prompt with `C-m` (Enter).
+   */
+  sendKeys(name: string, keys: string[]): void;
 }
 
 export interface ItermAdapter {
@@ -125,6 +137,30 @@ export const realTmuxAdapter: TmuxAdapter = {
   },
   ensureSocketConfigured() {
     realEnsureSocketConfigured();
+  },
+  capturePane(name) {
+    // stdio: ["ignore", "pipe", "ignore"] — read stdout, discard stderr (the
+    // "can't find pane" case is handled by the catch returning "").
+    try {
+      return execFileSync(
+        TMUX_PATH,
+        [...TMUX_ARGS, "capture-pane", "-p", "-t", name],
+        { encoding: "utf8", stdio: ["ignore", "pipe", "ignore"] }
+      );
+    } catch {
+      return "";
+    }
+  },
+  sendKeys(name, keys) {
+    // execFileSync + argv array: no shell, so `keys` cannot inject
+    // metacharacters. Best-effort — swallow transient tmux errors.
+    try {
+      execFileSync(TMUX_PATH, [...TMUX_ARGS, "send-keys", "-t", name, ...keys], {
+        stdio: "ignore",
+      });
+    } catch {
+      // Caller's poll loop retries or proceeds.
+    }
   },
 };
 

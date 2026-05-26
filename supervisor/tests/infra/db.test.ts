@@ -5,7 +5,7 @@ process.env.SUPERVISOR_DB_PATH = ":memory:";
 
 // Reset module cache to pick up the env var
 // Import after setting env
-const { getDb, insertSession, updateSessionStatus, updateSessionActivity, getRunningSessions, getRunningSessionByThread, getRunningSessionsByChannel, getLastSessionByChannel } = await import("../../src/infra/db");
+const { getDb, insertSession, updateSessionStatus, updateSessionActivity, getRunningSessions, getRunningSessionByThread, getRunningSessionsByChannel, getLastSessionByChannel, getSessionByClaudeSessionId } = await import("../../src/infra/db");
 
 describe("infra/db (in-memory)", () => {
   beforeEach(() => {
@@ -35,6 +35,42 @@ describe("infra/db (in-memory)", () => {
     expect(rows[0]!.id).toBe("test-1");
     expect(rows[0]!.channel_name).toBe("team-salary");
     expect(rows[0]!.thread_id).toBe("thread-1");
+  });
+
+  test("getSessionByClaudeSessionId returns the most recent matching row (#161)", () => {
+    const claudeId = "3139aa23-fe2a-485a-831a-2209081f9935";
+    // Older row with the same claude session id.
+    insertSession({
+      id: "resume-old",
+      channel_name: "team-salary",
+      thread_id: "thread-old",
+      project_dir: "/Users/x/team_salary",
+      pid: 100,
+      claude_session_id: claudeId,
+      started_at: "2026-05-24T10:00:00.000Z",
+      last_activity_at: "2026-05-24T10:00:00.000Z",
+      status: "stopped",
+    });
+    // Newer row with the same claude session id (e.g. a prior resume).
+    insertSession({
+      id: "resume-new",
+      channel_name: "team-salary",
+      thread_id: "thread-new",
+      project_dir: "/Users/x/team_salary",
+      pid: 200,
+      claude_session_id: claudeId,
+      started_at: "2026-05-25T10:00:00.000Z",
+      last_activity_at: "2026-05-25T10:00:00.000Z",
+      status: "stopped",
+    });
+
+    const found = getSessionByClaudeSessionId(claudeId);
+    expect(found?.id).toBe("resume-new"); // ORDER BY started_at DESC
+    expect(found?.project_dir).toBe("/Users/x/team_salary");
+
+    // bun:sqlite .get() returns null (not undefined) for no match; the handler
+    // treats both as "not found" via `if (!row)`.
+    expect(getSessionByClaudeSessionId("00000000-0000-0000-0000-000000000000")).toBeNull();
   });
 
   test("updateSessionStatus changes status and reason", () => {

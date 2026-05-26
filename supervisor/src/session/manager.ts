@@ -14,6 +14,8 @@ import {
   updateSessionStatus,
   updateSessionActivity,
   getRunningSessions,
+  getSessionByClaudeSessionId,
+  type SessionRow,
 } from "../infra/db";
 import {
   relayMessage,
@@ -28,6 +30,25 @@ import {
 
 const CLAUDE_PATH = resolve(homedir(), ".local", "bin", "claude");
 const TMUX_SESSION_PREFIX = "claude-";
+
+/**
+ * Claude session IDs are UUIDs. The resume flow embeds the id in the bash
+ * command string passed to tmux, so restrict it to the UUID shape — a value
+ * that fails this cannot carry shell metacharacters (Issue #161).
+ */
+const CLAUDE_SESSION_ID_RE =
+  /^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$/;
+
+/**
+ * Marker for Claude Code's interactive resume prompt
+ * (`Resume from summary (recommended)` / `Resume the full conversation`),
+ * shown when `claude --resume <id>` targets a compacted session. There is no
+ * CLI flag to pre-select it (`claude --help`), so the resume flow polls the
+ * pane for this marker and sends Enter (Issue #161).
+ */
+const RESUME_PROMPT_RE = /Resume (from summary|the full conversation)/i;
+/** Poll attempts (×0.5s) to detect the resume prompt before giving up. */
+const RESUME_PROMPT_POLL_ATTEMPTS = 12;
 
 /**
  * Build the argv for the `claude` invocation in a supervisor session.
@@ -109,6 +130,13 @@ export interface SessionManagerOptions {
    * delay before kill-session. Defaults to {@link GRACEFUL_KILL_TIMEOUT_MS}.
    */
   gracefulKillTimeoutMs?: number;
+  /**
+   * Resume-prompt poll tuning (Issue #161). Tests shrink these so the
+   * "no prompt" path doesn't pay the production ~6s wait. Defaults:
+   * {@link RESUME_PROMPT_POLL_ATTEMPTS} attempts × 500ms.
+   */
+  resumePromptPollAttempts?: number;
+  resumePromptPollIntervalMs?: number;
 }
 
 export class SessionManager {
@@ -118,6 +146,8 @@ export class SessionManager {
   private watchers = new Map<string, ReturnType<typeof setInterval>>();
   private readonly effects: SessionEffects;
   private readonly gracefulKillTimeoutMs: number;
+  private readonly resumePromptPollAttempts: number;
+  private readonly resumePromptPollIntervalMs: number;
 
   constructor(options: SessionManagerOptions = {}) {
     this.effects = {
@@ -130,6 +160,10 @@ export class SessionManager {
     };
     this.gracefulKillTimeoutMs =
       options.gracefulKillTimeoutMs ?? GRACEFUL_KILL_TIMEOUT_MS;
+    this.resumePromptPollAttempts =
+      options.resumePromptPollAttempts ?? RESUME_PROMPT_POLL_ATTEMPTS;
+    this.resumePromptPollIntervalMs =
+      options.resumePromptPollIntervalMs ?? 500;
 
     this.effects.tmux.ensureSocketConfigured();
     this.effects.relayServer.start();
@@ -316,6 +350,165 @@ export class SessionManager {
     }, 0);
 
     return info;
+  }
+
+  /**
+   * Look up a stopped (or any) session by its Claude session id so the caller
+   * can validate it before resuming. Returns the most recent matching row, or
+   * undefined when the id is unknown (Issue #161).
+   */
+  findResumableSession(claudeSessionId: string): SessionRow | undefined {
+    return getSessionByClaudeSessionId(claudeSessionId);
+  }
+
+  /**
+   * Resume a previously-stopped Claude session in a fresh thread with full
+   * relay wiring (Issue #161). Unlike {@link start}, this passes
+   * `claude --resume <id>` so the conversation history is preserved.
+   *
+   * `projectDir` MUST be the directory the original session ran in (recorded in
+   * sessions.db): `claude --resume` keys the transcript by cwd, so resuming
+   * from any other directory — including a `-w` worktree — fails to find the
+   * jsonl. Worktree re-creation is intentionally out of scope; a missing
+   * `projectDir` throws so the caller can report it instead of silently
+   * starting a fresh conversation.
+   */
+  resumeSession(
+    config: ChannelConfig,
+    threadId: string,
+    claudeSessionId: string,
+    projectDir: string
+  ): SessionInfo {
+    if (this.sessions.size >= MAX_SESSIONS) {
+      throw new Error(`最大セッション数 (${MAX_SESSIONS}) に達しています`);
+    }
+    if (this.sessions.has(threadId)) {
+      throw new Error(`このスレッドのセッションは既に稼働中です`);
+    }
+    if (!CLAUDE_SESSION_ID_RE.test(claudeSessionId)) {
+      throw new Error(
+        `claude session id の形式が不正です: ${claudeSessionId}`
+      );
+    }
+    if (!existsSync(projectDir)) {
+      throw new Error(
+        `プロジェクトディレクトリが見つかりません: ${projectDir}（worktree が削除された可能性があります）`
+      );
+    }
+
+    const sessionId = randomUUID();
+    const tmuxName = this.tmuxSessionName(threadId);
+    this.effects.tmux.killSession(tmuxName);
+
+    const relayUrl = `http://localhost:${this.effects.relayServer.getPort()}/relay/${encodeURIComponent(threadId)}`;
+    const relayUrlFile = relayUrlFilePath(projectDir);
+    const relayUrlDir = dirname(relayUrlFile);
+    this.cleanupRelayUrlFile(projectDir);
+
+    // `--resume <id>` continues the prior conversation in-place (no
+    // --fork-session, so the same claude session id keeps accumulating).
+    // claudeSessionId is validated as a UUID above, so embedding it in the
+    // bash string is shell-safe. The command is passed to tmux via execFileSync
+    // (argv) in the adapter, so it is not subject to outer-shell parsing.
+    const resumeFlags = [
+      "--resume",
+      claudeSessionId,
+      ...buildClaudeFlags(config),
+    ];
+    const claudeCmd = [
+      "unset ANTHROPIC_API_KEY",
+      `export PATH="${resolve(homedir(), ".local/bin")}:${resolve(homedir(), ".bun/bin")}:/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin"`,
+      `export SUPERVISOR_RELAY_URL="${relayUrl}"`,
+      `mkdir -p "${relayUrlDir}"`,
+      `printf "%s" "${relayUrl}" > "${relayUrlFile}"`,
+      `cd "${projectDir}"`,
+      `exec ${CLAUDE_PATH} ${resumeFlags.join(" ")}`,
+    ].join(" && ");
+
+    this.effects.tmux.newSession(tmuxName, claudeCmd);
+    this.effects.tmux.ensureSocketConfigured();
+
+    let pid: number | null = null;
+    for (let i = 0; i < 5; i++) {
+      pid = this.effects.tmux.getPid(tmuxName);
+      if (pid) break;
+      // shell-safe: literal constant, no interpolation.
+      execSync("sleep 0.5");
+    }
+
+    if (!pid) {
+      this.cleanupRelayUrlFile(projectDir);
+      throw new Error(
+        "Claude Code の起動に失敗しました（tmuxセッションのPID取得失敗）"
+      );
+    }
+
+    // Auto-confirm the interactive "Resume from summary" prompt if it appears.
+    this.confirmResumePromptIfPresent(tmuxName);
+
+    const now = new Date();
+    const info: SessionInfo = {
+      id: sessionId,
+      channelName: config.channelName,
+      threadId,
+      projectDir,
+      pid,
+      process: null as unknown as any, // tmux manages the process
+      claudeSessionId,
+      startedAt: now,
+      lastActivityAt: now,
+      status: "running",
+    };
+
+    this.sessions.set(threadId, info);
+
+    insertSession({
+      id: sessionId,
+      channel_name: config.channelName,
+      thread_id: threadId,
+      project_dir: projectDir,
+      pid,
+      claude_session_id: claudeSessionId,
+      started_at: now.toISOString(),
+      last_activity_at: now.toISOString(),
+      status: "running",
+    });
+
+    this.watchTmuxSession(threadId, tmuxName, sessionId);
+
+    console.log(
+      `[SessionManager] Resumed ${config.channelName} (claude session ${claudeSessionId}) via tmux (PID: ${pid}, tmux: ${tmuxName}, thread: ${threadId})`
+    );
+
+    setTimeout(() => {
+      this.effects.iterm2.openTab({
+        tmuxSessionName: tmuxName,
+        channelName: config.channelName,
+        projectDir,
+      });
+    }, 0);
+
+    return info;
+  }
+
+  /**
+   * Poll the pane for Claude Code's "Resume from summary" prompt and accept the
+   * default highlighted option with Enter. Marker-based rather than a fixed
+   * sleep (RW-025/027): if the marker never appears the session resumed without
+   * a prompt and we proceed without sending stray keys.
+   */
+  private confirmResumePromptIfPresent(tmuxName: string): void {
+    const seconds = this.resumePromptPollIntervalMs / 1000;
+    for (let i = 0; i < this.resumePromptPollAttempts; i++) {
+      const pane = this.effects.tmux.capturePane(tmuxName);
+      if (RESUME_PROMPT_RE.test(pane)) {
+        this.effects.tmux.sendKeys(tmuxName, ["C-m"]);
+        return;
+      }
+      // shell-safe: `seconds` is an internal number (intervalMs / 1000), never
+      // user input, so it cannot carry shell metacharacters.
+      execSync(`sleep ${seconds}`);
+    }
   }
 
   /**
