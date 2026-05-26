@@ -47,8 +47,22 @@ const CLAUDE_SESSION_ID_RE =
  * pane for this marker and sends Enter (Issue #161).
  */
 const RESUME_PROMPT_RE = /Resume (from summary|the full conversation)/i;
-/** Poll attempts (×0.5s) to detect the resume prompt before giving up. */
-const RESUME_PROMPT_POLL_ATTEMPTS = 12;
+/**
+ * Marker that the resumed TUI reached its normal input prompt — either a
+ * non-compacted session that never shows the picker, or the picker has already
+ * been dismissed. Lets the poll loop stop early instead of waiting out the full
+ * window when there is nothing to confirm (Issue #163).
+ */
+const RESUME_READY_RE = /bypass permissions|\? for shortcuts/i;
+/**
+ * Poll attempts (×interval) to detect the resume prompt before giving up.
+ * Large compacted sessions can take minutes to render the picker (observed
+ * ~4min for a 239k-token / 1d21h session), so with the default 1s interval this
+ * is a ~5min budget. The loop exits early as soon as the picker OR the ready
+ * marker appears, so a small/non-compacted resume still returns in ~1s
+ * (Issue #163 — a 12×0.5s=6s window timed out before the picker rendered).
+ */
+const RESUME_PROMPT_POLL_ATTEMPTS = 300;
 
 /**
  * Build the argv for the `claude` invocation in a supervisor session.
@@ -163,7 +177,7 @@ export class SessionManager {
     this.resumePromptPollAttempts =
       options.resumePromptPollAttempts ?? RESUME_PROMPT_POLL_ATTEMPTS;
     this.resumePromptPollIntervalMs =
-      options.resumePromptPollIntervalMs ?? 500;
+      options.resumePromptPollIntervalMs ?? 1000;
 
     this.effects.tmux.ensureSocketConfigured();
     this.effects.relayServer.start();
@@ -531,6 +545,12 @@ export class SessionManager {
         // Down moves from option 1 (summary, highlighted) to option 2 (full
         // session as-is); C-m confirms. See Issue #163.
         this.effects.tmux.sendKeys(tmuxName, ["Down", "C-m"]);
+        return;
+      }
+      // Reached the normal input prompt with no picker — stop polling instead
+      // of waiting out the (multi-minute) window for a picker that won't appear
+      // (Issue #163). Checked after the picker so the picker always wins.
+      if (RESUME_READY_RE.test(pane)) {
         return;
       }
       await new Promise((resolve) =>

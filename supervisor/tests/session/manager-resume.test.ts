@@ -108,6 +108,29 @@ describe("SessionManager.resumeSession (#161)", () => {
     expect(effects.tmux.sendKeysCalls).toHaveLength(0);
   });
 
+  test("exits early without keys when the ready marker appears (no picker, #163)", async () => {
+    // A large poll budget would hang the test if the loop ignored the ready
+    // marker; the early-exit must return on the first capture.
+    manager = new SessionManager({
+      effects,
+      gracefulKillTimeoutMs: 0,
+      resumePromptPollAttempts: 1000,
+      resumePromptPollIntervalMs: 5,
+    });
+    // Non-compacted session: resumes straight to the input prompt (no picker).
+    effects.tmux.setPaneContent(
+      tmuxName,
+      "❯ \n  ⏵⏵ bypass permissions on (shift+tab to cycle)"
+    );
+
+    await manager.resumeSession(makeConfig(projectDir), THREAD_ID, VALID_ID, projectDir);
+
+    // No picker → no keystrokes, and the resume completed (did not exhaust the
+    // 1000-attempt window).
+    expect(effects.tmux.sendKeysCalls).toHaveLength(0);
+    expect(manager.has(THREAD_ID)).toBe(true);
+  });
+
   test("rejects a malformed (non-UUID) session id before launching", async () => {
     manager = new SessionManager({ effects, gracefulKillTimeoutMs: 0, resumePromptPollAttempts: 0 });
     await expect(
