@@ -273,6 +273,7 @@ async function handleResume(
   await interaction.deferReply();
 
   let createdThread: ThreadChannel | null = null;
+  let resumed = false;
   try {
     const existingSessions = sessionManager.listRunningByChannel(channelName);
     const sessionNum = existingSessions.length + 1;
@@ -311,6 +312,7 @@ async function handleResume(
       sessionId,
       row.project_dir
     );
+    resumed = true;
 
     await thread.send(
       `♻️ **${config.displayName}** のセッションを復帰しました（resume）\n\n` +
@@ -325,6 +327,17 @@ async function handleResume(
       content: `✅ セッションを復帰しました → ${thread}`,
     });
   } catch (err) {
+    // If resumeSession already succeeded, the session is live; a failure in the
+    // follow-up notification (welcome message or interaction acknowledgement)
+    // must not leave a running session unreachable from Discord. Stop it before
+    // discarding the thread (PR #162 review: CodeRabbit Major).
+    if (resumed && createdThread) {
+      try {
+        await sessionManager.stop(createdThread.id, "manual");
+      } catch {
+        // Best-effort: nothing more to recover if the stop itself fails.
+      }
+    }
     if (createdThread) {
       try {
         await createdThread.delete();
@@ -377,10 +390,12 @@ async function handleStop(
   try {
     await sessionManager.stop(threadId, "manual");
 
-    // Update thread name to show stopped
+    // Update thread name to show stopped. Start threads lead with "🟢",
+    // resume threads with "♻️" — replace whichever prefix is present so resume
+    // threads also reflect the stopped state (PR #162 review: CodeRabbit).
     const thread = channel as ThreadChannel;
     const currentName = thread.name;
-    const stoppedName = currentName.replace("🟢", "🔴");
+    const stoppedName = currentName.replace("🟢", "🔴").replace("♻️", "🔴");
     await thread.setName(stoppedName);
 
     // Archive and lock the thread

@@ -127,4 +127,28 @@ describe("SessionManager.resumeSession (#161)", () => {
       manager.resumeSession(makeConfig(gone), THREAD_ID, VALID_ID, gone)
     ).rejects.toThrow(/見つかりません/);
   });
+
+  test("rolls back the tmux session if post-launch init throws (PR #162: CodeRabbit Major)", async () => {
+    manager = new SessionManager({
+      effects,
+      gracefulKillTimeoutMs: 0,
+      resumePromptPollAttempts: 3,
+    });
+    // Prompt marker present → confirmResumePromptIfPresent calls sendKeys, which
+    // we force to throw, simulating a failure after tmux has already started.
+    effects.tmux.setPaneContent(
+      tmuxName,
+      "Resume from summary (recommended)\n❯ 1. ..."
+    );
+    effects.tmux.failOnSendKeys = true;
+
+    await expect(
+      manager.resumeSession(makeConfig(projectDir), THREAD_ID, VALID_ID, projectDir)
+    ).rejects.toThrow(/sendKeys failed/);
+
+    // No orphaned tmux session, and no half-registered session state.
+    expect(effects.tmux.list()).toHaveLength(0);
+    expect(manager.has(THREAD_ID)).toBe(false);
+    expect(manager.count()).toBe(0);
+  });
 });

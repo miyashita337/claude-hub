@@ -32,16 +32,20 @@ function makeInteraction(opts: {
   channelName?: string;
   resumableRow?: ResumableRow | undefined;
   resumeImpl?: (...args: unknown[]) => unknown;
+  sendImpl?: () => unknown;
 }) {
   const replies: ReplyRecord[] = [];
   const resumeCalls: unknown[][] = [];
   const findCalls: string[] = [];
+  const stopCalls: unknown[][] = [];
   let threadCreated = false;
   let threadDeleted = false;
 
   const thread = {
     id: "thread-resume-1",
-    send: async () => {},
+    send: async () => {
+      opts.sendImpl?.();
+    },
     delete: async () => {
       threadDeleted = true;
     },
@@ -92,6 +96,9 @@ function makeInteraction(opts: {
       resumeCalls.push(args);
       return opts.resumeImpl?.(...args) ?? { id: "sess-1" };
     },
+    stop: async (...args: unknown[]) => {
+      stopCalls.push(args);
+    },
   };
 
   return {
@@ -100,6 +107,7 @@ function makeInteraction(opts: {
     replies,
     resumeCalls,
     findCalls,
+    stopCalls,
     get threadCreated() {
       return threadCreated;
     },
@@ -218,6 +226,36 @@ describe("/session resume validation (#161)", () => {
     await h.run();
 
     expect(h.threadCreated).toBe(true);
+    expect(h.threadDeleted).toBe(true);
+    // resumeSession never completed → no live session to stop.
+    expect(h.stopCalls).toHaveLength(0);
+    const editReplies = h.replies.filter((r) => r.kind === "editReply");
+    expect(editReplies[editReplies.length - 1]!.content).toContain(
+      "セッション復帰に失敗"
+    );
+  });
+
+  test("notify failure after resume → session stopped, then thread deleted (PR #162: CodeRabbit Major)", async () => {
+    const h = makeInteraction({
+      sessionId: VALID_ID,
+      channelName: "team-salary",
+      resumableRow: {
+        channel_name: "team-salary",
+        project_dir: "/Users/x/team_salary",
+        status: "stopped",
+      },
+      // resumeSession succeeds (default impl), but the welcome message fails.
+      sendImpl: () => {
+        throw new Error("Discord API 5xx");
+      },
+    });
+    await h.run();
+
+    expect(h.threadCreated).toBe(true);
+    // The live session must be stopped so it is not orphaned (unreachable).
+    expect(h.stopCalls).toHaveLength(1);
+    expect(h.stopCalls[0]![0]).toBe("thread-resume-1");
+    // The thread is then discarded and the error is surfaced.
     expect(h.threadDeleted).toBe(true);
     const editReplies = h.replies.filter((r) => r.kind === "editReply");
     expect(editReplies[editReplies.length - 1]!.content).toContain(

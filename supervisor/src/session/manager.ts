@@ -445,11 +445,6 @@ export class SessionManager {
       );
     }
 
-    // Auto-confirm the interactive "Resume from summary" prompt if it appears.
-    // Awaited (not fire-and-forget) so the session is registered only AFTER the
-    // TUI reaches its normal input prompt — see the ordering note below.
-    await this.confirmResumePromptIfPresent(tmuxName);
-
     const now = new Date();
     const info: SessionInfo = {
       id: sessionId,
@@ -464,19 +459,35 @@ export class SessionManager {
       status: "running",
     };
 
-    this.sessions.set(threadId, info);
+    // Post-launch init (prompt confirm + state registration) can throw. tmux is
+    // already running by now, so on failure we must kill it and drop the
+    // relay-url file — otherwise Discord reports failure while a Claude/tmux
+    // process is left orphaned (PR #162 review: CodeRabbit Major).
+    try {
+      // Auto-confirm the interactive "Resume from summary" prompt if it appears.
+      // Awaited (not fire-and-forget) so the session is registered only AFTER the
+      // TUI reaches its normal input prompt — see the ordering note below.
+      await this.confirmResumePromptIfPresent(tmuxName);
 
-    insertSession({
-      id: sessionId,
-      channel_name: config.channelName,
-      thread_id: threadId,
-      project_dir: projectDir,
-      pid,
-      claude_session_id: claudeSessionId,
-      started_at: now.toISOString(),
-      last_activity_at: now.toISOString(),
-      status: "running",
-    });
+      this.sessions.set(threadId, info);
+
+      insertSession({
+        id: sessionId,
+        channel_name: config.channelName,
+        thread_id: threadId,
+        project_dir: projectDir,
+        pid,
+        claude_session_id: claudeSessionId,
+        started_at: now.toISOString(),
+        last_activity_at: now.toISOString(),
+        status: "running",
+      });
+    } catch (err) {
+      this.sessions.delete(threadId);
+      this.effects.tmux.killSession(tmuxName);
+      this.cleanupRelayUrlFile(projectDir);
+      throw err;
+    }
 
     this.watchTmuxSession(threadId, tmuxName, sessionId);
 

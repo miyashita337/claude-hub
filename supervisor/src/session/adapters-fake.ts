@@ -23,6 +23,8 @@ export class FakeTmuxAdapter implements TmuxAdapter {
   private paneContent = new Map<string, string>();
   /** Records every sendKeys() call so tests can assert prompt confirmation. */
   sendKeysCalls: { name: string; keys: string[] }[] = [];
+  /** When set, sendKeys() throws to simulate a failure during prompt confirm. */
+  failOnSendKeys = false;
 
   newSession(name: string, command: string): void {
     this.sessions.set(name, { command, pid: this.pidCounter++ });
@@ -50,6 +52,9 @@ export class FakeTmuxAdapter implements TmuxAdapter {
 
   sendKeys(name: string, keys: string[]): void {
     this.sendKeysCalls.push({ name, keys });
+    if (this.failOnSendKeys) {
+      throw new Error("sendKeys failed");
+    }
   }
 
   list(): string[] {
