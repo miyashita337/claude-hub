@@ -432,8 +432,10 @@ export class SessionManager {
     for (let i = 0; i < 5; i++) {
       pid = this.effects.tmux.getPid(tmuxName);
       if (pid) break;
-      // shell-safe: literal constant, no interpolation.
-      execSync("sleep 0.5");
+      // Async wait — resumeSession is async, so unlike start()'s synchronous
+      // execSync("sleep") this does not block the single-process Discord bot's
+      // event loop while the tmux pane spins up (PR #162 review: gemini medium).
+      await new Promise((resolve) => setTimeout(resolve, 500));
     }
 
     if (!pid) {
