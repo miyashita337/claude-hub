@@ -330,6 +330,7 @@ export class SessionManager {
       startedAt: now,
       lastActivityAt: now,
       status: "running",
+      branch: trimmedBranch || undefined,
       worktree,
     };
 
@@ -345,6 +346,7 @@ export class SessionManager {
       started_at: now.toISOString(),
       last_activity_at: now.toISOString(),
       status: "running",
+      branch: trimmedBranch ?? null,
     });
 
     // Monitor tmux session for exit
@@ -391,7 +393,8 @@ export class SessionManager {
     config: ChannelConfig,
     threadId: string,
     claudeSessionId: string,
-    projectDir: string
+    projectDir: string,
+    branch?: string | null
   ): Promise<SessionInfo> {
     if (this.sessions.size >= MAX_SESSIONS) {
       throw new Error(`最大セッション数 (${MAX_SESSIONS}) に達しています`);
@@ -471,6 +474,9 @@ export class SessionManager {
       startedAt: now,
       lastActivityAt: now,
       status: "running",
+      // No worktree on resume (runs in the project dir), but keep the branch so
+      // same-branch counting and the thread title stay consistent (Issue #175).
+      branch: branch || undefined,
     };
 
     // Post-launch init (prompt confirm + state registration) can throw. tmux is
@@ -495,6 +501,9 @@ export class SessionManager {
         started_at: now.toISOString(),
         last_activity_at: now.toISOString(),
         status: "running",
+        // Carry the original session's branch (Issue #175) so the resumed
+        // thread title and any later /session list stay branch-consistent.
+        branch: branch ?? null,
       });
     } catch (err) {
       this.sessions.delete(threadId);

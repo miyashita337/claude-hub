@@ -7,6 +7,7 @@ import {
 } from "discord.js";
 import type { SessionManager } from "../session/manager";
 import { CHANNEL_MAP, MAX_SESSIONS } from "../config/channels";
+import { buildThreadTitle, markTitleStopped } from "../session/thread-title";
 
 export function createSessionCommand() {
   return new SlashCommandBuilder()
@@ -132,12 +133,20 @@ async function handleStart(
   let createdThread: ThreadChannel | null = null;
 
   try {
-    // Count existing sessions in this channel
-    const existingSessions = sessionManager.listRunningByChannel(channelName);
-    const sessionNum = existingSessions.length + 1;
-    const threadName = sessionNum > 1
-      ? `🟢 Session: ${config.displayName} (${sessionNum})`
-      : `🟢 Session: ${config.displayName}`;
+    // Issue #175: title by branch, with a sequence suffix only when another
+    // session is already live on the *same* branch (RW-046: same-branch
+    // multi-session is allowed). Counting same-branch (not channel-wide) keeps
+    // distinct branches at "(1)" so they read cleanly.
+    const sameBranchCount = sessionManager
+      .listRunningByChannel(channelName)
+      .filter((s) => s.branch === branch).length;
+    const sessionNum = sameBranchCount + 1;
+    const threadName = buildThreadTitle(
+      "running",
+      branch,
+      config.displayName,
+      sessionNum
+    );
 
     // Create a thread in the channel
     // Get the text channel to create thread in
@@ -275,12 +284,22 @@ async function handleResume(
   let createdThread: ThreadChannel | null = null;
   let resumed = false;
   try {
-    const existingSessions = sessionManager.listRunningByChannel(channelName);
-    const sessionNum = existingSessions.length + 1;
-    const threadName =
-      sessionNum > 1
-        ? `♻️ Resume: ${config.displayName} (${sessionNum})`
-        : `♻️ Resume: ${config.displayName}`;
+    // Issue #175: resumed thread title matches the start scheme. Branch comes
+    // from the original session row (null for pre-migration rows → falls back
+    // to a display-name-only title inside buildThreadTitle). Sequence counts
+    // same-branch live sessions; with a null branch it counts channel-wide,
+    // preserving the legacy "(N)" behaviour.
+    const liveSessions = sessionManager.listRunningByChannel(channelName);
+    const sessionNum =
+      (row.branch
+        ? liveSessions.filter((s) => s.branch === row.branch).length
+        : liveSessions.length) + 1;
+    const threadName = buildThreadTitle(
+      "resume",
+      row.branch,
+      config.displayName,
+      sessionNum
+    );
 
     const parentChannel =
       channel.isThread() && channel.parent ? channel.parent : channel;
@@ -310,7 +329,8 @@ async function handleResume(
       config,
       thread.id,
       sessionId,
-      row.project_dir
+      row.project_dir,
+      row.branch
     );
     resumed = true;
 
@@ -390,12 +410,11 @@ async function handleStop(
   try {
     await sessionManager.stop(threadId, "manual");
 
-    // Update thread name to show stopped. Start threads lead with "🟢",
-    // resume threads with "♻️" — replace whichever prefix is present so resume
-    // threads also reflect the stopped state (PR #162 review: CodeRabbit).
+    // Update thread name to show stopped. markTitleStopped swaps a leading 🟢
+    // (start) or ♻️ (resume) to 🔴 — shared with the reaper so both paths stay
+    // consistent (Issue #175).
     const thread = channel as ThreadChannel;
-    const currentName = thread.name;
-    const stoppedName = currentName.replace("🟢", "🔴").replace("♻️", "🔴");
+    const stoppedName = markTitleStopped(thread.name);
     await thread.setName(stoppedName);
 
     // Archive and lock the thread
