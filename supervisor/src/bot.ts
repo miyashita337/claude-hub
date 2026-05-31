@@ -523,13 +523,19 @@ export function buildSalvageReply(
   }
 
   if (verdict === "alive") {
-    const idLine = row.claude_session_id
-      ? `\n🔑 claude_session_id: \`${row.claude_session_id}\``
-      : "";
+    // Process still up but Supervisor lost tracking. Only suggest resume when
+    // we actually have an id to resume from — otherwise `/session resume` is
+    // not actionable (gemini review on PR #178).
+    if (row.claude_session_id) {
+      return (
+        "⚠️ このスレッドのセッションはプロセス上は生存していますが、Supervisor が管理を見失っています。" +
+        `\`/session stop\` 後に \`/session resume ${row.claude_session_id}\`、または新規 \`/session start\` を検討してください。` +
+        `\n🔑 claude_session_id: \`${row.claude_session_id}\``
+      );
+    }
     return (
       "⚠️ このスレッドのセッションはプロセス上は生存していますが、Supervisor が管理を見失っています。" +
-      "`/session stop` 後に `/session resume`、または新規 `/session start` を検討してください。" +
-      idLine
+      "claude_session_id は未記録のため、`/session stop` で停止後に `/session start` で起動し直してください。"
     );
   }
 
