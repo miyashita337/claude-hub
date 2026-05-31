@@ -80,7 +80,15 @@ export function buildStatusReply(
   sessionManager: SessionManager,
   threadId: string
 ): string {
-  if (sessionManager.livenessOf(threadId) === "alive") {
+  // "稼働中" only when the session is BOTH live AND tracked in memory — i.e. the
+  // Supervisor can actually relay to it. If livenessOf is alive but the session
+  // is no longer tracked (has() === false), the user cannot interact with it;
+  // fall through to the salvage wording which says the Supervisor lost tracking
+  // (gemini HIGH review, PR #179).
+  if (
+    sessionManager.livenessOf(threadId) === "alive" &&
+    sessionManager.has(threadId)
+  ) {
     const row = getSessionByThreadId(threadId);
     const id = row?.claude_session_id;
     return (
@@ -90,6 +98,6 @@ export function buildStatusReply(
         : "🔑 claude_session_id: 未記録（#167 導入前に開始されたセッション）")
     );
   }
-  // dead / unknown は salvage と同じ案内（resume / start）で十分。
+  // not tracked (lost tracking), dead, or unknown → salvage wording covers all.
   return buildSalvageReply(sessionManager, threadId);
 }
