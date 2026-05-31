@@ -8,6 +8,7 @@ import {
 import type { SessionManager } from "../session/manager";
 import { CHANNEL_MAP, MAX_SESSIONS } from "../config/channels";
 import { buildThreadTitle, markTitleStopped } from "../session/thread-title";
+import { buildStatusReply } from "../session/status-reply";
 
 export function createSessionCommand() {
   return new SlashCommandBuilder()
@@ -34,6 +35,11 @@ export function createSessionCommand() {
     )
     .addSubcommand((sub) =>
       sub.setName("list").setDescription("稼働中セッション一覧")
+    )
+    .addSubcommand((sub) =>
+      sub
+        .setName("status")
+        .setDescription("このスレッドのセッション生死と claude_session_id を表示")
     )
     .addSubcommand((sub) =>
       sub
@@ -64,11 +70,34 @@ export function createSessionHandler(sessionManager: SessionManager) {
       case "list":
         await handleList(interaction, sessionManager);
         break;
+      case "status":
+        await handleStatus(interaction, sessionManager);
+        break;
       case "resume":
         await handleResume(interaction, sessionManager);
         break;
     }
   };
+}
+
+async function handleStatus(
+  interaction: ChatInputCommandInteraction,
+  sessionManager: SessionManager
+): Promise<void> {
+  const channel = interaction.channel;
+  if (!channel || !channel.isThread()) {
+    await interaction.reply({
+      content: "❌ `/session status` はセッションスレッド内で実行してください。",
+      flags: 64,
+    });
+    return;
+  }
+  // Deterministic status query (Issue #170): authoritative liveness verdict
+  // (#168) + claude_session_id. Runs outside the message-relay path, so it can
+  // never hijack a real work message.
+  await interaction.reply({
+    content: buildStatusReply(sessionManager, channel.id),
+  });
 }
 
 async function handleStart(
