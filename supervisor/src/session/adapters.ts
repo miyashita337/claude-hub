@@ -63,6 +63,13 @@ export interface RelayServerAdapter {
 
 export interface ProcessAdapter {
   kill(pid: number, signal: NodeJS.Signals | number): void;
+  /**
+   * Best-effort liveness check for a pid. Used by {@link SessionManager} to
+   * cross-check DB `status='running'` against reality (Issue #168). Returns
+   * `true` when the process exists (or exists but we lack signal permission —
+   * EPERM), `false` when it has exited (ESRCH). Never throws.
+   */
+  isAlive(pid: number): boolean;
 }
 
 /**
@@ -183,6 +190,19 @@ export const realRelayServerAdapter: RelayServerAdapter = {
 export const realProcessAdapter: ProcessAdapter = {
   kill(pid, signal) {
     process.kill(pid, signal);
+  },
+  isAlive(pid) {
+    // `kill(pid, 0)` is the POSIX convention for liveness checks: it performs
+    // permission/existence resolution without sending a signal. ESRCH means
+    // the process no longer exists; EPERM means it exists but the calling
+    // process can't signal it — still alive for our purposes (Issue #168).
+    try {
+      process.kill(pid, 0);
+      return true;
+    } catch (err) {
+      const e = err as NodeJS.ErrnoException;
+      return e.code === "EPERM";
+    }
   },
 };
 
