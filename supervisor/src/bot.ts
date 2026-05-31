@@ -14,7 +14,7 @@ import { ResourceMonitor } from "./session/resource-monitor";
 import { createSessionCommand, createSessionHandler } from "./commands/session";
 import { CHANNEL_MAP } from "./config/channels";
 import type { AttachmentInfo } from "./session/relay";
-import { updateSessionClaudeId } from "./infra/db";
+import { updateSessionClaudeId, getSessionByThreadId } from "./infra/db";
 import { onProgress, onLateResponse } from "./session/relay-server";
 import {
   extractFilePaths,
@@ -203,10 +203,33 @@ export async function startBot(token: string): Promise<void> {
 
     const threadId = message.channel.id;
 
-    // Check if this thread has an active session
+    // No active in-memory session for this thread. Previously the bot silently
+    // ignored the message (Issue #41 debug log), leaving the user staring at a
+    // dead thread with no feedback (Epic #166). When the bot is @mentioned,
+    // reply with the authoritative liveness verdict (Issue #168) plus the
+    // claude_session_id and resume command so the session can be salvaged
+    // (Issue #169). Non-mention messages keep the quiet debug log to avoid
+    // spamming a dead thread on every line.
     if (!sessionManager.has(threadId)) {
-      // Log when a message arrives for a thread that once had a session (helps debug #41)
-      console.debug(`[Bot] Ignoring message in thread ${threadId} (no active session)`);
+      const botUserId = client.user?.id;
+      const mentioned = botUserId
+        ? message.mentions.users.has(botUserId)
+        : false;
+      if (!mentioned) {
+        console.debug(
+          `[Bot] Ignoring message in thread ${threadId} (no active session)`
+        );
+        return;
+      }
+      const salvage = buildSalvageReply(sessionManager, threadId);
+      try {
+        await (message.channel as ThreadChannel).send(salvage);
+      } catch (err) {
+        console.error(
+          `[Bot] Failed to send salvage reply in thread ${threadId}:`,
+          err
+        );
+      }
       return;
     }
 
@@ -470,4 +493,63 @@ function forwardToViveReading(threadId: string, channel: string, text: string): 
     const msg = err instanceof Error ? err.message : String(err);
     console.warn(`[Bot] vive-reading webhook failed for thread ${threadId} (sync): ${msg}`);
   }
+}
+
+/**
+ * Build the salvage reply for a thread whose Supervisor session is no longer
+ * active in memory (Epic #166 / Issue #169). Crosses the authoritative liveness
+ * verdict (Issue #168) with the persisted row so the user gets the
+ * claude_session_id and a ready-to-paste resume command instead of silence.
+ *
+ * Cases:
+ *   - unknown (no DB row)         → no history; suggest /session start
+ *   - alive (process still up)    → Supervisor lost tracking; suggest stop+resume/start
+ *   - dead + claude_session_id    → stopped; offer `/session resume <id>`
+ *   - dead + id missing           → pre-#167 row; suggest /session start
+ */
+export function buildSalvageReply(
+  sessionManager: SessionManager,
+  threadId: string
+): string {
+  const verdict = sessionManager.livenessOf(threadId);
+  if (verdict === "unknown") {
+    return "ℹ️ このスレッドにはセッション履歴がありません。`/session start` で開始してください。";
+  }
+
+  const row = getSessionByThreadId(threadId);
+  // verdict !== "unknown" guarantees a row exists, but guard defensively.
+  if (!row) {
+    return "ℹ️ このスレッドにはセッション履歴がありません。`/session start` で開始してください。";
+  }
+
+  if (verdict === "alive") {
+    // Process still up but Supervisor lost tracking. Only suggest resume when
+    // we actually have an id to resume from — otherwise `/session resume` is
+    // not actionable (gemini review on PR #178).
+    if (row.claude_session_id) {
+      return (
+        "⚠️ このスレッドのセッションはプロセス上は生存していますが、Supervisor が管理を見失っています。" +
+        `\`/session stop\` 後に \`/session resume ${row.claude_session_id}\`、または新規 \`/session start\` を検討してください。` +
+        `\n🔑 claude_session_id: \`${row.claude_session_id}\``
+      );
+    }
+    return (
+      "⚠️ このスレッドのセッションはプロセス上は生存していますが、Supervisor が管理を見失っています。" +
+      "claude_session_id は未記録のため、`/session stop` で停止後に `/session start` で起動し直してください。"
+    );
+  }
+
+  // verdict === "dead"
+  const reason = row.stopped_reason ? `（理由: ${row.stopped_reason}）` : "";
+  if (row.claude_session_id) {
+    return (
+      `💀 このスレッドのセッションは停止しています${reason}。\n` +
+      `🔑 claude_session_id: \`${row.claude_session_id}\`\n` +
+      `▶️ 復帰: \`/session resume ${row.claude_session_id}\``
+    );
+  }
+  return (
+    `💀 このスレッドのセッションは停止しています${reason}。\n` +
+    "🔑 claude_session_id は未記録です（#167 導入前に開始されたセッション）。`/session start` で新規起動してください。"
+  );
 }
