@@ -100,7 +100,7 @@ describe("sanitizeBranchForTitle (Issue #175 AC-4)", () => {
     for (const ch of title) {
       const code = ch.codePointAt(0)!;
       const isBidiOrControl =
-        (code <= 0x1f && code !== 0x20) ||
+        code <= 0x1f || // space (0x20) is already excluded by <= 0x1f
         code === 0x7f ||
         (code >= 0x202a && code <= 0x202e) ||
         (code >= 0x2066 && code <= 0x2069);

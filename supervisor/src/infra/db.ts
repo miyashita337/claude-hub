@@ -25,21 +25,28 @@ export function getDb(): Database {
       )
     `);
     // Migration: add thread_id if missing (for existing DBs)
-    try {
-      db.exec(`ALTER TABLE sessions ADD COLUMN thread_id TEXT`);
-    } catch {
-      // Column already exists
-    }
+    addColumnIfMissing(db, "thread_id", "TEXT");
     // Migration: add branch if missing (Issue #175). Nullable so existing rows
     // (started before this column) stay valid; resume of such a row falls back
     // to the display-name-only thread title.
-    try {
-      db.exec(`ALTER TABLE sessions ADD COLUMN branch TEXT`);
-    } catch {
-      // Column already exists
-    }
+    addColumnIfMissing(db, "branch", "TEXT");
   }
   return db;
+}
+
+/**
+ * Idempotent `ALTER TABLE sessions ADD COLUMN`. Swallows only the
+ * already-exists case; any other failure (locked DB, disk error, bad type) is
+ * rethrown so a real migration failure surfaces here instead of as a confusing
+ * INSERT error later (CodeRabbit review).
+ */
+function addColumnIfMissing(db: Database, column: string, type: string): void {
+  try {
+    db.exec(`ALTER TABLE sessions ADD COLUMN ${column} ${type}`);
+  } catch (err) {
+    const message = err instanceof Error ? err.message : String(err);
+    if (!message.includes("duplicate column")) throw err;
+  }
 }
 
 export interface SessionRow {

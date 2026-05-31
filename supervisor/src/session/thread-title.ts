@@ -67,25 +67,30 @@ function truncateWhole(s: string, max: number): string {
  * leaving an ellipsis to mark the cut. Both ends of the branch carry identifying
  * information (prefix like `feat/123-`, suffix like the feature name), so centre
  * truncation preserves more signal than head/tail truncation.
+ *
+ * Single pass (O(n)): grow a head and a tail window inward from both ends,
+ * taking from the head first (prefix bias), until the next character would
+ * exceed the budget. The branch is untrusted Discord input, so the prior
+ * slice/join-in-a-loop (O(n²)) is avoided (gemini review).
  */
 function centreTruncate(s: string, max: number): string {
   if (s.length <= max) return s;
   if (max <= ELLIPSIS.length) return truncateWhole(ELLIPSIS, max);
   const chars = [...s];
-  let head = Math.ceil(chars.length / 2); // bias the kept half to the prefix
-  let tail = chars.length - head;
-  while (head + tail > 0) {
-    const candidate =
-      chars.slice(0, head).join("") +
-      ELLIPSIS +
-      chars.slice(chars.length - tail).join("");
-    if (candidate.length <= max) return candidate;
-    // Shrink the larger half; Math.max keeps the index non-negative even though
-    // the loop guard already prevents the negative path.
-    if (head >= tail) head = Math.max(0, head - 1);
-    else tail = Math.max(0, tail - 1);
+  const budget = max - ELLIPSIS.length; // UTF-16 units left for kept content
+  let used = 0;
+  let i = 0; // exclusive end of the head window
+  let j = chars.length; // inclusive start of the tail window
+  let takeHead = true; // bias the first kept char to the prefix
+  while (i < j) {
+    const ch = takeHead ? chars[i]! : chars[j - 1]!;
+    if (used + ch.length > budget) break;
+    used += ch.length;
+    if (takeHead) i++;
+    else j--;
+    takeHead = !takeHead;
   }
-  return ELLIPSIS;
+  return chars.slice(0, i).join("") + ELLIPSIS + chars.slice(j).join("");
 }
 
 /**
