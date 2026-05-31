@@ -71,6 +71,25 @@ describe("SessionManager (thread-based)", () => {
     expect(session.status).toBe("running");
   });
 
+  test("start injects --session-id and captures claudeSessionId deterministically (Issue #167)", () => {
+    const threadId = "thread-csid";
+    const session = manager.start(primaryConfig, threadId);
+
+    // The id is captured on start, not via a relay round-trip (which times out
+    // ~90% of the time and left the DB column NULL).
+    expect(session.claudeSessionId).toMatch(
+      /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i
+    );
+
+    // The spawned claude command pins that id with --session-id, and a fresh
+    // start must NOT use --resume (the two flags are mutually exclusive).
+    // tmux name is deterministic: "claude-" + first 12 chars of threadId.
+    const tmuxName = `claude-${threadId.slice(0, 12)}`;
+    const cmd = effects.tmux.getCommand(tmuxName)!;
+    expect(cmd).toContain(`--session-id ${session.claudeSessionId}`);
+    expect(cmd).not.toContain("--resume");
+  });
+
   test("has() checks by threadId", () => {
     const threadId = "thread-456";
     manager.start(primaryConfig, threadId);
