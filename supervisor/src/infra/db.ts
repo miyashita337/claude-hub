@@ -150,7 +150,17 @@ export function getLastSessionByChannel(
     .get(channelName) as SessionRow | undefined;
 }
 
-export function getLastSessionByThread(
+/**
+ * Most-recent session row for the given thread regardless of status. Used by
+ * the authoritative liveness check (Issue #168) and any caller that needs the
+ * latest run on a thread — including stopped ones. Returns `undefined` when
+ * the thread has never been seen.
+ *
+ * Renamed from `getLastSessionByThread` in Issue #168 to align with the rest
+ * of the file's `getSessionBy<Key>` naming (mirrors
+ * `getSessionByClaudeSessionId`). The old name had zero callers.
+ */
+export function getSessionByThreadId(
   threadId: string
 ): SessionRow | undefined {
   const db = getDb();

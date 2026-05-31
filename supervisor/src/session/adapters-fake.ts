@@ -112,12 +112,18 @@ export class FakeRelayServerAdapter implements RelayServerAdapter {
 export class FakeProcessAdapter implements ProcessAdapter {
   killCalls: { pid: number; signal: NodeJS.Signals | number }[] = [];
   failOnKill = false;
+  /** Pids that {@link isAlive} should report as alive. Anything else is dead. */
+  alivePids = new Set<number>();
 
   kill(pid: number, signal: NodeJS.Signals | number): void {
     this.killCalls.push({ pid, signal });
     if (this.failOnKill) {
       throw new Error("process not found");
     }
+  }
+
+  isAlive(pid: number): boolean {
+    return this.alivePids.has(pid);
   }
 }
 

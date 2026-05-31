@@ -15,6 +15,7 @@ import {
   updateSessionActivity,
   getRunningSessions,
   getSessionByClaudeSessionId,
+  getSessionByThreadId,
   type SessionRow,
 } from "../infra/db";
 import {
@@ -30,6 +31,16 @@ import {
 
 const CLAUDE_PATH = resolve(homedir(), ".local", "bin", "claude");
 const TMUX_SESSION_PREFIX = "claude-";
+
+/**
+ * Authoritative liveness verdict produced by {@link SessionManager.livenessOf}
+ * (Issue #168). Single source of truth so salvage responses and resume guards
+ * do not drift.
+ *   - `alive`: DB running + pid alive + tmux session exists
+ *   - `dead`: DB stopped, OR DB running but pid dead / tmux missing
+ *   - `unknown`: no DB row for the thread (never observed)
+ */
+export type Liveness = "alive" | "dead" | "unknown";
 
 /**
  * Claude session IDs are UUIDs. The resume flow embeds the id in the bash
@@ -194,6 +205,33 @@ export class SessionManager {
 
   get(threadId: string): SessionInfo | undefined {
     return this.sessions.get(threadId);
+  }
+
+  /**
+   * Authoritative liveness for the given thread (Issue #168 / Epic #166).
+   * Crosses DB `status` with reality — `process.kill(pid, 0)` for the recorded
+   * pid, and tmux session existence — and returns a single `alive | dead |
+   * unknown` verdict. Salvage responses and resume guards share this verdict so
+   * callers cannot drift from each other.
+   *
+   * Behaviour matrix:
+   *   - no DB row for the thread                        → `unknown`
+   *   - row.status !== "running"                        → `dead`
+   *   - row.status === "running" + no pid recorded     → `dead`
+   *   - row.status === "running" + pid alive + tmux alive → `alive`
+   *   - row.status === "running" + (pid dead OR tmux missing) → `dead`
+   *     (DB says running but reality contradicts — answer is the reality)
+   */
+  livenessOf(threadId: string): Liveness {
+    const row = getSessionByThreadId(threadId);
+    if (!row) return "unknown";
+    if (row.status !== "running") return "dead";
+    if (row.pid == null) return "dead";
+    const pidAlive = this.effects.process.isAlive(row.pid);
+    const tmuxAlive = this.effects.tmux.hasSession(
+      this.tmuxSessionName(threadId)
+    );
+    return pidAlive && tmuxAlive ? "alive" : "dead";
   }
 
   entries(): IterableIterator<[string, SessionInfo]> {

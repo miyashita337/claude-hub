@@ -5,7 +5,7 @@ process.env.SUPERVISOR_DB_PATH = ":memory:";
 
 // Reset module cache to pick up the env var
 // Import after setting env
-const { getDb, insertSession, updateSessionStatus, updateSessionActivity, getRunningSessions, getRunningSessionByThread, getRunningSessionsByChannel, getLastSessionByChannel, getSessionByClaudeSessionId } = await import("../../src/infra/db");
+const { getDb, insertSession, updateSessionStatus, updateSessionActivity, getRunningSessions, getRunningSessionByThread, getRunningSessionsByChannel, getLastSessionByChannel, getSessionByClaudeSessionId, getSessionByThreadId } = await import("../../src/infra/db");
 
 describe("infra/db (in-memory)", () => {
   beforeEach(() => {
@@ -71,6 +71,42 @@ describe("infra/db (in-memory)", () => {
     // bun:sqlite .get() returns null (not undefined) for no match; the handler
     // treats both as "not found" via `if (!row)`.
     expect(getSessionByClaudeSessionId("00000000-0000-0000-0000-000000000000")).toBeNull();
+  });
+
+  test("getSessionByThreadId returns the latest row (started_at DESC LIMIT 1) regardless of status (#168)", () => {
+    const threadId = "thread-resumed-twice";
+    // First run on this thread, since stopped.
+    insertSession({
+      id: "first",
+      channel_name: "team-salary",
+      thread_id: threadId,
+      project_dir: "/Users/x/team_salary",
+      pid: 100,
+      claude_session_id: null,
+      started_at: "2026-05-29T10:00:00.000Z",
+      last_activity_at: "2026-05-29T10:00:00.000Z",
+      status: "stopped",
+    });
+    // Second run on the same thread, currently running.
+    insertSession({
+      id: "second",
+      channel_name: "team-salary",
+      thread_id: threadId,
+      project_dir: "/Users/x/team_salary",
+      pid: 200,
+      claude_session_id: null,
+      started_at: "2026-05-31T10:00:00.000Z",
+      last_activity_at: "2026-05-31T10:00:00.000Z",
+      status: "running",
+    });
+
+    // AC: latest by started_at, irrespective of status.
+    const found = getSessionByThreadId(threadId);
+    expect(found?.id).toBe("second");
+    expect(found?.status).toBe("running");
+
+    // No row → null (bun:sqlite convention, treated as "not found" by callers).
+    expect(getSessionByThreadId("thread-never-seen")).toBeNull();
   });
 
   test("updateSessionStatus changes status and reason", () => {
