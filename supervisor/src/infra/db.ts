@@ -25,13 +25,28 @@ export function getDb(): Database {
       )
     `);
     // Migration: add thread_id if missing (for existing DBs)
-    try {
-      db.exec(`ALTER TABLE sessions ADD COLUMN thread_id TEXT`);
-    } catch {
-      // Column already exists
-    }
+    addColumnIfMissing(db, "thread_id", "TEXT");
+    // Migration: add branch if missing (Issue #175). Nullable so existing rows
+    // (started before this column) stay valid; resume of such a row falls back
+    // to the display-name-only thread title.
+    addColumnIfMissing(db, "branch", "TEXT");
   }
   return db;
+}
+
+/**
+ * Idempotent `ALTER TABLE sessions ADD COLUMN`. Swallows only the
+ * already-exists case; any other failure (locked DB, disk error, bad type) is
+ * rethrown so a real migration failure surfaces here instead of as a confusing
+ * INSERT error later (CodeRabbit review).
+ */
+function addColumnIfMissing(db: Database, column: string, type: string): void {
+  try {
+    db.exec(`ALTER TABLE sessions ADD COLUMN ${column} ${type}`);
+  } catch (err) {
+    const message = err instanceof Error ? err.message : String(err);
+    if (!message.includes("duplicate column")) throw err;
+  }
 }
 
 export interface SessionRow {
@@ -45,13 +60,19 @@ export interface SessionRow {
   last_activity_at: string;
   status: string;
   stopped_reason: string | null;
+  /** Branch the session runs on, when started via `/session start <branch>` (Issue #175). */
+  branch: string | null;
 }
 
-export function insertSession(row: Omit<SessionRow, "stopped_reason">): void {
+export function insertSession(
+  // `branch` is optional so existing callers/tests that predate Issue #175 keep
+  // compiling; it defaults to NULL (no branch recorded).
+  row: Omit<SessionRow, "stopped_reason" | "branch"> & { branch?: string | null }
+): void {
   const db = getDb();
   db.prepare(
-    `INSERT INTO sessions (id, channel_name, thread_id, project_dir, pid, claude_session_id, started_at, last_activity_at, status)
-     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`
+    `INSERT INTO sessions (id, channel_name, thread_id, project_dir, pid, claude_session_id, started_at, last_activity_at, status, branch)
+     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
   ).run(
     row.id,
     row.channel_name,
@@ -61,7 +82,8 @@ export function insertSession(row: Omit<SessionRow, "stopped_reason">): void {
     row.claude_session_id,
     row.started_at,
     row.last_activity_at,
-    row.status
+    row.status,
+    row.branch ?? null
   );
 }
 

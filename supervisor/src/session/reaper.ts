@@ -4,6 +4,7 @@ import {
   IDLE_TIMEOUT_MS,
   IDLE_CHECK_INTERVAL_MS,
 } from "../config/channels";
+import { markTitleStopped } from "./thread-title";
 
 export class Reaper {
   private timer: ReturnType<typeof setInterval> | null = null;
@@ -52,8 +53,9 @@ export class Reaper {
           `⏰ 7日間無操作のためセッションを自動終了しました。`
         );
 
-        // Rename and archive
-        const stoppedName = thread.name.replace("🟢", "🔴");
+        // Rename and archive. markTitleStopped also handles ♻️ resume threads,
+        // which the old `.replace("🟢", ...)` skipped (Issue #175).
+        const stoppedName = markTitleStopped(thread.name);
         await thread.setName(stoppedName);
         await thread.setArchived(true);
       }
