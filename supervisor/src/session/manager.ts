@@ -258,6 +258,12 @@ export class SessionManager {
     }
 
     const sessionId = randomUUID();
+    // Pre-generate the Claude session id and pin it via `claude --session-id`
+    // so the DB row captures it deterministically at start (Issue #167).
+    // The previous opportunistic capture (relay round-trip in bot.ts) left
+    // ~90% of rows NULL because relays time out before reporting the id; that
+    // path is now an idempotent fallback (only sets when still NULL).
+    const claudeSessionId = randomUUID();
     const tmuxName = this.tmuxSessionName(threadId);
 
     // Kill existing tmux session if any
@@ -289,7 +295,10 @@ export class SessionManager {
       `mkdir -p "${relayUrlDir}"`,
       `printf "%s" "${relayUrl}" > "${relayUrlFile}"`,
       `cd "${projectDir}"`,
-      `exec ${CLAUDE_PATH} ${buildClaudeFlags(config).join(" ")}`,
+      // `--session-id <uuid>` only on fresh start; resume uses `--resume <id>`
+      // (the two are mutually exclusive). claudeSessionId is a randomUUID() so
+      // it is shell-safe to embed here.
+      `exec ${CLAUDE_PATH} --session-id ${claudeSessionId} ${buildClaudeFlags(config).join(" ")}`,
     ].join(" && ");
 
     // Launch via tmux (provides a real TTY). Uses Supervisor's dedicated
@@ -326,6 +335,7 @@ export class SessionManager {
       threadId,
       projectDir,
       pid,
+      claudeSessionId,
       process: null as unknown as any, // tmux manages the process
       startedAt: now,
       lastActivityAt: now,
@@ -341,7 +351,7 @@ export class SessionManager {
       thread_id: threadId,
       project_dir: projectDir,
       pid,
-      claude_session_id: null,
+      claude_session_id: claudeSessionId,
       started_at: now.toISOString(),
       last_activity_at: now.toISOString(),
       status: "running",
