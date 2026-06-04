@@ -20,6 +20,11 @@ claude-hub プロジェクトで運用している Discord Bot の役割分担�
 - **起動**: `tmux -CC new-session ... --channels plugin:discord@claude-plugins-official`
   - `CLAUDE_HUB_UNSAFE_SKIP_PERMISSIONS=1` （Phase 1 default）の場合のみ `--dangerously-skip-permissions` を追加。詳細は本 doc 下部の「Permission Mode (claudeHubExit)」参照
 - **役割**: **Channel-Supervisor 自身が壊れた時の非常口**
+- **idle context リセット（Issue #110）**: 1 つの長命 Claude Code session が Discord メッセージを蓄積し続けると context が無制限に膨らみ、auto-compact が非決定的に発火して応答が止まる。`scripts/hijoguchi-record-activity.sh`（UserPromptSubmit hook）が各受信メッセージの epoch を `~/.claude-hub-state/last-message-ts` に記録し、`start-hijoguchi.sh` の watchdog が `HIJOGUCHI_IDLE_RESET_MIN` 分（default 60）アイドルなら tmux session を kill → fresh で再起動する。
+  - 閾値は launchd plist の `HIJOGUCHI_IDLE_RESET_MIN` で上書き可能。`0` で機能無効化（オプトアウト）
+  - hook は `CLAUDE_HUB_HIJOGUCHI_SESSION=1`（watchdog が export）でスコープされるため、開発者が `~/claude-hub` で素の `claude` を起動しても idle timer は温まらない
+  - 既知の制限: idle 判定は「最終メッセージ受信時刻」のみを見る。閾値が短く（テスト用 1 分等）かつ受信直後に長時間 tool 実行が続くケースでは理論上 reset され得るが、default 60 分では受信から 60 分後に tool 実行中という状況は事実上発生しないため許容する。仮に reset が tool 実行中に起きても、watchdog が tmux session を kill → launchd KeepAlive 相当の outer loop が fresh で再起動するだけで復旧する（context を意図的に捨てる設計なので中断自体が許容される）
+  - state file ディレクトリが作成不能な場合、baseline 書き込みは WARN を残して継続し、idle 判定は fail-safe で KEEP（reset 無効）になる。watchdog 本来の責務（クラッシュ時の再起動）は idle 機能の失敗で止めない設計
 
 ## 絶対ルール
 
