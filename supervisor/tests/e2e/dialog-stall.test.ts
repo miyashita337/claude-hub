@@ -3,6 +3,7 @@ import { execFileSync } from "child_process";
 import { startDialogWatchdog } from "../../src/session/dialog-watchdog";
 import {
   detectDialog,
+  AUTO_ACCEPT_KEYS,
   type DialogMatch,
 } from "../../src/session/dialog-detect";
 import { TMUX_ARGS, ensureSocketConfigured } from "../../src/session/tmux";
@@ -200,6 +201,51 @@ describe("Issue #57 dialog stall — E2E with real tmux", () => {
         const result = detectDialog(pane);
         expect(result).not.toBeNull();
         expect(result!.kind).toBe("bash-yn");
+      } finally {
+        killSession(name);
+      }
+    }
+  );
+
+  // Issue #153 AC-3 verification: the feedback satisfaction survey, captured
+  // from a real tmux pane, is detected as `feedback-survey` and the watchdog
+  // auto-accepts it by sending `0` (Dismiss) via real tmux send-keys — never
+  // `1` (which would submit "Bad" feedback). This is the round-trip proof
+  // that production capture-pane output for the survey unblocks the relay.
+  itmux(
+    "AC-3 (#153): feedback survey pane → detect feedback-survey + send 0",
+    async () => {
+      const name = makeName("survey");
+      startStalePane(name);
+      try {
+        injectText(
+          name,
+          "How is Claude doing this session? (optional)\n  1: Bad    2: Fine   3: Good   0: Dismiss\n"
+        );
+        await wait(100);
+        const pane = capture(name);
+        const result = detectDialog(pane);
+        expect(result).not.toBeNull();
+        expect(result!.kind).toBe("feedback-survey");
+
+        const accepts: DialogMatch[] = [];
+        const watchdog = startDialogWatchdog({
+          tmuxSessionName: name,
+          pollIntervalMs: 50,
+          maxAutoAcceptAttempts: 1,
+          onAutoAccept: (m) => {
+            accepts.push(m);
+          },
+        });
+        await wait(250);
+        watchdog.stop();
+
+        expect(accepts.length).toBeGreaterThanOrEqual(1);
+        expect(accepts[0]!.kind).toBe("feedback-survey");
+        // Round-trip: AUTO_ACCEPT_KEYS sends `0` then Enter (real send-keys).
+        // We assert via the kind→keys map since send-keys to a `cat` pane
+        // can't be re-read; the kind is the deterministic contract.
+        expect(AUTO_ACCEPT_KEYS["feedback-survey"]).toEqual(["0", "C-m"]);
       } finally {
         killSession(name);
       }
