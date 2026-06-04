@@ -60,9 +60,9 @@ describe("SessionManager (thread-based)", () => {
     await manager.shutdownAll();
   });
 
-  test("starts a session with threadId", () => {
+  test("starts a session with threadId", async () => {
     const threadId = "thread-123";
-    const session = manager.start(primaryConfig, threadId);
+    const session = await manager.start(primaryConfig, threadId);
 
     expect(session.id).toBeTruthy();
     expect(session.channelName).toBe("channel-primary");
@@ -71,9 +71,9 @@ describe("SessionManager (thread-based)", () => {
     expect(session.status).toBe("running");
   });
 
-  test("start injects --session-id and captures claudeSessionId deterministically (Issue #167)", () => {
+  test("start injects --session-id and captures claudeSessionId deterministically (Issue #167)", async () => {
     const threadId = "thread-csid";
-    const session = manager.start(primaryConfig, threadId);
+    const session = await manager.start(primaryConfig, threadId);
 
     // The id is captured on start, not via a relay round-trip (which times out
     // ~90% of the time and left the DB column NULL).
@@ -90,34 +90,34 @@ describe("SessionManager (thread-based)", () => {
     expect(cmd).not.toContain("--resume");
   });
 
-  test("has() checks by threadId", () => {
+  test("has() checks by threadId", async () => {
     const threadId = "thread-456";
-    manager.start(primaryConfig, threadId);
+    await manager.start(primaryConfig, threadId);
 
     expect(manager.has(threadId)).toBe(true);
     expect(manager.has("thread-nonexistent")).toBe(false);
   });
 
-  test("allows multiple sessions in the same channel", () => {
-    manager.start(primaryConfig, "thread-1");
-    manager.start(primaryConfig, "thread-2");
+  test("allows multiple sessions in the same channel", async () => {
+    await manager.start(primaryConfig, "thread-1");
+    await manager.start(primaryConfig, "thread-2");
 
     expect(manager.count()).toBe(2);
     expect(manager.has("thread-1")).toBe(true);
     expect(manager.has("thread-2")).toBe(true);
   });
 
-  test("listRunningByChannel returns sessions for a specific channel", () => {
-    manager.start(primaryConfig, "thread-pri-1");
-    manager.start(primaryConfig, "thread-pri-2");
-    manager.start(secondaryConfig, "thread-sec-1");
+  test("listRunningByChannel returns sessions for a specific channel", async () => {
+    await manager.start(primaryConfig, "thread-pri-1");
+    await manager.start(primaryConfig, "thread-pri-2");
+    await manager.start(secondaryConfig, "thread-sec-1");
 
     expect(manager.listRunningByChannel("channel-primary")).toHaveLength(2);
     expect(manager.listRunningByChannel("channel-secondary")).toHaveLength(1);
   });
 
   test("stop() removes session by threadId", async () => {
-    manager.start(primaryConfig, "thread-to-stop");
+    await manager.start(primaryConfig, "thread-to-stop");
 
     expect(manager.has("thread-to-stop")).toBe(true);
     await manager.stop("thread-to-stop", "manual");
@@ -130,24 +130,24 @@ describe("SessionManager (thread-based)", () => {
     ).rejects.toThrow("セッションが見つかりません");
   });
 
-  test("throws when max sessions exceeded", () => {
+  test("throws when max sessions exceeded", async () => {
     for (let i = 0; i < 10; i++) {
-      manager.start(primaryConfig, `thread-${i}`);
+      await manager.start(primaryConfig, `thread-${i}`);
     }
-    expect(() => manager.start(primaryConfig, "thread-overflow")).toThrow(
-      "最大セッション数"
-    );
+    await expect(
+      manager.start(primaryConfig, "thread-overflow")
+    ).rejects.toThrow("最大セッション数");
   });
 
-  test("throws for duplicate threadId", () => {
-    manager.start(primaryConfig, "thread-dup");
-    expect(() => manager.start(primaryConfig, "thread-dup")).toThrow(
+  test("throws for duplicate threadId", async () => {
+    await manager.start(primaryConfig, "thread-dup");
+    await expect(manager.start(primaryConfig, "thread-dup")).rejects.toThrow(
       "既に稼働中です"
     );
   });
 
-  test("touchActivity updates lastActivityAt", () => {
-    const session = manager.start(primaryConfig, "thread-touch");
+  test("touchActivity updates lastActivityAt", async () => {
+    const session = await manager.start(primaryConfig, "thread-touch");
     const initialTime = session.lastActivityAt.getTime();
 
     manager.touchActivity("thread-touch");
@@ -167,13 +167,13 @@ describe("SessionManager (thread-based)", () => {
    * external side effects are triggered.
    */
 
-  test("AC-1: start() does not call real tmux — only the fake adapter sees it", () => {
-    manager.start(primaryConfig, "thread-ac1");
+  test("AC-1: start() does not call real tmux — only the fake adapter sees it", async () => {
+    await manager.start(primaryConfig, "thread-ac1");
     expect(effects.tmux.list()).toContain("claude-thread-ac1");
   });
 
   test("AC-2: start() defers iTerm2 tab opening through the fake adapter (no osascript)", async () => {
-    manager.start(primaryConfig, "thread-ac2");
+    await manager.start(primaryConfig, "thread-ac2");
     // openTab is dispatched via setTimeout(0); flush the macrotask queue.
     await new Promise((r) => setTimeout(r, 0));
     expect(effects.iterm2.openTabCalls).toHaveLength(1);
@@ -198,7 +198,7 @@ describe("SessionManager (thread-based)", () => {
   });
 
   test("stop() sends SIGTERM via the process adapter, not real OS signals", async () => {
-    const session = manager.start(primaryConfig, "thread-sigterm");
+    const session = await manager.start(primaryConfig, "thread-sigterm");
     await manager.stop("thread-sigterm", "manual");
     expect(effects.process.killCalls).toEqual([
       { pid: session.pid, signal: "SIGTERM" },
@@ -206,7 +206,7 @@ describe("SessionManager (thread-based)", () => {
   });
 
   test("stop() routes kill-session through the fake tmux adapter", async () => {
-    manager.start(primaryConfig, "thread-killsess");
+    await manager.start(primaryConfig, "thread-killsess");
     // tmuxSessionName takes the first 12 chars of threadId (see manager.ts).
     expect(effects.tmux.list()).toContain("claude-thread-kills");
     await manager.stop("thread-killsess", "manual");
@@ -214,8 +214,8 @@ describe("SessionManager (thread-based)", () => {
   });
 
   test("shutdownAll() clears all sessions and stops the relay server", async () => {
-    manager.start(primaryConfig, "thread-a");
-    manager.start(primaryConfig, "thread-b");
+    await manager.start(primaryConfig, "thread-a");
+    await manager.start(primaryConfig, "thread-b");
     expect(manager.count()).toBe(2);
 
     await manager.shutdownAll();
@@ -226,9 +226,9 @@ describe("SessionManager (thread-based)", () => {
   // -------------------------------------------------------------------------
   // Issue #104 / Epic #101: cold-start optimisation flags
   // -------------------------------------------------------------------------
-  test("default channel disables Chrome and all MCPs in the tmux command", () => {
+  test("default channel disables Chrome and all MCPs in the tmux command", async () => {
     const config = makeChannelConfig({ channelName: "default-flags" });
-    manager.start(config, "th-default");
+    await manager.start(config, "th-default");
 
     const cmd = effects.tmux.getCommand("claude-th-default") ?? "";
     expect(cmd).toContain("--no-chrome");
@@ -237,24 +237,24 @@ describe("SessionManager (thread-based)", () => {
     expect(cmd).toContain(`--name "default-flags"`);
   });
 
-  test("chromeEnabled=true omits --no-chrome but still strips MCPs", () => {
+  test("chromeEnabled=true omits --no-chrome but still strips MCPs", async () => {
     const config = makeChannelConfig({
       channelName: "chrome-on",
       chromeEnabled: true,
     });
-    manager.start(config, "th-chrome");
+    await manager.start(config, "th-chrome");
 
     const cmd = effects.tmux.getCommand("claude-th-chrome") ?? "";
     expect(cmd).not.toContain("--no-chrome");
     expect(cmd).toContain("--strict-mcp-config");
   });
 
-  test("mcpProfile='default' restores user-scope MCP loading", () => {
+  test("mcpProfile='default' restores user-scope MCP loading", async () => {
     const config = makeChannelConfig({
       channelName: "mcp-default",
       mcpProfile: "default",
     });
-    manager.start(config, "th-mcp-def");
+    await manager.start(config, "th-mcp-def");
 
     const cmd = effects.tmux.getCommand("claude-th-mcp-def") ?? "";
     expect(cmd).not.toContain("--strict-mcp-config");
@@ -326,8 +326,8 @@ describe("SessionManager worktree integration (#154)", () => {
     await manager.shutdownAll();
   });
 
-  test("AC-1: start with branch creates a worktree and runs claude there", () => {
-    const session = manager.start(config, "thread-wt", "feature-foo");
+  test("AC-1: start with branch creates a worktree and runs claude there", async () => {
+    const session = await manager.start(config, "thread-wt", "feature-foo");
 
     expect(effects.worktree.ensureCalls).toEqual([
       { mainRepoDir: config.dir, branch: "feature-foo" },
@@ -345,26 +345,26 @@ describe("SessionManager worktree integration (#154)", () => {
     expect(cmd).toContain(`cd "${wtPath}"`);
   });
 
-  test("start without branch keeps legacy behaviour (no worktree)", () => {
-    const session = manager.start(config, "thread-plain");
+  test("start without branch keeps legacy behaviour (no worktree)", async () => {
+    const session = await manager.start(config, "thread-plain");
 
     expect(session.worktree).toBeUndefined();
     expect(session.projectDir).toBe(config.dir);
     expect(effects.worktree.ensureCalls).toHaveLength(0);
   });
 
-  test("AC-3 / Q4: a pre-existing worktree is reused", () => {
+  test("AC-3 / Q4: a pre-existing worktree is reused", async () => {
     const wtPath = `${config.dir}/.claude/worktrees/feature-foo`;
     effects.worktree.existingPaths.add(wtPath);
 
-    const session = manager.start(config, "thread-reuse", "feature-foo");
+    const session = await manager.start(config, "thread-reuse", "feature-foo");
     expect(session.worktree?.path).toBe(wtPath);
     // ensure() was still consulted (it decides reuse), but no second creation.
     expect(effects.worktree.ensureCalls).toHaveLength(1);
   });
 
   test("AC-5 / Q3: stop removes the worktree (branch preserved)", async () => {
-    const session = manager.start(config, "thread-stop-wt", "feature-foo");
+    const session = await manager.start(config, "thread-stop-wt", "feature-foo");
     const wtPath = session.worktree!.path;
 
     await manager.stop("thread-stop-wt", "manual");
@@ -375,15 +375,15 @@ describe("SessionManager worktree integration (#154)", () => {
   });
 
   test("stop of a branchless session does not call worktree.remove", async () => {
-    manager.start(config, "thread-plain-stop");
+    await manager.start(config, "thread-plain-stop");
     await manager.stop("thread-plain-stop", "manual");
     expect(effects.worktree.removeCalls).toHaveLength(0);
   });
 
   test("Q4: two sessions share one worktree → only the last stop removes it", async () => {
     // 同 branch 多重 session (AC-3 / Q4): both sessions reuse the same worktree.
-    const s1 = manager.start(config, "thread-share-1", "feature-foo");
-    const s2 = manager.start(config, "thread-share-2", "feature-foo");
+    const s1 = await manager.start(config, "thread-share-1", "feature-foo");
+    const s2 = await manager.start(config, "thread-share-2", "feature-foo");
     expect(s1.worktree!.path).toBe(s2.worktree!.path);
 
     // Stopping the first must NOT remove the worktree — thread-share-2 still
@@ -399,33 +399,33 @@ describe("SessionManager worktree integration (#154)", () => {
     ]);
   });
 
-  test("AC-6: two branches start in parallel as independent worktrees", () => {
-    const a = manager.start(config, "thread-a", "feat-a");
-    const b = manager.start(config, "thread-b", "feat-b");
+  test("AC-6: two branches start in parallel as independent worktrees", async () => {
+    const a = await manager.start(config, "thread-a", "feat-a");
+    const b = await manager.start(config, "thread-b", "feat-b");
 
     expect(a.worktree?.path).toBe(`${config.dir}/.claude/worktrees/feat-a`);
     expect(b.worktree?.path).toBe(`${config.dir}/.claude/worktrees/feat-b`);
     expect(manager.count()).toBe(2);
   });
 
-  test("a worktree creation failure aborts start and propagates", () => {
+  test("a worktree creation failure aborts start and propagates", async () => {
     effects.worktree.failOnEnsure = true;
-    expect(() => manager.start(config, "thread-fail", "feature-foo")).toThrow(
-      /git worktree add failed/
-    );
+    await expect(
+      manager.start(config, "thread-fail", "feature-foo")
+    ).rejects.toThrow(/git worktree add failed/);
     // No session registered when worktree setup fails.
     expect(manager.has("thread-fail")).toBe(false);
   });
 
-  test("path-traversal / injection branch is rejected before a session starts", () => {
+  test("path-traversal / injection branch is rejected before a session starts", async () => {
     // The fake delegates to the real resolveWorktreePath, so the guard fires
     // through the manager too.
-    expect(() => manager.start(config, "thread-trav", "../../evil")).toThrow(
-      /path traversal/
-    );
-    expect(() => manager.start(config, "thread-inj", 'foo"; id; echo "')).toThrow(
-      /使用できない文字/
-    );
+    await expect(
+      manager.start(config, "thread-trav", "../../evil")
+    ).rejects.toThrow(/path traversal/);
+    await expect(
+      manager.start(config, "thread-inj", 'foo"; id; echo "')
+    ).rejects.toThrow(/使用できない文字/);
     expect(manager.has("thread-trav")).toBe(false);
     expect(manager.has("thread-inj")).toBe(false);
   });

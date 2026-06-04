@@ -1,4 +1,3 @@
-import { execSync } from "child_process";
 import { randomUUID } from "crypto";
 import { existsSync, unlinkSync } from "fs";
 import { dirname, resolve } from "path";
@@ -261,7 +260,17 @@ export class SessionManager {
    * channel's main worktree, isolating its working tree from other sessions on
    * the same repo. Without a branch the behaviour is unchanged (cwd = config.dir).
    */
-  start(config: ChannelConfig, threadId: string, branch?: string): SessionInfo {
+  async start(
+    config: ChannelConfig,
+    threadId: string,
+    branch?: string
+  ): Promise<SessionInfo> {
+    // Ordering guarantee (Issue #99): although start() is now async, the
+    // duplicate/limit guards below through the first `await` (the PID-poll
+    // sleep) run synchronously in one microtask, so the single-process Discord
+    // bot's event loop cannot interleave a second start() between this check
+    // and the `this.sessions.set` registration further down. No new race is
+    // introduced by the sync→async change.
     if (this.sessions.size >= MAX_SESSIONS) {
       throw new Error(`最大セッション数 (${MAX_SESSIONS}) に達しています`);
     }
@@ -346,12 +355,15 @@ export class SessionManager {
     // The constructor's eager call is a no-op before the first new-session.
     this.effects.tmux.ensureSocketConfigured();
 
-    // Wait briefly for process to start
+    // Wait briefly for process to start. start() is async (Issue #99) so this
+    // uses a non-blocking setTimeout instead of the previous
+    // `execSync("sleep 0.5")`, which spawned a shell per iteration and blocked
+    // the single-process Discord bot's event loop. Mirrors resumeSession().
     let pid: number | null = null;
     for (let i = 0; i < 5; i++) {
       pid = this.effects.tmux.getPid(tmuxName);
       if (pid) break;
-      execSync("sleep 0.5");
+      await new Promise((resolve) => setTimeout(resolve, 500));
     }
 
     if (!pid) {
