@@ -82,8 +82,12 @@ describe("dialog-watchdog", () => {
       sendKeys: (_, keys) => sentKeys.push(keys),
       onAutoAccept: (m) => accepts.push(m),
     });
-    await wait(SHORT_TICK_MS * 3);
-    watchdog.stop();
+    // finally-guard stop() so a thrown assertion can't leak the poll timer.
+    try {
+      await wait(SHORT_TICK_MS * 3);
+    } finally {
+      watchdog.stop();
+    }
     expect(accepts.length).toBeGreaterThanOrEqual(1);
     expect(accepts[0]!.kind).toBe("feedback-survey");
     expect(sentKeys[0]).toEqual(["0", "C-m"]);

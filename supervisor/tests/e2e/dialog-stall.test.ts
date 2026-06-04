@@ -217,6 +217,9 @@ describe("Issue #57 dialog stall — E2E with real tmux", () => {
     async () => {
       const name = makeName("survey");
       startStalePane(name);
+      // Declared outside try so the finally can stop it even if an assertion
+      // throws — prevents the poll timer leaking past the test.
+      let watchdog: { stop(): void } | null = null;
       try {
         injectText(
           name,
@@ -229,7 +232,7 @@ describe("Issue #57 dialog stall — E2E with real tmux", () => {
         expect(result!.kind).toBe("feedback-survey");
 
         const accepts: DialogMatch[] = [];
-        const watchdog = startDialogWatchdog({
+        watchdog = startDialogWatchdog({
           tmuxSessionName: name,
           pollIntervalMs: 50,
           maxAutoAcceptAttempts: 1,
@@ -238,7 +241,6 @@ describe("Issue #57 dialog stall — E2E with real tmux", () => {
           },
         });
         await wait(250);
-        watchdog.stop();
 
         expect(accepts.length).toBeGreaterThanOrEqual(1);
         expect(accepts[0]!.kind).toBe("feedback-survey");
@@ -247,6 +249,7 @@ describe("Issue #57 dialog stall — E2E with real tmux", () => {
         // can't be re-read; the kind is the deterministic contract.
         expect(AUTO_ACCEPT_KEYS["feedback-survey"]).toEqual(["0", "C-m"]);
       } finally {
+        watchdog?.stop();
         killSession(name);
       }
     }
