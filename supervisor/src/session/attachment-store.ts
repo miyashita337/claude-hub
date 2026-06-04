@@ -1,5 +1,5 @@
 import { resolve, basename } from "path";
-import { mkdirSync, copyFileSync } from "fs";
+import { mkdir, copyFile } from "fs/promises";
 
 /**
  * Persist relayed Discord attachments as project assets (Issue #152).
@@ -39,7 +39,10 @@ export function sanitizeThreadId(threadId: string): string {
  */
 export function sanitizeFilename(name: string): string {
   const base = basename(name).replace(/[/\\]/g, "").replace(/\.\.+/g, ".");
-  return base.length > 0 ? base : "file";
+  // `.` / `..` would resolve to the dir itself (EISDIR on copy) — treat any
+  // dot-only result, or an empty one, as a generic name.
+  if (base.length === 0 || base === "." || base === "..") return "file";
+  return base;
 }
 
 /** Absolute path to the persistent materials dir for a given project + thread. */
@@ -56,17 +59,17 @@ export function materialsDir(projectDir: string, threadId: string): string {
  * cleaned up after 5 min) and a warning is logged. Persistence failure must
  * never fail the relay itself.
  */
-export function persistAttachments(
+export async function persistAttachments(
   tmpFiles: string[],
   projectDir: string,
   threadId: string
-): string[] {
+): Promise<string[]> {
   if (tmpFiles.length === 0) return [];
 
   const destDir = materialsDir(projectDir, threadId);
   let dirReady = false;
   try {
-    mkdirSync(destDir, { recursive: true });
+    await mkdir(destDir, { recursive: true });
     dirReady = true;
   } catch (err) {
     console.warn(
@@ -75,18 +78,23 @@ export function persistAttachments(
     );
   }
 
-  return tmpFiles.map((tmp) => {
-    if (!dirReady) return tmp;
-    const dest = resolve(destDir, sanitizeFilename(basename(tmp)));
-    try {
-      copyFileSync(tmp, dest);
-      return dest;
-    } catch (err) {
-      console.warn(
-        `[AttachmentStore] failed to copy ${tmp} -> ${dest}, keeping tmp path:`,
-        err
-      );
-      return tmp;
-    }
-  });
+  // Copy concurrently: the supervisor is a single process serving every
+  // Discord channel, so blocking the event loop on synchronous disk I/O would
+  // stall unrelated sessions (domain-expert.md: Gateway responsiveness).
+  return Promise.all(
+    tmpFiles.map(async (tmp) => {
+      if (!dirReady) return tmp;
+      const dest = resolve(destDir, sanitizeFilename(basename(tmp)));
+      try {
+        await copyFile(tmp, dest);
+        return dest;
+      } catch (err) {
+        console.warn(
+          `[AttachmentStore] failed to copy ${tmp} -> ${dest}, keeping tmp path:`,
+          err
+        );
+        return tmp;
+      }
+    })
+  );
 }

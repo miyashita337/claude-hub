@@ -190,7 +190,7 @@ export async function relayMessage(
       // persistDir is known) so the materials survive past the 5-min tmp
       // cleanup. Falls back to the tmp paths per-file if persistence fails.
       const claudeFiles = options.persistDir
-        ? persistAttachments(localFiles, options.persistDir, threadId)
+        ? await persistAttachments(localFiles, options.persistDir, threadId)
         : localFiles;
       const imageInstructions = claudeFiles
         .map((f) => `Read the image at ${f}`)

@@ -33,13 +33,13 @@ describe("attachment-store (Issue #152)", () => {
   }
 
   // Journey AC-1: all attachments saved to the persistent project path.
-  test("copies every attachment into <projectDir>/.claude/discord-materials/<threadId>/", () => {
+  test("copies every attachment into <projectDir>/.claude/discord-materials/<threadId>/", async () => {
     const threadId = "1779450275804";
     const files = [1, 2, 3, 4].map((n) =>
       makeTmpFile(`${n}-IMG_479${n}.png`, `image-${n}`)
     );
 
-    const persisted = persistAttachments(files, projectDir, threadId);
+    const persisted = await persistAttachments(files, projectDir, threadId);
 
     const dir = materialsDir(projectDir, threadId);
     expect(persisted.length).toBe(4);
@@ -53,18 +53,18 @@ describe("attachment-store (Issue #152)", () => {
 
   // Journey AC-2: persisted path is NOT the tmp path, so the relay's 5-min
   // tmp cleanup (which targets the tmp list) leaves the persistent copy intact.
-  test("returns persistent paths distinct from the tmp paths", () => {
+  test("returns persistent paths distinct from the tmp paths", async () => {
     const threadId = "thread-abc";
     const tmp = makeTmpFile("99-shot.png", "x");
 
-    const persisted = persistAttachments([tmp], projectDir, threadId)[0]!;
+    const persisted = (await persistAttachments([tmp], projectDir, threadId))[0]!;
 
     expect(persisted).not.toBe(tmp);
     expect(persisted.startsWith(projectDir)).toBe(true);
   });
 
-  test("empty input returns empty array", () => {
-    expect(persistAttachments([], projectDir, "t")).toEqual([]);
+  test("empty input returns empty array", async () => {
+    expect(await persistAttachments([], projectDir, "t")).toEqual([]);
   });
 
   // Defense: a hostile thread id cannot escape the materials dir.
@@ -81,24 +81,27 @@ describe("attachment-store (Issue #152)", () => {
     expect(sanitizeFilename("a/b/c.png")).toBe("c.png");
     // A `..` run inside a name (no traversal) is collapsed but not rejected.
     expect(sanitizeFilename("foo..bar.png")).toBe("foo.bar.png");
+    // `.` / `..` would resolve to the dir itself → mapped to a generic name.
+    expect(sanitizeFilename(".")).toBe("file");
+    expect(sanitizeFilename("..")).toBe("file");
     expect(sanitizeFilename("")).toBe("file");
   });
 
-  test("traversal-laden threadId still writes inside the project dir", () => {
+  test("traversal-laden threadId still writes inside the project dir", async () => {
     const tmp = makeTmpFile("1-x.png", "x");
-    const persisted = persistAttachments([tmp], projectDir, "../../../../tmp/evil")[0]!;
+    const persisted = (await persistAttachments([tmp], projectDir, "../../../../tmp/evil"))[0]!;
     expect(persisted.startsWith(projectDir)).toBe(true);
     expect(existsSync(persisted)).toBe(true);
   });
 
   // Fail-open: if the persistent dir can't be created (projectDir is a file),
   // the tmp path is returned so the relay still works this turn.
-  test("falls back to tmp path when the materials dir cannot be created", () => {
+  test("falls back to tmp path when the materials dir cannot be created", async () => {
     const fileAsProject = resolve(root, "not-a-dir");
     writeFileSync(fileAsProject, "i am a file");
     const tmp = makeTmpFile("1-x.png", "x");
 
-    const persisted = persistAttachments([tmp], fileAsProject, "t")[0]!;
+    const persisted = (await persistAttachments([tmp], fileAsProject, "t"))[0]!;
 
     expect(persisted).toBe(tmp);
   });
@@ -106,11 +109,11 @@ describe("attachment-store (Issue #152)", () => {
   // Fail-open per file: the dir is created fine, but one source file is missing,
   // so its copy throws — that file falls back to its (nonexistent) tmp path
   // while the other file still persists.
-  test("falls back per-file when an individual copy fails", () => {
+  test("falls back per-file when an individual copy fails", async () => {
     const good = makeTmpFile("1-good.png", "ok");
     const missing = resolve(tmpDir, "2-missing.png"); // never written
 
-    const [p1, p2] = persistAttachments([good, missing], projectDir, "t");
+    const [p1, p2] = await persistAttachments([good, missing], projectDir, "t");
 
     expect(p1!.startsWith(projectDir)).toBe(true);
     expect(existsSync(p1!)).toBe(true);
