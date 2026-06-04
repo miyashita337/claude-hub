@@ -14,7 +14,11 @@ import { ResourceMonitor } from "./session/resource-monitor";
 import { createSessionCommand, createSessionHandler } from "./commands/session";
 import { CHANNEL_MAP } from "./config/channels";
 import type { AttachmentInfo } from "./session/relay";
-import { updateSessionClaudeId, getSessionByThreadId } from "./infra/db";
+import { updateSessionClaudeId } from "./infra/db";
+import {
+  buildSalvageReply,
+  buildStatusReply,
+} from "./session/status-reply";
 import { onProgress, onLateResponse } from "./session/relay-server";
 import {
   extractFilePaths,
@@ -234,6 +238,33 @@ export async function startBot(token: string): Promise<void> {
     }
 
     const thread = message.channel as ThreadChannel;
+
+    // Status token (#170): `@Supervisor status` in a live thread returns the
+    // session's liveness + claude_session_id WITHOUT relaying the query into
+    // the session. Exact token only (mention + "status", case-insensitive) so a
+    // real work message that merely contains the word "status" is never
+    // hijacked — no NL detection (RW-020/027 lesson). The /session status slash
+    // command (commands/session.ts) is the equivalent deterministic trigger.
+    {
+      const botUserId = client.user?.id;
+      if (botUserId && message.mentions.users.has(botUserId)) {
+        const withoutMention = message.content
+          .replace(new RegExp(`<@!?${botUserId}>`, "g"), "")
+          .trim()
+          .toLowerCase();
+        if (withoutMention === "status") {
+          try {
+            await thread.send(buildStatusReply(sessionManager, threadId));
+          } catch (err) {
+            console.error(
+              `[Bot] Failed to send status reply in thread ${threadId}:`,
+              err
+            );
+          }
+          return;
+        }
+      }
+    }
 
     // Collect attachments
     const attachments: AttachmentInfo[] = [];
@@ -493,63 +524,4 @@ function forwardToViveReading(threadId: string, channel: string, text: string): 
     const msg = err instanceof Error ? err.message : String(err);
     console.warn(`[Bot] vive-reading webhook failed for thread ${threadId} (sync): ${msg}`);
   }
-}
-
-/**
- * Build the salvage reply for a thread whose Supervisor session is no longer
- * active in memory (Epic #166 / Issue #169). Crosses the authoritative liveness
- * verdict (Issue #168) with the persisted row so the user gets the
- * claude_session_id and a ready-to-paste resume command instead of silence.
- *
- * Cases:
- *   - unknown (no DB row)         → no history; suggest /session start
- *   - alive (process still up)    → Supervisor lost tracking; suggest stop+resume/start
- *   - dead + claude_session_id    → stopped; offer `/session resume <id>`
- *   - dead + id missing           → pre-#167 row; suggest /session start
- */
-export function buildSalvageReply(
-  sessionManager: SessionManager,
-  threadId: string
-): string {
-  const verdict = sessionManager.livenessOf(threadId);
-  if (verdict === "unknown") {
-    return "ℹ️ このスレッドにはセッション履歴がありません。`/session start` で開始してください。";
-  }
-
-  const row = getSessionByThreadId(threadId);
-  // verdict !== "unknown" guarantees a row exists, but guard defensively.
-  if (!row) {
-    return "ℹ️ このスレッドにはセッション履歴がありません。`/session start` で開始してください。";
-  }
-
-  if (verdict === "alive") {
-    // Process still up but Supervisor lost tracking. Only suggest resume when
-    // we actually have an id to resume from — otherwise `/session resume` is
-    // not actionable (gemini review on PR #178).
-    if (row.claude_session_id) {
-      return (
-        "⚠️ このスレッドのセッションはプロセス上は生存していますが、Supervisor が管理を見失っています。" +
-        `\`/session stop\` 後に \`/session resume ${row.claude_session_id}\`、または新規 \`/session start\` を検討してください。` +
-        `\n🔑 claude_session_id: \`${row.claude_session_id}\``
-      );
-    }
-    return (
-      "⚠️ このスレッドのセッションはプロセス上は生存していますが、Supervisor が管理を見失っています。" +
-      "claude_session_id は未記録のため、`/session stop` で停止後に `/session start` で起動し直してください。"
-    );
-  }
-
-  // verdict === "dead"
-  const reason = row.stopped_reason ? `（理由: ${row.stopped_reason}）` : "";
-  if (row.claude_session_id) {
-    return (
-      `💀 このスレッドのセッションは停止しています${reason}。\n` +
-      `🔑 claude_session_id: \`${row.claude_session_id}\`\n` +
-      `▶️ 復帰: \`/session resume ${row.claude_session_id}\``
-    );
-  }
-  return (
-    `💀 このスレッドのセッションは停止しています${reason}。\n` +
-    "🔑 claude_session_id は未記録です（#167 導入前に開始されたセッション）。`/session start` で新規起動してください。"
-  );
 }
