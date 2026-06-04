@@ -123,6 +123,13 @@ export function startRelayServer(): void {
 
   server = Bun.serve({
     port: 0,
+    // Bind loopback-only. Every consumer (manager.ts builds relayUrl as
+    // http://localhost:<port>/..., hook scripts POST to that URL) reaches the
+    // server via localhost, so 127.0.0.1 is sufficient. Bun.serve defaults to
+    // 0.0.0.0, which would expose the relay endpoints — including the
+    // /health/sessions session enumeration (Issue #78) — to the local network
+    // (e.g. a LAN-reachable Raspberry Pi supervisor). Restrict by default.
+    hostname: "127.0.0.1",
     async fetch(req) {
       const url = new URL(req.url);
 

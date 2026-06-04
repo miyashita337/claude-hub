@@ -293,7 +293,7 @@ export class SessionManager {
   }
 
   private tmuxSessionName(threadId: string): string {
-    // Use a short prefix + first 8 chars of threadId for tmux session name
+    // Use a short prefix + first 12 chars of threadId for tmux session name
     return `${TMUX_SESSION_PREFIX}${threadId.slice(0, 12)}`;
   }
 
