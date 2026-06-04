@@ -31,7 +31,8 @@ export type DialogKind =
   | "ink-confirm"
   | "bash-yn"
   | "numbered-choice"
-  | "press-enter";
+  | "press-enter"
+  | "feedback-survey";
 
 export interface DialogMatch {
   /** Detected dialog family. */
@@ -53,6 +54,10 @@ export interface DialogMatch {
  *    pressing 'y' explicitly (we don't try to detect default polarity).
  *  - numbered-choice: select option 1 (typically Yes/Continue).
  *  - press-enter: just Enter.
+ *  - feedback-survey: select option 0 (Dismiss). Issue #153: Claude Code's
+ *    "How is Claude doing this session?" survey looks like a numbered choice,
+ *    but options 1/2/3 *submit* feedback (1 = "Bad"). Only `0` (Dismiss)
+ *    clears it without side effects, so this kind MUST press 0, never 1.
  *
  * Each entry is an argv list passed to `tmux send-keys -t <session> ...`.
  * Multiple entries mean multiple sequential send-keys calls (with no
@@ -63,6 +68,7 @@ export const AUTO_ACCEPT_KEYS: Record<DialogKind, string[]> = {
   "bash-yn": ["y", "C-m"],
   "numbered-choice": ["1", "C-m"],
   "press-enter": ["C-m"],
+  "feedback-survey": ["0", "C-m"],
 };
 
 /** Number of trailing lines to inspect. Dialogs render at the bottom of
@@ -81,6 +87,30 @@ export function detectDialog(paneText: string): DialogMatch | null {
   const lines = paneText.split("\n");
   const window = lines.slice(-DETECT_WINDOW_LINES);
   const windowText = window.join("\n");
+
+  // 0. Feedback satisfaction survey (Issue #153). Checked first as a safety
+  //    guard. Today the survey's option line uses colons ("1: Bad ... 0:
+  //    Dismiss") while numbered-choice (case 3) requires periods ("1. Yes"),
+  //    so misclassification can't happen yet — but if a future TUI switches
+  //    the survey to "1. Bad", numbered-choice would send `1` (= submit "Bad"
+  //    feedback). Ordering this first future-proofs against that. We require
+  //    BOTH the distinctive question and a `0: Dismiss` option so prose merely
+  //    quoting the question doesn't trigger auto-dismiss.
+  //    The i+4 lookahead window covers the question line plus the option line
+  //    (adjacent in practice) with slack for a blank spacer line between them.
+  for (let i = 0; i < window.length; i++) {
+    const line = window[i] ?? "";
+    if (/How is Claude doing this session\?/i.test(line)) {
+      const lookahead = window.slice(i, i + 4).join("\n");
+      if (/\b0\s*:\s*Dismiss\b/i.test(lookahead)) {
+        return {
+          kind: "feedback-survey",
+          autoAcceptable: true,
+          line: line.trim(),
+        };
+      }
+    }
+  }
 
   // 1. Ink-style confirm: lines beginning with "❯ Yes" (the cursor marker)
   //    plus an adjacent "No" option line. We require the cursor symbol so

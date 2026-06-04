@@ -67,6 +67,34 @@ describe("dialog-watchdog", () => {
     expect(sentKeys[0]).toEqual(["y", "C-m"]);
   });
 
+  // Issue #153: the feedback survey must be dismissed with `0`, NEVER `1`
+  // (option 1 submits "Bad" feedback). This locks the survey wiring against
+  // future regressions.
+  test("auto-dismisses feedback-survey with 0 + Enter (never 1)", async () => {
+    const sentKeys: string[][] = [];
+    const accepts: DialogMatch[] = [];
+    const watchdog = startDialogWatchdog({
+      tmuxSessionName: "test-survey",
+      pollIntervalMs: SHORT_TICK_MS,
+      maxAutoAcceptAttempts: 1,
+      capture: () =>
+        "● How is Claude doing this session? (optional)\n  1: Bad    2: Fine   3: Good   0: Dismiss\n",
+      sendKeys: (_, keys) => sentKeys.push(keys),
+      onAutoAccept: (m) => accepts.push(m),
+    });
+    // finally-guard stop() so a thrown assertion can't leak the poll timer.
+    try {
+      await wait(SHORT_TICK_MS * 3);
+    } finally {
+      watchdog.stop();
+    }
+    expect(accepts.length).toBeGreaterThanOrEqual(1);
+    expect(accepts[0]!.kind).toBe("feedback-survey");
+    expect(sentKeys[0]).toEqual(["0", "C-m"]);
+    // Defensive: the survey must never auto-press 1 (= "Bad" feedback).
+    expect(sentKeys.some((k) => k[0] === "1")).toBe(false);
+  });
+
   test("escalates to onHeartbeat after auto-accept budget exhausted", async () => {
     const heartbeats: DialogMatch[] = [];
     const acceptsFired: DialogMatch[] = [];
