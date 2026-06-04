@@ -1,4 +1,4 @@
-import { execSync, spawn } from "child_process";
+import { execFileSync, spawn } from "child_process";
 import { readFileSync } from "fs";
 import { resolve, basename } from "path";
 import { homedir } from "os";
@@ -73,7 +73,9 @@ export function resolveColor(projectName: string): string {
 
 export function isItermRunning(): boolean {
   try {
-    const result = execSync("pgrep -x iTerm2", {
+    // argv form (no shell): pgrep exits 1 when nothing matches, which
+    // execFileSync surfaces as a throw → caught below as "not running".
+    const result = execFileSync("pgrep", ["-x", "iTerm2"], {
       encoding: "utf8",
       timeout: 3000,
     }).trim();
@@ -108,37 +110,39 @@ export function openTab(opts: OpenTabOptions): void {
     return;
   }
 
-  // Set tmux window name so it persists after attach
+  // Set tmux window name so it persists after attach.
   const tabTitle = `${opts.channelName} (running)`;
-  // shell-safe: every interpolation below is non-free-text — TMUX_CMD is a
-  // module constant, tmuxSessionName is `claude-<numeric Discord threadId>`,
-  // and tabTitle is built from channelName (a static CHANNEL_MAP key). No
-  // Discord message content reaches these strings (RW-045 guard, #159).
+  // argv form (no shell): tmuxSessionName / tabTitle are passed as discrete
+  // arguments, so no quoting or shell parsing is involved (Issue #97). This
+  // also removes the prior reliance on these values being injection-safe.
+  // stdio: "ignore" matches the fire-and-forget tmux calls in adapters.ts —
+  // failures are non-fatal (the session may have already exited) and tmux's
+  // stderr must not leak to the Supervisor's terminal.
   try {
-    // shell-safe: TMUX_CMD const + internal session id / static channel name
-    execSync(
-      `${TMUX_CMD} rename-window -t "${opts.tmuxSessionName}" "${tabTitle}"`,
-      { timeout: 3000 }
+    execFileSync(
+      TMUX_PATH,
+      [...TMUX_ARGS, "rename-window", "-t", opts.tmuxSessionName, tabTitle],
+      { timeout: 3000, stdio: "ignore" }
     );
-    // shell-safe: TMUX_CMD const + internal session id (no free text)
-    execSync(
-      `${TMUX_CMD} set-option -t "${opts.tmuxSessionName}" automatic-rename off`,
-      { timeout: 3000 }
+    execFileSync(
+      TMUX_PATH,
+      [...TMUX_ARGS, "set-option", "-t", opts.tmuxSessionName, "automatic-rename", "off"],
+      { timeout: 3000, stdio: "ignore" }
     );
-    // shell-safe: TMUX_CMD const + internal session id (no free text)
-    execSync(
-      `${TMUX_CMD} set-option -t "${opts.tmuxSessionName}" set-titles on`,
-      { timeout: 3000 }
+    execFileSync(
+      TMUX_PATH,
+      [...TMUX_ARGS, "set-option", "-t", opts.tmuxSessionName, "set-titles", "on"],
+      { timeout: 3000, stdio: "ignore" }
     );
-    // shell-safe: TMUX_CMD const + internal session id (no free text)
-    execSync(
-      `${TMUX_CMD} set-option -t "${opts.tmuxSessionName}" set-titles-string "#{window_name}"`,
-      { timeout: 3000 }
+    execFileSync(
+      TMUX_PATH,
+      [...TMUX_ARGS, "set-option", "-t", opts.tmuxSessionName, "set-titles-string", "#{window_name}"],
+      { timeout: 3000, stdio: "ignore" }
     );
-    // shell-safe: TMUX_CMD const + internal session id / static channel name
-    execSync(
-      `${TMUX_CMD} select-pane -t "${opts.tmuxSessionName}" -T "${tabTitle}"`,
-      { timeout: 3000 }
+    execFileSync(
+      TMUX_PATH,
+      [...TMUX_ARGS, "select-pane", "-t", opts.tmuxSessionName, "-T", tabTitle],
+      { timeout: 3000, stdio: "ignore" }
     );
   } catch {
     // tmux session may have already exited
@@ -171,9 +175,10 @@ export function openTab(opts: OpenTabOptions): void {
   ].join("\n");
 
   try {
-    // shell-safe: the AppleScript is single-quote-escaped (every `'` → `'\''`)
-    // before being wrapped in the outer single-quoted `osascript -e '...'`.
-    execSync(`osascript -e '${script.replace(/'/g, "'\\''")}'`, {
+    // argv form (no shell): the AppleScript is passed as a single -e argument,
+    // so the prior manual single-quote escaping is no longer needed (Issue
+    // #97). Matches markTabStopped's spawn(osascript, ["-e", script]).
+    execFileSync("osascript", ["-e", script], {
       timeout: 5000,
     });
     console.log(`[iTerm2] Opened tab for ${opts.channelName}`);

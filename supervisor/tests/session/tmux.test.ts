@@ -13,20 +13,21 @@ import {
  *
  * The function in src/session/tmux.ts swallows `no server running` (expected
  * on the very first call before any tmux server exists) and warns on any
- * other error. We verify both branches by mocking child_process.execSync.
+ * other error. We verify both branches by mocking child_process.execFileSync
+ * (Issue #97 switched from execSync(template) to execFileSync(argv)).
  */
 
-let mockExecSyncImpl: () => string = () => "";
+let mockExecFileSyncImpl: () => string = () => "";
 
-// Spy-wrapped mock so we can assert the command/options passed to execSync
-// (#117 follow-up: gemini medium #3142222781).
-const mockExecSync = mock((..._args: unknown[]) => mockExecSyncImpl());
+// Spy-wrapped mock so we can assert the file/argv/options passed to
+// execFileSync (#117 follow-up: gemini medium #3142222781).
+const mockExecFileSync = mock((..._args: unknown[]) => mockExecFileSyncImpl());
 
 mock.module("child_process", () => ({
-  execSync: mockExecSync,
+  execFileSync: mockExecFileSync,
 }));
 
-const { ensureSocketConfigured, TMUX_CMD } = await import(
+const { ensureSocketConfigured, TMUX_PATH, TMUX_SOCKET } = await import(
   "../../src/session/tmux"
 );
 
@@ -41,8 +42,8 @@ describe("ensureSocketConfigured unhappy-path (#85)", () => {
   let warnSpy: ReturnType<typeof setupWarnSpy>;
 
   beforeEach(() => {
-    mockExecSyncImpl = () => "";
-    mockExecSync.mockClear();
+    mockExecFileSyncImpl = () => "";
+    mockExecFileSync.mockClear();
     warnSpy = setupWarnSpy();
   });
 
@@ -50,8 +51,8 @@ describe("ensureSocketConfigured unhappy-path (#85)", () => {
     warnSpy.mockRestore();
   });
 
-  test("warns when execSync throws an error other than 'no server running'", () => {
-    mockExecSyncImpl = () => {
+  test("warns when execFileSync throws an error other than 'no server running'", () => {
+    mockExecFileSyncImpl = () => {
       throw new Error("EACCES: permission denied, /tmp/tmux-501");
     };
 
@@ -63,8 +64,8 @@ describe("ensureSocketConfigured unhappy-path (#85)", () => {
     expect(firstCall[1]).toBeInstanceOf(Error);
   });
 
-  test("stays silent when execSync throws 'no server running' (first-call case)", () => {
-    mockExecSyncImpl = () => {
+  test("stays silent when execFileSync throws 'no server running' (first-call case)", () => {
+    mockExecFileSyncImpl = () => {
       throw new Error("no server running on /tmp/tmux-501/claude-hub");
     };
 
@@ -73,8 +74,8 @@ describe("ensureSocketConfigured unhappy-path (#85)", () => {
     expect(warnSpy).not.toHaveBeenCalled();
   });
 
-  test("stays silent when execSync succeeds", () => {
-    mockExecSyncImpl = () => "";
+  test("stays silent when execFileSync succeeds", () => {
+    mockExecFileSyncImpl = () => "";
 
     ensureSocketConfigured();
 
@@ -82,7 +83,7 @@ describe("ensureSocketConfigured unhappy-path (#85)", () => {
   });
 
   test("matches 'no server running' regex case-insensitively", () => {
-    mockExecSyncImpl = () => {
+    mockExecFileSyncImpl = () => {
       throw new Error("No Server Running");
     };
 
@@ -92,7 +93,7 @@ describe("ensureSocketConfigured unhappy-path (#85)", () => {
   });
 
   test("re-runs and re-warns on every invocation (no memoisation by design)", () => {
-    mockExecSyncImpl = () => {
+    mockExecFileSyncImpl = () => {
       throw new Error("EBUSY: tmux socket is locked");
     };
 
@@ -105,7 +106,7 @@ describe("ensureSocketConfigured unhappy-path (#85)", () => {
 
   test("preserves the original Error instance in the warning payload", () => {
     const customError = new Error("ENOSPC: no space left on device");
-    mockExecSyncImpl = () => {
+    mockExecFileSyncImpl = () => {
       throw customError;
     };
 
@@ -120,7 +121,7 @@ describe("ensureSocketConfigured unhappy-path (#85)", () => {
     // correctly falls through to the warn branch (#117 follow-up: coderabbit
     // minor #3142223332).
     const thrown = { code: "EPERM", path: "/tmp/tmux-501" };
-    mockExecSyncImpl = () => {
+    mockExecFileSyncImpl = () => {
       throw thrown;
     };
 
@@ -130,19 +131,29 @@ describe("ensureSocketConfigured unhappy-path (#85)", () => {
     expect(warnSpy.mock.calls[0]![1]).toBe(thrown);
   });
 
-  test("invokes execSync with the expected tmux command and options", () => {
-    mockExecSyncImpl = () => "";
+  test("invokes execFileSync with the expected tmux file, argv and options", () => {
+    mockExecFileSyncImpl = () => "";
 
     ensureSocketConfigured();
 
-    expect(mockExecSync).toHaveBeenCalledTimes(1);
-    const call = mockExecSync.mock.calls[0]!;
-    const cmd = call[0] as string;
-    const opts = call[1] as { timeout?: number; stdio?: string };
-    expect(cmd).toContain(TMUX_CMD);
-    expect(cmd).toContain("set-option -g mouse off");
-    expect(cmd).toContain("set-option -g mode-keys emacs");
-    expect(cmd).toContain("set-option -g history-limit 10000");
+    expect(mockExecFileSync).toHaveBeenCalledTimes(1);
+    const call = mockExecFileSync.mock.calls[0]!;
+    const file = call[0] as string;
+    const argv = call[1] as string[];
+    const opts = call[2] as { timeout?: number; stdio?: string };
+
+    // argv form (Issue #97): file is the tmux binary; the exact argv asserts
+    // both that every option token is a discrete element AND that the two ";"
+    // separators sit between the three set-option groups (an exact match, so a
+    // mis-placed or extra separator fails — `arrayContaining` would not catch
+    // that).
+    expect(file).toBe(TMUX_PATH);
+    expect(argv).toEqual([
+      "-L", TMUX_SOCKET,
+      "set-option", "-g", "mouse", "off", ";",
+      "set-option", "-g", "mode-keys", "emacs", ";",
+      "set-option", "-g", "history-limit", "10000",
+    ]);
     expect(opts).toMatchObject({ timeout: 3000, stdio: "pipe" });
   });
 });

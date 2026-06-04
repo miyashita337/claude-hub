@@ -1,4 +1,4 @@
-import { execSync } from "child_process";
+import { execFileSync } from "child_process";
 
 export const TMUX_PATH = process.env.TMUX_PATH ?? "/opt/homebrew/bin/tmux";
 
@@ -31,8 +31,13 @@ export const TMUX_SOCKET = rawSocket;
 export const TMUX_ARGS: readonly string[] = ["-L", TMUX_SOCKET];
 
 /**
- * Shell fragment for template-string execSync calls. Safe because
- * `TMUX_SOCKET` has been validated against `SOCKET_NAME_PATTERN`.
+ * Shell fragment (`tmux -L <socket>`) for the few places that still need a
+ * command *string* rather than argv — currently only the iTerm2 AppleScript
+ * `write text`, which the interactive shell in the new tab runs on attach
+ * (see {@link ./iterm2}.openTab). Safe because `TMUX_SOCKET` has been
+ * validated against `SOCKET_NAME_PATTERN`. Direct tmux calls use argv via
+ * `execFileSync` (Issue #97); do not introduce new template-string execSync
+ * uses of this constant.
  */
 export const TMUX_CMD = `${TMUX_PATH} -L ${TMUX_SOCKET}`;
 
@@ -65,16 +70,30 @@ export const TMUX_CMD = `${TMUX_PATH} -L ${TMUX_SOCKET}`;
  */
 export function ensureSocketConfigured(): void {
   try {
-    // shell-safe: TMUX_CMD is a module constant and every other token is a
-    // hard-coded literal — no external input is interpolated (RW-045 guard).
-    execSync(
-      `${TMUX_CMD} set-option -g mouse off \\; ` +
-        `set-option -g mode-keys emacs \\; ` +
-        `set-option -g history-limit 10000`,
+    // argv form (no shell): tmux's OWN command parser (not the shell) treats a
+    // standalone ";" token as a separator between chained subcommands, so the
+    // three set-option calls still run in one tmux invocation. execFileSync
+    // passes argv directly, eliminating the shell parse step entirely (Issue
+    // #97). NOTE: do not "simplify" by joining these into one string — the
+    // chaining depends on ";" being its own argv element. Every token here is
+    // a hard-coded literal so there is no injection surface to begin with.
+    execFileSync(
+      TMUX_PATH,
+      [
+        ...TMUX_ARGS,
+        "set-option", "-g", "mouse", "off", ";",
+        "set-option", "-g", "mode-keys", "emacs", ";",
+        "set-option", "-g", "history-limit", "10000",
+      ],
       { timeout: 3000, stdio: "pipe" }
     );
   } catch (err) {
-    const msg = err instanceof Error ? err.message : String(err);
+    // execFileSync surfaces tmux's stderr ("no server running" on the very
+    // first call, before any server exists) via err.stderr rather than
+    // err.message — check both so the expected first-call case stays silent.
+    const e = err as NodeJS.ErrnoException & { stderr?: Buffer | string };
+    const stderr = e?.stderr != null ? e.stderr.toString() : "";
+    const msg = `${err instanceof Error ? err.message : String(err)} ${stderr}`;
     const isNoServer = /no server running/i.test(msg);
     if (!isNoServer) {
       console.warn("[tmux] ensureSocketConfigured failed:", err);
