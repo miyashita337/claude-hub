@@ -116,6 +116,47 @@ describe("SessionManager (thread-based)", () => {
     expect(manager.listRunningByChannel("channel-secondary")).toHaveLength(1);
   });
 
+  // Issue #78 (AC-4): the read-only snapshot must map each thread to the same
+  // tmux session name the manager actually uses (`claude-<threadId[..12]>`).
+  test("sessionsHealth() returns empty when no sessions are running", () => {
+    expect(manager.sessionsHealth()).toEqual([]);
+  });
+
+  test("sessionsHealth() maps threadId to claude-<threadId[..12]> tmux name", () => {
+    // A >12-char threadId proves the slice; AC-4 asserts this exact mapping.
+    const threadId = "1234567890123456789";
+    manager.start(primaryConfig, threadId);
+
+    const health = manager.sessionsHealth();
+    expect(health).toHaveLength(1);
+    const row = health[0]!;
+    expect(row.threadId).toBe(threadId);
+    expect(row.tmuxSession).toBe(`claude-${threadId.slice(0, 12)}`);
+    expect(row.channelName).toBe("channel-primary");
+    expect(row.status).toBe("running");
+    // ISO-8601 strings so the payload is plain JSON.
+    expect(() => new Date(row.startedAt).toISOString()).not.toThrow();
+    expect(row.startedAt).toBe(new Date(row.startedAt).toISOString());
+  });
+
+  test("sessionsHealth() reflects all running sessions and excludes secrets", () => {
+    manager.start(primaryConfig, "thread-a");
+    manager.start(secondaryConfig, "thread-b");
+
+    const health = manager.sessionsHealth();
+    expect(health).toHaveLength(2);
+    expect(health.map((s) => s.threadId).sort()).toEqual([
+      "thread-a",
+      "thread-b",
+    ]);
+    // No secret/process fields leak through the DTO.
+    for (const row of health) {
+      expect(row).not.toHaveProperty("pid");
+      expect(row).not.toHaveProperty("process");
+      expect(row).not.toHaveProperty("claudeSessionId");
+    }
+  });
+
   test("stop() removes session by threadId", async () => {
     manager.start(primaryConfig, "thread-to-stop");
 

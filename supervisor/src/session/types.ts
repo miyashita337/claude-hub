@@ -28,4 +28,23 @@ export interface SessionInfo {
   worktree?: { mainRepoDir: string; path: string; branch: string };
 }
 
+/**
+ * Read-only health snapshot of a single running session (Issue #78, AC-4).
+ * Exposed by the Supervisor relay server at `GET /health/sessions` so an E2E
+ * harness can decisively verify that a thread maps to the expected tmux session
+ * (`claude-<threadId[..12]>`) without shelling into the host. Intentionally
+ * minimal: contains no secrets (token, pid, raw process handle) — only the
+ * non-sensitive identifiers needed for verification. Dates are ISO-8601 strings
+ * so the payload is plain JSON.
+ */
+export interface SessionHealthInfo {
+  threadId: string;
+  /** tmux session name as derived by SessionManager (`claude-<threadId[..12]>`). */
+  tmuxSession: string;
+  channelName: string;
+  status: "running" | "stopping";
+  startedAt: string;
+  lastActivityAt: string;
+}
+
 export type StopReason = "manual" | "idle_timeout" | "resource_limit" | "error" | "tmux_exited" | "supervisor_restart";

@@ -3,7 +3,7 @@ import { randomUUID } from "crypto";
 import { existsSync, unlinkSync } from "fs";
 import { dirname, resolve } from "path";
 import { homedir } from "os";
-import type { SessionInfo, StopReason } from "./types";
+import type { SessionInfo, SessionHealthInfo, StopReason } from "./types";
 import type { ChannelConfig } from "../config/channels";
 import {
   MAX_SESSIONS,
@@ -272,6 +272,24 @@ export class SessionManager {
     return Array.from(this.sessions.values()).filter(
       (s) => s.channelName === channelName && s.status === "running"
     );
+  }
+
+  /**
+   * Read-only health snapshot of every in-memory running session (Issue #78,
+   * AC-4). Backs the relay server's `GET /health/sessions` endpoint. Keeps the
+   * tmux-naming logic ({@link tmuxSessionName}) as the single source of truth so
+   * the E2E harness verifies the real mapping rather than a duplicated guess.
+   * Excludes secrets (token, pid, process handle) by construction.
+   */
+  sessionsHealth(): SessionHealthInfo[] {
+    return Array.from(this.sessions.values()).map((s) => ({
+      threadId: s.threadId,
+      tmuxSession: this.tmuxSessionName(s.threadId),
+      channelName: s.channelName,
+      status: s.status,
+      startedAt: s.startedAt.toISOString(),
+      lastActivityAt: s.lastActivityAt.toISOString(),
+    }));
   }
 
   private tmuxSessionName(threadId: string): string {
