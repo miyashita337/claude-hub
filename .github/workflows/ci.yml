@@ -86,6 +86,7 @@ jobs:
                    tests/session/output-formatter.test.ts \
                    tests/session/relay.test.ts \
                    tests/session/relay-server.test.ts \
+                   tests/session/gc-attachments.test.ts \
                    tests/session/queue-resilience.test.ts \
                    tests/session/manager-resume.test.ts \
                    tests/session/manager-liveness.test.ts \
