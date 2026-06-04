@@ -22,6 +22,7 @@ import {
 } from "./session/file-attacher";
 import {
   isKnownSlashCommand,
+  loadProjectCommands,
   looksLikeSlashCommand,
   stripLeadingSlash,
 } from "./session/slash-prefix";
@@ -263,9 +264,19 @@ export async function startBot(token: string): Promise<void> {
     // are now passed through unmodified so legitimate `/save-session` etc. keep
     // working as actual Claude Code slash commands. Strip only fires on
     // unknown / typo'd commands.
+    // Issue #155: also recognise PROJECT-scoped commands for this session's
+    // cwd (`<projectDir>/.claude/commands/*.md`), not just built-ins +
+    // user-global. Without this, a legit project command like
+    // `/write-article` is judged "unknown" and demoted to natural language.
+    // A session is guaranteed to exist here (the `!has` early-return above),
+    // but guard defensively in case of a teardown race.
+    const session = sessionManager.get(threadId);
+    const projectLoader = session
+      ? () => loadProjectCommands(session.projectDir)
+      : undefined;
     if (
       looksLikeSlashCommand(messageText) &&
-      !isKnownSlashCommand(messageText)
+      !isKnownSlashCommand(messageText, undefined, projectLoader)
     ) {
       const original = messageText;
       messageText = stripLeadingSlash(messageText);
