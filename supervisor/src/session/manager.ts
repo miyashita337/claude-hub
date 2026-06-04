@@ -652,6 +652,9 @@ export class SessionManager {
 
     return relayMessage(tmuxName, threadId, message, {
       attachments,
+      // Issue #152: persist attachments as project assets so they outlive the
+      // 5-min tmp cleanup and stay readable for the whole task.
+      persistDir: session.projectDir,
       onDialogStuck: options?.onDialogStuck,
     });
   }

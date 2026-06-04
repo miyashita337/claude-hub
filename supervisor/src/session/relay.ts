@@ -3,6 +3,7 @@ import { resolve } from "path";
 import { homedir } from "os";
 import { mkdirSync, writeFileSync, unlinkSync } from "fs";
 import { waitForRelay, type RelayResult } from "./relay-server";
+import { persistAttachments } from "./attachment-store";
 import { TMUX_PATH, TMUX_ARGS } from "./tmux";
 import { createLatencyTracker } from "./latency-logger";
 import { startDialogWatchdog } from "./dialog-watchdog";
@@ -146,6 +147,15 @@ export async function tmuxSend(sessionName: string, extraArgs: string[]): Promis
 export interface RelayMessageOptions {
   attachments?: AttachmentInfo[];
   /**
+   * Project directory of the session (the claude cwd). When provided,
+   * downloaded attachments are also persisted under
+   * `<persistDir>/.claude/discord-materials/<threadId>/` and Claude is handed
+   * the persistent path instead of the ephemeral tmp path (Issue #152). The
+   * tmp copy is still cleaned up after 5 min; the persistent copy survives so
+   * "material screenshots" remain readable for the whole task.
+   */
+  persistDir?: string;
+  /**
    * Called when the watchdog has exhausted its auto-accept budget for a
    * dialog and the user must intervene manually. The callback typically
    * posts a `ダイアログ検出: <kind>、手動操作要求` heartbeat to the
@@ -176,7 +186,13 @@ export async function relayMessage(
     }
 
     if (localFiles.length > 0) {
-      const imageInstructions = localFiles
+      // Issue #152: hand Claude the persistent project-asset paths (when a
+      // persistDir is known) so the materials survive past the 5-min tmp
+      // cleanup. Falls back to the tmp paths per-file if persistence fails.
+      const claudeFiles = options.persistDir
+        ? persistAttachments(localFiles, options.persistDir, threadId)
+        : localFiles;
+      const imageInstructions = claudeFiles
         .map((f) => `Read the image at ${f}`)
         .join(", and ");
       fullMessage = `${imageInstructions}. ${message}`;
