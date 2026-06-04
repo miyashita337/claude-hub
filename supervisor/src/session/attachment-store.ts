@@ -84,7 +84,8 @@ export async function persistAttachments(
   return Promise.all(
     tmpFiles.map(async (tmp) => {
       if (!dirReady) return tmp;
-      const dest = resolve(destDir, sanitizeFilename(basename(tmp)));
+      // sanitizeFilename applies basename() internally, so pass tmp directly.
+      const dest = resolve(destDir, sanitizeFilename(tmp));
       try {
         await copyFile(tmp, dest);
         return dest;
