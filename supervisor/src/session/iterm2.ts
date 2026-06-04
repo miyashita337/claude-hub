@@ -115,33 +115,23 @@ export function openTab(opts: OpenTabOptions): void {
   // argv form (no shell): tmuxSessionName / tabTitle are passed as discrete
   // arguments, so no quoting or shell parsing is involved (Issue #97). This
   // also removes the prior reliance on these values being injection-safe.
+  // Chain all five window-config commands into ONE tmux invocation via bare
+  // ";" separators (tmux's own command parser treats ";" as a separator — see
+  // ensureSocketConfigured in tmux.ts), cutting five process spawns to one.
   // stdio: "ignore" matches the fire-and-forget tmux calls in adapters.ts —
   // failures are non-fatal (the session may have already exited) and tmux's
   // stderr must not leak to the Supervisor's terminal.
   try {
     execFileSync(
       TMUX_PATH,
-      [...TMUX_ARGS, "rename-window", "-t", opts.tmuxSessionName, tabTitle],
-      { timeout: 3000, stdio: "ignore" }
-    );
-    execFileSync(
-      TMUX_PATH,
-      [...TMUX_ARGS, "set-option", "-t", opts.tmuxSessionName, "automatic-rename", "off"],
-      { timeout: 3000, stdio: "ignore" }
-    );
-    execFileSync(
-      TMUX_PATH,
-      [...TMUX_ARGS, "set-option", "-t", opts.tmuxSessionName, "set-titles", "on"],
-      { timeout: 3000, stdio: "ignore" }
-    );
-    execFileSync(
-      TMUX_PATH,
-      [...TMUX_ARGS, "set-option", "-t", opts.tmuxSessionName, "set-titles-string", "#{window_name}"],
-      { timeout: 3000, stdio: "ignore" }
-    );
-    execFileSync(
-      TMUX_PATH,
-      [...TMUX_ARGS, "select-pane", "-t", opts.tmuxSessionName, "-T", tabTitle],
+      [
+        ...TMUX_ARGS,
+        "rename-window", "-t", opts.tmuxSessionName, tabTitle, ";",
+        "set-option", "-t", opts.tmuxSessionName, "automatic-rename", "off", ";",
+        "set-option", "-t", opts.tmuxSessionName, "set-titles", "on", ";",
+        "set-option", "-t", opts.tmuxSessionName, "set-titles-string", "#{window_name}", ";",
+        "select-pane", "-t", opts.tmuxSessionName, "-T", tabTitle,
+      ],
       { timeout: 3000, stdio: "ignore" }
     );
   } catch {
