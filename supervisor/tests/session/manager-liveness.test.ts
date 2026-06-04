@@ -119,3 +119,77 @@ describe("SessionManager.livenessOf (#168)", () => {
     expect(manager.livenessOf(threadId)).toBe("alive");
   });
 });
+
+/**
+ * livenessOfClaudeSession (Issue #171, 穴 A). The resume guard keys liveness on
+ * the claude_session_id (not the DB `status` column), resolving the latest row
+ * for the id and deferring to livenessOf on its thread. Same in-memory SQLite +
+ * fake adapters — no real tmux/process.
+ */
+function rowWithClaudeId(
+  id: string,
+  threadId: string,
+  claudeId: string,
+  status: "running" | "stopped",
+  pid: number | null,
+  startedAt: string = new Date().toISOString()
+) {
+  return { ...rowFor(id, threadId, status, pid, startedAt), claude_session_id: claudeId };
+}
+
+describe("SessionManager.livenessOfClaudeSession (#171)", () => {
+  let manager: InstanceType<typeof SessionManager>;
+  let effects: FakeSessionEffects;
+  const CID = "3139aa23-fe2a-485a-831a-2209081f9935";
+
+  beforeEach(() => {
+    getDb().exec("DELETE FROM sessions");
+    effects = createFakeEffects();
+    manager = new SessionManager({ effects, gracefulKillTimeoutMs: 0 });
+  });
+
+  afterEach(async () => {
+    await manager?.shutdownAll();
+  });
+
+  test("no row for the id → unknown (caller treats as not-alive)", () => {
+    expect(manager.livenessOfClaudeSession(CID)).toBe("unknown");
+  });
+
+  test("running + pid alive + tmux present → alive", () => {
+    const threadId = "thread-cid-live";
+    insertSession(rowWithClaudeId("c1", threadId, CID, "running", 5151));
+    effects.process.alivePids.add(5151);
+    effects.tmux.newSession(tmuxNameFor(threadId), "echo ok");
+    expect(manager.livenessOfClaudeSession(CID)).toBe("alive");
+  });
+
+  test("穴 A: DB status=running but pid dead → dead (stale status must not block resume)", () => {
+    const threadId = "thread-cid-zombie";
+    insertSession(rowWithClaudeId("c2", threadId, CID, "running", 6262));
+    // pid 6262 NOT alive, no tmux → reality wins → dead.
+    expect(manager.livenessOfClaudeSession(CID)).toBe("dead");
+  });
+
+  test("explicitly stopped row → dead", () => {
+    const threadId = "thread-cid-stopped";
+    insertSession(rowWithClaudeId("c3", threadId, CID, "stopped", 7373));
+    effects.process.alivePids.add(7373);
+    effects.tmux.newSession(tmuxNameFor(threadId), "echo ok");
+    expect(manager.livenessOfClaudeSession(CID)).toBe("dead");
+  });
+
+  test("resolves the LATEST row for the id (older dead run does not mask a newer alive one)", () => {
+    // A single claude session accumulates rows across resumes; the newest run is
+    // what "is it alive now" cares about (getSessionByClaudeSessionId DESC LIMIT 1).
+    insertSession(
+      rowWithClaudeId("old", "thread-old", CID, "stopped", 1111, "2026-05-29T10:00:00.000Z")
+    );
+    insertSession(
+      rowWithClaudeId("new", "thread-new", CID, "running", 2222, "2026-05-31T10:00:00.000Z")
+    );
+    effects.process.alivePids.add(2222);
+    effects.tmux.newSession(tmuxNameFor("thread-new"), "echo ok");
+    expect(manager.livenessOfClaudeSession(CID)).toBe("alive");
+  });
+});
