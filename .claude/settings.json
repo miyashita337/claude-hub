@@ -182,6 +182,16 @@
           }
         ]
       }
+    ],
+    "UserPromptSubmit": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "\"$CLAUDE_PROJECT_DIR\"/scripts/hijoguchi-record-activity.sh"
+          }
+        ]
+      }
     ]
   }
 }

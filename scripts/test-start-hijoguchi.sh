@@ -278,6 +278,113 @@ t25_empty_channel_id_fails() {
       bash "${TARGET}" >/dev/null 2>&1
 }
 
+# --- Issue #110: idle context reset --------------------------------------
+# The idle decision is exposed via HIJOGUCHI_IDLE_DECISION_ONLY=1, which prints
+# RESET/KEEP and exits before any tmux/claude side effect. `now` is pinned with
+# HIJOGUCHI_NOW_EPOCH so the threshold maths is fully deterministic.
+HOOK="${SCRIPT_DIR}/hijoguchi-record-activity.sh"
+
+# Stamp older than the threshold → reset the session.
+# now - last = 5000 - 1000 = 4000s (66.7min) > 3600s (60min) → RESET.
+t26_idle_past_threshold_resets() {
+  local tmp; tmp=$(mktemp)
+  # shellcheck disable=SC2064
+  trap "rm -f '${tmp}'" RETURN
+  echo 1000 > "${tmp}"
+  HIJOGUCHI_IDLE_DECISION_ONLY=1 HIJOGUCHI_IDLE_RESET_MIN=60 \
+    LAST_MSG_TS_FILE="${tmp}" HIJOGUCHI_NOW_EPOCH=5000 \
+    bash "${TARGET}" 2>/dev/null | grep -Fxq RESET
+}
+
+# Stamp within the threshold → keep the session alive.
+t27_idle_within_threshold_keeps() {
+  local tmp; tmp=$(mktemp)
+  # shellcheck disable=SC2064
+  trap "rm -f '${tmp}'" RETURN
+  echo 1000 > "${tmp}"
+  HIJOGUCHI_IDLE_DECISION_ONLY=1 HIJOGUCHI_IDLE_RESET_MIN=60 \
+    LAST_MSG_TS_FILE="${tmp}" HIJOGUCHI_NOW_EPOCH=2000 \
+    bash "${TARGET}" 2>/dev/null | grep -Fxq KEEP
+}
+
+# Threshold 0 (opt-out) → never reset, even with an ancient stamp.
+t28_optout_never_resets() {
+  local tmp; tmp=$(mktemp)
+  # shellcheck disable=SC2064
+  trap "rm -f '${tmp}'" RETURN
+  echo 1 > "${tmp}"
+  HIJOGUCHI_IDLE_DECISION_ONLY=1 HIJOGUCHI_IDLE_RESET_MIN=0 \
+    LAST_MSG_TS_FILE="${tmp}" HIJOGUCHI_NOW_EPOCH=9999999999 \
+    bash "${TARGET}" 2>/dev/null | grep -Fxq KEEP
+}
+
+# Missing state file → fail safe (keep). Happens transiently before baseline.
+t29_missing_state_keeps() {
+  HIJOGUCHI_IDLE_DECISION_ONLY=1 HIJOGUCHI_IDLE_RESET_MIN=60 \
+    LAST_MSG_TS_FILE=/nonexistent/hijoguchi/ts HIJOGUCHI_NOW_EPOCH=9999999999 \
+    bash "${TARGET}" 2>/dev/null | grep -Fxq KEEP
+}
+
+# Corrupt (non-numeric) stamp → fail safe (keep).
+t30_corrupt_stamp_keeps() {
+  local tmp; tmp=$(mktemp)
+  # shellcheck disable=SC2064
+  trap "rm -f '${tmp}'" RETURN
+  echo "not-a-number" > "${tmp}"
+  HIJOGUCHI_IDLE_DECISION_ONLY=1 HIJOGUCHI_IDLE_RESET_MIN=60 \
+    LAST_MSG_TS_FILE="${tmp}" HIJOGUCHI_NOW_EPOCH=9999999999 \
+    bash "${TARGET}" 2>/dev/null | grep -Fxq KEEP
+}
+
+# Exactly at the boundary (delta == reset_min*60) → reset (>= comparison).
+t31_boundary_resets() {
+  local tmp; tmp=$(mktemp)
+  # shellcheck disable=SC2064
+  trap "rm -f '${tmp}'" RETURN
+  echo 1000 > "${tmp}"
+  HIJOGUCHI_IDLE_DECISION_ONLY=1 HIJOGUCHI_IDLE_RESET_MIN=60 \
+    LAST_MSG_TS_FILE="${tmp}" HIJOGUCHI_NOW_EPOCH=$((1000 + 60 * 60)) \
+    bash "${TARGET}" 2>/dev/null | grep -Fxq RESET
+}
+
+# Hook stamps the activity file when running inside the hijoguchi session.
+t32_hook_writes_when_in_session() {
+  local dir; dir=$(mktemp -d)
+  # shellcheck disable=SC2064
+  trap "rm -rf '${dir}'" RETURN
+  local f="${dir}/last-message-ts"
+  echo '{"hook_event_name":"UserPromptSubmit"}' \
+    | CLAUDE_HUB_HIJOGUCHI_SESSION=1 CLAUDE_HUB_STATE_DIR="${dir}" \
+      LAST_MSG_TS_FILE="${f}" bash "${HOOK}"
+  [ -f "${f}" ] && grep -Eq '^[0-9]+$' "${f}"
+}
+
+# Hook is a no-op (no write) outside the hijoguchi session.
+t33_hook_noop_without_marker() {
+  local dir; dir=$(mktemp -d)
+  # shellcheck disable=SC2064
+  trap "rm -rf '${dir}'" RETURN
+  local f="${dir}/last-message-ts"
+  echo '{"hook_event_name":"UserPromptSubmit"}' \
+    | env -u CLAUDE_HUB_HIJOGUCHI_SESSION CLAUDE_HUB_STATE_DIR="${dir}" \
+      LAST_MSG_TS_FILE="${f}" bash "${HOOK}"
+  [ ! -f "${f}" ]
+}
+
+# Launch command injects the activity-tracking env via an explicit `env` prefix
+# (not export), so it survives a pre-existing tmux server (gemini HIGH #192).
+t34_launch_cmd_has_env_prefix() {
+  HIJOGUCHI_PRINT_CMD=1 bash "${TARGET}" 2>/dev/null \
+    | grep -Eq 'env CLAUDE_HUB_HIJOGUCHI_SESSION=1 CLAUDE_HUB_STATE_DIR=.* LAST_MSG_TS_FILE='
+}
+
+# Invalid HIJOGUCHI_IDLE_POLL_SEC falls back to 10 with a warning instead of
+# spinning a busy loop (gemini MEDIUM #192).
+t35_invalid_poll_sec_falls_back() {
+  HIJOGUCHI_IDLE_POLL_SEC=abc HIJOGUCHI_PRINT_CMD=1 bash "${TARGET}" 2>&1 >/dev/null \
+    | grep -Fq "invalid HIJOGUCHI_IDLE_POLL_SEC"
+}
+
 run "T1 channel ID expanded"          t1_channel_id_expanded
 run "T2 no residual {{}} tokens"      t2_no_residual_tokens
 run "T3 env override works"           t3_env_override
@@ -303,6 +410,16 @@ run "T22 unset CHANNEL_ID logs error" t22_unset_channel_id_logs_error
 run "T23 unset BOT_MENTION exits 1"   t23_unset_bot_mention_fails
 run "T24 unset BOT_MENTION logs error" t24_unset_bot_mention_logs_error
 run "T25 empty CHANNEL_ID exits 1"    t25_empty_channel_id_fails
+run "T26 idle past threshold resets"  t26_idle_past_threshold_resets
+run "T27 idle within threshold keeps" t27_idle_within_threshold_keeps
+run "T28 opt-out never resets"        t28_optout_never_resets
+run "T29 missing state keeps"         t29_missing_state_keeps
+run "T30 corrupt stamp keeps"         t30_corrupt_stamp_keeps
+run "T31 boundary resets"             t31_boundary_resets
+run "T32 hook writes in session"      t32_hook_writes_when_in_session
+run "T33 hook no-op without marker"   t33_hook_noop_without_marker
+run "T34 launch cmd has env prefix"   t34_launch_cmd_has_env_prefix
+run "T35 invalid poll sec falls back" t35_invalid_poll_sec_falls_back
 
 if [ "${fail}" -eq 0 ]; then
   echo "ALL TESTS PASSED"

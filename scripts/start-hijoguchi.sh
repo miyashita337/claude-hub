@@ -16,6 +16,74 @@ LOG_DIR="${CLAUDE_HUB_DIR}/logs"
 CLAUDE_BIN="${HOME}/.local/bin/claude"
 TMUX_BIN="${TMUX_PATH:-/opt/homebrew/bin/tmux}"
 BACKOFF_SEC=5
+
+# --- Idle context reset (Issue #110) ---------------------------------------
+# claudeHubExit accumulates every Discord message in one long-lived Claude Code
+# session, so context grows unbounded and auto-compact fires at random times,
+# stalling responses. A UserPromptSubmit hook
+# (scripts/hijoguchi-record-activity.sh) stamps the epoch of each inbound
+# message into LAST_MSG_TS_FILE; the watchdog below kills the session once it
+# has been idle for HIJOGUCHI_IDLE_RESET_MIN minutes so the next message starts
+# from a fresh context. Set the threshold to 0 to opt out entirely.
+HIJOGUCHI_IDLE_RESET_MIN="${HIJOGUCHI_IDLE_RESET_MIN:-1440}"
+# How often the watchdog re-checks idle / session liveness. Kept short (10s) so
+# crash-restart latency is unchanged; the idle decision is threshold-based, not
+# poll-count based, so a small poll only bounds reset latency, not its timing.
+HIJOGUCHI_IDLE_POLL_SEC="${HIJOGUCHI_IDLE_POLL_SEC:-10}"
+# Guard against a blank / non-numeric override: an invalid value would make the
+# watchdog `sleep` fail and (without set -e) spin the loop into a 100% CPU busy
+# loop. Fall back to 10s on anything that is not a positive integer.
+if ! [[ "${HIJOGUCHI_IDLE_POLL_SEC}" =~ ^[1-9][0-9]*$ ]]; then
+  echo "[hijoguchi] WARN: invalid HIJOGUCHI_IDLE_POLL_SEC='${HIJOGUCHI_IDLE_POLL_SEC}', using 10" >&2
+  HIJOGUCHI_IDLE_POLL_SEC=10
+fi
+CLAUDE_HUB_STATE_DIR="${CLAUDE_HUB_STATE_DIR:-${HOME}/.claude-hub-state}"
+LAST_MSG_TS_FILE="${LAST_MSG_TS_FILE:-${CLAUDE_HUB_STATE_DIR}/last-message-ts}"
+
+# Decide whether the session has been idle long enough to reset. Prints
+# "RESET" / "KEEP" and mirrors the decision in the exit status (0 = reset).
+# `now` is overridable via HIJOGUCHI_NOW_EPOCH so tests stay deterministic.
+# Every non-reset path fails safe (KEEP): opt-out, missing/corrupt stamp, or a
+# not-yet-stale delta must never tear down an active session.
+hijoguchi_idle_should_reset() {
+  local reset_min now last delta
+  reset_min="${HIJOGUCHI_IDLE_RESET_MIN}"
+  if ! [[ "${reset_min}" =~ ^[0-9]+$ ]] || [ "${reset_min}" -eq 0 ]; then
+    echo "KEEP"; return 1   # opt-out or non-numeric → never reset
+  fi
+  if [ ! -r "${LAST_MSG_TS_FILE}" ]; then
+    echo "KEEP"; return 1   # no activity recorded yet → treat as fresh
+  fi
+  last="$(cat "${LAST_MSG_TS_FILE}" 2>/dev/null)"
+  if ! [[ "${last}" =~ ^[0-9]+$ ]]; then
+    echo "KEEP"; return 1   # corrupt stamp → fail safe, keep the session
+  fi
+  now="${HIJOGUCHI_NOW_EPOCH:-$(date +%s)}"
+  delta=$(( now - last ))
+  if [ "${delta}" -ge $(( reset_min * 60 )) ]; then
+    echo "RESET"; return 0
+  fi
+  echo "KEEP"; return 1
+}
+
+# Stamp the activity file with the current time. Used to baseline a freshly
+# launched session so it is not reset before the first Discord message arrives.
+hijoguchi_write_activity_baseline() {
+  mkdir -p "${CLAUDE_HUB_STATE_DIR}" 2>/dev/null
+  if ! date +%s > "${LAST_MSG_TS_FILE}" 2>/dev/null; then
+    echo "[hijoguchi] WARN: cannot write activity baseline to ${LAST_MSG_TS_FILE}" >&2
+  fi
+}
+
+# Dry-run: print the idle decision and exit. Used by tests to exercise the
+# threshold logic without spawning tmux/claude. Placed before the required-env
+# checks so the decision logic can be tested without channel/bot IDs.
+if [ "${HIJOGUCHI_IDLE_DECISION_ONLY:-0}" = "1" ]; then
+  hijoguchi_idle_should_reset
+  exit $?
+fi
+# ---------------------------------------------------------------------------
+
 # System-prompt file for `claude --append-system-prompt`. Overridable via env
 # so tests / alt deploys can swap it. S3 (#49) populates the real content.
 SYSTEM_PROMPT_FILE="${SYSTEM_PROMPT_FILE:-${CLAUDE_HUB_DIR}/scripts/hijoguchi-system-prompt.md}"
@@ -134,7 +202,24 @@ fi
 # re-parses back to the exact same argv — prompt content with $VAR, backticks,
 # or quotes cannot leak into command evaluation, and CLAUDE_BIN paths with
 # spaces remain intact.
-CLAUDE_CMD=$(printf '%q ' "${CLAUDE_ARGV[@]}")
+# Inject the activity-tracking context with an explicit `env` prefix rather than
+# relying on `export` + tmux inheritance. When a tmux server is ALREADY running
+# (this script uses the default socket, which commonly pre-exists), `tmux
+# new-session` spawns the pane from the *server's* cached environment, so a
+# freshly-exported var does not reach the claude process or its UserPromptSubmit
+# hook — the hook would then always skip and the idle timer would never warm,
+# resetting the session on a fixed schedule regardless of activity. `env` sets
+# the vars on the claude process directly, independent of server state.
+CLAUDE_CMD=$(printf 'env CLAUDE_HUB_HIJOGUCHI_SESSION=1 CLAUDE_HUB_STATE_DIR=%q LAST_MSG_TS_FILE=%q ' \
+  "${CLAUDE_HUB_STATE_DIR}" "${LAST_MSG_TS_FILE}")
+CLAUDE_CMD+=$(printf '%q ' "${CLAUDE_ARGV[@]}")
+
+# Opt-in introspection for tests: print the fully-built launch command (incl.
+# the env prefix) and exit before any tmux / filesystem side effect.
+if [ "${HIJOGUCHI_PRINT_CMD:-0}" = "1" ]; then
+  printf '%s\n' "${CLAUDE_CMD}"
+  exit 0
+fi
 
 # Create log dir only for real launches. Deferred past render-only / print-argv
 # so tests don't create directories as a side effect.
@@ -144,6 +229,17 @@ mkdir -p "${LOG_DIR}"
 trap 'echo "[hijoguchi] SIGTERM received, killing tmux session" >&2; "${TMUX_BIN}" kill-session -t "${SESSION}" 2>/dev/null; exit 0' TERM INT
 
 echo "[hijoguchi] watchdog starting at $(date)" >&2
+
+# The activity-tracking context is propagated to the in-session
+# UserPromptSubmit hook (scripts/hijoguchi-record-activity.sh) via the explicit
+# `env` prefix baked into CLAUDE_CMD above — NOT via these exports, because tmux
+# does not reliably inherit a freshly-exported var when the server pre-exists
+# (see the CLAUDE_CMD comment). The exports remain as harmless defense-in-depth
+# for the fresh-server case; the marker scopes the hook to THIS session so a
+# developer running `claude` in ~/claude-hub never warms the idle timer.
+export CLAUDE_HUB_HIJOGUCHI_SESSION=1
+export CLAUDE_HUB_STATE_DIR
+export LAST_MSG_TS_FILE
 
 while true; do
   # Ensure no stale session
@@ -161,9 +257,20 @@ while true; do
   fi
   echo "[hijoguchi] tmux session verified: ${SESSION}" >&2
 
-  # Block while the session exists
+  # Baseline the activity timestamp so a fresh session isn't reset before the
+  # first Discord message stamps it (Issue #110).
+  hijoguchi_write_activity_baseline
+
+  # Block while the session exists. Every HIJOGUCHI_IDLE_POLL_SEC, re-check
+  # whether the session has been idle past the reset threshold; if so, kill it
+  # so the outer loop restarts claude with a fresh context.
   while "${TMUX_BIN}" has-session -t "${SESSION}" 2>/dev/null; do
-    sleep 10
+    if [ "$(hijoguchi_idle_should_reset)" = "RESET" ]; then
+      echo "[hijoguchi] idle >= ${HIJOGUCHI_IDLE_RESET_MIN}min, resetting session for fresh context at $(date)" >&2
+      "${TMUX_BIN}" kill-session -t "${SESSION}" 2>/dev/null
+      break
+    fi
+    sleep "${HIJOGUCHI_IDLE_POLL_SEC}"
   done
 
   echo "[hijoguchi] session '${SESSION}' ended at $(date), backing off ${BACKOFF_SEC}s" >&2

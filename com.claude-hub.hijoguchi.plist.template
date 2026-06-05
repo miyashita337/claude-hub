@@ -22,6 +22,10 @@
         <string>__HOME__/.local/bin:__HOME__/.bun/bin:/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin</string>
         <key>HOME</key>
         <string>__HOME__</string>
+        <!-- Issue #110: reset the session for a fresh context after N idle
+             minutes (no Discord message). Set to 0 to disable (opt-out). -->
+        <key>HIJOGUCHI_IDLE_RESET_MIN</key>
+        <string>1440</string>
     </dict>
 
     <key>KeepAlive</key>
