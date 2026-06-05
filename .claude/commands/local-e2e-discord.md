@@ -71,13 +71,14 @@ DB="${SUPERVISOR_DB_PATH:-$HOME/claude-hub/supervisor/sessions.db}"; echo "db=$D
 ### 手順 2: `/session start <branch>` 送信 → Welcome 検出
 
 1. T0 を記録（bash `date +%s%3N`）
-2. メッセージ入力欄を `find` でクリック → `/session start ` を入力 → branch 名入力 → Discord の slash UI を確定（Tab → Return）
+2. メッセージ入力欄を `find` でクリック → `/session start` を入力 → 半角スペース → branch 名入力 → Discord の slash UI を確定（Tab → Return）
 3. **DB polling**（`--timeout-welcome` まで、0.5s 間隔）:
 
    ```bash
    DB="${SUPERVISOR_DB_PATH:-$HOME/claude-hub/supervisor/sessions.db}"
-   # channel_name 一致かつ status='running' の row が出現するまで待つ
-   sqlite3 "$DB" "SELECT id,thread_id,status FROM sessions WHERE channel_name='openclaw-rpi5-ops' AND status='running' ORDER BY started_at DESC LIMIT 1;"
+   # channel_name 一致かつ status='running' の row が出現するまで待つ。
+   # <channel_name> は --channel の値（既定 openclaw-rpi5-ops）に置換する。
+   sqlite3 "$DB" "SELECT id,thread_id,status FROM sessions WHERE channel_name='<channel_name>' AND status='running' ORDER BY started_at DESC LIMIT 1;"
    ```
 
 4. Welcome 表示を `gif_creator` または screenshot で撮影

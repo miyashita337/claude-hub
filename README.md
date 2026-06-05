@@ -52,7 +52,7 @@ CI 版（Issue #111、headless / API direct）が拾えない局面を補完す�
 
 Claude Code で以下を実行する:
 
-```
+```text
 /local-e2e-discord
 /local-e2e-discord --channel openclaw-rpi5-ops --branch local-e2e-test
 /local-e2e-discord --expect-fail   # supervisor 停止状態で FAIL を期待する失敗ケース検証
@@ -73,3 +73,23 @@ Claude Code で以下を実行する:
 - 1 Chrome ウィンドウ 1 セッション。並列実行は想定しない。
 
 詳細・全オプションはスキル定義 [`.claude/commands/local-e2e-discord.md`](./.claude/commands/local-e2e-discord.md) を参照。
+
+## 添付ファイルの GC (Issue #151)
+
+Discord で受領した素材は `~/claude-hub/tmp/attachments` に保存され、**30 日保持**される
+（以前は relay 完了の 5 分後に削除され、セッションを跨ぐと素材が消えていた）。
+日次 GC ジョブで 30 日超のファイルのみ削除し、削除ごとに warning ログを残す。
+
+```bash
+# 手動実行 (動作確認・即時 GC)
+bun run supervisor/src/session/gc-attachments.ts
+
+# 日次自動 GC を常駐化 (04:00 実行)。logs/ が無ければ先に作成する
+mkdir -p ~/claude-hub/logs
+# plist 内の /Users/YOUR_USER プレースホルダを $HOME に置換して配置する
+sed "s|/Users/YOUR_USER|$HOME|g" com.claude-hub.gc-attachments.plist > ~/Library/LaunchAgents/com.claude-hub.gc-attachments.plist
+launchctl load ~/Library/LaunchAgents/com.claude-hub.gc-attachments.plist
+
+# GC ログ確認 (削除実績の consumer)
+tail ~/claude-hub/logs/gc-attachments.stdout.log
+```

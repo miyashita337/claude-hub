@@ -1,6 +1,10 @@
-import { describe, test, expect, beforeEach } from "bun:test";
+import { describe, test, expect, beforeEach, afterEach } from "bun:test";
+import { mkdtempSync, mkdirSync, writeFileSync, rmSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import {
   isKnownSlashCommand,
+  loadProjectCommands,
   looksLikeSlashCommand,
   stripLeadingSlash,
   _resetUserCommandCache,
@@ -13,6 +17,10 @@ import {
  *
  * Issue #86 follow-up: known commands (built-ins + ~/.claude/commands/) are
  * passed through unmodified so legitimate slash commands keep working.
+ *
+ * Issue #155 (#86 follow-up A): the allowlist also consults project-scoped
+ * commands (`<projectDir>/.claude/commands/*.md`) for the session's cwd, so a
+ * project command like `/write-article` is no longer wrongly stripped.
  */
 
 describe("looksLikeSlashCommand", () => {
@@ -177,5 +185,142 @@ describe("isKnownSlashCommand", () => {
     // returns a boolean without throwing.
     const result = isKnownSlashCommand("/totally-unknown-XYZ");
     expect(typeof result).toBe("boolean");
+  });
+
+  // Issue #155: project-scoped commands (the injected projectLoader path).
+  describe("project-scoped commands (Issue #155)", () => {
+    const projectLoader = () => new Set(["write-article", "draft-article"]);
+
+    test("AC-1: recognises a project command via projectLoader", () => {
+      // built-in + user-global are empty here; only the project loader knows it
+      expect(
+        isKnownSlashCommand("/write-article", emptyLoader, projectLoader),
+      ).toBe(true);
+      expect(
+        isKnownSlashCommand("/write-article 199", emptyLoader, projectLoader),
+      ).toBe(true);
+    });
+
+    test("AC-3: a typo of a project command is still unknown (stripped)", () => {
+      expect(
+        isKnownSlashCommand("/wrtie-article", emptyLoader, projectLoader),
+      ).toBe(false);
+    });
+
+    test("AC-2: built-ins and user-global still recognised alongside project loader", () => {
+      // built-in
+      expect(isKnownSlashCommand("/help", emptyLoader, projectLoader)).toBe(
+        true,
+      );
+      // user-global (customLoader) command unaffected by project loader
+      expect(
+        isKnownSlashCommand("/save-session", customLoader, projectLoader),
+      ).toBe(true);
+    });
+
+    test("absent projectLoader preserves prior built-in + user-global behaviour", () => {
+      // No third arg → empty project loader default. Project-only command is
+      // unknown; built-ins/user-global unchanged.
+      expect(isKnownSlashCommand("/write-article", customLoader)).toBe(false);
+      expect(isKnownSlashCommand("/pdca", customLoader)).toBe(true);
+    });
+  });
+});
+
+describe("loadProjectCommands (Issue #155)", () => {
+  let tmpDirs: string[] = [];
+
+  function makeProject(commands: string[]): string {
+    const root = mkdtempSync(join(tmpdir(), "claude-hub-proj-"));
+    tmpDirs.push(root);
+    const cmdDir = join(root, ".claude", "commands");
+    mkdirSync(cmdDir, { recursive: true });
+    for (const name of commands) {
+      writeFileSync(join(cmdDir, `${name}.md`), `# ${name}\n`);
+    }
+    return root;
+  }
+
+  beforeEach(() => {
+    _resetUserCommandCache(); // also clears the per-project cache
+  });
+
+  afterEach(() => {
+    for (const dir of tmpDirs) {
+      rmSync(dir, { recursive: true, force: true });
+    }
+    tmpDirs = [];
+  });
+
+  test("reads <projectDir>/.claude/commands/*.md into a name set", () => {
+    const proj = makeProject(["write-article", "draft-article"]);
+    const set = loadProjectCommands(proj);
+    expect(set.has("write-article")).toBe(true);
+    expect(set.has("draft-article")).toBe(true);
+    expect(set.has("nonexistent")).toBe(false);
+  });
+
+  test("end-to-end: isKnownSlashCommand resolves a real project command", () => {
+    const proj = makeProject(["write-article"]);
+    expect(
+      isKnownSlashCommand("/write-article 199", () => new Set(), () =>
+        loadProjectCommands(proj),
+      ),
+    ).toBe(true);
+    // typo still unknown
+    expect(
+      isKnownSlashCommand("/wrtie-article", () => new Set(), () =>
+        loadProjectCommands(proj),
+      ),
+    ).toBe(false);
+  });
+
+  test("caches are isolated per projectDir (no cross-project leakage)", () => {
+    const projA = makeProject(["alpha-cmd"]);
+    const projB = makeProject(["beta-cmd"]);
+    const setA = loadProjectCommands(projA);
+    const setB = loadProjectCommands(projB);
+    expect(setA.has("alpha-cmd")).toBe(true);
+    expect(setA.has("beta-cmd")).toBe(false);
+    expect(setB.has("beta-cmd")).toBe(true);
+    expect(setB.has("alpha-cmd")).toBe(false);
+  });
+
+  test("missing project command dir returns empty set without throwing", () => {
+    const root = mkdtempSync(join(tmpdir(), "claude-hub-noproj-"));
+    tmpDirs.push(root);
+    // No .claude/commands dir created → ENOENT path.
+    const set = loadProjectCommands(root);
+    expect(set.size).toBe(0);
+  });
+
+  test("ignores non-.md and .bak.md files", () => {
+    const root = mkdtempSync(join(tmpdir(), "claude-hub-mixed-"));
+    tmpDirs.push(root);
+    const cmdDir = join(root, ".claude", "commands");
+    mkdirSync(cmdDir, { recursive: true });
+    writeFileSync(join(cmdDir, "real-cmd.md"), "# real\n");
+    writeFileSync(join(cmdDir, "notes.txt"), "not a command\n");
+    writeFileSync(join(cmdDir, "old-cmd.bak.md"), "# backup\n");
+    const set = loadProjectCommands(root);
+    expect(set.has("real-cmd")).toBe(true);
+    expect(set.has("notes")).toBe(false);
+    expect(set.has("old-cmd.bak")).toBe(false);
+    expect(set.has("old-cmd")).toBe(false);
+  });
+
+  test("returns cached set within the TTL window after dir changes", () => {
+    const proj = makeProject(["first-cmd"]);
+    const first = loadProjectCommands(proj);
+    expect(first.has("first-cmd")).toBe(true);
+    // Add a new command on disk; within TTL the cached set is returned
+    // unchanged (proves caching is active and per-project).
+    writeFileSync(
+      join(proj, ".claude", "commands", "second-cmd.md"),
+      "# second\n",
+    );
+    const second = loadProjectCommands(proj);
+    expect(second.has("second-cmd")).toBe(false);
+    expect(second).toBe(first); // same cached reference
   });
 });

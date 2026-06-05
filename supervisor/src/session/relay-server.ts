@@ -1,4 +1,6 @@
 import { formatForDiscord } from "./output-formatter";
+import { MAX_SESSIONS } from "../config/channels";
+import type { SessionHealthInfo } from "./types";
 
 export interface RelayResult {
   text: string;
@@ -35,6 +37,11 @@ export interface AskUserEvent {
 type ProgressCallback = (event: ProgressEvent) => void;
 type LateResponseCallback = (event: LateResponseEvent) => void;
 type AskUserCallback = (event: AskUserEvent) => void;
+// Issue #78 (AC-4): supplies the read-only running-session snapshot served at
+// `GET /health/sessions`. Registered by bot.ts so the relay server (a
+// module-level singleton with no SessionManager reference) can answer health
+// queries without importing the manager and creating a cycle.
+type SessionsProvider = () => SessionHealthInfo[];
 
 interface PendingRequest {
   resolve: (result: RelayResult) => void;
@@ -61,9 +68,20 @@ let relayPort = 0;
 let progressCallback: ProgressCallback | null = null;
 let lateResponseCallback: LateResponseCallback | null = null;
 let askUserCallback: AskUserCallback | null = null;
+let sessionsProvider: SessionsProvider | null = null;
 
 export function onProgress(callback: ProgressCallback): void {
   progressCallback = callback;
+}
+
+/**
+ * Register the provider that backs `GET /health/sessions` (Issue #78, AC-4).
+ * When no provider is registered the endpoint reports zero sessions rather than
+ * failing, so a freshly-started supervisor (or a test that never wires it) still
+ * answers 200 with an empty list.
+ */
+export function onSessionsQuery(provider: SessionsProvider): void {
+  sessionsProvider = provider;
 }
 
 export function onLateResponse(callback: LateResponseCallback): void {
@@ -105,11 +123,31 @@ export function startRelayServer(): void {
 
   server = Bun.serve({
     port: 0,
+    // Bind loopback-only. Every consumer (manager.ts builds relayUrl as
+    // http://localhost:<port>/..., hook scripts POST to that URL) reaches the
+    // server via localhost, so 127.0.0.1 is sufficient. Bun.serve defaults to
+    // 0.0.0.0, which would expose the relay endpoints — including the
+    // /health/sessions session enumeration (Issue #78) — to the local network
+    // (e.g. a LAN-reachable Raspberry Pi supervisor). Restrict by default.
+    hostname: "127.0.0.1",
     async fetch(req) {
       const url = new URL(req.url);
 
       if (url.pathname === "/health" && req.method === "GET") {
         return new Response("ok", { status: 200 });
+      }
+
+      // Issue #78 (AC-4): read-only snapshot of running sessions so an E2E
+      // harness can decisively verify the thread → tmux session mapping
+      // (`claude-<threadId[..12]>`) without shelling into the host. Returns an
+      // empty list (not an error) when no provider is registered.
+      if (url.pathname === "/health/sessions" && req.method === "GET") {
+        const sessions = sessionsProvider ? sessionsProvider() : [];
+        return Response.json({
+          count: sessions.length,
+          max: MAX_SESSIONS,
+          sessions,
+        });
       }
 
       // Progress endpoint: PostToolUse hook sends tool progress here
@@ -337,6 +375,7 @@ export function stopRelayServer(): void {
   progressCallback = null;
   lateResponseCallback = null;
   askUserCallback = null;
+  sessionsProvider = null;
 }
 
 export function waitForRelay(

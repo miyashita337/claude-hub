@@ -14,18 +14,20 @@ import { ResourceMonitor } from "./session/resource-monitor";
 import { createSessionCommand, createSessionHandler } from "./commands/session";
 import { CHANNEL_MAP } from "./config/channels";
 import type { AttachmentInfo } from "./session/relay";
+import { buildDialogStuckHandler } from "./session/dialog-stuck-handler";
 import { updateSessionClaudeId } from "./infra/db";
 import {
   buildSalvageReply,
   buildStatusReply,
 } from "./session/status-reply";
-import { onProgress, onLateResponse } from "./session/relay-server";
+import { onProgress, onLateResponse, onSessionsQuery } from "./session/relay-server";
 import {
   extractFilePaths,
   collectAttachableFiles,
 } from "./session/file-attacher";
 import {
   isKnownSlashCommand,
+  loadProjectCommands,
   looksLikeSlashCommand,
   stripLeadingSlash,
 } from "./session/slash-prefix";
@@ -134,6 +136,11 @@ export async function startBot(token: string): Promise<void> {
         message: event.message,
       });
     });
+
+    // Issue #78 (AC-4): back the read-only GET /health/sessions endpoint with a
+    // live snapshot of the manager's in-memory sessions so an E2E harness can
+    // verify the thread → tmux session mapping without host access.
+    onSessionsQuery(() => sessionManager.sessionsHealth());
 
     // Register late-response callback: when a Stop hook POST arrives after
     // the initial relay already resolved (e.g. Monitor/background-task split
@@ -294,9 +301,19 @@ export async function startBot(token: string): Promise<void> {
     // are now passed through unmodified so legitimate `/save-session` etc. keep
     // working as actual Claude Code slash commands. Strip only fires on
     // unknown / typo'd commands.
+    // Issue #155: also recognise PROJECT-scoped commands for this session's
+    // cwd (`<projectDir>/.claude/commands/*.md`), not just built-ins +
+    // user-global. Without this, a legit project command like
+    // `/write-article` is judged "unknown" and demoted to natural language.
+    // A session is guaranteed to exist here (the `!has` early-return above),
+    // but guard defensively in case of a teardown race.
+    const session = sessionManager.get(threadId);
+    const projectLoader = session
+      ? () => loadProjectCommands(session.projectDir)
+      : undefined;
     if (
       looksLikeSlashCommand(messageText) &&
-      !isKnownSlashCommand(messageText)
+      !isKnownSlashCommand(messageText, undefined, projectLoader)
     ) {
       const original = messageText;
       messageText = stripLeadingSlash(messageText);
@@ -364,7 +381,11 @@ export async function startBot(token: string): Promise<void> {
         const result = await sessionManager.sendMessage(
           threadId,
           messageText,
-          attachments
+          attachments,
+          // Issue #12: when a dialog slips past auto-accept or the relay
+          // stalls on an unknown dialog, page the user on this thread (+
+          // best-effort Pushover) with the tmux session to attach to.
+          { onDialogStuck: buildDialogStuckHandler(thread) }
         );
 
         console.log(`[Bot] Got ${result.chunks.length} chunks, error: ${result.error ?? "none"}`);

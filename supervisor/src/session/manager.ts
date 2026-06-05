@@ -1,9 +1,8 @@
-import { execSync } from "child_process";
 import { randomUUID } from "crypto";
 import { existsSync, unlinkSync } from "fs";
 import { dirname, resolve } from "path";
 import { homedir } from "os";
-import type { SessionInfo, StopReason } from "./types";
+import type { SessionInfo, SessionHealthInfo, StopReason } from "./types";
 import type { ChannelConfig } from "../config/channels";
 import {
   MAX_SESSIONS,
@@ -170,6 +169,17 @@ export class SessionManager {
   /** Map<threadId, intervalHandle> — watchdogs to clear on stop/shutdown */
   private watchers = new Map<string, ReturnType<typeof setInterval>>();
   /**
+   * threadIds with a start currently in flight (review #185 gemini HIGH).
+   * Since {@link start} is async (it awaits the PID poll), the dup-check and
+   * MAX_SESSIONS guard could otherwise be bypassed by a second concurrent
+   * start() interleaving at the await before the first reaches
+   * `this.sessions.set`. Registered synchronously before any await and released
+   * in `finally`, so on the single-threaded event loop a racing start of the
+   * same thread — or one that would exceed MAX_SESSIONS — is rejected
+   * deterministically (TOCTOU; mirrors resumeSession's single-flight lock).
+   */
+  private readonly pendingStarts = new Set<string>();
+  /**
    * claude_session_ids with a resume currently in flight (Issue #171, 穴 C).
    * Acquired synchronously at the top of {@link resumeSession} and released in
    * its `finally`, so on the single-threaded event loop a second near-
@@ -274,8 +284,26 @@ export class SessionManager {
     );
   }
 
+  /**
+   * Read-only health snapshot of every in-memory running session (Issue #78,
+   * AC-4). Backs the relay server's `GET /health/sessions` endpoint. Keeps the
+   * tmux-naming logic ({@link tmuxSessionName}) as the single source of truth so
+   * the E2E harness verifies the real mapping rather than a duplicated guess.
+   * Excludes secrets (token, pid, process handle) by construction.
+   */
+  sessionsHealth(): SessionHealthInfo[] {
+    return Array.from(this.sessions.values()).map((s) => ({
+      threadId: s.threadId,
+      tmuxSession: this.tmuxSessionName(s.threadId),
+      channelName: s.channelName,
+      status: s.status,
+      startedAt: s.startedAt.toISOString(),
+      lastActivityAt: s.lastActivityAt.toISOString(),
+    }));
+  }
+
   private tmuxSessionName(threadId: string): string {
-    // Use a short prefix + first 8 chars of threadId for tmux session name
+    // Use a short prefix + first 12 chars of threadId for tmux session name
     return `${TMUX_SESSION_PREFIX}${threadId.slice(0, 12)}`;
   }
 
@@ -287,12 +315,22 @@ export class SessionManager {
    * channel's main worktree, isolating its working tree from other sessions on
    * the same repo. Without a branch the behaviour is unchanged (cwd = config.dir).
    */
-  start(config: ChannelConfig, threadId: string, branch?: string): SessionInfo {
-    if (this.sessions.size >= MAX_SESSIONS) {
+  async start(
+    config: ChannelConfig,
+    threadId: string,
+    branch?: string
+  ): Promise<SessionInfo> {
+    // Single-flight guard (review #185 gemini HIGH): start() is async (awaits
+    // the PID poll below), so these checks must not be bypassed by a second
+    // concurrent start() interleaving at the await before `this.sessions.set`
+    // runs. Count pendingStarts in both guards and register threadId
+    // synchronously (before any await), releasing in finally — mirrors
+    // resumeSession's single-flight lock.
+    if (this.sessions.size + this.pendingStarts.size >= MAX_SESSIONS) {
       throw new Error(`最大セッション数 (${MAX_SESSIONS}) に達しています`);
     }
 
-    if (this.sessions.has(threadId)) {
+    if (this.sessions.has(threadId) || this.pendingStarts.has(threadId)) {
       throw new Error(`このスレッドのセッションは既に稼働中です`);
     }
 
@@ -302,6 +340,26 @@ export class SessionManager {
       );
     }
 
+    this.pendingStarts.add(threadId);
+    try {
+      return await this.launchStart(config, threadId, branch);
+    } finally {
+      this.pendingStarts.delete(threadId);
+    }
+  }
+
+  /**
+   * Internal: worktree resolution + tmux launch + state registration for a
+   * start, run under the pendingStarts single-flight lock held by {@link start}.
+   * Split out so the lock acquire/release stays a thin, readable wrapper. Every
+   * guard (MAX_SESSIONS, thread/pending collision, projectDir existence) is
+   * enforced by the caller before this runs.
+   */
+  private async launchStart(
+    config: ChannelConfig,
+    threadId: string,
+    branch?: string
+  ): Promise<SessionInfo> {
     // Issue #154: resolve the effective cwd. With a branch, create/reuse a
     // worktree (Q1/Q2/Q4 in worktree.ts); failures propagate so the caller can
     // report them rather than starting claude in the wrong directory.
@@ -372,12 +430,15 @@ export class SessionManager {
     // The constructor's eager call is a no-op before the first new-session.
     this.effects.tmux.ensureSocketConfigured();
 
-    // Wait briefly for process to start
+    // Wait briefly for process to start. start() is async (Issue #99) so this
+    // uses a non-blocking setTimeout instead of the previous
+    // `execSync("sleep 0.5")`, which spawned a shell per iteration and blocked
+    // the single-process Discord bot's event loop. Mirrors resumeSession().
     let pid: number | null = null;
     for (let i = 0; i < 5; i++) {
       pid = this.effects.tmux.getPid(tmuxName);
       if (pid) break;
-      execSync("sleep 0.5");
+      await new Promise((resolve) => setTimeout(resolve, 500));
     }
 
     if (!pid) {
@@ -409,6 +470,11 @@ export class SessionManager {
     };
 
     this.sessions.set(threadId, info);
+    // Hand off from pendingStarts → sessions: now that the session is real, the
+    // MAX_SESSIONS / dup guards count it via `this.sessions`, so drop the
+    // pending marker to avoid double-counting (start()'s finally is the
+    // error-path safety net; delete is idempotent).
+    this.pendingStarts.delete(threadId);
 
     insertSession({
       id: sessionId,
@@ -726,6 +792,9 @@ export class SessionManager {
 
     return relayMessage(tmuxName, threadId, message, {
       attachments,
+      // Issue #152: persist attachments as project assets so they outlive the
+      // 5-min tmp cleanup and stay readable for the whole task.
+      persistDir: session.projectDir,
       onDialogStuck: options?.onDialogStuck,
     });
   }
