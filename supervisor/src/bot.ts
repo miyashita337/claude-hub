@@ -14,6 +14,7 @@ import { ResourceMonitor } from "./session/resource-monitor";
 import { createSessionCommand, createSessionHandler } from "./commands/session";
 import { CHANNEL_MAP } from "./config/channels";
 import type { AttachmentInfo } from "./session/relay";
+import { buildDialogStuckHandler } from "./session/dialog-stuck-handler";
 import { updateSessionClaudeId } from "./infra/db";
 import {
   buildSalvageReply,
@@ -375,7 +376,11 @@ export async function startBot(token: string): Promise<void> {
         const result = await sessionManager.sendMessage(
           threadId,
           messageText,
-          attachments
+          attachments,
+          // Issue #12: when a dialog slips past auto-accept or the relay
+          // stalls on an unknown dialog, page the user on this thread (+
+          // best-effort Pushover) with the tmux session to attach to.
+          { onDialogStuck: buildDialogStuckHandler(thread) }
         );
 
         console.log(`[Bot] Got ${result.chunks.length} chunks, error: ${result.error ?? "none"}`);

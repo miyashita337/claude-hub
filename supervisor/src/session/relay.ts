@@ -6,7 +6,9 @@ import { persistAttachments } from "./attachment-store";
 import { TMUX_PATH, TMUX_ARGS } from "./tmux";
 import { createLatencyTracker } from "./latency-logger";
 import { startDialogWatchdog } from "./dialog-watchdog";
-import type { DialogMatch } from "./dialog-detect";
+import { scheduleStallHeartbeat } from "./stall-heartbeat";
+import { createPageOnce } from "./dialog-stuck-handler";
+import type { DialogStuckInfo } from "./dialog-stuck-handler";
 import { ATTACHMENT_DIR } from "./gc-attachments";
 
 /** How long to wait for Claude Code Stop hook to fire (ms) */
@@ -154,13 +156,17 @@ export interface RelayMessageOptions {
    */
   persistDir?: string;
   /**
-   * Called when the watchdog has exhausted its auto-accept budget for a
-   * dialog and the user must intervene manually. The callback typically
-   * posts a `ダイアログ検出: <kind>、手動操作要求` heartbeat to the
-   * Discord thread so the user knows the relay is paused. Errors thrown
-   * by the callback are caught and logged — they never block the relay.
+   * Called when the relay is stuck waiting for the user. Two triggers:
+   *  - the dialog watchdog exhausted its auto-accept budget for a *known*
+   *    dialog family (`kind` = detected DialogKind), or
+   *  - no response arrived within the stall threshold and no known dialog
+   *    matched — an *unknown* dialog (`kind: "stall"`).
+   * The callback typically posts a heartbeat to the Discord thread and pages
+   * Pushover so the user can `tmux attach`. Errors thrown by the callback are
+   * caught and logged — they never block the relay. Fired at most once per
+   * relay turn.
    */
-  onDialogStuck?: (match: DialogMatch) => void | Promise<void>;
+  onDialogStuck?: (info: DialogStuckInfo) => void | Promise<void>;
 }
 
 export async function relayMessage(
@@ -258,15 +264,51 @@ export async function relayMessage(
   // して観測する設計と一致)。
   tracker.markStart("d_e_c");
 
+  // Issue #12: page the user at most once per relay turn. Two independent
+  // triggers can fire — the watchdog (known dialog, ~10s) and the stall timer
+  // (unknown dialog, 3min). For a persistent *known* dialog both would
+  // otherwise fire, double-posting to Discord and risking a Pushover
+  // rate-limit. `createPageOnce` collapses them to a single page; the first
+  // trigger wins (the watchdog reports the precise dialog kind when it can).
+  const pageOnce = createPageOnce(options?.onDialogStuck);
+
   // Issue #57: Start the dialog watchdog *during* the wait. Stops in
   // finally so a thrown error or early return path can never leak the
-  // setInterval handle. onHeartbeat is wired through to the caller; if
-  // they didn't supply onDialogStuck we still log to stderr so the dialog
-  // surfaces in supervisor logs (the Pushover / Discord heartbeat path is
-  // the optional consumer per `rules/general/observability.md`).
+  // timer handle. The watchdog's DialogMatch is adapted to DialogStuckInfo
+  // (adding tmuxSessionName so the heartbeat can tell the user which session
+  // to `tmux attach`). If the caller supplied no onDialogStuck we still log
+  // to stderr inside the watchdog so the dialog surfaces in supervisor logs.
   const watchdog = startDialogWatchdog({
     tmuxSessionName,
-    onHeartbeat: options?.onDialogStuck,
+    onHeartbeat: options?.onDialogStuck
+      ? (match) =>
+          pageOnce({
+            kind: match.kind,
+            line: match.line,
+            tmuxSessionName,
+          })
+      : undefined,
+  });
+
+  // Issue #12 (Journey AC #2): the watchdog only fires for *known* dialog
+  // families. An unknown dialog leaves the relay waiting silently. This
+  // one-shot stall timer is the final defense — it pages the user once if no
+  // response arrives within the stall threshold, then the relay keeps waiting
+  // up to RELAY_TIMEOUT_MS. Cancelled in finally as soon as we resolve.
+  const stall = scheduleStallHeartbeat({
+    fire: () => {
+      // Always surface the stall in supervisor logs: when no onDialogStuck
+      // handler is registered pageOnce is a silent no-op, so without this the
+      // 3-min stall would never appear anywhere observable (gemini #195).
+      console.warn(
+        `[Relay] session ${tmuxSessionName} stalled: no response within stall threshold`
+      );
+      return pageOnce({
+        kind: "stall",
+        line: "no response within stall threshold",
+        tmuxSessionName,
+      });
+    },
   });
 
   let result: RelayResult;
@@ -274,6 +316,7 @@ export async function relayMessage(
     result = await waitForRelay(threadId, RELAY_TIMEOUT_MS);
   } finally {
     watchdog.stop();
+    stall.cancel();
   }
   tracker.markEnd("d_e_c");
   if (result.error) {
