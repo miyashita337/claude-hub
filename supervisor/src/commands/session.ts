@@ -199,7 +199,7 @@ async function handleStart(
 
     // Start the session with the thread ID — runs claude in a per-branch
     // worktree (Issue #154).
-    const session = sessionManager.start(config, thread.id, branch);
+    const session = await sessionManager.start(config, thread.id, branch);
 
     // Post welcome message in the thread
     const locationLine = session.worktree

@@ -1,16 +1,15 @@
 import { execFileSync } from "child_process";
 import { resolve } from "path";
-import { homedir } from "os";
-import { mkdirSync, writeFileSync, unlinkSync } from "fs";
+import { mkdirSync, writeFileSync } from "fs";
 import { waitForRelay, type RelayResult } from "./relay-server";
+import { persistAttachments } from "./attachment-store";
 import { TMUX_PATH, TMUX_ARGS } from "./tmux";
 import { createLatencyTracker } from "./latency-logger";
 import { startDialogWatchdog } from "./dialog-watchdog";
 import { scheduleStallHeartbeat } from "./stall-heartbeat";
 import { createPageOnce } from "./dialog-stuck-handler";
 import type { DialogStuckInfo } from "./dialog-stuck-handler";
-
-const ATTACHMENT_DIR = resolve(homedir(), "claude-hub", "tmp", "attachments");
+import { ATTACHMENT_DIR } from "./gc-attachments";
 
 /** How long to wait for Claude Code Stop hook to fire (ms) */
 const RELAY_TIMEOUT_MS = 5 * 60_000;
@@ -148,6 +147,15 @@ export async function tmuxSend(sessionName: string, extraArgs: string[]): Promis
 export interface RelayMessageOptions {
   attachments?: AttachmentInfo[];
   /**
+   * Project directory of the session (the claude cwd). When provided,
+   * downloaded attachments are also persisted under
+   * `<persistDir>/.claude/discord-materials/<threadId>/` and Claude is handed
+   * the persistent path instead of the ephemeral tmp path (Issue #152). The
+   * tmp copy is still cleaned up after 5 min; the persistent copy survives so
+   * "material screenshots" remain readable for the whole task.
+   */
+  persistDir?: string;
+  /**
    * Called when the relay is stuck waiting for the user. Two triggers:
    *  - the dialog watchdog exhausted its auto-accept budget for a *known*
    *    dialog family (`kind` = detected DialogKind), or
@@ -156,7 +164,7 @@ export interface RelayMessageOptions {
    * The callback typically posts a heartbeat to the Discord thread and pages
    * Pushover so the user can `tmux attach`. Errors thrown by the callback are
    * caught and logged — they never block the relay. Fired at most once per
-   * trigger per relay turn.
+   * relay turn.
    */
   onDialogStuck?: (info: DialogStuckInfo) => void | Promise<void>;
 }
@@ -182,7 +190,13 @@ export async function relayMessage(
     }
 
     if (localFiles.length > 0) {
-      const imageInstructions = localFiles
+      // Issue #152: hand Claude the persistent project-asset paths (when a
+      // persistDir is known) so the materials survive past the 5-min tmp
+      // cleanup. Falls back to the tmp paths per-file if persistence fails.
+      const claudeFiles = options.persistDir
+        ? await persistAttachments(localFiles, options.persistDir, threadId)
+        : localFiles;
+      const imageInstructions = claudeFiles
         .map((f) => `Read the image at ${f}`)
         .join(", and ");
       fullMessage = `${imageInstructions}. ${message}`;
@@ -231,7 +245,6 @@ export async function relayMessage(
     tracker.markEnd("b");
     tracker.setError("b");
     tracker.flush();
-    scheduleCleanup(localFiles, 5 * 60_000);
     return {
       text: "",
       chunks: [`⚠️ Claude Code へのメッセージ送信に失敗: ${err}`],
@@ -283,12 +296,19 @@ export async function relayMessage(
   // response arrives within the stall threshold, then the relay keeps waiting
   // up to RELAY_TIMEOUT_MS. Cancelled in finally as soon as we resolve.
   const stall = scheduleStallHeartbeat({
-    fire: () =>
-      pageOnce({
+    fire: () => {
+      // Always surface the stall in supervisor logs: when no onDialogStuck
+      // handler is registered pageOnce is a silent no-op, so without this the
+      // 3-min stall would never appear anywhere observable (gemini #195).
+      console.warn(
+        `[Relay] session ${tmuxSessionName} stalled: no response within stall threshold`
+      );
+      return pageOnce({
         kind: "stall",
         line: "no response within stall threshold",
         tmuxSessionName,
-      }),
+      });
+    },
   });
 
   let result: RelayResult;
@@ -304,22 +324,10 @@ export async function relayMessage(
   }
   tracker.flush();
 
-  scheduleCleanup(localFiles, 5 * 60_000);
+  // Note: downloaded attachments are intentionally NOT deleted here. They used
+  // to be unlinked 5 minutes after each relay, which made material screenshots
+  // vanish between sessions (Issue #151). They now persist in ATTACHMENT_DIR and
+  // are swept only by age via gc-attachments (com.claude-hub.gc-attachments,
+  // daily, 30-day retention).
   return result;
-}
-
-/**
- * Schedule file cleanup after a delay.
- */
-function scheduleCleanup(files: string[], delayMs: number): void {
-  if (files.length === 0) return;
-  setTimeout(() => {
-    for (const filePath of files) {
-      try {
-        unlinkSync(filePath);
-      } catch {
-        // Ignore
-      }
-    }
-  }, delayMs);
 }

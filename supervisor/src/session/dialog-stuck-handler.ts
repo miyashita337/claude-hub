@@ -43,7 +43,9 @@ function buildMessage(info: DialogStuckInfo): string {
     // SUPERVISOR_TMUX_SOCKET is customised (TMUX_SOCKET is validated in tmux.ts).
     `tmux -L ${TMUX_SOCKET} attach -t ${info.tmuxSessionName}`,
     "```",
-    info.line ? `検出行: \`${info.line}\`` : "",
+    // Escape backticks so a captured terminal line can't break out of the
+    // Discord inline code span (the line is arbitrary TUI output).
+    info.line ? `検出行: \`${info.line.replace(/`/g, "'")}\`` : "",
   ]
     .filter(Boolean)
     .join("\n");
@@ -70,8 +72,11 @@ export function buildDialogStuckHandler(
     // throws (the relay loop must not break on a paging error). `.then` wraps
     // pushover so an injected impl that throws synchronously is also caught.
     await Promise.all([
-      thread
-        .send(message)
+      // `.then` wraps send() so a synchronous throw (not just a rejected
+      // promise) is also caught here and can never escape Promise.all — the
+      // handler's "never throws" contract must hold for the relay loop.
+      Promise.resolve()
+        .then(() => thread.send(message))
         .catch((err) =>
           console.warn("[DialogStuck] failed to post Discord heartbeat:", err)
         ),

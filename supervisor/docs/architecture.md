@@ -20,6 +20,7 @@ Issue #13 で評価した 20 通り（A-T）のうち、以下の **A + B + G** 
 | 中間進捗表示 | **PostToolUse hook → HTTP POST → Supervisor `/progress`** | `hooks/progress-relay.sh` |
 | パーミッションデッドロック回避 | **PermissionRequest hook で自動承認** + Supervisor セッションは `--dangerously-skip-permissions` を常時付与（`manager.ts:130`） | `hooks/auto-approve-permission.sh` + `src/session/manager.ts` |
 | 画像添付 (Discord → Claude) | Discord 画像を `~/claude-hub/tmp/attachments` に DL → メッセージ本文先頭に `Read the image at <path>` を連結して `tmux send-keys` で注入 | `src/session/relay.ts` (`downloadAttachment` + `relayMessage`) |
+| 添付ファイルのライフサイクル | `~/claude-hub/tmp/attachments` に DL したファイルは **30 日保持**（Issue #151, 案B）。以前は relay 完了の 5 分後に削除していたためセッションを跨ぐと素材が消えていた。現在は age ベースで日次 GC するのみ（削除ごとに warning ログ）。GC: `src/session/gc-attachments.ts`（`bun run` 可）/ 日次起動: `com.claude-hub.gc-attachments.plist` | `src/session/gc-attachments.ts` |
 | ファイル添付 (Claude → Discord) | Claude の応答からファイルパスを抽出し Discord にアップロード | `src/session/file-attacher.ts` |
 
 ## メッセージフロー
