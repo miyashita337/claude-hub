@@ -168,6 +168,17 @@ export class SessionManager {
   private sessions = new Map<string, SessionInfo>();
   /** Map<threadId, intervalHandle> — watchdogs to clear on stop/shutdown */
   private watchers = new Map<string, ReturnType<typeof setInterval>>();
+  /**
+   * threadIds with a start currently in flight (review #185 gemini HIGH).
+   * Since {@link start} is async (it awaits the PID poll), the dup-check and
+   * MAX_SESSIONS guard could otherwise be bypassed by a second concurrent
+   * start() interleaving at the await before the first reaches
+   * `this.sessions.set`. Registered synchronously before any await and released
+   * in `finally`, so on the single-threaded event loop a racing start of the
+   * same thread — or one that would exceed MAX_SESSIONS — is rejected
+   * deterministically (TOCTOU; mirrors resumeSession's single-flight lock).
+   */
+  private readonly pendingStarts = new Set<string>();
   private readonly effects: SessionEffects;
   private readonly gracefulKillTimeoutMs: number;
   private readonly resumePromptPollAttempts: number;
@@ -265,14 +276,17 @@ export class SessionManager {
     threadId: string,
     branch?: string
   ): Promise<SessionInfo> {
-    // WARNING: start() が async 化されたため、PIDポールの await 待ちの間に
-    // 同一 threadId に対する重複起動や最大数超過の割り込みが発生する可能性があります。
-    // TODO: pendingStarts 等を用いて、await 前に同期的に起動中状態をロックする仕組みを導入してください。
-    if (this.sessions.size >= MAX_SESSIONS) {
+    // Single-flight guard (review #185 gemini HIGH): start() is async (awaits
+    // the PID poll below), so these checks must not be bypassed by a second
+    // concurrent start() interleaving at the await before `this.sessions.set`
+    // runs. Count pendingStarts in both guards and register threadId
+    // synchronously (before any await), releasing in finally — mirrors
+    // resumeSession's single-flight lock.
+    if (this.sessions.size + this.pendingStarts.size >= MAX_SESSIONS) {
       throw new Error(`最大セッション数 (${MAX_SESSIONS}) に達しています`);
     }
 
-    if (this.sessions.has(threadId)) {
+    if (this.sessions.has(threadId) || this.pendingStarts.has(threadId)) {
       throw new Error(`このスレッドのセッションは既に稼働中です`);
     }
 
@@ -282,6 +296,26 @@ export class SessionManager {
       );
     }
 
+    this.pendingStarts.add(threadId);
+    try {
+      return await this.launchStart(config, threadId, branch);
+    } finally {
+      this.pendingStarts.delete(threadId);
+    }
+  }
+
+  /**
+   * Internal: worktree resolution + tmux launch + state registration for a
+   * start, run under the pendingStarts single-flight lock held by {@link start}.
+   * Split out so the lock acquire/release stays a thin, readable wrapper. Every
+   * guard (MAX_SESSIONS, thread/pending collision, projectDir existence) is
+   * enforced by the caller before this runs.
+   */
+  private async launchStart(
+    config: ChannelConfig,
+    threadId: string,
+    branch?: string
+  ): Promise<SessionInfo> {
     // Issue #154: resolve the effective cwd. With a branch, create/reuse a
     // worktree (Q1/Q2/Q4 in worktree.ts); failures propagate so the caller can
     // report them rather than starting claude in the wrong directory.
@@ -392,6 +426,11 @@ export class SessionManager {
     };
 
     this.sessions.set(threadId, info);
+    // Hand off from pendingStarts → sessions: now that the session is real, the
+    // MAX_SESSIONS / dup guards count it via `this.sessions`, so drop the
+    // pending marker to avoid double-counting (start()'s finally is the
+    // error-path safety net; delete is idempotent).
+    this.pendingStarts.delete(threadId);
 
     insertSession({
       id: sessionId,

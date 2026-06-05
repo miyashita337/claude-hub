@@ -400,12 +400,37 @@ describe("SessionManager worktree integration (#154)", () => {
   });
 
   test("AC-6: two branches start in parallel as independent worktrees", async () => {
-    const a = await manager.start(config, "thread-a", "feat-a");
-    const b = await manager.start(config, "thread-b", "feat-b");
+    // Start concurrently (review #185 coderabbit): launching both with
+    // Promise.all exercises the real interleaving at start()'s PID-poll await,
+    // so the pendingStarts single-flight lock (distinct threadIds → both
+    // succeed; same threadId → one rejects) is actually verified rather than
+    // serialised away by sequential awaits.
+    const [a, b] = await Promise.all([
+      manager.start(config, "thread-a", "feat-a"),
+      manager.start(config, "thread-b", "feat-b"),
+    ]);
 
     expect(a.worktree?.path).toBe(`${config.dir}/.claude/worktrees/feat-a`);
     expect(b.worktree?.path).toBe(`${config.dir}/.claude/worktrees/feat-b`);
     expect(manager.count()).toBe(2);
+  });
+
+  test("AC-6b: concurrent starts on the SAME thread reject the duplicate (review #185 gemini HIGH)", async () => {
+    // The pendingStarts lock must reject a racing second start() for the same
+    // threadId even when it interleaves at the PID-poll await — otherwise the
+    // async start() bypasses the duplicate-session guard (TOCTOU).
+    const results = await Promise.allSettled([
+      manager.start(config, "thread-dup", "feat-x"),
+      manager.start(config, "thread-dup", "feat-x"),
+    ]);
+    const fulfilled = results.filter((r) => r.status === "fulfilled");
+    const rejected = results.filter((r) => r.status === "rejected");
+    expect(fulfilled).toHaveLength(1);
+    expect(rejected).toHaveLength(1);
+    expect((rejected[0] as PromiseRejectedResult).reason.message).toMatch(
+      /既に稼働中/
+    );
+    expect(manager.count()).toBe(1);
   });
 
   test("a worktree creation failure aborts start and propagates", async () => {
