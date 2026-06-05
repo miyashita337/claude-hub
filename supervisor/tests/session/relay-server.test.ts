@@ -6,9 +6,12 @@ import {
   getRelayPort,
   onLateResponse,
   onProgress,
+  onSessionsQuery,
   type LateResponseEvent,
   type ProgressEvent,
 } from "../../src/session/relay-server";
+import { MAX_SESSIONS } from "../../src/config/channels";
+import type { SessionHealthInfo } from "../../src/session/types";
 
 describe("relay-server", () => {
   afterEach(() => {
@@ -232,5 +235,87 @@ describe("relay-server", () => {
       body: JSON.stringify({ tool: "Bash", message: "hi" }),
     });
     expect(res.status).toBe(400);
+  });
+
+  // Issue #78 (AC-4): GET /health/sessions exposes a read-only snapshot of
+  // running sessions so an E2E harness can verify the thread → tmux mapping.
+  test("GET /health/sessions returns empty list (200) when no provider registered", async () => {
+    startRelayServer();
+    const port = getRelayPort();
+
+    const res = await fetch(`http://localhost:${port}/health/sessions`);
+    expect(res.status).toBe(200);
+    const body = (await res.json()) as {
+      count: number;
+      max: number;
+      sessions: SessionHealthInfo[];
+    };
+    expect(body).toEqual({ count: 0, max: MAX_SESSIONS, sessions: [] });
+  });
+
+  test("GET /health/sessions returns the registered provider's snapshot", async () => {
+    startRelayServer();
+    const port = getRelayPort();
+
+    const snapshot: SessionHealthInfo[] = [
+      {
+        threadId: "1234567890123456789",
+        tmuxSession: "claude-123456789012",
+        channelName: "channel-primary",
+        status: "running",
+        startedAt: "2026-06-05T00:00:00.000Z",
+        lastActivityAt: "2026-06-05T00:01:00.000Z",
+      },
+    ];
+    onSessionsQuery(() => snapshot);
+
+    const res = await fetch(`http://localhost:${port}/health/sessions`);
+    expect(res.status).toBe(200);
+    const body = (await res.json()) as {
+      count: number;
+      max: number;
+      sessions: SessionHealthInfo[];
+    };
+    expect(body.count).toBe(1);
+    expect(body.max).toBe(MAX_SESSIONS);
+    expect(body.sessions).toEqual(snapshot);
+    // AC-4: the tmux session name follows claude-<threadId[..12]>.
+    expect(body.sessions[0]!.tmuxSession).toBe(
+      `claude-${snapshot[0]!.threadId.slice(0, 12)}`,
+    );
+  });
+
+  test("GET /health/sessions provider is cleared on stopRelayServer (no leak across restarts)", async () => {
+    startRelayServer();
+    onSessionsQuery(() => [
+      {
+        threadId: "leaky",
+        tmuxSession: "claude-leaky",
+        channelName: "c",
+        status: "running",
+        startedAt: "2026-06-05T00:00:00.000Z",
+        lastActivityAt: "2026-06-05T00:00:00.000Z",
+      },
+    ]);
+    stopRelayServer();
+
+    // Restart without re-registering — must fall back to the empty default.
+    startRelayServer();
+    const port = getRelayPort();
+    const res = await fetch(`http://localhost:${port}/health/sessions`);
+    const body = (await res.json()) as { count: number };
+    expect(body.count).toBe(0);
+  });
+
+  test("POST /health/sessions is not a valid route (falls through to 404)", async () => {
+    startRelayServer();
+    const port = getRelayPort();
+
+    const res = await fetch(`http://localhost:${port}/health/sessions`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({}),
+    });
+    expect(res.status).toBe(404);
   });
 });

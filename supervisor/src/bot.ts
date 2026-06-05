@@ -20,7 +20,7 @@ import {
   buildSalvageReply,
   buildStatusReply,
 } from "./session/status-reply";
-import { onProgress, onLateResponse } from "./session/relay-server";
+import { onProgress, onLateResponse, onSessionsQuery } from "./session/relay-server";
 import {
   extractFilePaths,
   collectAttachableFiles,
@@ -136,6 +136,11 @@ export async function startBot(token: string): Promise<void> {
         message: event.message,
       });
     });
+
+    // Issue #78 (AC-4): back the read-only GET /health/sessions endpoint with a
+    // live snapshot of the manager's in-memory sessions so an E2E harness can
+    // verify the thread → tmux session mapping without host access.
+    onSessionsQuery(() => sessionManager.sessionsHealth());
 
     // Register late-response callback: when a Stop hook POST arrives after
     // the initial relay already resolved (e.g. Monitor/background-task split
