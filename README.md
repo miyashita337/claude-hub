@@ -48,7 +48,8 @@ bun run supervisor/src/session/gc-attachments.ts
 
 # 日次自動 GC を常駐化 (04:00 実行)。logs/ が無ければ先に作成する
 mkdir -p ~/claude-hub/logs
-cp com.claude-hub.gc-attachments.plist ~/Library/LaunchAgents/
+# plist 内の /Users/YOUR_USER プレースホルダを $HOME に置換して配置する
+sed "s|/Users/YOUR_USER|$HOME|g" com.claude-hub.gc-attachments.plist > ~/Library/LaunchAgents/com.claude-hub.gc-attachments.plist
 launchctl load ~/Library/LaunchAgents/com.claude-hub.gc-attachments.plist
 
 # GC ログ確認 (削除実績の consumer)

@@ -9,26 +9,29 @@
     <!--
       Daily garbage-collection of ~/claude-hub/tmp/attachments.
       Deletes Discord attachment files older than 30 days (Issue #151, 案B).
+      Paths use a /Users/YOUR_USER placeholder; substitute $HOME on install so
+      the job works on any machine (gc-attachments.ts itself resolves paths via
+      os.homedir()).
       Install (logs/ must exist first, or launchd fails to spawn the job):
         mkdir -p ~/claude-hub/logs
-        cp com.claude-hub.gc-attachments.plist ~/Library/LaunchAgents/
+        sed "s|/Users/YOUR_USER|$HOME|g" com.claude-hub.gc-attachments.plist > ~/Library/LaunchAgents/com.claude-hub.gc-attachments.plist
         launchctl load ~/Library/LaunchAgents/com.claude-hub.gc-attachments.plist
     -->
 
     <key>ProgramArguments</key>
     <array>
-        <string>/Users/harieshokunin/.bun/bin/bun</string>
+        <string>/Users/YOUR_USER/.bun/bin/bun</string>
         <string>run</string>
-        <string>/Users/harieshokunin/claude-hub/supervisor/src/session/gc-attachments.ts</string>
+        <string>/Users/YOUR_USER/claude-hub/supervisor/src/session/gc-attachments.ts</string>
     </array>
 
     <key>WorkingDirectory</key>
-    <string>/Users/harieshokunin/claude-hub/supervisor</string>
+    <string>/Users/YOUR_USER/claude-hub/supervisor</string>
 
     <key>EnvironmentVariables</key>
     <dict>
         <key>PATH</key>
-        <string>/Users/harieshokunin/.local/bin:/Users/harieshokunin/.bun/bin:/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin</string>
+        <string>/Users/YOUR_USER/.local/bin:/Users/YOUR_USER/.bun/bin:/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin</string>
     </dict>
 
     <!-- Run once a day at 04:00 local time. -->
@@ -41,9 +44,9 @@
     </dict>
 
     <key>StandardOutPath</key>
-    <string>/Users/harieshokunin/claude-hub/logs/gc-attachments.stdout.log</string>
+    <string>/Users/YOUR_USER/claude-hub/logs/gc-attachments.stdout.log</string>
     <key>StandardErrorPath</key>
-    <string>/Users/harieshokunin/claude-hub/logs/gc-attachments.stderr.log</string>
+    <string>/Users/YOUR_USER/claude-hub/logs/gc-attachments.stderr.log</string>
 
     <key>Nice</key>
     <integer>10</integer>
