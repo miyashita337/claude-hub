@@ -25,11 +25,18 @@ BACKOFF_SEC=5
 # message into LAST_MSG_TS_FILE; the watchdog below kills the session once it
 # has been idle for HIJOGUCHI_IDLE_RESET_MIN minutes so the next message starts
 # from a fresh context. Set the threshold to 0 to opt out entirely.
-HIJOGUCHI_IDLE_RESET_MIN="${HIJOGUCHI_IDLE_RESET_MIN:-60}"
+HIJOGUCHI_IDLE_RESET_MIN="${HIJOGUCHI_IDLE_RESET_MIN:-1440}"
 # How often the watchdog re-checks idle / session liveness. Kept short (10s) so
 # crash-restart latency is unchanged; the idle decision is threshold-based, not
 # poll-count based, so a small poll only bounds reset latency, not its timing.
 HIJOGUCHI_IDLE_POLL_SEC="${HIJOGUCHI_IDLE_POLL_SEC:-10}"
+# Guard against a blank / non-numeric override: an invalid value would make the
+# watchdog `sleep` fail and (without set -e) spin the loop into a 100% CPU busy
+# loop. Fall back to 10s on anything that is not a positive integer.
+if ! [[ "${HIJOGUCHI_IDLE_POLL_SEC}" =~ ^[1-9][0-9]*$ ]]; then
+  echo "[hijoguchi] WARN: invalid HIJOGUCHI_IDLE_POLL_SEC='${HIJOGUCHI_IDLE_POLL_SEC}', using 10" >&2
+  HIJOGUCHI_IDLE_POLL_SEC=10
+fi
 CLAUDE_HUB_STATE_DIR="${CLAUDE_HUB_STATE_DIR:-${HOME}/.claude-hub-state}"
 LAST_MSG_TS_FILE="${LAST_MSG_TS_FILE:-${CLAUDE_HUB_STATE_DIR}/last-message-ts}"
 
@@ -195,7 +202,24 @@ fi
 # re-parses back to the exact same argv — prompt content with $VAR, backticks,
 # or quotes cannot leak into command evaluation, and CLAUDE_BIN paths with
 # spaces remain intact.
-CLAUDE_CMD=$(printf '%q ' "${CLAUDE_ARGV[@]}")
+# Inject the activity-tracking context with an explicit `env` prefix rather than
+# relying on `export` + tmux inheritance. When a tmux server is ALREADY running
+# (this script uses the default socket, which commonly pre-exists), `tmux
+# new-session` spawns the pane from the *server's* cached environment, so a
+# freshly-exported var does not reach the claude process or its UserPromptSubmit
+# hook — the hook would then always skip and the idle timer would never warm,
+# resetting the session on a fixed schedule regardless of activity. `env` sets
+# the vars on the claude process directly, independent of server state.
+CLAUDE_CMD=$(printf 'env CLAUDE_HUB_HIJOGUCHI_SESSION=1 CLAUDE_HUB_STATE_DIR=%q LAST_MSG_TS_FILE=%q ' \
+  "${CLAUDE_HUB_STATE_DIR}" "${LAST_MSG_TS_FILE}")
+CLAUDE_CMD+=$(printf '%q ' "${CLAUDE_ARGV[@]}")
+
+# Opt-in introspection for tests: print the fully-built launch command (incl.
+# the env prefix) and exit before any tmux / filesystem side effect.
+if [ "${HIJOGUCHI_PRINT_CMD:-0}" = "1" ]; then
+  printf '%s\n' "${CLAUDE_CMD}"
+  exit 0
+fi
 
 # Create log dir only for real launches. Deferred past render-only / print-argv
 # so tests don't create directories as a side effect.
@@ -206,11 +230,13 @@ trap 'echo "[hijoguchi] SIGTERM received, killing tmux session" >&2; "${TMUX_BIN
 
 echo "[hijoguchi] watchdog starting at $(date)" >&2
 
-# Surface the activity-tracking context to the in-session UserPromptSubmit hook
-# (scripts/hijoguchi-record-activity.sh). The marker scopes the hook to THIS
-# session, so a developer who runs `claude` in ~/claude-hub doesn't keep the
-# idle timer warm. tmux and claude inherit this environment and the hook runs
-# as a grandchild process, so the exports propagate down to it.
+# The activity-tracking context is propagated to the in-session
+# UserPromptSubmit hook (scripts/hijoguchi-record-activity.sh) via the explicit
+# `env` prefix baked into CLAUDE_CMD above — NOT via these exports, because tmux
+# does not reliably inherit a freshly-exported var when the server pre-exists
+# (see the CLAUDE_CMD comment). The exports remain as harmless defense-in-depth
+# for the fresh-server case; the marker scopes the hook to THIS session so a
+# developer running `claude` in ~/claude-hub never warms the idle timer.
 export CLAUDE_HUB_HIJOGUCHI_SESSION=1
 export CLAUDE_HUB_STATE_DIR
 export LAST_MSG_TS_FILE

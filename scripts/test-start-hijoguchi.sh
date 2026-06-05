@@ -371,6 +371,20 @@ t33_hook_noop_without_marker() {
   [ ! -f "${f}" ]
 }
 
+# Launch command injects the activity-tracking env via an explicit `env` prefix
+# (not export), so it survives a pre-existing tmux server (gemini HIGH #192).
+t34_launch_cmd_has_env_prefix() {
+  HIJOGUCHI_PRINT_CMD=1 bash "${TARGET}" 2>/dev/null \
+    | grep -Eq 'env CLAUDE_HUB_HIJOGUCHI_SESSION=1 CLAUDE_HUB_STATE_DIR=.* LAST_MSG_TS_FILE='
+}
+
+# Invalid HIJOGUCHI_IDLE_POLL_SEC falls back to 10 with a warning instead of
+# spinning a busy loop (gemini MEDIUM #192).
+t35_invalid_poll_sec_falls_back() {
+  HIJOGUCHI_IDLE_POLL_SEC=abc HIJOGUCHI_PRINT_CMD=1 bash "${TARGET}" 2>&1 >/dev/null \
+    | grep -Fq "invalid HIJOGUCHI_IDLE_POLL_SEC"
+}
+
 run "T1 channel ID expanded"          t1_channel_id_expanded
 run "T2 no residual {{}} tokens"      t2_no_residual_tokens
 run "T3 env override works"           t3_env_override
@@ -404,6 +418,8 @@ run "T30 corrupt stamp keeps"         t30_corrupt_stamp_keeps
 run "T31 boundary resets"             t31_boundary_resets
 run "T32 hook writes in session"      t32_hook_writes_when_in_session
 run "T33 hook no-op without marker"   t33_hook_noop_without_marker
+run "T34 launch cmd has env prefix"   t34_launch_cmd_has_env_prefix
+run "T35 invalid poll sec falls back" t35_invalid_poll_sec_falls_back
 
 if [ "${fail}" -eq 0 ]; then
   echo "ALL TESTS PASSED"
