@@ -33,6 +33,12 @@ function makeInteraction(opts: {
   resumableRow?: ResumableRow | undefined;
   resumeImpl?: (...args: unknown[]) => unknown;
   sendImpl?: () => unknown;
+  /**
+   * Issue #171: the handler now keys the "already running" guard on the
+   * authoritative liveness verdict, not the DB `status` column. Defaults to
+   * "dead" so legacy stopped-row tests keep passing.
+   */
+  liveness?: "alive" | "dead" | "unknown";
 }) {
   const replies: ReplyRecord[] = [];
   const resumeCalls: unknown[][] = [];
@@ -88,6 +94,7 @@ function makeInteraction(opts: {
   const sessionManager = {
     count: () => 0,
     listRunningByChannel: () => [],
+    livenessOfClaudeSession: () => opts.liveness ?? "dead",
     findResumableSession: (id: string) => {
       findCalls.push(id);
       return opts.resumableRow;
@@ -172,10 +179,11 @@ describe("/session resume validation (#161)", () => {
     expect(h.replies[0]!.content).toContain("agent-base");
   });
 
-  test("session already running → warns, no resume", async () => {
+  test("session genuinely alive (liveness=alive) → warns, no resume (#171 穴 A)", async () => {
     const h = makeInteraction({
       sessionId: VALID_ID,
       channelName: "team-salary",
+      liveness: "alive",
       resumableRow: {
         channel_name: "team-salary",
         project_dir: "/Users/x/team_salary",
@@ -185,6 +193,24 @@ describe("/session resume validation (#161)", () => {
     await h.run();
     expect(h.resumeCalls).toHaveLength(0);
     expect(h.replies[0]!.content).toContain("既に稼働中");
+  });
+
+  test("stale status='running' but liveness=dead → resume proceeds (#171 穴 A)", async () => {
+    // The DB row still says running (process died without a clean stop), but the
+    // authoritative liveness verdict is dead — the handler must NOT block resume.
+    const h = makeInteraction({
+      sessionId: VALID_ID,
+      channelName: "team-salary",
+      liveness: "dead",
+      resumableRow: {
+        channel_name: "team-salary",
+        project_dir: "/Users/x/team_salary",
+        status: "running",
+      },
+    });
+    await h.run();
+    expect(h.threadCreated).toBe(true);
+    expect(h.resumeCalls).toHaveLength(1);
   });
 
   test("valid stopped session → resumeSession called with project_dir, thread created", async () => {

@@ -82,6 +82,46 @@ describe("detectDialog — Claude Code TUI dialogs", () => {
     expect(result!.autoAcceptable).toBe(true);
   });
 
+  // Issue #153: Claude Code's feedback satisfaction survey ("How is Claude
+  // doing this session?") renders as a numbered-choice lookalike but the
+  // numeric options (1: Bad / 2: Fine / 3: Good) are *survey answers* with
+  // side effects, not a Yes/Continue confirmation. Sending `1` would submit
+  // negative feedback. We auto-press `0` (Dismiss) instead. This must be
+  // detected as its own kind so AUTO_ACCEPT_KEYS picks `0`, never `1`.
+  test("detects feedback survey: 'How is Claude doing this session?'", () => {
+    const pane = [
+      "⎿  API Error: Claude Code is unable to respond to this request, which appears to violate our Usage Policy",
+      "   Request ID: req_011CbJu5U5eDtnPErMPtpnXP",
+      "",
+      "● How is Claude doing this session? (optional)",
+      "  1: Bad    2: Fine   3: Good   0: Dismiss",
+    ].join("\n");
+    const result = detectDialog(pane);
+    expect(result).not.toBeNull();
+    expect(result!.kind).toBe("feedback-survey");
+    expect(result!.autoAcceptable).toBe(true);
+  });
+
+  test("feedback survey takes priority over numbered-choice (never sends 1)", () => {
+    // The survey's `0: Dismiss` line resembles a numbered choice. Ensure the
+    // detector classifies it as feedback-survey so AUTO_ACCEPT sends `0`.
+    const pane = [
+      "● How is Claude doing this session? (optional)",
+      "  1: Bad    2: Fine   3: Good   0: Dismiss",
+    ].join("\n");
+    const result = detectDialog(pane);
+    expect(result!.kind).toBe("feedback-survey");
+    expect(AUTO_ACCEPT_KEYS[result!.kind]).toEqual(["0", "C-m"]);
+  });
+
+  test("does NOT match the survey question as prose without the options line", () => {
+    // The question alone (e.g. quoted in a chat message) must not trigger —
+    // we require the numbered options line with `0: Dismiss` to be present.
+    expect(
+      detectDialog("Someone asked: how is Claude doing this session?")
+    ).toBeNull();
+  });
+
   test("does NOT match prose containing 'yes' or 'no' words", () => {
     expect(detectDialog("Yes, the answer is correct.")).toBeNull();
     expect(
@@ -116,6 +156,7 @@ describe("detectDialog — Claude Code TUI dialogs", () => {
     expect(AUTO_ACCEPT_KEYS["bash-yn"]).toEqual(["y", "C-m"]);
     expect(AUTO_ACCEPT_KEYS["numbered-choice"]).toEqual(["1", "C-m"]);
     expect(AUTO_ACCEPT_KEYS["press-enter"]).toEqual(["C-m"]);
+    expect(AUTO_ACCEPT_KEYS["feedback-survey"]).toEqual(["0", "C-m"]);
   });
 });
 

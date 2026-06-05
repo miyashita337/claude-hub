@@ -179,6 +179,15 @@ export class SessionManager {
    * deterministically (TOCTOU; mirrors resumeSession's single-flight lock).
    */
   private readonly pendingStarts = new Set<string>();
+  /**
+   * claude_session_ids with a resume currently in flight (Issue #171, 穴 C).
+   * Acquired synchronously at the top of {@link resumeSession} and released in
+   * its `finally`, so on the single-threaded event loop a second near-
+   * simultaneous resume of the SAME id observes the lock and is rejected before
+   * it can launch a duplicate `claude --resume <id>` in the same cwd (which
+   * would double-write the transcript jsonl — RW-046-type corruption).
+   */
+  private readonly resumingClaudeSessions = new Set<string>();
   private readonly effects: SessionEffects;
   private readonly gracefulKillTimeoutMs: number;
   private readonly resumePromptPollAttempts: number;
@@ -242,6 +251,23 @@ export class SessionManager {
       this.tmuxSessionName(threadId)
     );
     return pidAlive && tmuxAlive ? "alive" : "dead";
+  }
+
+  /**
+   * Authoritative liveness for a claude session id (Issue #171). Resolves the
+   * most-recent row for the id (a single claude session may have several rows
+   * across start + prior resumes — the latest run is what "is it alive now"
+   * cares about) and defers to {@link livenessOf} on that row's thread.
+   *
+   * The resume guard uses this instead of the DB `status` column so a stale
+   * `status='running'` row can't block a legitimate resume (穴 A), while a
+   * genuinely-live session still rejects. Returns `unknown` when no row exists
+   * for the id (callers treat `unknown` as "not alive → resume may proceed").
+   */
+  livenessOfClaudeSession(claudeSessionId: string): Liveness {
+    const row = getSessionByClaudeSessionId(claudeSessionId);
+    if (!row || row.thread_id == null) return "unknown";
+    return this.livenessOf(row.thread_id);
   }
 
   entries(): IterableIterator<[string, SessionInfo]> {
@@ -509,6 +535,54 @@ export class SessionManager {
       );
     }
 
+    // Single-flight guard (Issue #171, 穴 C): reject a second concurrent resume
+    // of the SAME claude session id. Mutated synchronously and held across the
+    // awaits inside launchResume, so on the single-threaded event loop the
+    // second caller observes the lock and fails before launching a duplicate
+    // `claude --resume <id>` in the same cwd (RW-046-type transcript corruption).
+    if (this.resumingClaudeSessions.has(claudeSessionId)) {
+      throw new Error(
+        "この session は現在 resume 処理中です。完了までお待ちください（多重 resume 防止）。"
+      );
+    }
+    this.resumingClaudeSessions.add(claudeSessionId);
+    try {
+      // Authoritative liveness re-check UNDER the lock (Issue #171, 穴 A). The
+      // handler checks too for fast UX, but re-checking here closes the TOCTOU
+      // between the handler's check and our insert: a session that became alive
+      // (or was already alive) is rejected; a stale `status='running'` row whose
+      // process is dead is treated as dead and resume proceeds.
+      if (this.livenessOfClaudeSession(claudeSessionId) === "alive") {
+        throw new Error(
+          "この session は既に稼働中です。稼働中のスレッドで操作してください（多重 resume 防止）。"
+        );
+      }
+      return await this.launchResume(
+        config,
+        threadId,
+        claudeSessionId,
+        projectDir,
+        branch
+      );
+    } finally {
+      this.resumingClaudeSessions.delete(claudeSessionId);
+    }
+  }
+
+  /**
+   * Internal: the actual tmux launch + state registration for a resume, run
+   * under the single-flight lock held by {@link resumeSession}. Split out so the
+   * lock acquire/release and the authoritative liveness re-check stay a thin,
+   * readable wrapper. Every guard (MAX_SESSIONS, thread collision, UUID shape,
+   * projectDir existence, liveness) is enforced by the caller before this runs.
+   */
+  private async launchResume(
+    config: ChannelConfig,
+    threadId: string,
+    claudeSessionId: string,
+    projectDir: string,
+    branch?: string | null
+  ): Promise<SessionInfo> {
     const sessionId = randomUUID();
     const tmuxName = this.tmuxSessionName(threadId);
     this.effects.tmux.killSession(tmuxName);

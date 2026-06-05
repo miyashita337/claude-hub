@@ -74,6 +74,9 @@ jobs:
       - name: Install dependencies
         run: bun install --frozen-lockfile
 
+      # Curated list of deterministic, non-tmux test files. dialog-detect is
+      # pure/deterministic and gated here (#153); dialog-watchdog is wall-clock
+      # timing-flaky and stays out until de-flaked (#190).
       - name: Run tests
         env:
           SUPERVISOR_DB_PATH: ":memory:"
@@ -90,6 +93,7 @@ jobs:
                    tests/commands/session-resume.test.ts \
                    tests/hooks/stop-relay.test.ts \
                    tests/infra/db.test.ts \
+                   tests/session/dialog-detect.test.ts \
                    tests/hijoguchi-routing/p0.test.ts \
                    tests/e2e/ac-verification.test.ts
 
