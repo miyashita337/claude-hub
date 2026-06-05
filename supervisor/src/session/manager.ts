@@ -265,12 +265,9 @@ export class SessionManager {
     threadId: string,
     branch?: string
   ): Promise<SessionInfo> {
-    // Ordering guarantee (Issue #99): although start() is now async, the
-    // duplicate/limit guards below through the first `await` (the PID-poll
-    // sleep) run synchronously in one microtask, so the single-process Discord
-    // bot's event loop cannot interleave a second start() between this check
-    // and the `this.sessions.set` registration further down. No new race is
-    // introduced by the sync→async change.
+    // WARNING: start() が async 化されたため、PIDポールの await 待ちの間に
+    // 同一 threadId に対する重複起動や最大数超過の割り込みが発生する可能性があります。
+    // TODO: pendingStarts 等を用いて、await 前に同期的に起動中状態をロックする仕組みを導入してください。
     if (this.sessions.size >= MAX_SESSIONS) {
       throw new Error(`最大セッション数 (${MAX_SESSIONS}) に達しています`);
     }
