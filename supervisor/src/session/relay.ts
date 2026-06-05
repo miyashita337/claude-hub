@@ -1,15 +1,13 @@
 import { execFileSync } from "child_process";
 import { resolve } from "path";
-import { homedir } from "os";
-import { mkdirSync, writeFileSync, unlinkSync } from "fs";
+import { mkdirSync, writeFileSync } from "fs";
 import { waitForRelay, type RelayResult } from "./relay-server";
 import { persistAttachments } from "./attachment-store";
 import { TMUX_PATH, TMUX_ARGS } from "./tmux";
 import { createLatencyTracker } from "./latency-logger";
 import { startDialogWatchdog } from "./dialog-watchdog";
 import type { DialogMatch } from "./dialog-detect";
-
-const ATTACHMENT_DIR = resolve(homedir(), "claude-hub", "tmp", "attachments");
+import { ATTACHMENT_DIR } from "./gc-attachments";
 
 /** How long to wait for Claude Code Stop hook to fire (ms) */
 const RELAY_TIMEOUT_MS = 5 * 60_000;
@@ -241,7 +239,6 @@ export async function relayMessage(
     tracker.markEnd("b");
     tracker.setError("b");
     tracker.flush();
-    scheduleCleanup(localFiles, 5 * 60_000);
     return {
       text: "",
       chunks: [`⚠️ Claude Code へのメッセージ送信に失敗: ${err}`],
@@ -284,22 +281,10 @@ export async function relayMessage(
   }
   tracker.flush();
 
-  scheduleCleanup(localFiles, 5 * 60_000);
+  // Note: downloaded attachments are intentionally NOT deleted here. They used
+  // to be unlinked 5 minutes after each relay, which made material screenshots
+  // vanish between sessions (Issue #151). They now persist in ATTACHMENT_DIR and
+  // are swept only by age via gc-attachments (com.claude-hub.gc-attachments,
+  // daily, 30-day retention).
   return result;
-}
-
-/**
- * Schedule file cleanup after a delay.
- */
-function scheduleCleanup(files: string[], delayMs: number): void {
-  if (files.length === 0) return;
-  setTimeout(() => {
-    for (const filePath of files) {
-      try {
-        unlinkSync(filePath);
-      } catch {
-        // Ignore
-      }
-    }
-  }, delayMs);
 }
