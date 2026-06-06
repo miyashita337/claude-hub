@@ -133,6 +133,39 @@ export async function tmuxSend(sessionName: string, extraArgs: string[]): Promis
 }
 
 /**
+ * Type one line into the pane and submit it, without waiting for any relay
+ * response. This is the shared send sequence used by {@link relayMessage}
+ * (which then waits for the Stop-hook POST) and by fire-and-forget sends such
+ * as `/session compact` (Issue #200), where the TUI built-in does NOT POST a
+ * Stop-hook response — waiting would just burn RELAY_TIMEOUT_MS.
+ *
+ * Steps (mirrors what relayMessage has always relied on):
+ *   1. Exit any stuck tmux mode (copy-mode) so keys reach the app, not the
+ *      mode handler (Issue #73 — silent drop / `not in a mode`).
+ *   2. Escape to clear Ink TUI modal state (error/confirmation dialogs) that
+ *      would otherwise swallow the input (#33).
+ *   3. `send-keys -l <literal>` — argv-based, no shell, so backticks/$/quotes
+ *      can't corrupt long input.
+ *   4. A brief pause, then `C-m` (Enter) as a separate call — the Ink TUI can
+ *      drop an Enter sent in the same call as a long literal (#32).
+ *
+ * Newlines are flattened to spaces because `send-keys -l` would submit at the
+ * first newline.
+ */
+export async function sendToPane(
+  tmuxSessionName: string,
+  text: string
+): Promise<void> {
+  const literalText = text.replace(/\n/g, " ");
+  await ensurePaneNotInMode(tmuxSessionName);
+  await tmuxSend(tmuxSessionName, ["Escape"]);
+  await new Promise((r) => setTimeout(r, 50));
+  await tmuxSend(tmuxSessionName, ["-l", literalText]);
+  await new Promise((r) => setTimeout(r, 100));
+  await tmuxSend(tmuxSessionName, ["C-m"]);
+}
+
+/**
  * Send a message to Claude Code via tmux send-keys and wait for
  * the response via HTTP relay (Stop hook POST).
  *
@@ -209,37 +242,14 @@ export async function relayMessage(
   // 観測機構の失敗は relay 本来の処理を止めない (latency-logger.ts 参照)。
   const tracker = createLatencyTracker(tmuxSessionName);
 
-  // 2. Send via tmux send-keys using execFileSync (argv array, no shell).
-  // We issue the input and the submit as two separate calls:
-  //   (a) `send-keys -l <literal>` — tmux forwards the bytes verbatim.
-  //       Argv-based invocation avoids shell-escape hazards (backticks, $,
-  //       quotes, backslashes) that corrupted long messages in earlier builds.
-  //   (b) A brief delay, then `send-keys C-m` — Claude Code's ink-based TUI
-  //       occasionally drops `Enter` sent in the same call when the input is
-  //       long, leaving the message typed but un-submitted (issue #32).
-  //
-  // tmux server can transiently stall — typically right after a relay timed
-  // out — so each send-keys call is wrapped in a short retry. Total budget
-  // per call: 15s (tmuxSend covers transient lock waits without making the
-  // overall latency unbearable).
-  const literalText = fullMessage.replace(/\n/g, " ");
-
+  // 2. Send via tmux send-keys (mode exit + Escape + send-keys -l + C-m). The
+  // full sequence and its rationale (Issue #73 copy-mode, #33 modal clear, #32
+  // dropped Enter, argv-no-shell safety) live in sendToPane, shared with the
+  // fire-and-forget compact path (Issue #200).
   try {
-    // Segment (b): tmux 経路 (mode exit + Escape + send-keys -l + C-m)
+    // Segment (b): tmux 経路
     tracker.markStart("b");
-    // Exit any stuck tmux mode (copy-mode, view-mode) BEFORE any send-keys.
-    // A pane in copy-mode consumes keys as mode commands and silently drops
-    // the payload or yields `not in a mode` on the retry path (Issue #73).
-    await ensurePaneNotInMode(tmuxSessionName);
-    // Clear any modal state (error dialogs, confirmation prompts) in Claude
-    // Code's Ink TUI before sending input. Without this, text sent via
-    // send-keys silently disappears when the TUI is in a modal state (#33).
-    await tmuxSend(tmuxSessionName, ["Escape"]);
-    await new Promise((r) => setTimeout(r, 50));
-    await tmuxSend(tmuxSessionName, ["-l", literalText]);
-    // Small pause so the TUI finishes ingesting the text before Enter.
-    await new Promise((r) => setTimeout(r, 100));
-    await tmuxSend(tmuxSessionName, ["C-m"]);
+    await sendToPane(tmuxSessionName, fullMessage);
     tracker.markEnd("b");
   } catch (err) {
     tracker.markEnd("b");

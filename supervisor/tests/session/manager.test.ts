@@ -496,3 +496,38 @@ describe("SessionManager worktree integration (#154)", () => {
     expect(manager.has("thread-inj")).toBe(false);
   });
 });
+
+/**
+ * Issue #200: compactSession invariants that short-circuit before the real
+ * tmux send (sendToPane). The happy path is covered by the command-layer test
+ * (session-compact.test.ts) and the send sequence by relay.test.ts.
+ */
+describe("SessionManager.compactSession (#200)", () => {
+  let manager: SessionManager;
+
+  beforeEach(() => {
+    manager = new SessionManager({
+      effects: createFakeEffects(),
+      gracefulKillTimeoutMs: 0,
+    });
+  });
+
+  afterEach(async () => {
+    await manager.shutdownAll();
+  });
+
+  test("empty intent throws before any send (RW-032 hard invariant)", async () => {
+    await expect(manager.compactSession("any-thread", "")).rejects.toThrow(
+      /non-empty/
+    );
+    await expect(manager.compactSession("any-thread", "   ")).rejects.toThrow(
+      /non-empty/
+    );
+  });
+
+  test("unknown thread throws (no session to compact)", async () => {
+    await expect(
+      manager.compactSession("no-such-thread", "保持して圧縮")
+    ).rejects.toThrow(/セッションが見つかりません/);
+  });
+});
