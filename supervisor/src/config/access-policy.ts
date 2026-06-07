@@ -42,6 +42,15 @@ export interface GroupPolicy {
    * (still subject to `requireMention`).
    */
   allowFrom?: string[];
+  /**
+   * Source snowflakes (webhook / bot ids) allowed to trigger a session via a
+   * `/dispatch` message on this channel. Issue #32 / S7 dispatch transport.
+   *
+   * UNLIKE `allowFrom`, an empty / absent `dispatchFrom` means "no dispatch
+   * source" (fail-closed) — never "any source". Dispatch starts a privileged
+   * session, so it must be explicitly enumerated.
+   */
+  dispatchFrom?: string[];
 }
 
 /** Minimal shape of access.json needed for runtime relay gating. */
@@ -109,6 +118,69 @@ export function isSenderAllowed(
   }
 
   return { allowed: true, reason: "allowed" };
+}
+
+/** Coarse, non-identifying dispatch-source reasons (safe to log). */
+export type DispatchDecisionReason =
+  | "allowed"
+  | "policy_unavailable"
+  | "channel_not_configured"
+  | "source_not_allowlisted";
+
+export interface DispatchDecision {
+  allowed: boolean;
+  reason: DispatchDecisionReason;
+}
+
+/**
+ * Read the optional global dispatch-source allowlist from the
+ * `DISPATCH_ALLOWED_SOURCE_IDS` env var (comma-separated snowflakes). Returns
+ * an empty array when unset / empty. This complements per-channel
+ * `dispatchFrom` but never bypasses the "channel must be configured" gate.
+ */
+export function envDispatchAllowedSourceIds(): string[] {
+  const raw = process.env.DISPATCH_ALLOWED_SOURCE_IDS;
+  if (!raw) return [];
+  return raw
+    .split(",")
+    .map((s) => s.trim())
+    .filter((s) => s.length > 0);
+}
+
+/**
+ * Decide whether an external source (webhook / bot snowflake) may trigger a
+ * `/dispatch` on `channelKey`. Fail-closed:
+ *
+ *   1. policy unavailable                         -> DENY
+ *   2. channel not present in `groups`            -> DENY
+ *   3. source not in `dispatchFrom` AND not in env allowlist -> DENY
+ *   4. otherwise                                  -> ALLOW
+ *
+ * An empty / absent `dispatchFrom` is NOT "any source" — it denies. This is the
+ * sole exception to the blanket bot/webhook drop, so it is enumerated only.
+ * Never throws. Reasons are coarse enums (no raw ids).
+ */
+export function isDispatchSourceAllowed(
+  policy: AccessPolicy | null | undefined,
+  channelKey: string,
+  sourceId: string,
+  envAllowed: string[] = envDispatchAllowedSourceIds(),
+): DispatchDecision {
+  if (!policy || typeof policy !== "object") {
+    return { allowed: false, reason: "policy_unavailable" };
+  }
+
+  const group = policy.groups?.[channelKey];
+  if (!group) {
+    return { allowed: false, reason: "channel_not_configured" };
+  }
+
+  const channelDispatch = group.dispatchFrom ?? [];
+  if (channelDispatch.includes(sourceId) || envAllowed.includes(sourceId)) {
+    return { allowed: true, reason: "allowed" };
+  }
+
+  return { allowed: false, reason: "source_not_allowlisted" };
 }
 
 /**

@@ -72,3 +72,45 @@ describe("access enforcement is wired (#32 / S7)", () => {
     }
   });
 });
+
+describe("dispatch transport is wired fail-closed (#32 / S7)", () => {
+  test("bot.ts intercepts dispatch BEFORE the bot/webhook drop", async () => {
+    const src = await read("src/bot.ts");
+    // The dispatch interception must run before the `message.author.bot` drop,
+    // otherwise an external source (a bot/webhook) can never trigger it.
+    const dispatchIdx = src.indexOf("handleDispatchMessage(message)");
+    const botDropIdx = src.indexOf("if (message.author.bot) return;");
+    expect(dispatchIdx).toBeGreaterThan(-1);
+    expect(botDropIdx).toBeGreaterThan(-1);
+    // The call inside the MessageCreate handler precedes the bot drop.
+    expect(dispatchIdx).toBeLessThan(botDropIdx);
+  });
+
+  test("bot.ts authorizes the source before parsing/starting (fail-closed)", async () => {
+    const src = await read("src/bot.ts");
+    expect(src).toContain("isDispatchSourceAllowed");
+    const authIdx = src.indexOf("isDispatchSourceAllowed");
+    const parseIdx = src.indexOf("parseDispatchCommand(content)");
+    const runIdx = src.indexOf("runDispatch(");
+    expect(authIdx).toBeGreaterThan(-1);
+    expect(parseIdx).toBeGreaterThan(-1);
+    expect(runIdx).toBeGreaterThan(-1);
+    // Source authorization must precede both parsing and the actual start.
+    expect(authIdx).toBeLessThan(parseIdx);
+    expect(authIdx).toBeLessThan(runIdx);
+    // A denied decision must not proceed to runDispatch.
+    expect(src).toContain("decision.allowed");
+  });
+
+  test("dispatch denial logs do not interpolate raw source/channel ids or body", async () => {
+    const src = await read("src/bot.ts");
+    const denialLines = src
+      .split("\n")
+      .filter((l) => /Dispatch denied|Dispatch rejected/.test(l));
+    expect(denialLines.length).toBeGreaterThan(0);
+    for (const line of denialLines) {
+      expect(line).not.toContain("message.author.id");
+      expect(line).not.toContain("message.content");
+    }
+  });
+});
