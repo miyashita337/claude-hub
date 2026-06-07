@@ -254,9 +254,14 @@ export async function startBot(token: string): Promise<void> {
       console.warn(
         `[Bot] Dispatch denied (reason=${decision.reason}) in channel ${channelName}; not started`
       );
-      // A disallowed bot/webhook is handled (and dropped) here so it does not
-      // fall through to the normal relay path.
-      return message.author.bot;
+      // Consume (drop) the message regardless of bot/human. By here it is a
+      // `/dispatch` in a known department channel and — per the isThread guard
+      // at the top — a non-thread message, which the normal relay path never
+      // acts on anyway. Returning a hard `true` stops it explicitly so a future
+      // refactor of the relay path below cannot let a denied source reach the
+      // privileged session start. (Was `return message.author.bot`: correct but
+      // fragile — both review lenses flagged the implicit semantics.)
+      return true;
     }
 
     const parsed = parseDispatchCommand(content);
