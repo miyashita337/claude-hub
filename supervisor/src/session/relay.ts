@@ -156,7 +156,7 @@ export async function sendToPane(
   tmuxSessionName: string,
   text: string
 ): Promise<void> {
-  const literalText = text.replace(/\n/g, " ");
+  const literalText = text.replace(/[\\r\\n]+/g, " ");
   await ensurePaneNotInMode(tmuxSessionName);
   await tmuxSend(tmuxSessionName, ["Escape"]);
   await new Promise((r) => setTimeout(r, 50));
