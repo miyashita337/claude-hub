@@ -53,8 +53,26 @@ export function createSessionCommand() {
             .setDescription("復帰する claude session id（/session list で確認できる UUID）")
             .setRequired(false)
         )
+    )
+    .addSubcommand((sub) =>
+      sub
+        .setName("compact")
+        // Issue #200: namespaced under /session (claude-hub owns it) so it never
+        // collides with another bot's top-level /compact in the same guild.
+        .setDescription("このスレッドのセッションを compact（コンテキスト圧縮）")
+        .addStringOption((opt) =>
+          opt
+            .setName("intent")
+            .setDescription("圧縮時に保持したい意図（省略時は既定の意図文を付与）")
+            .setRequired(false)
+        )
     );
 }
+
+// RW-032: a bare `/compact` produces a bad compact (the model can't predict the
+// next work direction). When the user omits an intent we attach this default so
+// the summary keeps the current state and next action.
+export const DEFAULT_COMPACT_INTENT = "直近の作業状態と次アクションを保持して圧縮";
 
 export function createSessionHandler(sessionManager: SessionManager) {
   return async (interaction: ChatInputCommandInteraction) => {
@@ -76,8 +94,62 @@ export function createSessionHandler(sessionManager: SessionManager) {
       case "resume":
         await handleResume(interaction, sessionManager);
         break;
+      case "compact":
+        await handleCompact(interaction, sessionManager);
+        break;
     }
   };
+}
+
+async function handleCompact(
+  interaction: ChatInputCommandInteraction,
+  sessionManager: SessionManager
+): Promise<void> {
+  const channel = interaction.channel;
+  // compact targets the session bound to *this* thread (like /session stop), so
+  // it must run inside a session thread. Outside one, return a usage hint and
+  // never send keys (Issue #200 AC-3).
+  if (!channel || !channel.isThread()) {
+    await interaction.reply({
+      content:
+        "ℹ️ `/session compact` は稼働中セッションのスレッド内で実行してください。" +
+        "スレッドが無ければ `/session start <branch>` か `/session resume <session_id>` で開始できます。",
+      flags: 64,
+    });
+    return;
+  }
+
+  const threadId = channel.id;
+  if (!sessionManager.has(threadId)) {
+    await interaction.reply({
+      content:
+        "ℹ️ このスレッドに稼働中のセッションはありません。" +
+        "`/session start <branch>` か `/session resume <session_id>` で開始してください。",
+      flags: 64,
+    });
+    return;
+  }
+
+  // RW-032: never relay a bare /compact. Use the user's intent, or a default
+  // that preserves working state + next action.
+  const rawIntent = interaction.options.getString("intent")?.trim() ?? "";
+  const intent = rawIntent || DEFAULT_COMPACT_INTENT;
+
+  await interaction.deferReply({ flags: 64 });
+
+  try {
+    await sessionManager.compactSession(threadId, intent);
+    await interaction.editReply({
+      content: `🗜️ compact を送信しました: \`/compact ${intent}\``,
+    });
+  } catch (err) {
+    const msg = `❌ compact の送信に失敗: ${err instanceof Error ? err.message : String(err)}`;
+    if (interaction.deferred || interaction.replied) {
+      await interaction.editReply({ content: msg });
+    } else {
+      await interaction.reply({ content: msg, flags: 64 });
+    }
+  }
 }
 
 async function handleStatus(

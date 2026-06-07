@@ -19,6 +19,7 @@ import {
 } from "../infra/db";
 import {
   relayMessage,
+  sendToPane,
   type AttachmentInfo,
   type RelayResult,
   type RelayMessageOptions,
@@ -797,6 +798,46 @@ export class SessionManager {
       persistDir: session.projectDir,
       onDialogStuck: options?.onDialogStuck,
     });
+  }
+
+  /**
+   * Issue #200: relay a `/compact <intent>` into the session's TUI as a
+   * fire-and-forget send. Unlike {@link sendMessage}, this does NOT wait for a
+   * relay (Stop-hook) response: the `/compact` built-in compacts context and
+   * does not POST to the relay server, so waiting would only burn the 5-min
+   * RELAY_TIMEOUT_MS. The caller acks immediately.
+   *
+   * `intent` is always non-empty by contract (the command layer substitutes a
+   * default) — a bare `/compact` is never sent (RW-032: bad-compact prevention).
+   * Throws if the thread has no session or the tmux pane is gone, so the caller
+   * can surface a clear failure instead of silently dropping the request.
+   */
+  async compactSession(threadId: string, intent: string): Promise<void> {
+    // RW-032 made a hard invariant, not just documentation: reject an empty
+    // intent so a future caller can never relay a bare `/compact` (which
+    // produces a bad compact). The command layer always substitutes a default,
+    // so this only fires on a programming error.
+    if (!intent.trim()) {
+      throw new Error("compact intent must be non-empty (RW-032)");
+    }
+
+    const session = this.sessions.get(threadId);
+    if (!session) {
+      throw new Error(`スレッド ${threadId} にセッションが見つかりません`);
+    }
+
+    const tmuxName = this.tmuxSessionName(threadId);
+    if (!this.effects.tmux.hasSession(tmuxName)) {
+      throw new Error("tmux session dead");
+    }
+
+    session.lastActivityAt = new Date();
+    updateSessionActivity(session.id);
+
+    // Fire-and-forget. On a mid-sequence sendToPane failure the pane may be left
+    // in an indeterminate state (e.g. the Escape landed but the literal/Enter
+    // did not); the caller surfaces the throw so the user can retry.
+    await sendToPane(tmuxName, `/compact ${intent}`);
   }
 
   async stop(
