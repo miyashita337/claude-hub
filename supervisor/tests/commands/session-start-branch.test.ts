@@ -1,5 +1,41 @@
-import { test, expect, describe } from "bun:test";
+import { test, expect, describe, beforeEach, afterEach } from "bun:test";
+import { mkdtempSync, writeFileSync, rmSync } from "fs";
+import { join } from "path";
+import { tmpdir } from "os";
 import { createSessionHandler } from "../../src/commands/session";
+
+// Issue #32 / S7: handleStart now enforces access.json. These branch-validation
+// tests assert behavior that occurs AFTER access is granted, so we point the
+// runtime loader at a temp policy that allows the fixture user on the fixture
+// channel id. Access-denial behavior is covered in session-start-access.test.ts.
+const FIXTURE_CHANNEL_ID = "fixture-parent-channel";
+const FIXTURE_USER_ID = "fixture-user";
+let accessDir: string;
+const prevAccessPath = process.env.SUPERVISOR_ACCESS_JSON_PATH;
+
+beforeEach(() => {
+  accessDir = mkdtempSync(join(tmpdir(), "session-start-branch-access-"));
+  const accessPath = join(accessDir, "access.json");
+  writeFileSync(
+    accessPath,
+    JSON.stringify({
+      groups: {
+        [FIXTURE_CHANNEL_ID]: {
+          requireMention: true,
+          allowFrom: [FIXTURE_USER_ID],
+        },
+      },
+    }),
+  );
+  process.env.SUPERVISOR_ACCESS_JSON_PATH = accessPath;
+});
+
+afterEach(() => {
+  if (prevAccessPath === undefined)
+    delete process.env.SUPERVISOR_ACCESS_JSON_PATH;
+  else process.env.SUPERVISOR_ACCESS_JSON_PATH = prevAccessPath;
+  rmSync(accessDir, { recursive: true, force: true });
+});
 
 /**
  * Handler-level tests for the `/session start <branch>` migration (Issue #154).
@@ -37,6 +73,7 @@ function makeInteraction(opts: {
   };
 
   const channel = {
+    id: FIXTURE_CHANNEL_ID,
     isThread: () => false,
     isTextBased: () => true,
     isDMBased: () => false,
@@ -51,6 +88,7 @@ function makeInteraction(opts: {
   };
 
   const interaction = {
+    user: { id: FIXTURE_USER_ID },
     options: {
       getSubcommand: () => "start",
       getString: (name: string) =>

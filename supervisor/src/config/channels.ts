@@ -33,6 +33,18 @@ const home = homedir();
 
 export const CHANNEL_MAP = new Map<string, ChannelConfig>([
   [
+    // #corp: AI 持株会社の本社（CEO ハブ）。ここで `/session start <branch>` すると
+    // ~/corp（corp secretary）のセッションが立ち、スレッド内の会話に応答し、
+    // `npm run secretary -- dispatch` で各部署（衛星）チャンネルへ実装依頼を出せる。
+    // branch を渡すと worktree（現 HEAD から分岐）で起動するため dispatch コードを含む。
+    "corp",
+    {
+      channelName: "corp",
+      dir: resolve(home, "corp"),
+      displayName: "Corp CEO",
+    },
+  ],
+  [
     "team-salary",
     {
       channelName: "team-salary",

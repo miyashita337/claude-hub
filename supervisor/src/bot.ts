@@ -7,12 +7,13 @@ import {
   type Interaction,
   type Message,
   type ThreadChannel,
+  type TextChannel,
 } from "discord.js";
 import { SessionManager } from "./session/manager";
 import { Reaper } from "./session/reaper";
 import { ResourceMonitor } from "./session/resource-monitor";
 import { createSessionCommand, createSessionHandler } from "./commands/session";
-import { CHANNEL_MAP } from "./config/channels";
+import { CHANNEL_MAP, MAX_SESSIONS } from "./config/channels";
 import type { AttachmentInfo } from "./session/relay";
 import { buildDialogStuckHandler } from "./session/dialog-stuck-handler";
 import { updateSessionClaudeId } from "./infra/db";
@@ -33,6 +34,17 @@ import {
 } from "./session/slash-prefix";
 import { ProgressBuffer } from "./session/progress-buffer";
 import { formatForDiscord } from "./session/output-formatter";
+import {
+  evaluateAccess,
+  isDispatchSourceAllowed,
+  loadAccessPolicy,
+} from "./config/access-policy";
+import {
+  DISPATCH_PREFIX,
+  parseDispatchCommand,
+  runDispatch,
+} from "./session/dispatch";
+import { buildThreadTitle } from "./session/thread-title";
 
 export async function startBot(token: string): Promise<void> {
   const client = new Client({
@@ -197,8 +209,141 @@ export async function startBot(token: string): Promise<void> {
     });
   });
 
+  // Issue #32 / S7 (dispatch transport): handle a `/dispatch <branch> <issue>`
+  // message from an allowed external source (webhook / bot). Returns true when
+  // the message was a dispatch attempt and was fully handled (caller must stop),
+  // false when it is not a dispatch and normal processing should continue.
+  //
+  // This is the ONLY exception to the blanket `message.author.bot` drop, and it
+  // is fail-closed at every step: the channel must be a known department channel
+  // AND configured in the access policy, the source must be enumerated in
+  // `dispatchFrom` / `DISPATCH_ALLOWED_SOURCE_IDS`, the branch passes the RW-045
+  // metachar / traversal guard, and the issue number must be a positive integer.
+  async function handleDispatchMessage(message: Message): Promise<boolean> {
+    // Dispatch only applies to a non-thread message in a known department
+    // channel whose text starts with the dispatch token.
+    if (message.channel.isThread()) return false;
+    const content = message.content ?? "";
+    if (
+      content.trim() !== DISPATCH_PREFIX &&
+      !content.trim().startsWith(DISPATCH_PREFIX + " ")
+    ) {
+      return false;
+    }
+
+    const channelName =
+      "name" in message.channel ? (message.channel.name as string) : "";
+    const config = CHANNEL_MAP.get(channelName);
+    if (!config) {
+      // Unknown channel: not a valid dispatch target. Treat as "not handled"
+      // so a non-bot author still flows through normal processing; a bot author
+      // is dropped by the caller's bot guard.
+      return false;
+    }
+    const channelId = message.channel.id;
+
+    // Authorize the SOURCE (webhook / bot id). Fail-closed.
+    const decision = isDispatchSourceAllowed(
+      loadAccessPolicy(),
+      channelId,
+      message.author.id,
+    );
+    if (!decision.allowed) {
+      // Identifier-free denial log; never log the source/channel snowflake or
+      // the message body.
+      console.warn(
+        `[Bot] Dispatch denied (reason=${decision.reason}) in channel ${channelName}; not started`
+      );
+      // Consume (drop) the message regardless of bot/human. By here it is a
+      // `/dispatch` in a known department channel and — per the isThread guard
+      // at the top — a non-thread message, which the normal relay path never
+      // acts on anyway. Returning a hard `true` stops it explicitly so a future
+      // refactor of the relay path below cannot let a denied source reach the
+      // privileged session start. (Was `return message.author.bot`: correct but
+      // fragile — both review lenses flagged the implicit semantics.)
+      return true;
+    }
+
+    const parsed = parseDispatchCommand(content);
+    if (parsed.kind === "not_dispatch") {
+      return false;
+    }
+    if (parsed.kind === "error") {
+      console.warn(
+        `[Bot] Dispatch rejected (${parsed.reason}) in channel ${channelName}`
+      );
+      return true;
+    }
+
+    const { branch, issueNumber } = parsed;
+    console.log(
+      `[Bot] Dispatch accepted in channel ${channelName} (branch len=${branch.length}, issue=${issueNumber})`
+    );
+
+    const textChannel = message.channel as TextChannel;
+    const result = await runDispatch({
+      config,
+      branch,
+      issueNumber,
+      sessionManager,
+      createThread: async (b: string) => {
+        // Sequence suffix only when another session is already live on the same
+        // branch (mirrors handleStart / RW-046 same-branch multi-session).
+        const sameBranchCount = sessionManager
+          .listRunningByChannel(channelName)
+          .filter((s) => s.branch === b).length;
+        const threadName = buildThreadTitle(
+          "running",
+          b,
+          config.displayName,
+          sameBranchCount + 1
+        );
+        const thread = await textChannel.threads.create({
+          name: threadName,
+          autoArchiveDuration: 10080, // 7 days
+        });
+        return { id: thread.id };
+      },
+    });
+
+    if (result.ok) {
+      try {
+        const thread = await client.channels.fetch(result.threadId);
+        if (thread?.isThread()) {
+          await thread.send(
+            `🛰️ **${config.displayName}** をディスパッチで起動しました\n\n` +
+              `🌿 ブランチ: \`${branch}\`\n` +
+              `▶️ 初期コマンド: \`${result.injected}\`\n` +
+              `📊 稼働中セッション: ${sessionManager.count()}/${MAX_SESSIONS}`
+          );
+        }
+      } catch (err) {
+        console.error(
+          `[Bot] Dispatch welcome message failed for thread ${result.threadId}:`,
+          err
+        );
+      }
+    } else {
+      console.error(
+        `[Bot] Dispatch failed (stage=${result.stage}) in channel ${channelName}: ${result.error}`
+      );
+    }
+    return true;
+  }
+
   // Message relay: thread messages → Claude Code → thread reply
   client.on(Events.MessageCreate, async (message: Message) => {
+    // Issue #32 / S7 (dispatch transport): intercept `/dispatch` from an allowed
+    // external source BEFORE the blanket bot/webhook drop below. Only an
+    // authorized source on a known, policy-configured channel can start a
+    // session this way (fail-closed inside handleDispatchMessage).
+    try {
+      if (await handleDispatchMessage(message)) return;
+    } catch (err) {
+      console.error("[Bot] Dispatch handler error:", err);
+      return;
+    }
+
     if (message.author.bot) return;
 
     // Only handle messages in threads
@@ -213,6 +358,33 @@ export async function startBot(token: string): Promise<void> {
     }
 
     const threadId = message.channel.id;
+
+    // Issue #32 / S7 (Critical): enforce access.json `allowFrom` / `requireMention`
+    // BEFORE any relay or response. The relayed session runs with
+    // `--dangerously-skip-permissions`, so an un-gated message is lateral
+    // movement. Fail-closed: a missing / broken policy or an undefined channel
+    // denies. Threads inherit their parent channel's opt-in, so the policy is
+    // keyed on the parent channel id (matching the upstream channel server gate).
+    {
+      const parentChannelId = message.channel.parentId ?? threadId;
+      const botUserId = client.user?.id;
+      const isMention = botUserId
+        ? message.mentions.users.has(botUserId)
+        : false;
+      const decision = evaluateAccess({
+        channelKey: parentChannelId,
+        userId: message.author.id,
+        isMention,
+      });
+      if (!decision.allowed) {
+        // Structured, identifier-free denial log. Never log the user/channel
+        // snowflakes or message body so transcripts can't leak them.
+        console.warn(
+          `[Bot] Access denied (reason=${decision.reason}) for thread ${threadId}; message not relayed`
+        );
+        return;
+      }
+    }
 
     // No active in-memory session for this thread. Previously the bot silently
     // ignored the message (Issue #41 debug log), leaving the user staring at a

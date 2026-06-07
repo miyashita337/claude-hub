@@ -15,5 +15,6 @@
   "agent-base": { "requireMention": true, "allowFrom": ["<owner>"] },
   "openclaw-rpi5-ops": { "requireMention": true, "allowFrom": ["<owner>"] },
   "vive-reading": { "requireMention": true, "allowFrom": ["<owner>"] },
-  "video-qa": { "requireMention": true, "allowFrom": ["<owner>"] }
+  "video-qa": { "requireMention": true, "allowFrom": ["<owner>"] },
+  "corp": { "requireMention": false, "allowFrom": ["<owner>"] }
 }

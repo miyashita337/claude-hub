@@ -76,6 +76,24 @@ const RESUME_READY_RE = /bypass permissions|\? for shortcuts/i;
 const RESUME_PROMPT_POLL_ATTEMPTS = 300;
 
 /**
+ * Input-ready marker for a freshly STARTED session's Ink TUI (same prompt
+ * markers as {@link RESUME_READY_RE}; a `--dangerously-skip-permissions` session
+ * shows the "bypass permissions" banner + "? for shortcuts" hint once it can
+ * accept input). The dispatch transport (dispatch.ts) waits for this before
+ * injecting `/impl <N>` so the slash-command picker doesn't swallow the leading
+ * `/` while the TUI is still booting (CLAUDE.md / skills / MCP) and strand the
+ * text un-submitted (RW-025 / RW-027 / RW-047 timing class).
+ */
+const INPUT_READY_RE = /bypass permissions|\? for shortcuts/i;
+/**
+ * Poll attempts (×interval) to detect the input-ready marker before giving up.
+ * A fresh dispatch session (mcpProfile "none") boots in ~5-15s; 60×1s = 60s is a
+ * generous ceiling. On timeout the caller injects anyway (best-effort) — the
+ * marker may have scrolled off, and by then the TUI is almost certainly ready.
+ */
+const INPUT_READY_POLL_ATTEMPTS = 60;
+
+/**
  * Build the argv for the `claude` invocation in a supervisor session.
  *
  * Issue #104 / Epic #101: by default supervisor sessions disable Chrome
@@ -162,6 +180,13 @@ export interface SessionManagerOptions {
    */
   resumePromptPollAttempts?: number;
   resumePromptPollIntervalMs?: number;
+  /**
+   * Input-ready poll tuning for {@link SessionManager.waitForInputReady} (the
+   * dispatch readiness wait). Tests shrink these so they don't pay the
+   * production wait. Defaults: {@link INPUT_READY_POLL_ATTEMPTS} attempts × 1s.
+   */
+  inputReadyPollAttempts?: number;
+  inputReadyPollIntervalMs?: number;
 }
 
 export class SessionManager {
@@ -193,6 +218,8 @@ export class SessionManager {
   private readonly gracefulKillTimeoutMs: number;
   private readonly resumePromptPollAttempts: number;
   private readonly resumePromptPollIntervalMs: number;
+  private readonly inputReadyPollAttempts: number;
+  private readonly inputReadyPollIntervalMs: number;
 
   constructor(options: SessionManagerOptions = {}) {
     this.effects = {
@@ -209,6 +236,10 @@ export class SessionManager {
       options.resumePromptPollAttempts ?? RESUME_PROMPT_POLL_ATTEMPTS;
     this.resumePromptPollIntervalMs =
       options.resumePromptPollIntervalMs ?? 1000;
+    this.inputReadyPollAttempts =
+      options.inputReadyPollAttempts ?? INPUT_READY_POLL_ATTEMPTS;
+    this.inputReadyPollIntervalMs =
+      options.inputReadyPollIntervalMs ?? 1000;
 
     this.effects.tmux.ensureSocketConfigured();
     this.effects.relayServer.start();
@@ -755,6 +786,34 @@ export class SessionManager {
         setTimeout(resolve, this.resumePromptPollIntervalMs)
       );
     }
+  }
+
+  /**
+   * Poll a freshly started session's pane until its Ink TUI is ready to accept
+   * input ({@link INPUT_READY_RE}). The dispatch transport (dispatch.ts) awaits
+   * this before injecting the `/impl <N>` slash command: {@link start} only
+   * waits for the PID, so the TUI is still booting (CLAUDE.md / skills / MCP)
+   * when start() returns. Injecting a slash command into a not-yet-ready TUI
+   * lets the Ink slash-picker eat the leading `/` and strands the text
+   * un-submitted (RW-025 / RW-047 timing class — the same bug a fixed sleep
+   * would only paper over).
+   *
+   * Returns true when the marker appears, false on timeout or a dead pane.
+   * Marker-based, not a fixed sleep; the inter-poll wait is a non-blocking
+   * awaited setTimeout so the single-process bot's event loop stays free for
+   * other channels' relays while this session boots.
+   */
+  async waitForInputReady(threadId: string): Promise<boolean> {
+    const tmuxName = this.tmuxSessionName(threadId);
+    for (let i = 0; i < this.inputReadyPollAttempts; i++) {
+      if (!this.effects.tmux.hasSession(tmuxName)) return false;
+      const pane = this.effects.tmux.capturePane(tmuxName);
+      if (INPUT_READY_RE.test(pane)) return true;
+      await new Promise((resolve) =>
+        setTimeout(resolve, this.inputReadyPollIntervalMs)
+      );
+    }
+    return false;
   }
 
   /**
