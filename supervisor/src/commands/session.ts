@@ -9,6 +9,7 @@ import type { SessionManager } from "../session/manager";
 import { CHANNEL_MAP, MAX_SESSIONS } from "../config/channels";
 import { buildThreadTitle, markTitleStopped } from "../session/thread-title";
 import { buildStatusReply } from "../session/status-reply";
+import { evaluateAccess } from "../config/access-policy";
 
 export function createSessionCommand() {
   return new SlashCommandBuilder()
@@ -129,6 +130,36 @@ async function handleStart(
       flags: 64,
     });
     return;
+  }
+
+  // Issue #32 / S7 (Critical): enforce access.json `allowFrom` BEFORE starting a
+  // session. `/session start` spawns a Claude process running with
+  // `--dangerously-skip-permissions`, so an un-gated start is privilege
+  // escalation. Fail-closed: missing/broken policy or an undefined channel
+  // denies. A slash command is an explicit, structured invocation by the user,
+  // so the mention requirement is satisfied — the decisive gate is the per-
+  // channel `allowFrom` allowlist. Policy is keyed on the parent channel id
+  // (threads inherit their parent's opt-in).
+  {
+    const parentChannelId =
+      channel.isThread() && channel.parentId ? channel.parentId : channel.id;
+    const decision = evaluateAccess({
+      channelKey: parentChannelId,
+      userId: interaction.user.id,
+      isMention: true,
+    });
+    if (!decision.allowed) {
+      // Identifier-free denial log; user-facing message stays generic.
+      console.warn(
+        `[Session] /session start access denied (reason=${decision.reason}) in channel ${channelName}`
+      );
+      await interaction.reply({
+        content:
+          "❌ このチャンネルでセッションを開始する権限がありません（アクセスポリシー）。",
+        flags: 64,
+      });
+      return;
+    }
   }
 
   // Issue #154 (Q6): branch is required; only an empty/whitespace value is

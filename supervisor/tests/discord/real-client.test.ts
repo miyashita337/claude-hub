@@ -6,6 +6,9 @@
 // through InMemoryDiscordClient and the real tmux + claude-mock.sh.
 
 import { afterEach, describe, expect, test } from "bun:test";
+import { mkdtempSync, writeFileSync, rmSync } from "fs";
+import { join } from "path";
+import { tmpdir } from "os";
 import { Client, GatewayIntentBits } from "discord.js";
 import { RealDiscordClient } from "../../src/discord/real-client";
 
@@ -171,44 +174,164 @@ describe("RealDiscordClient", () => {
     // wrapper subscribes to Events.MessageCreate at construction time, so
     // emitting that event fires the chain. We feed a minimal message-shaped
     // object to assert the propagation contract end-to-end (gating + payload).
+    //
+    // Issue #32 / S7: the wrapper now enforces access.json before dispatching.
+    // Point the runtime loader at a temp policy that allows this sender on the
+    // parent channel (requireMention:false so no mention object is needed) so
+    // we still exercise the propagation contract. The access gate itself is
+    // covered behaviorally below and in tests/config/access-policy.test.ts.
+    const dir = mkdtempSync(join(tmpdir(), "real-client-access-"));
+    const accessPath = join(dir, "access.json");
+    writeFileSync(
+      accessPath,
+      JSON.stringify({
+        groups: {
+          parent_1: { requireMention: false, allowFrom: ["user_1"] },
+        },
+      }),
+    );
+    const prevAccess = process.env.SUPERVISOR_ACCESS_JSON_PATH;
+    process.env.SUPERVISOR_ACCESS_JSON_PATH = accessPath;
+
+    try {
+      const inner = new Client({ intents: [GatewayIntentBits.Guilds] });
+      const wrapper = new RealDiscordClient("fake-token", { client: inner });
+      created.push(wrapper);
+
+      const events: Array<{ threadId: string; content: string; isBot: boolean }> = [];
+      wrapper.onThreadMessage((m) => {
+        events.push({ threadId: m.threadId, content: m.content, isBot: m.authorBot });
+      });
+
+      const baseMessage = {
+        author: { bot: false, id: "user_1" },
+        channel: { isThread: () => true, id: "thread_1", parentId: "parent_1" },
+        mentions: { users: { has: () => false } },
+        content: "hi from user",
+        id: "msg_1",
+        attachments: new Map(),
+      };
+
+      inner.emit("messageCreate", baseMessage as never);
+      expect(events).toEqual([
+        { threadId: "thread_1", content: "hi from user", isBot: false },
+      ]);
+
+      // Bot author → gated out
+      inner.emit("messageCreate", {
+        ...baseMessage,
+        author: { bot: true, id: "bot_2" },
+        id: "msg_2",
+        content: "bot says",
+      } as never);
+
+      // Non-thread channel → gated out
+      inner.emit("messageCreate", {
+        ...baseMessage,
+        id: "msg_3",
+        channel: { isThread: () => false, id: "channel_1" },
+        content: "channel msg",
+      } as never);
+
+      expect(events).toHaveLength(1);
+    } finally {
+      if (prevAccess === undefined)
+        delete process.env.SUPERVISOR_ACCESS_JSON_PATH;
+      else process.env.SUPERVISOR_ACCESS_JSON_PATH = prevAccess;
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+});
+
+describe("RealDiscordClient MessageCreate access enforcement (#32 / S7)", () => {
+  const created: RealDiscordClient[] = [];
+  let dir: string;
+  let accessPath: string;
+  const prevAccess = process.env.SUPERVISOR_ACCESS_JSON_PATH;
+
+  const PARENT = "846209781206941736";
+  const OWNER = "184695080709324800";
+  const OUTSIDER = "999999999999999999";
+
+  afterEach(async () => {
+    while (created.length) {
+      const c = created.pop()!;
+      try {
+        await c.stop();
+      } catch {
+        // best-effort cleanup
+      }
+    }
+    if (prevAccess === undefined) delete process.env.SUPERVISOR_ACCESS_JSON_PATH;
+    else process.env.SUPERVISOR_ACCESS_JSON_PATH = prevAccess;
+    rmSync(dir, { recursive: true, force: true });
+  });
+
+  function setup(policy: unknown | undefined) {
+    dir = mkdtempSync(join(tmpdir(), "real-client-deny-"));
+    accessPath = join(dir, "access.json");
+    if (policy !== undefined) {
+      writeFileSync(accessPath, JSON.stringify(policy));
+    }
+    process.env.SUPERVISOR_ACCESS_JSON_PATH = accessPath;
+
     const inner = new Client({ intents: [GatewayIntentBits.Guilds] });
+    // Stand in for the bot's own user so mention detection has an id to match.
+    (inner as unknown as { user: { id: string } }).user = { id: "bot_self" };
     const wrapper = new RealDiscordClient("fake-token", { client: inner });
     created.push(wrapper);
 
-    const events: Array<{ threadId: string; content: string; isBot: boolean }> = [];
-    wrapper.onThreadMessage((m) => {
-      events.push({ threadId: m.threadId, content: m.content, isBot: m.authorBot });
-    });
+    const events: string[] = [];
+    wrapper.onThreadMessage((m) => events.push(m.content));
+    return { inner, events };
+  }
 
-    const baseMessage = {
-      author: { bot: false, id: "user_1" },
-      channel: { isThread: () => true, id: "thread_1" },
-      content: "hi from user",
-      id: "msg_1",
+  function msg(opts: { userId: string; mentioned?: boolean; content: string }) {
+    return {
+      author: { bot: false, id: opts.userId },
+      channel: { isThread: () => true, id: "thread_1", parentId: PARENT },
+      mentions: { users: { has: (id: string) => !!opts.mentioned && id === "bot_self" } },
+      content: opts.content,
+      id: "m",
       attachments: new Map(),
-    };
+    } as never;
+  }
 
-    inner.emit("messageCreate", baseMessage as never);
-    expect(events).toEqual([
-      { threadId: "thread_1", content: "hi from user", isBot: false },
-    ]);
+  test("allowlisted + mention → dispatched", () => {
+    const { inner, events } = setup({
+      groups: { [PARENT]: { requireMention: true, allowFrom: [OWNER] } },
+    });
+    inner.emit("messageCreate", msg({ userId: OWNER, mentioned: true, content: "ok" }));
+    expect(events).toEqual(["ok"]);
+  });
 
-    // Bot author → gated out
-    inner.emit("messageCreate", {
-      ...baseMessage,
-      author: { bot: true, id: "bot_2" },
-      id: "msg_2",
-      content: "bot says",
-    } as never);
+  test("non-allowlisted sender → dropped", () => {
+    const { inner, events } = setup({
+      groups: { [PARENT]: { requireMention: true, allowFrom: [OWNER] } },
+    });
+    inner.emit("messageCreate", msg({ userId: OUTSIDER, mentioned: true, content: "x" }));
+    expect(events).toEqual([]);
+  });
 
-    // Non-thread channel → gated out
-    inner.emit("messageCreate", {
-      ...baseMessage,
-      id: "msg_3",
-      channel: { isThread: () => false, id: "channel_1" },
-      content: "channel msg",
-    } as never);
+  test("requireMention + no mention → dropped", () => {
+    const { inner, events } = setup({
+      groups: { [PARENT]: { requireMention: true, allowFrom: [OWNER] } },
+    });
+    inner.emit("messageCreate", msg({ userId: OWNER, mentioned: false, content: "x" }));
+    expect(events).toEqual([]);
+  });
 
-    expect(events).toHaveLength(1);
+  test("fail-closed: missing access.json → dropped", () => {
+    const { inner, events } = setup(undefined); // no file written
+    inner.emit("messageCreate", msg({ userId: OWNER, mentioned: true, content: "x" }));
+    expect(events).toEqual([]);
+  });
+
+  test("fail-closed: undefined channel → dropped", () => {
+    const { inner, events } = setup({
+      groups: { "111111111111111111": { requireMention: false, allowFrom: [OWNER] } },
+    });
+    inner.emit("messageCreate", msg({ userId: OWNER, mentioned: true, content: "x" }));
+    expect(events).toEqual([]);
   });
 });

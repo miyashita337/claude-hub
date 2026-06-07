@@ -33,6 +33,7 @@ import {
 } from "./session/slash-prefix";
 import { ProgressBuffer } from "./session/progress-buffer";
 import { formatForDiscord } from "./session/output-formatter";
+import { evaluateAccess } from "./config/access-policy";
 
 export async function startBot(token: string): Promise<void> {
   const client = new Client({
@@ -213,6 +214,33 @@ export async function startBot(token: string): Promise<void> {
     }
 
     const threadId = message.channel.id;
+
+    // Issue #32 / S7 (Critical): enforce access.json `allowFrom` / `requireMention`
+    // BEFORE any relay or response. The relayed session runs with
+    // `--dangerously-skip-permissions`, so an un-gated message is lateral
+    // movement. Fail-closed: a missing / broken policy or an undefined channel
+    // denies. Threads inherit their parent channel's opt-in, so the policy is
+    // keyed on the parent channel id (matching the upstream channel server gate).
+    {
+      const parentChannelId = message.channel.parentId ?? threadId;
+      const botUserId = client.user?.id;
+      const isMention = botUserId
+        ? message.mentions.users.has(botUserId)
+        : false;
+      const decision = evaluateAccess({
+        channelKey: parentChannelId,
+        userId: message.author.id,
+        isMention,
+      });
+      if (!decision.allowed) {
+        // Structured, identifier-free denial log. Never log the user/channel
+        // snowflakes or message body so transcripts can't leak them.
+        console.warn(
+          `[Bot] Access denied (reason=${decision.reason}) for thread ${threadId}; message not relayed`
+        );
+        return;
+      }
+    }
 
     // No active in-memory session for this thread. Previously the bot silently
     // ignored the message (Issue #41 debug log), leaving the user staring at a

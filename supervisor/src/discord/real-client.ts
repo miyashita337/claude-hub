@@ -21,6 +21,7 @@ import type {
   SlashCommandHandler,
   ThreadMessageHandler,
 } from "./types";
+import { evaluateAccess } from "../config/access-policy";
 
 export interface RealDiscordClientOptions {
   /** discord.js intents. Defaults match bot.ts for backwards compatibility. */
@@ -55,6 +56,31 @@ export class RealDiscordClient implements IDiscordClient {
       if (message.author.bot) return;
       if (!message.channel.isThread()) return;
       const thread = message.channel as ThreadChannel;
+
+      // Issue #32 / S7 (Critical): mirror bot.ts access enforcement. Evaluate
+      // access.json `allowFrom` / `requireMention` BEFORE dispatching the
+      // thread event to any relay handler. Fail-closed (missing/broken policy
+      // or undefined channel denies). Keyed on the parent channel id since
+      // threads inherit their parent's opt-in.
+      {
+        const parentChannelId = thread.parentId ?? thread.id;
+        const botUserId = this.client.user?.id;
+        const isMention = botUserId
+          ? message.mentions.users.has(botUserId)
+          : false;
+        const decision = evaluateAccess({
+          channelKey: parentChannelId,
+          userId: message.author.id,
+          isMention,
+        });
+        if (!decision.allowed) {
+          console.warn(
+            `[RealDiscordClient] Access denied (reason=${decision.reason}) for thread ${thread.id}; message not dispatched`,
+          );
+          return;
+        }
+      }
+
       const attachments: AttachmentInfo[] = [];
       for (const [, att] of message.attachments) {
         attachments.push({
