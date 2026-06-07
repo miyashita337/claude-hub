@@ -29,6 +29,7 @@ function fakeManager(overrides: Partial<{
         startCalls.push({ threadId, branch });
         return { id: "session-1" };
       }),
+    waitForInputReady: async () => true,
     sendMessage:
       overrides.sendMessage ??
       (async (threadId, message) => {

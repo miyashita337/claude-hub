@@ -56,6 +56,7 @@ async function simulateDispatch(opts: {
       startCalls.push({ threadId, branch });
       return { id: "s" };
     },
+    waitForInputReady: async () => true,
     sendMessage: async (threadId, message) => {
       sendCalls.push({ threadId, message });
       return {};

@@ -112,6 +112,14 @@ export interface DispatchSessionManager {
     threadId: string,
     branch?: string,
   ): Promise<unknown>;
+  /**
+   * Wait until the freshly started session's Ink TUI is ready to accept input.
+   * Resolves true when the input-ready marker is observed, false on timeout or a
+   * dead pane. {@link runDispatch} injects the `/impl` slash command only after
+   * this so the slash-picker doesn't swallow the leading `/` while the TUI is
+   * still booting (RW-025 / RW-047 timing class).
+   */
+  waitForInputReady(threadId: string): Promise<boolean>;
   sendMessage(threadId: string, message: string): Promise<unknown>;
 }
 
@@ -159,6 +167,27 @@ export async function runDispatch(
     await sessionManager.start(config, threadId, branch);
   } catch (err) {
     return { ok: false, stage: "start", error: errMsg(err) };
+  }
+
+  // The dept TUI is still booting when start() returns — start() only waits for
+  // the PID, not an input-ready prompt. Injecting `/impl` into a not-yet-ready
+  // Ink TUI lets the slash-command picker swallow the leading `/` and strands
+  // the text un-submitted (RW-025 / RW-047 timing class — observed live as
+  // "impl <N>" stuck in the input box). Wait for the input-ready marker first.
+  // Best-effort: on timeout / probe error we still inject (the marker may have
+  // scrolled off and the TUI is ready by then) so a transient miss never drops
+  // the dispatch silently.
+  try {
+    const ready = await sessionManager.waitForInputReady(threadId);
+    if (!ready) {
+      console.warn(
+        `[Dispatch] input-ready marker not seen for thread ${threadId}; injecting anyway`,
+      );
+    }
+  } catch (err) {
+    console.warn(
+      `[Dispatch] waitForInputReady failed for thread ${threadId}: ${errMsg(err)}`,
+    );
   }
 
   const initialCommand = `/impl ${issueNumber}`;
