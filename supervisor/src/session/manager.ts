@@ -28,6 +28,10 @@ import {
   realSessionEffects,
   type SessionEffects,
 } from "./adapters";
+import {
+  createContextBudgetTracker,
+  type ContextBudgetWarning,
+} from "./context-budget";
 
 const CLAUDE_PATH = resolve(homedir(), ".local", "bin", "claude");
 const TMUX_SESSION_PREFIX = "claude-";
@@ -857,6 +861,29 @@ export class SessionManager {
       persistDir: session.projectDir,
       onDialogStuck: options?.onDialogStuck,
     });
+  }
+
+  /**
+   * Issue #204: feed the latest context token count (from the relay's Stop-hook
+   * POST) for a thread and return a degraded warning the caller should post to
+   * the Discord thread — but only when the session first crosses *up* into a
+   * higher context-rot band. Returns null when the count is below the yellow
+   * threshold, was already warned at that band (de-dup, no per-turn spam), or
+   * the session/token count is unknown. Pure bookkeeping: the caller (bot.ts)
+   * owns the actual Discord/Pushover delivery so this stays unit-testable and
+   * cannot break the relay loop.
+   */
+  contextBudgetWarning(
+    threadId: string,
+    tokens: number | undefined
+  ): ContextBudgetWarning | null {
+    if (tokens == null) return null;
+    const session = this.sessions.get(threadId);
+    if (!session) return null;
+    if (!session.contextBudgetTracker) {
+      session.contextBudgetTracker = createContextBudgetTracker();
+    }
+    return session.contextBudgetTracker.check(tokens);
   }
 
   /**

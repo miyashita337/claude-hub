@@ -100,6 +100,7 @@ jobs:
                    tests/session/notify-pushover.test.ts \
                    tests/session/dialog-stuck-handler.test.ts \
                    tests/session/stall-heartbeat.test.ts \
+                   tests/session/context-budget.test.ts \
                    tests/hijoguchi-routing/p0.test.ts \
                    tests/e2e/ac-verification.test.ts
 
