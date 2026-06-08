@@ -91,6 +91,7 @@ async function simulateDispatch(opts: {
     config: { dir: "/x", channelName: "agent-base", displayName: "Agent Base" },
     branch: parsed.branch,
     issueNumber: parsed.issueNumber,
+    command: parsed.command,
     sessionManager: manager,
     createThread: async () => {
       threadsCreated += 1;
@@ -135,6 +136,19 @@ describe("dispatch integration (auth -> parse -> run)", () => {
     expect(r.threadsCreated).toBe(1);
     expect(r.startCalls).toEqual([{ threadId: "thread-1", branch: "corp-dispatch-42" }]);
     expect(r.sendCalls).toEqual([{ threadId: "thread-1", message: "/impl 42" }]);
+  });
+
+  test("allowed source + pdca mode → session started, /pdca injected (Epic)", async () => {
+    writePolicy([SOURCE]);
+    const r = await simulateDispatch({
+      accessPath,
+      channelId: CHANNEL_ID,
+      sourceId: SOURCE,
+      content: "/dispatch corp-dispatch-341 341 pdca",
+    });
+    expect(r.outcome).toBe("started");
+    expect(r.startCalls).toEqual([{ threadId: "thread-1", branch: "corp-dispatch-341" }]);
+    expect(r.sendCalls).toEqual([{ threadId: "thread-1", message: "/pdca 341" }]);
   });
 
   test("non-allowed source → denied, no session (fail-closed)", async () => {

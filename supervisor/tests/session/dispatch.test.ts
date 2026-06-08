@@ -19,21 +19,47 @@ import {
  */
 
 describe("parseDispatchCommand", () => {
-  test("parses a valid /dispatch command", () => {
+  test("parses a valid /dispatch command (mode defaults to impl)", () => {
     const r = parseDispatchCommand("/dispatch corp-dispatch-42 42");
     expect(r.kind).toBe("ok");
     if (r.kind === "ok") {
       expect(r.branch).toBe("corp-dispatch-42");
       expect(r.issueNumber).toBe(42);
+      expect(r.command).toBe("impl");
     }
   });
 
+  test("parses an explicit impl mode", () => {
+    const r = parseDispatchCommand("/dispatch corp-dispatch-42 42 impl");
+    expect(r.kind).toBe("ok");
+    if (r.kind === "ok") {
+      expect(r.issueNumber).toBe(42);
+      expect(r.command).toBe("impl");
+    }
+  });
+
+  test("parses a pdca mode (Epic dispatch)", () => {
+    const r = parseDispatchCommand("/dispatch corp-dispatch-341 341 pdca");
+    expect(r.kind).toBe("ok");
+    if (r.kind === "ok") {
+      expect(r.branch).toBe("corp-dispatch-341");
+      expect(r.issueNumber).toBe(341);
+      expect(r.command).toBe("pdca");
+    }
+  });
+
+  test("an unrecognized mode token → error (fail-closed)", () => {
+    const r = parseDispatchCommand("/dispatch corp-dispatch-42 42 bogus");
+    expect(r.kind).toBe("error");
+  });
+
   test("tolerates extra surrounding whitespace", () => {
-    const r = parseDispatchCommand("   /dispatch   feat/foo   7   ");
+    const r = parseDispatchCommand("   /dispatch   feat/foo   7   pdca   ");
     expect(r.kind).toBe("ok");
     if (r.kind === "ok") {
       expect(r.branch).toBe("feat/foo");
       expect(r.issueNumber).toBe(7);
+      expect(r.command).toBe("pdca");
     }
   });
 
@@ -50,7 +76,7 @@ describe("parseDispatchCommand", () => {
   });
 
   test("too many arguments → error", () => {
-    const r = parseDispatchCommand("/dispatch some-branch 42 extra");
+    const r = parseDispatchCommand("/dispatch some-branch 42 pdca extra");
     expect(r.kind).toBe("error");
   });
 
@@ -135,6 +161,7 @@ describe("runDispatch readiness ordering (RW-025/047)", () => {
       config: {},
       branch: "corp-dispatch-42",
       issueNumber: 42,
+      command: "impl",
       sessionManager: sm,
       createThread: async () => ({ id: "thread-1" }),
     });
@@ -147,12 +174,28 @@ describe("runDispatch readiness ordering (RW-025/047)", () => {
     expect(calls).toEqual(["start", "waitForInputReady", "send:/impl 42"]);
   });
 
+  test("pdca mode injects /pdca (Epic-aware) after readiness", async () => {
+    const { sm, calls } = recordingManager(true);
+    const r = await runDispatch({
+      config: {},
+      branch: "corp-dispatch-341",
+      issueNumber: 341,
+      command: "pdca",
+      sessionManager: sm,
+      createThread: async () => ({ id: "thread-1" }),
+    });
+    expect(r.ok).toBe(true);
+    if (r.ok) expect(r.injected).toBe("/pdca 341");
+    expect(calls).toEqual(["start", "waitForInputReady", "send:/pdca 341"]);
+  });
+
   test("injects anyway when readiness times out (best-effort, no silent drop)", async () => {
     const { sm, calls } = recordingManager(false);
     const r = await runDispatch({
       config: {},
       branch: "b",
       issueNumber: 7,
+      command: "impl",
       sessionManager: sm,
       createThread: async () => ({ id: "t" }),
     });
@@ -180,6 +223,7 @@ describe("runDispatch readiness ordering (RW-025/047)", () => {
       config: {},
       branch: "b",
       issueNumber: 9,
+      command: "impl",
       sessionManager: sm,
       createThread: async () => ({ id: "t" }),
     });
