@@ -275,9 +275,9 @@ export async function startBot(token: string): Promise<void> {
       return true;
     }
 
-    const { branch, issueNumber } = parsed;
+    const { branch, issueNumber, command } = parsed;
     console.log(
-      `[Bot] Dispatch accepted in channel ${channelName} (branch len=${branch.length}, issue=${issueNumber})`
+      `[Bot] Dispatch accepted in channel ${channelName} (branch len=${branch.length}, issue=${issueNumber}, mode=${command})`
     );
 
     const textChannel = message.channel as TextChannel;
@@ -285,6 +285,7 @@ export async function startBot(token: string): Promise<void> {
       config,
       branch,
       issueNumber,
+      command,
       sessionManager,
       createThread: async (b: string) => {
         // Sequence suffix only when another session is already live on the same

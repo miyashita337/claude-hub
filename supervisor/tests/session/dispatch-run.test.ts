@@ -55,6 +55,7 @@ describe("runDispatch", () => {
       config,
       branch: "corp-dispatch-42",
       issueNumber: 42,
+      command: "impl",
       sessionManager: manager,
       createThread,
     });
@@ -89,6 +90,7 @@ describe("runDispatch", () => {
       config,
       branch: "b",
       issueNumber: 1,
+      command: "impl",
       sessionManager: manager,
       createThread: async () => ({ id: "t" }),
     });
@@ -101,6 +103,7 @@ describe("runDispatch", () => {
       config,
       branch: "b",
       issueNumber: 1,
+      command: "impl",
       sessionManager: manager,
       createThread: async () => {
         throw new Error("missing perms");
@@ -122,6 +125,7 @@ describe("runDispatch", () => {
       config,
       branch: "b",
       issueNumber: 1,
+      command: "impl",
       sessionManager: manager,
       createThread: async () => ({ id: "t" }),
     });
@@ -140,6 +144,7 @@ describe("runDispatch", () => {
       config,
       branch: "b",
       issueNumber: 7,
+      command: "impl",
       sessionManager: manager,
       createThread: async () => ({ id: "t" }),
     });
