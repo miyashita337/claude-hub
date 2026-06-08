@@ -46,6 +46,49 @@ describe("relay-server", () => {
     expect(result.chunks.length).toBeGreaterThanOrEqual(1);
   });
 
+  // Issue #204: context_tokens forwarded by the Stop hook
+  test("POST parses a valid context_tokens into RelayResult", async () => {
+    startRelayServer();
+    const port = getRelayPort();
+    const promise = waitForRelay("thread-ctx", 5000);
+    await fetch(`http://localhost:${port}/relay/thread-ctx`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ text: "hi", session_id: "s", context_tokens: 350000 }),
+    });
+    const result = await promise;
+    expect(result.contextTokens).toBe(350000);
+  });
+
+  test("POST omits contextTokens when absent or invalid", async () => {
+    startRelayServer();
+    const port = getRelayPort();
+
+    const p1 = waitForRelay("thread-noctx", 5000);
+    await fetch(`http://localhost:${port}/relay/thread-noctx`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ text: "hi", session_id: "s" }),
+    });
+    expect((await p1).contextTokens).toBeUndefined();
+
+    const p2 = waitForRelay("thread-badctx", 5000);
+    await fetch(`http://localhost:${port}/relay/thread-badctx`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ text: "hi", session_id: "s", context_tokens: "lots" }),
+    });
+    expect((await p2).contextTokens).toBeUndefined();
+
+    const p3 = waitForRelay("thread-negctx", 5000);
+    await fetch(`http://localhost:${port}/relay/thread-negctx`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ text: "hi", session_id: "s", context_tokens: -5 }),
+    });
+    expect((await p3).contextTokens).toBeUndefined();
+  });
+
   test("waitForRelay times out if no POST received", async () => {
     startRelayServer();
 
@@ -108,6 +151,33 @@ describe("relay-server", () => {
     expect(late.threadId).toBe("thread-monitor");
     expect(late.text).toBe("18 件の下書きがあります。");
     expect(late.chunks.length).toBeGreaterThanOrEqual(1);
+  });
+
+  // Issue #204: a late Stop event must carry context_tokens so the budget check
+  // runs on the Monitor-split path too (not just the resolved relay).
+  test("late-arriving POST forwards context_tokens to onLateResponse", async () => {
+    startRelayServer();
+    const port = getRelayPort();
+
+    const received: LateResponseEvent[] = [];
+    onLateResponse((event) => received.push(event));
+
+    const promise = waitForRelay("thread-late-ctx", 5000);
+    await fetch(`http://localhost:${port}/relay/thread-late-ctx`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ text: "first" }),
+    });
+    await promise;
+
+    await fetch(`http://localhost:${port}/relay/thread-late-ctx`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ text: "second", context_tokens: 820000 }),
+    });
+
+    expect(received.length).toBe(1);
+    expect(received[0]!.contextTokens).toBe(820000);
   });
 
   test("POST with empty text and no pending returns 404 even with late handler", async () => {

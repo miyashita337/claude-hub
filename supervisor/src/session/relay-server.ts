@@ -7,6 +7,13 @@ export interface RelayResult {
   chunks: string[];
   claudeSessionId?: string;
   error?: string;
+  /**
+   * Session's current context token count at the moment the Stop hook fired
+   * (Issue #204). Forwarded by `hooks/stop-relay.sh`. Absent when the hook
+   * could not compute it (no transcript / older hook). Consumers use it to warn
+   * the Discord thread when a session enters context-rot territory.
+   */
+  contextTokens?: number;
 }
 
 export interface ProgressEvent {
@@ -19,6 +26,9 @@ export interface LateResponseEvent {
   threadId: string;
   chunks: string[];
   text: string;
+  /** Session context token count for this late turn (Issue #204), if reported
+   *  by the Stop hook. Lets the late-response path warn on context rot too. */
+  contextTokens?: number;
 }
 
 // Issue #12 (Phase 1): AskUserQuestion fallback. When `claude` raises an
@@ -320,12 +330,21 @@ export function startRelayServer(): void {
               : "";
         const sessionId =
           typeof body.session_id === "string" ? body.session_id : undefined;
+        // Issue #204: best-effort context size from the Stop hook. Accept only a
+        // non-negative integer (the hook only ever emits one); anything else is
+        // treated as "not reported".
+        const contextTokens =
+          typeof body.context_tokens === "number" &&
+          Number.isInteger(body.context_tokens) &&
+          body.context_tokens >= 0
+            ? body.context_tokens
+            : undefined;
         const chunks = formatForDiscord(text);
 
         const pending = pendingRequests.get(threadId);
         if (pending) {
           clearTimeout(pending.timer);
-          pending.resolve({ text, chunks, claudeSessionId: sessionId });
+          pending.resolve({ text, chunks, claudeSessionId: sessionId, contextTokens });
           pendingRequests.delete(threadId);
           return new Response("ok", { status: 200 });
         }
@@ -335,7 +354,7 @@ export function startRelayServer(): void {
         // Forward to Discord as a follow-up message so responses aren't lost.
         if (text && lateResponseCallback) {
           try {
-            lateResponseCallback({ threadId, chunks, text });
+            lateResponseCallback({ threadId, chunks, text, contextTokens });
           } catch (err) {
             console.error("[relay-server] lateResponseCallback error:", err);
           }

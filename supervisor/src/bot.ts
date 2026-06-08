@@ -16,6 +16,7 @@ import { createSessionCommand, createSessionHandler } from "./commands/session";
 import { CHANNEL_MAP, MAX_SESSIONS } from "./config/channels";
 import type { AttachmentInfo } from "./session/relay";
 import { buildDialogStuckHandler } from "./session/dialog-stuck-handler";
+import { notifyPushover } from "./session/notify-pushover";
 import { updateSessionClaudeId } from "./infra/db";
 import {
   buildSalvageReply,
@@ -169,6 +170,35 @@ export async function startBot(token: string): Promise<void> {
           if (chunk.trim()) {
             await channel.send(chunk);
           }
+        }
+        // Issue #204: a late Stop event (Monitor-split turn) can still be the
+        // turn where context crossed into rot territory — run the same
+        // per-thread budget check so this path warns too. The tracker is shared
+        // with the main relay path, so de-dup holds across both.
+        try {
+          const budget = sessionManager.contextBudgetWarning(
+            event.threadId,
+            event.contextTokens
+          );
+          if (budget) {
+            console.warn(
+              `[Bot] context-budget ${budget.level} on thread ${event.threadId} (late): ${budget.tokens} tokens`
+            );
+            await channel.send(budget.message);
+            if (budget.level === "red" || budget.level === "critical") {
+              await notifyPushover(
+                "Claude Code: コンテキスト肥大化",
+                `${channel.name ?? event.threadId} (${budget.level}, ${Math.floor(budget.tokens / 1000)}k tokens) — /session compact 推奨 (#204)`
+              ).catch((err) =>
+                console.warn(`[Bot] context-budget pushover failed (late):`, err)
+              );
+            }
+          }
+        } catch (budgetErr) {
+          console.warn(
+            `[Bot] context-budget check failed (late) for thread ${event.threadId}:`,
+            budgetErr
+          );
         }
       } catch (err) {
         console.error(`[Bot] Late response send error for thread ${event.threadId}:`, err);
@@ -579,6 +609,39 @@ export async function startBot(token: string): Promise<void> {
             await thread.send(chunk);
             console.log(`[Bot] Chunk sent successfully`);
           }
+        }
+
+        // Issue #204: warn when this session has entered context-rot territory.
+        // At high context, tool-call markup can degrade to plain text and a
+        // tool silently never runs — the relay still resolves (a text turn), so
+        // the dialog watchdog / stall heartbeat never fire. The Stop hook
+        // reports the context token count; we surface a degraded warning (and
+        // page Pushover for red/critical) once per band crossing. Best-effort:
+        // a failure here must never affect the already-delivered response.
+        try {
+          const budget = sessionManager.contextBudgetWarning(
+            threadId,
+            result.contextTokens
+          );
+          if (budget) {
+            console.warn(
+              `[Bot] context-budget ${budget.level} on thread ${threadId}: ${budget.tokens} tokens`
+            );
+            await thread.send(budget.message);
+            if (budget.level === "red" || budget.level === "critical") {
+              await notifyPushover(
+                "Claude Code: コンテキスト肥大化",
+                `${thread.name ?? threadId} (${budget.level}, ${Math.floor(budget.tokens / 1000)}k tokens) — /session compact 推奨 (#204)`
+              ).catch((err) =>
+                console.warn(`[Bot] context-budget pushover failed:`, err)
+              );
+            }
+          }
+        } catch (budgetErr) {
+          console.warn(
+            `[Bot] context-budget check failed for thread ${threadId}:`,
+            budgetErr
+          );
         }
 
         // Forward to vive-reading TTS webhook (fire-and-forget)

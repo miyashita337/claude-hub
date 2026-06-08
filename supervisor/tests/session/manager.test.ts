@@ -98,6 +98,33 @@ describe("SessionManager (thread-based)", () => {
     expect(manager.has("thread-nonexistent")).toBe(false);
   });
 
+  describe("contextBudgetWarning (#204)", () => {
+    test("returns null for unknown thread, undefined tokens, or below yellow", async () => {
+      expect(manager.contextBudgetWarning("no-such-thread", 500_000)).toBeNull();
+      await manager.start(primaryConfig, "thread-cb0");
+      expect(manager.contextBudgetWarning("thread-cb0", undefined)).toBeNull();
+      expect(manager.contextBudgetWarning("thread-cb0", 100_000)).toBeNull();
+    });
+
+    test("warns once on first band crossing, de-dups within band, escalates up", async () => {
+      const t = "thread-cb1";
+      await manager.start(primaryConfig, t);
+      expect(manager.contextBudgetWarning(t, 320_000)?.level).toBe("yellow");
+      expect(manager.contextBudgetWarning(t, 350_000)).toBeNull(); // same band → no spam
+      expect(manager.contextBudgetWarning(t, 410_000)?.level).toBe("red"); // escalate
+      expect(manager.contextBudgetWarning(t, 850_000)?.level).toBe("critical");
+      expect(manager.contextBudgetWarning(t, 900_000)).toBeNull(); // same band
+    });
+
+    test("trackers are per-thread (independent sessions)", async () => {
+      await manager.start(primaryConfig, "thread-cbA");
+      await manager.start(primaryConfig, "thread-cbB");
+      expect(manager.contextBudgetWarning("thread-cbA", 320_000)?.level).toBe("yellow");
+      // B is independent: it still gets its own first-crossing warning.
+      expect(manager.contextBudgetWarning("thread-cbB", 320_000)?.level).toBe("yellow");
+    });
+  });
+
   test("allows multiple sessions in the same channel", async () => {
     await manager.start(primaryConfig, "thread-1");
     await manager.start(primaryConfig, "thread-2");

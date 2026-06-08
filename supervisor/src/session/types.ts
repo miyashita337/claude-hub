@@ -1,4 +1,5 @@
 import type { ChildProcess } from "child_process";
+import type { ContextBudgetTracker } from "./context-budget";
 
 export interface SessionInfo {
   id: string;
@@ -26,6 +27,13 @@ export interface SessionInfo {
    * repo from which the worktree was created.
    */
   worktree?: { mainRepoDir: string; path: string; branch: string };
+  /**
+   * Per-session context-budget de-dup tracker (Issue #204). Lazily created on
+   * the first relay turn that reports a context token count; held in memory and
+   * discarded when the session is removed from the map. Ensures a steady
+   * high-context session is warned only when it crosses up into a new band.
+   */
+  contextBudgetTracker?: ContextBudgetTracker;
 }
 
 /**
