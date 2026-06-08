@@ -34,6 +34,7 @@ CONTEXT_TOKENS=""
 TRANSCRIPT=$(echo "$INPUT" | jq -r '.transcript_path // empty')
 if [ -n "$TRANSCRIPT" ] && [ -f "$TRANSCRIPT" ]; then
   CONTEXT_TOKENS=$(tail -n 400 "$TRANSCRIPT" 2>/dev/null \
+    | grep '"usage"' 2>/dev/null \
     | jq -c -R 'fromjson? // empty' 2>/dev/null \
     | jq -s -r '
         [ .[] | select(.message.usage) ] as $u

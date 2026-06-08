@@ -138,7 +138,15 @@ export function createContextBudgetTracker(
         return null;
       }
       const rank = LEVEL_RANK[level];
-      if (rank <= warnedRank) return null; // already warned at this or higher level
+      if (rank < warnedRank) {
+        // Dropped to a lower (but still >= yellow) band — e.g. a partial
+        // /session compact that shaved one band but not below yellow. Lower the
+        // high-water mark so a later climb back up re-warns, while the downward
+        // move itself stays silent (we never warn on shrinking context).
+        warnedRank = rank;
+        return null;
+      }
+      if (rank <= warnedRank) return null; // same band — already warned, no spam
       warnedRank = rank;
       return {
         level,

@@ -90,6 +90,17 @@ describe("createContextBudgetTracker (de-dup, Journey AC #2/#3)", () => {
     expect(tr.check(299_999)).toBeNull();
   });
 
+  test("dropping to a lower band (not below yellow) re-arms a re-climb (partial compact)", () => {
+    const tr = createContextBudgetTracker(T);
+    expect(tr.check(820_000)!.level).toBe("critical");
+    expect(tr.check(410_000)).toBeNull(); // partial compact: critical → red, silent
+    const back = tr.check(820_000); // climbs back to critical
+    expect(back).not.toBeNull();
+    expect(back!.level).toBe("critical"); // re-warned
+    // ...and once re-warned at critical, it de-dups again within the band.
+    expect(tr.check(900_000)).toBeNull();
+  });
+
   test("dropping below yellow resets the episode so a re-climb re-warns (post-compact)", () => {
     const tr = createContextBudgetTracker(T);
     expect(tr.check(420_000)!.level).toBe("red");
