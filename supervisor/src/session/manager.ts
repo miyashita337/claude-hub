@@ -32,6 +32,7 @@ import {
   createContextBudgetTracker,
   type ContextBudgetWarning,
 } from "./context-budget";
+import { compactClaudeHubExit } from "./primary-compact";
 
 const CLAUDE_PATH = resolve(homedir(), ".local", "bin", "claude");
 const TMUX_SESSION_PREFIX = "claude-";
@@ -924,6 +925,21 @@ export class SessionManager {
     // in an indeterminate state (e.g. the Escape landed but the literal/Enter
     // did not); the caller surfaces the throw so the user can retry.
     await sendToPane(tmuxName, `/compact ${intent}`);
+  }
+
+  /**
+   * Issue #199 AC1: compact the claudeHubExit primary-channel session.
+   *
+   * Unlike {@link compactSession} (a SessionManager-managed thread session on
+   * the `-L claude-hub` socket), claudeHubExit is a long-lived launchd process
+   * on the DEFAULT tmux socket, outside SessionManager. Delegated to
+   * primary-compact — the single sanctioned cross-socket reach — which checks
+   * liveness and throws `"claudeHubExit session dead"` when absent so the
+   * command layer can surface an ephemeral error (AC3 parity). `intent` is
+   * non-empty by contract (the command layer substitutes a default; RW-032).
+   */
+  async compactPrimarySession(intent: string): Promise<void> {
+    await compactClaudeHubExit(intent);
   }
 
   async stop(

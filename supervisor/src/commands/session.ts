@@ -75,6 +75,22 @@ export function createSessionCommand() {
 // the summary keeps the current state and next action.
 export const DEFAULT_COMPACT_INTENT = "直近の作業状態と次アクションを保持して圧縮";
 
+/**
+ * Issue #199 AC1: the claudeHubExit primary channel id, read from the
+ * `HIJOGUCHI_CHANNEL_ID` env (same name start-hijoguchi.sh already uses, so the
+ * operator sets one value). Read at call time (not module load) so tests and a
+ * launchd reload pick it up without rebuilding the importing module.
+ *
+ * Returns undefined when unset/blank — the compact handler then fails safe to
+ * the normal thread-bound path (the primary channel just shows the usage hint),
+ * keeping the Supervisor↔claudeHubExit boundary closed unless explicitly wired.
+ * Channel ids are kept out of committed source (Issue #63 convention); env-only.
+ */
+export function claudeHubExitPrimaryChannelId(): string | undefined {
+  const id = process.env.HIJOGUCHI_CHANNEL_ID?.trim();
+  return id ? id : undefined;
+}
+
 export function createSessionHandler(sessionManager: SessionManager) {
   return async (interaction: ChatInputCommandInteraction) => {
     const subcommand = interaction.options.getSubcommand();
@@ -107,6 +123,34 @@ async function handleCompact(
   sessionManager: SessionManager
 ): Promise<void> {
   const channel = interaction.channel;
+
+  // Issue #199 AC1: the claudeHubExit primary channel is a normal text channel
+  // (not a thread) whose long-lived session runs on the DEFAULT tmux socket,
+  // outside SessionManager. Route its `/session compact` to compactPrimarySession
+  // (claudeHubExit) instead of the thread-bound path. Checked before the
+  // isThread() guard precisely because the primary channel is not a thread.
+  // Gated on HIJOGUCHI_CHANNEL_ID so it no-ops when the Supervisor isn't wired.
+  const primaryChannelId = claudeHubExitPrimaryChannelId();
+  if (primaryChannelId && channel?.id === primaryChannelId) {
+    const rawIntent = interaction.options.getString("intent")?.trim() ?? "";
+    const intent = rawIntent || DEFAULT_COMPACT_INTENT;
+    await interaction.deferReply({ flags: 64 });
+    try {
+      await sessionManager.compactPrimarySession(intent);
+      await interaction.editReply({
+        content: `🗜️ claudeHubExit に compact を送信しました: \`/compact ${intent}\``,
+      });
+    } catch (err) {
+      const msg = `❌ compact の送信に失敗: ${err instanceof Error ? err.message : String(err)}`;
+      if (interaction.deferred || interaction.replied) {
+        await interaction.editReply({ content: msg });
+      } else {
+        await interaction.reply({ content: msg, flags: 64 });
+      }
+    }
+    return;
+  }
+
   // compact targets the session bound to *this* thread (like /session stop), so
   // it must run inside a session thread. Outside one, return a usage hint and
   // never send keys (Issue #200 AC-3).

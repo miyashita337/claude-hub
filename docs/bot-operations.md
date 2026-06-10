@@ -11,7 +11,7 @@ claude-hub プロジェクトで運用している Discord Bot の役割分担�
   - 現在: team-salary, convert-service, segment-anything, claude-context-manager, dev-tool, obsidian-img-annotator, oci-develop
   - 追加は `supervisor/src/config/channels.ts` の `CHANNEL_MAP` を編集
 - **方式**: tmux + Claude Code CLI + HTTP relay (Stop/PostToolUse hook)
-- **コマンド**: `/session start|stop|list`
+- **コマンド**: `/session start|stop|list|status|resume|compact`（`compact` は Issue #200。primary channel での compact は Issue #199 AC1、下記 §「Required env vars (Supervisor ...)」参照）
 - **メッセージ中継**: Discord thread ↔ tmux send-keys ↔ Claude Code
 
 ### 2. claudeHubExit（旧 PM-Agent）
@@ -168,6 +168,26 @@ plist に env 漏れがあると `[hijoguchi] ERROR: HIJOGUCHI_CHANNEL_ID is req
 ### Phase 2 移行チェックリスト前提
 
 下記 Phase 2 移行は本 env 注入が完了している前提。両 env が plist にあることを `defaults read ~/Library/LaunchAgents/com.claude-hub.hijoguchi.plist EnvironmentVariables` などで確認してから進めること。
+
+## Required env vars (Supervisor — `/session compact` の primary channel routing, Issue #199 AC1)
+
+claudeHubExit の primary channel（`#claude-hub-hijoguchi`）はスレッドではない通常チャンネルで、その長命セッションは **default tmux socket** の `claudeHubExit` session（`start-hijoguchi.sh` 管理、Supervisor の `-L claude-hub` socket とは別サーバ）。この channel で `/session compact` を実行したとき claudeHubExit を compact できるよう、**Supervisor 側にも** primary channel id を教える。
+
+`~/Library/LaunchAgents/com.claude-hub.supervisor.plist` の `EnvironmentVariables` に以下を追加（値は hijoguchi plist の `HIJOGUCHI_CHANNEL_ID` と同じ。上記 §「Required env vars (claudeHubExit)」の `1487701062205964329`）:
+
+```xml
+<key>HIJOGUCHI_CHANNEL_ID</key>
+<string>1487701062205964329</string>
+```
+
+反映:
+
+```bash
+launchctl kickstart -k gui/$(id -u)/com.claude-hub.supervisor
+```
+
+- **未設定（空文字）= 機能 OFF（fail-safe）**: primary channel で `/session compact` はスレッド用の usage hint を返すだけ。境界（Supervisor↔claudeHubExit の独立性）は明示 wiring するまで閉じたまま。
+- スレッド内セッションの `/session compact`（Issue #200）は本 env に依存せず従来どおり動作する。
 
 ## 参考: 過去の事故
 
