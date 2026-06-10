@@ -1,5 +1,5 @@
 import { test, expect, describe, beforeEach, afterEach } from "bun:test";
-import { mkdtempSync, writeFileSync, rmSync } from "fs";
+import { mkdtempSync, writeFileSync, rmSync, mkdirSync } from "fs";
 import { join } from "path";
 import { tmpdir } from "os";
 import { createSessionHandler } from "../../src/commands/session";
@@ -36,7 +36,7 @@ beforeEach(() => {
   process.env.SUPERVISOR_ACCESS_JSON_PATH = accessPath;
 
   summaryDir = join(tmpRoot, "sessions");
-  require("fs").mkdirSync(summaryDir, { recursive: true });
+  mkdirSync(summaryDir, { recursive: true });
   process.env.SUPERVISOR_SESSION_SUMMARY_DIRS = summaryDir;
 });
 
@@ -135,5 +135,75 @@ describe("/session start surfaces previous-session summary (#141)", () => {
     expect(h.sentToThread.length).toBe(1);
     expect(h.sentToThread[0]).toContain("セッションを開始しました");
     expect(h.sentToThread.some((m) => m.includes("前回セッションの要約"))).toBe(false);
+  });
+});
+
+// AC-2: /session resume surfaces the summary for the resumed project_dir.
+const RESUME_PROJECT_DIR = "/tmp/it-141-repo";
+
+function makeResumeInteraction() {
+  const sentToThread: string[] = [];
+  const thread = {
+    id: "thread-resume-summary",
+    send: async (content: string) => {
+      sentToThread.push(content);
+    },
+    delete: async () => {},
+  };
+  const channel = {
+    id: FIXTURE_CHANNEL_ID,
+    isThread: () => false,
+    isTextBased: () => true,
+    isDMBased: () => false,
+    name: "agent-base",
+    parent: null,
+    threads: { create: async () => thread },
+  };
+  const interaction = {
+    user: { id: FIXTURE_USER_ID },
+    options: {
+      getSubcommand: () => "resume",
+      getString: (name: string) => (name === "session_id" ? "sess-123" : null),
+    },
+    channel,
+    deferred: false,
+    replied: false,
+    async reply() {
+      this.replied = true;
+    },
+    async deferReply() {
+      this.deferred = true;
+    },
+    async editReply() {},
+  };
+
+  const sessionManager = {
+    count: () => 0,
+    listRunningByChannel: () => [],
+    findResumableSession: () => ({
+      claude_session_id: "sess-123",
+      channel_name: "agent-base",
+      project_dir: RESUME_PROJECT_DIR,
+      branch: "feat-foo",
+    }),
+    livenessOfClaudeSession: () => "dead",
+    resumeSession: async () => {},
+  };
+
+  return {
+    run: () => createSessionHandler(sessionManager as never)(interaction as never),
+    sentToThread,
+  };
+}
+
+describe("/session resume surfaces previous-session summary (#141)", () => {
+  test("AC-2: matching summary for the resumed project_dir is posted", async () => {
+    writeSummaryFile(RESUME_PROJECT_DIR, "## Session Summary\n復帰前の作業: #199 の compact 配線");
+    const h = makeResumeInteraction();
+    await h.run();
+
+    const summaryMsg = h.sentToThread.find((m) => m.includes("前回セッションの要約"));
+    expect(summaryMsg).toBeDefined();
+    expect(summaryMsg).toContain("#199 の compact 配線");
   });
 });
