@@ -29,7 +29,10 @@
              (Issue #63 fail-closed). Fill the real id in the installed plist
              (~/Library/LaunchAgents/com.claude-hub.supervisor.plist) — use the
              same value as the hijoguchi plist's HIJOGUCHI_CHANNEL_ID — then
-             `launchctl kickstart -k gui/$(id -u)/com.claude-hub.supervisor`.
+             reload with bootout+bootstrap (NOT `kickstart -k`, which restarts
+             from the cached service definition and ignores plist env changes):
+             `launchctl bootout gui/$(id -u)/com.claude-hub.supervisor &&
+             launchctl bootstrap gui/$(id -u) <this plist>`.
              Blank = feature disabled (fail-safe). -->
         <key>HIJOGUCHI_CHANNEL_ID</key>
         <string></string>
