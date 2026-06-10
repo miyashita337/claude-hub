@@ -18,6 +18,7 @@ import {
 import {
   ensureWorktree,
   removeWorktree,
+  recreateWorktreeForExistingBranch,
   realGitGhRunner,
   type EnsureWorktreeResult,
 } from "./worktree";
@@ -82,6 +83,13 @@ export interface WorktreeAdapter {
   ensure(mainRepoDir: string, branch: string): EnsureWorktreeResult;
   /** Remove the worktree (branch is preserved). */
   remove(mainRepoDir: string, worktreePath: string): void;
+  /**
+   * Re-create the worktree for an *existing* branch only — resume recovery
+   * (Issue #217). Returns true when the worktree exists afterwards, false when
+   * the branch is gone (caller surfaces a clear error). Never creates a new
+   * branch from the default branch.
+   */
+  recreateForBranch(mainRepoDir: string, branch: string): boolean;
 }
 
 export interface SessionEffects {
@@ -212,6 +220,13 @@ export const realWorktreeAdapter: WorktreeAdapter = {
   },
   remove(mainRepoDir, worktreePath) {
     removeWorktree(mainRepoDir, worktreePath, realGitGhRunner);
+  },
+  recreateForBranch(mainRepoDir, branch) {
+    return recreateWorktreeForExistingBranch(
+      mainRepoDir,
+      branch,
+      realGitGhRunner,
+    );
   },
 };
 

@@ -1,7 +1,10 @@
 import { test, expect, describe, beforeEach, afterEach } from "bun:test";
-import { mkdirSync, rmSync } from "fs";
+import { existsSync, mkdirSync, rmSync } from "fs";
 import { tmpdir } from "os";
 import { resolve } from "path";
+// Pure path resolver (no DB access) — safe to import statically before the
+// SUPERVISOR_DB_PATH override below.
+import { resolveWorktreePath } from "../../src/session/worktree";
 
 // Isolate DB writes from the real sessions.db (mirrors tests/infra/db.test.ts).
 process.env.SUPERVISOR_DB_PATH = ":memory:";
@@ -69,7 +72,9 @@ describe("SessionManager.resumeSession (#161)", () => {
     expect(info.claudeSessionId).toBe(VALID_ID);
     expect(info.projectDir).toBe(projectDir);
     expect(info.status).toBe("running");
-    // No worktree for resume (resumes the recorded cwd, Q2).
+    // No worktree for a non-branch resume: it runs in the recorded cwd and did
+    // not rebuild anything, so it owns no worktree (cf. #217 recovery, which
+    // does set one).
     expect(info.worktree).toBeUndefined();
   });
 
@@ -176,6 +181,146 @@ describe("SessionManager.resumeSession (#161)", () => {
     expect(effects.tmux.list()).toHaveLength(0);
     expect(manager.has(THREAD_ID)).toBe(false);
     expect(manager.count()).toBe(0);
+  });
+});
+
+/**
+ * Resume worktree recovery (Issue #217). A branch session's worktree is removed
+ * on /session stop (Q3, RW-046) but the branch + cwd-keyed transcript survive,
+ * so resume re-creates the worktree at the recorded projectDir. Maps to the
+ * journey AC:
+ *   - AC-2 (branch healthy): missing worktree is rebuilt → resume proceeds.
+ *   - AC-3 (branch gone):    deterministic "cannot recover" error, no rebuild.
+ */
+describe("SessionManager.resumeSession worktree recovery (#217)", () => {
+  let manager: InstanceType<typeof SessionManager>;
+  let effects: FakeSessionEffects;
+  let repoDir: string;
+
+  beforeEach(() => {
+    effects = createFakeEffects();
+    // A main repo dir that exists; the per-branch worktree under it does NOT
+    // (simulates the post-/session stop state where the worktree was removed).
+    repoDir = resolve(tmpdir(), `supervisor-resume-repo-${process.pid}`);
+    mkdirSync(repoDir, { recursive: true });
+  });
+
+  afterEach(async () => {
+    await manager?.shutdownAll();
+    rmSync(repoDir, { recursive: true, force: true });
+  });
+
+  test("AC-2: missing worktree + existing branch → re-creates worktree and resumes", async () => {
+    manager = new SessionManager({
+      effects,
+      gracefulKillTimeoutMs: 0,
+      resumePromptPollAttempts: 0,
+    });
+    const branch = "feat-217";
+    const wtPath = resolveWorktreePath(repoDir, branch);
+    expect(existsSync(wtPath)).toBe(false); // removed on /session stop
+    effects.worktree.existingBranches.add(branch); // branch is healthy
+
+    const info = await manager.resumeSession(
+      makeConfig(repoDir),
+      THREAD_ID,
+      VALID_ID,
+      wtPath,
+      branch
+    );
+
+    // Recovery ran exactly once for this branch, and the worktree now exists.
+    expect(effects.worktree.recreateForBranchCalls).toEqual([
+      { mainRepoDir: repoDir, branch },
+    ]);
+    expect(existsSync(wtPath)).toBe(true);
+    // claude --resume launches with cwd = the recorded (rebuilt) worktree path
+    // so the transcript is found.
+    const cmd = effects.tmux.getCommand(tmuxName) ?? "";
+    expect(cmd).toContain(`cd "${wtPath}"`);
+    expect(cmd).toContain(`--resume ${VALID_ID}`);
+    expect(info.status).toBe("running");
+    expect(info.projectDir).toBe(wtPath);
+    // The resumed session now OWNS the worktree it rebuilt, so /session stop can
+    // clean it up (review #217 should-3). Without this the recreated dir leaks.
+    expect(info.worktree).toEqual({
+      mainRepoDir: repoDir,
+      path: wtPath,
+      branch,
+    });
+  });
+
+  test("should-3: /session stop removes the worktree that resume re-created", async () => {
+    manager = new SessionManager({
+      effects,
+      gracefulKillTimeoutMs: 0,
+      resumePromptPollAttempts: 0,
+    });
+    const branch = "feat-217";
+    const wtPath = resolveWorktreePath(repoDir, branch);
+    effects.worktree.existingBranches.add(branch);
+
+    await manager.resumeSession(
+      makeConfig(repoDir),
+      THREAD_ID,
+      VALID_ID,
+      wtPath,
+      branch
+    );
+    expect(existsSync(wtPath)).toBe(true);
+
+    await manager.stop(THREAD_ID, "manual");
+
+    // The rebuilt worktree is the last user of its path → removed on stop (no leak).
+    expect(effects.worktree.removeCalls).toEqual([
+      { mainRepoDir: repoDir, worktreePath: wtPath },
+    ]);
+  });
+
+  test("AC-3: missing worktree + deleted branch → clear error, no resume", async () => {
+    manager = new SessionManager({
+      effects,
+      gracefulKillTimeoutMs: 0,
+      resumePromptPollAttempts: 0,
+    });
+    const branch = "deleted-branch";
+    const wtPath = resolveWorktreePath(repoDir, branch);
+    // existingBranches intentionally left empty → recreateForBranch returns false.
+
+    await expect(
+      manager.resumeSession(makeConfig(repoDir), THREAD_ID, VALID_ID, wtPath, branch)
+    ).rejects.toThrow(
+      /再生成できませんでした[\s\S]*branch 'deleted-branch' が削除されている/
+    );
+
+    expect(effects.worktree.recreateForBranchCalls.length).toBe(1);
+    expect(existsSync(wtPath)).toBe(false);
+    expect(effects.tmux.list()).toHaveLength(0);
+    expect(manager.has(THREAD_ID)).toBe(false);
+  });
+
+  test("recovery is skipped when the recorded projectDir still exists", async () => {
+    manager = new SessionManager({
+      effects,
+      gracefulKillTimeoutMs: 0,
+      resumePromptPollAttempts: 0,
+    });
+    const branch = "feat-217";
+    // projectDir already present → no rebuild needed even with a branch.
+    const present = resolve(tmpdir(), `supervisor-resume-present-${process.pid}`);
+    mkdirSync(present, { recursive: true });
+    try {
+      await manager.resumeSession(
+        makeConfig(repoDir),
+        THREAD_ID,
+        VALID_ID,
+        present,
+        branch
+      );
+      expect(effects.worktree.recreateForBranchCalls.length).toBe(0);
+    } finally {
+      rmSync(present, { recursive: true, force: true });
+    }
   });
 });
 

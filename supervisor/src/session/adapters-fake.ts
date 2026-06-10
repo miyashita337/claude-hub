@@ -6,6 +6,7 @@ import type {
   TmuxAdapter,
   WorktreeAdapter,
 } from "./adapters";
+import { mkdirSync } from "fs";
 import { resolveWorktreePath, type EnsureWorktreeResult } from "./worktree";
 import type { OpenTabOptions } from "./iterm2";
 
@@ -130,8 +131,15 @@ export class FakeProcessAdapter implements ProcessAdapter {
 export class FakeWorktreeAdapter implements WorktreeAdapter {
   ensureCalls: { mainRepoDir: string; branch: string }[] = [];
   removeCalls: { mainRepoDir: string; worktreePath: string }[] = [];
+  recreateForBranchCalls: { mainRepoDir: string; branch: string }[] = [];
   /** Worktree paths considered already-present (drives the Q4 reuse path). */
   existingPaths = new Set<string>();
+  /**
+   * Branch names that still resolve in the repo (Issue #217). Drives the Q1
+   * checkout in {@link recreateForBranch}: a branch NOT in this set is treated
+   * as deleted, so recovery returns false.
+   */
+  existingBranches = new Set<string>();
   /** When set, ensure() throws to simulate a git worktree failure. */
   failOnEnsure = false;
 
@@ -151,6 +159,20 @@ export class FakeWorktreeAdapter implements WorktreeAdapter {
   remove(mainRepoDir: string, worktreePath: string): void {
     this.removeCalls.push({ mainRepoDir, worktreePath });
     this.existingPaths.delete(worktreePath);
+  }
+
+  recreateForBranch(mainRepoDir: string, branch: string): boolean {
+    this.recreateForBranchCalls.push({ mainRepoDir, branch });
+    const path = resolveWorktreePath(mainRepoDir, branch.trim());
+    if (this.existingPaths.has(path)) return true; // Q4: already present
+    if (!this.existingBranches.has(branch.trim())) return false; // branch gone
+    // Q1: materialize the real directory so SessionManager's own existsSync()
+    // re-check passes after recovery (manager runs against the real fs). Tests
+    // must clean this up — the dir lives under <mainRepoDir>/.claude/worktrees,
+    // so an afterEach `rmSync(repoDir, { recursive: true })` removes it too.
+    mkdirSync(path, { recursive: true });
+    this.existingPaths.add(path);
+    return true;
   }
 }
 

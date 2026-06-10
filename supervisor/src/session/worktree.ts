@@ -135,6 +135,45 @@ export function ensureWorktree(
   return { path: worktreePath, reused: false, baseBranch: base };
 }
 
+/**
+ * Re-create the worktree for an *existing* branch only — the resume-recovery
+ * path (Issue #217). A branch session's worktree is physically removed on
+ * `/session stop` (Q3, RW-046), but the branch and the conversation transcript
+ * (keyed by cwd) survive. Rebuilding the worktree at the SAME path restores the
+ * cwd that `claude --resume` needs.
+ *
+ * Unlike {@link ensureWorktree}, an unknown branch is intentionally NOT created
+ * from the default branch (no Q2): resuming must never fabricate unrelated
+ * content under the original branch's name. Returns true when the worktree
+ * exists afterwards (Q4 already-present, or Q1 freshly checked out), false when
+ * the branch is gone so the caller can surface a clear "cannot recover" error.
+ */
+export function recreateWorktreeForExistingBranch(
+  mainRepoDir: string,
+  branch: string,
+  runner: GitGhRunner,
+): boolean {
+  const trimmed = branch.trim();
+  if (!trimmed) {
+    return false;
+  }
+  const worktreePath = resolveWorktreePath(mainRepoDir, trimmed);
+
+  // Q4: a worktree is already present at the path → nothing to recover.
+  if (runner.pathExists(worktreePath)) {
+    return true;
+  }
+
+  // Q1: the branch still exists → check it out into a fresh worktree. A missing
+  // branch falls through to `false` (no Q2 new-branch creation).
+  if (runner.branchExists(mainRepoDir, trimmed)) {
+    runner.addWorktreeFromBranch(mainRepoDir, worktreePath, trimmed);
+    return true;
+  }
+
+  return false;
+}
+
 /** Remove a worktree (Q3). Caller decides whether failures are fatal. */
 export function removeWorktree(
   mainRepoDir: string,
