@@ -145,6 +145,20 @@ export async function tmuxSend(
 }
 
 /**
+ * Flatten every newline (CR / LF, in any combination or run) to a single space
+ * so a multi-line message survives `tmux send-keys -l`, which would otherwise
+ * submit at the first newline and split/corrupt the input (Issue #210).
+ *
+ * The regex MUST use single-backslash `\r` / `\n` (the real CR 0x0D / LF 0x0A
+ * code points). The earlier `/[\\r\\n]+/` was double-escaped and matched only
+ * the literal characters `\`, `r`, `n`, so it never removed actual newlines —
+ * multi-line Discord relays were silently dropped while single-line ones worked.
+ */
+export function flattenForSendKeys(text: string): string {
+  return text.replace(/[\r\n]+/g, " ");
+}
+
+/**
  * Type one line into the pane and submit it, without waiting for any relay
  * response. This is the shared send sequence used by {@link relayMessage}
  * (which then waits for the Stop-hook POST) and by fire-and-forget sends such
@@ -173,7 +187,7 @@ export async function sendToPane(
   // either socket, so this stays the single source of truth (no dead copy).
   socketArgs: readonly string[] = TMUX_ARGS
 ): Promise<void> {
-  const literalText = text.replace(/[\\r\\n]+/g, " ");
+  const literalText = flattenForSendKeys(text);
   await ensurePaneNotInMode(tmuxSessionName, socketArgs);
   await tmuxSend(tmuxSessionName, ["Escape"], socketArgs);
   await new Promise((r) => setTimeout(r, 50));
