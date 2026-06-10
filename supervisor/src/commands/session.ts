@@ -10,6 +10,7 @@ import { CHANNEL_MAP, MAX_SESSIONS } from "../config/channels";
 import { buildThreadTitle, markTitleStopped } from "../session/thread-title";
 import { buildStatusReply } from "../session/status-reply";
 import { evaluateAccess } from "../config/access-policy";
+import { postPreviousSummary } from "../session/session-summary";
 
 export function createSessionCommand() {
   return new SlashCommandBuilder()
@@ -360,6 +361,13 @@ async function handleStart(
         `終了するには \`/session stop\` をこのスレッド内で実行してください。`
     );
 
+    // Issue #141: surface the previous-session summary into the thread, since
+    // the ECC SessionStart hook only injects it into Claude's invisible context.
+    await postPreviousSummary(thread, {
+      projectDir: session.worktree?.path ?? config.dir,
+      repoRoot: config.dir,
+    });
+
     await interaction.editReply({
       content: `✅ セッションをスレッドで起動しました → ${thread}`,
     });
@@ -526,6 +534,13 @@ async function handleResume(
         `前回の会話を引き継いで再開します。このスレッドにメッセージを送信すると中継されます。\n` +
         `終了するには \`/session stop\` をこのスレッド内で実行してください。`
     );
+
+    // Issue #141: surface the previous-session summary for the resumed
+    // project_dir (resume runs in the repo dir, not a worktree).
+    await postPreviousSummary(thread, {
+      projectDir: row.project_dir,
+      repoRoot: config.dir,
+    });
 
     await interaction.editReply({
       content: `✅ セッションを復帰しました → ${thread}`,
