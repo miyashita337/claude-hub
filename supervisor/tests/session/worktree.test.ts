@@ -3,6 +3,7 @@ import { resolve } from "path";
 import {
   ensureWorktree,
   removeWorktree,
+  recreateWorktreeForExistingBranch,
   resolveWorktreePath,
   WORKTREE_SUBDIR,
   type GitGhRunner,
@@ -167,5 +168,51 @@ describe("removeWorktree", () => {
 
     expect(runner.calls).toContain(`remove:${path}`);
     expect(runner.pathExists(path)).toBe(false);
+  });
+});
+
+/**
+ * Resume-recovery path (Issue #217). A stopped branch session's worktree is
+ * removed on /session stop, but the branch + cwd-keyed transcript survive, so
+ * resume re-creates the worktree at the SAME path. Unlike ensureWorktree, an
+ * unknown branch must NOT be created from default (no Q2) — recovery returns
+ * false so the caller surfaces a clear error.
+ */
+describe("recreateWorktreeForExistingBranch (#217)", () => {
+  let runner: FakeRunner;
+  beforeEach(() => {
+    runner = new FakeRunner();
+  });
+
+  test("Q4: worktree path already present → true, no git add", () => {
+    const path = resolveWorktreePath(REPO, "feat-217");
+    runner.existing.add(path);
+    expect(recreateWorktreeForExistingBranch(REPO, "feat-217", runner)).toBe(
+      true,
+    );
+    expect(runner.calls.some((c) => c.startsWith("add"))).toBe(false);
+  });
+
+  test("Q1: existing branch, missing worktree → checks out from branch, true", () => {
+    runner.branches.add("feat-217");
+    expect(recreateWorktreeForExistingBranch(REPO, "feat-217", runner)).toBe(
+      true,
+    );
+    expect(runner.calls).toContain("addFromBranch:feat-217");
+    // No Q2 new-branch creation on the recovery path.
+    expect(runner.calls.some((c) => c.startsWith("addNewBranch"))).toBe(false);
+  });
+
+  test("branch gone → false WITHOUT creating a new branch (no Q2)", () => {
+    expect(recreateWorktreeForExistingBranch(REPO, "deleted", runner)).toBe(
+      false,
+    );
+    expect(runner.calls).toContain("branchExists:deleted");
+    expect(runner.calls.some((c) => c.startsWith("add"))).toBe(false);
+  });
+
+  test("empty / whitespace branch → false, no git calls", () => {
+    expect(recreateWorktreeForExistingBranch(REPO, "   ", runner)).toBe(false);
+    expect(runner.calls.length).toBe(0);
   });
 });

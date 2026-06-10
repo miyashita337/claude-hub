@@ -584,12 +584,6 @@ export class SessionManager {
         `claude session id の形式が不正です: ${claudeSessionId}`
       );
     }
-    if (!existsSync(projectDir)) {
-      throw new Error(
-        `プロジェクトディレクトリが見つかりません: ${projectDir}（worktree が削除された可能性があります）`
-      );
-    }
-
     // Single-flight guard (Issue #171, 穴 C): reject a second concurrent resume
     // of the SAME claude session id. Mutated synchronously and held across the
     // awaits inside launchResume, so on the single-threaded event loop the
@@ -612,12 +606,60 @@ export class SessionManager {
           "この session は既に稼働中です。稼働中のスレッドで操作してください（多重 resume 防止）。"
         );
       }
+      // Issue #217: a branch session's worktree is physically removed on
+      // /session stop (Q3, RW-046), but the branch and the conversation
+      // transcript (keyed by cwd) survive. Re-create the worktree at the
+      // recorded projectDir so `claude --resume` finds the transcript. Run this
+      // UNDER the single-flight lock so two concurrent resumes of the same id
+      // cannot both `git worktree add` the same path (review #217 must-1). A
+      // deleted branch is intentionally NOT rebuilt from the default branch
+      // (that would resume into unrelated content) — surface a clear error.
+      let recoveredWorktree: SessionInfo["worktree"];
+      if (!existsSync(projectDir)) {
+        const trimmedBranch = branch?.trim();
+        const recovered = trimmedBranch
+          ? this.recoverWorktreeForResume(config.dir, projectDir, trimmedBranch)
+          : false;
+        if (recovered && existsSync(projectDir) && trimmedBranch) {
+          // We rebuilt the worktree, so THIS resumed session now owns its
+          // cleanup — a later /session stop removes it (last-user-only via
+          // isWorktreePathInUse). Without this the recreated dir would leak,
+          // since resume otherwise carries no worktree (review #217 should-3).
+          recoveredWorktree = {
+            mainRepoDir: config.dir,
+            path: projectDir,
+            branch: trimmedBranch,
+          };
+        } else if (recovered && !existsSync(projectDir)) {
+          // recreateForBranch reported success but the recorded projectDir is
+          // still missing → the rebuilt path differs from projectDir (likely a
+          // config.dir drift between start and resume). Surface it so the
+          // mismatch is diagnosable instead of masquerading as "branch gone"
+          // (review #217 must-2).
+          console.warn(
+            `[SessionManager] Worktree recovery reported success but ${projectDir} is still missing; ` +
+              `the recorded projectDir likely differs from <config.dir>/.claude/worktrees/<branch>`
+          );
+        }
+        if (!existsSync(projectDir)) {
+          if (trimmedBranch) {
+            throw new Error(
+              `セッションの作業ディレクトリ（worktree）を再生成できませんでした: ${projectDir}\n` +
+                `branch '${trimmedBranch}' が削除されている可能性があります。branch を復元してから再度 resume してください。`
+            );
+          }
+          throw new Error(
+            `プロジェクトディレクトリが見つかりません: ${projectDir}（worktree が削除された可能性があります）`
+          );
+        }
+      }
       return await this.launchResume(
         config,
         threadId,
         claudeSessionId,
         projectDir,
-        branch
+        branch,
+        recoveredWorktree
       );
     } finally {
       this.resumingClaudeSessions.delete(claudeSessionId);
@@ -636,7 +678,8 @@ export class SessionManager {
     threadId: string,
     claudeSessionId: string,
     projectDir: string,
-    branch?: string | null
+    branch?: string | null,
+    recoveredWorktree?: SessionInfo["worktree"]
   ): Promise<SessionInfo> {
     const sessionId = randomUUID();
     const tmuxName = this.tmuxSessionName(threadId);
@@ -699,9 +742,12 @@ export class SessionManager {
       startedAt: now,
       lastActivityAt: now,
       status: "running",
-      // No worktree on resume (runs in the project dir), but keep the branch so
-      // same-branch counting and the thread title stay consistent (Issue #175).
+      // Normally no worktree on resume (runs in the recorded cwd). The exception
+      // is Issue #217: when resume re-created a removed branch worktree, carry it
+      // so a later /session stop cleans up what this resume rebuilt. Always keep
+      // the branch for same-branch counting / thread title (Issue #175).
       branch: branch || undefined,
+      worktree: recoveredWorktree,
     };
 
     // Post-launch init (prompt confirm + state registration) can throw. tmux is
@@ -993,6 +1039,41 @@ export class SessionManager {
       console.log(
         `[SessionManager] Worktree ${session.worktree.path} still in use by another session; not removing`
       );
+    }
+  }
+
+  /**
+   * Issue #217: re-create a stopped branch session's worktree so it can resume.
+   * `/session stop` removes the worktree (Q3) but the branch and the cwd-keyed
+   * transcript survive, so rebuilding the worktree at `projectDir` restores the
+   * cwd `claude --resume` needs. Only an existing branch is rebuilt (Q1/Q4); a
+   * deleted branch returns false so the caller reports a clear error rather than
+   * fabricating unrelated content. Failures are swallowed → false, leaving the
+   * caller's existsSync re-check to decide the outcome deterministically.
+   */
+  private recoverWorktreeForResume(
+    mainRepoDir: string,
+    projectDir: string,
+    branch: string
+  ): boolean {
+    try {
+      const ok = this.effects.worktree.recreateForBranch(mainRepoDir, branch);
+      if (ok) {
+        console.log(
+          `[SessionManager] Re-created worktree for branch '${branch}' to resume: ${projectDir}`
+        );
+      } else {
+        console.warn(
+          `[SessionManager] Cannot re-create worktree for branch '${branch}' (branch missing?); resume of ${projectDir} will fail`
+        );
+      }
+      return ok;
+    } catch (err) {
+      console.warn(
+        `[SessionManager] Failed to re-create worktree for branch '${branch}':`,
+        err
+      );
+      return false;
     }
   }
 
