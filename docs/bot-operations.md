@@ -180,10 +180,16 @@ claudeHubExit の primary channel（`#claude-hub-hijoguchi`）はスレッドで
 <string>1487701062205964329</string>
 ```
 
-反映:
+反映（**`kickstart -k` ではなく `bootout`+`bootstrap`**）:
 
 ```bash
-launchctl kickstart -k gui/$(id -u)/com.claude-hub.supervisor
+# kickstart -k はキャッシュされたサービス定義で再起動するだけで plist の
+# env 変更を再読込しない。新規 env を反映するには bootout + bootstrap が必須。
+launchctl bootout   gui/$(id -u)/com.claude-hub.supervisor
+launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/com.claude-hub.supervisor.plist
+
+# 確認: environment セクションに HIJOGUCHI_CHANNEL_ID が出ること
+launchctl print gui/$(id -u)/com.claude-hub.supervisor | grep -A4 '	environment = {'
 ```
 
 - **未設定（空文字）= 機能 OFF（fail-safe）**: primary channel で `/session compact` はスレッド用の usage hint を返すだけ。境界（Supervisor↔claudeHubExit の独立性）は明示 wiring するまで閉じたまま。
