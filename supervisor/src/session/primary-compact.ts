@@ -1,4 +1,4 @@
-import { execFileSync } from "child_process";
+import { execFile } from "child_process";
 import { TMUX_PATH } from "./tmux";
 import { sendToPane } from "./relay";
 
@@ -26,17 +26,20 @@ const DEFAULT_SOCKET_ARGS: readonly string[] = [];
  * Best-effort: any tmux error (no server running / no such session) is treated
  * as "dead". The session name is a hard-coded constant, so there is no shell
  * injection surface even though this spawns tmux directly.
+ *
+ * Async (execFile, not execFileSync) so the 2 s probe never blocks the
+ * Supervisor's single Discord event loop if tmux is slow to respond
+ * (gemini-code-assist review on #213).
  */
-export function claudeHubExitSessionAlive(): boolean {
-  try {
-    execFileSync(TMUX_PATH, ["has-session", "-t", CLAUDEHUBEXIT_TMUX_SESSION], {
-      timeout: 2000,
-      stdio: "pipe",
-    });
-    return true;
-  } catch {
-    return false;
-  }
+export function claudeHubExitSessionAlive(): Promise<boolean> {
+  return new Promise((resolve) => {
+    execFile(
+      TMUX_PATH,
+      ["has-session", "-t", CLAUDEHUBEXIT_TMUX_SESSION],
+      { timeout: 2000 },
+      (err) => resolve(!err)
+    );
+  });
 }
 
 /**
@@ -59,7 +62,7 @@ export async function compactClaudeHubExit(intent: string): Promise<void> {
   // the command layer surfaces it the same way — so this only upgrades the
   // user-facing message to a clear "session dead" instead of a raw tmux error.
   // Worth one extra cross-socket RTT on a manual, infrequent command.
-  if (!claudeHubExitSessionAlive()) {
+  if (!(await claudeHubExitSessionAlive())) {
     throw new Error("claudeHubExit session dead");
   }
   await sendToPane(
