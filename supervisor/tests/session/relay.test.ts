@@ -4,8 +4,59 @@ import {
   startRelayServer,
   stopRelayServer,
 } from "../../src/session/relay-server";
-import { tmuxSend, ensurePaneNotInMode } from "../../src/session/relay";
+import {
+  tmuxSend,
+  ensurePaneNotInMode,
+  flattenForSendKeys,
+} from "../../src/session/relay";
 import { TMUX_ARGS, ensureSocketConfigured } from "../../src/session/tmux";
+
+// Issue #210: the newline-flatten regex was double-escaped (`/[\\r\\n]+/`) so it
+// matched only the literal chars `\`, `r`, `n` and never removed real CR/LF.
+// Multi-line Discord messages kept their newlines, so `send-keys -l` submitted
+// at the first newline and the input was split/corrupted -> silent drop -> stall.
+describe("flattenForSendKeys (Issue #210)", () => {
+  test("AC-1: mixed LF and CRLF collapse to single spaces", () => {
+    expect(flattenForSendKeys("A\nB\r\nC")).toBe("A B C");
+  });
+
+  test("a run of consecutive newlines collapses to ONE space (the `+` quantifier)", () => {
+    expect(flattenForSendKeys("A\n\n\nB")).toBe("A B");
+    expect(flattenForSendKeys("A\r\n\r\nB")).toBe("A B");
+  });
+
+  test("a newline-only string flattens to a single space, not empty", () => {
+    expect(flattenForSendKeys("\n")).toBe(" ");
+    expect(flattenForSendKeys("\r\n\r\n")).toBe(" ");
+  });
+
+  test("bare CR and bare LF are both removed", () => {
+    expect(flattenForSendKeys("A\rB")).toBe("A B");
+    expect(flattenForSendKeys("A\nB")).toBe("A B");
+  });
+
+  test("a single-line message is returned unchanged", () => {
+    expect(flattenForSendKeys("just one line")).toBe("just one line");
+  });
+
+  test("a leading `--` (tmux flag-like) line is preserved as literal text", () => {
+    // The dangerous part for tmux is argv injection, handled by `-l`; flatten
+    // only normalizes newlines and must not mangle the rest of the content.
+    expect(flattenForSendKeys("next:\n- a\n- b")).toBe("next: - a - b");
+  });
+
+  test("realistic 3-line bullet message becomes one prompt line", () => {
+    const msg = "次から\n- note記事にヘッダ画像\n- nanobanana2で";
+    expect(flattenForSendKeys(msg)).toBe(
+      "次から - note記事にヘッダ画像 - nanobanana2で",
+    );
+  });
+
+  test("the buggy double-escaped behavior is gone (regression guard)", () => {
+    // The old regex would leave real newlines in place; assert they're gone.
+    expect(flattenForSendKeys("A\nB\nC")).not.toContain("\n");
+  });
+});
 
 describe("relayMessage", () => {
   beforeAll(() => {
