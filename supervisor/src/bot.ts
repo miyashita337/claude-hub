@@ -11,6 +11,7 @@ import {
 } from "discord.js";
 import { SessionManager } from "./session/manager";
 import { Reaper } from "./session/reaper";
+import { ActivityWatchdog } from "./session/session-activity-watchdog";
 import { ResourceMonitor } from "./session/resource-monitor";
 import { createSessionCommand, createSessionHandler } from "./commands/session";
 import { CHANNEL_MAP, MAX_SESSIONS } from "./config/channels";
@@ -83,6 +84,39 @@ export async function startBot(token: string): Promise<void> {
     });
   }
   const reaper = new Reaper(sessionManager, client);
+  // Issue #209: nudge the owner when a live session has been running for hours
+  // (long_lived, AC3) or has gone silent (quiet, AC1) — the gap between the
+  // per-turn stall heartbeat and the 7-day reaper. De-dup is internal so each
+  // signal pages at most once per episode.
+  const activityWatchdog = new ActivityWatchdog({
+    entries: () => sessionManager.entries(),
+    isAlive: (threadId) => sessionManager.livenessOf(threadId) === "alive",
+    notify: async (threadId, warning) => {
+      try {
+        const channel = await client.channels.fetch(threadId);
+        if (!channel?.isThread()) return;
+        console.warn(
+          `[Bot] activity-watchdog ${warning.level} on thread ${threadId}`
+        );
+        await channel.send(warning.message);
+        // long_lived is the more serious "is it stuck?" signal — also page
+        // Pushover so the owner sees it off-Discord (best-effort).
+        if (warning.level === "long_lived") {
+          await notifyPushover(
+            "Claude Code: 長時間稼働セッション",
+            `${channel.name ?? threadId} が長時間稼働中（生存・完了報告なし）— /session status で確認 (#209)`
+          ).catch((err) =>
+            console.warn("[Bot] activity-watchdog pushover failed:", err)
+          );
+        }
+      } catch (err) {
+        console.error(
+          `[Bot] activity-watchdog notify error for thread ${threadId}:`,
+          err
+        );
+      }
+    },
+  });
   const resourceMonitor = new ResourceMonitor(sessionManager);
   const sessionHandler = createSessionHandler(sessionManager);
 
@@ -138,12 +172,22 @@ export async function startBot(token: string): Promise<void> {
     }
 
     reaper.start();
+    activityWatchdog.start();
     resourceMonitor.start();
 
     // Register progress callback to send tool progress to Discord threads.
     // Events are buffered (Issue #119) and flushed every 2s as a single
     // message per thread to stay under Discord's 5-msg/5-sec rate limit.
     onProgress((event) => {
+      // Issue #209: a session streaming PostToolUse progress is *not* silent.
+      // Refresh lastActivityAt here so the activity watchdog's "quiet" signal
+      // (AC1) doesn't false-positive on a session that is actively reporting
+      // tool progress between relay turns (the relay path only touches activity
+      // when a turn completes). This is the first live caller of touchActivity.
+      // touchActivity also persists via updateSessionActivity (one small
+      // UPDATE-by-id); at MAX_SESSIONS=10 the per-event write rate is trivial
+      // for SQLite WAL, and the watchdog/reaper both read the in-memory value.
+      sessionManager.touchActivity(event.threadId);
       progressBuffer.add(event.threadId, {
         tool: event.tool,
         message: event.message,
@@ -725,6 +769,7 @@ export async function startBot(token: string): Promise<void> {
   const shutdown = async () => {
     console.log("[Bot] Shutdown signal received");
     reaper.stop();
+    activityWatchdog.stop();
     resourceMonitor.stop();
     // Drain pending progress buffers before tearing down the Discord client
     // so in-flight tool events still reach the user (Issue #119).
