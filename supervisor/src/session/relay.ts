@@ -69,12 +69,18 @@ function getExecStderr(err: unknown): string {
  *
  * See Issue #73: tmux pane copy-mode stuck → send-keys silent drop + `not in a mode`.
  */
-export async function ensurePaneNotInMode(sessionName: string): Promise<void> {
+export async function ensurePaneNotInMode(
+  sessionName: string,
+  // Issue #199 AC1: socket selector. Defaults to the Supervisor's dedicated
+  // `-L claude-hub` socket; pass `[]` to target the DEFAULT socket where the
+  // claudeHubExit session lives (started by start-hijoguchi.sh with no -L).
+  socketArgs: readonly string[] = TMUX_ARGS
+): Promise<void> {
   let mode: string;
   try {
     mode = execFileSync(
       TMUX_PATH,
-      [...TMUX_ARGS, "display-message", "-t", sessionName, "-p", "#{pane_in_mode}"],
+      [...socketArgs, "display-message", "-t", sessionName, "-p", "#{pane_in_mode}"],
       { timeout: 2000 }
     ).toString().trim();
   } catch (err) {
@@ -87,7 +93,7 @@ export async function ensurePaneNotInMode(sessionName: string): Promise<void> {
   if (mode !== "1") return;
   console.warn(`[Relay] pane ${sessionName} in copy-mode, cancelling before send-keys`);
   try {
-    execFileSync(TMUX_PATH, [...TMUX_ARGS, "send-keys", "-t", sessionName, "-X", "cancel"], {
+    execFileSync(TMUX_PATH, [...socketArgs, "send-keys", "-t", sessionName, "-X", "cancel"], {
       timeout: 2000,
     });
   } catch (err) {
@@ -99,8 +105,14 @@ export async function ensurePaneNotInMode(sessionName: string): Promise<void> {
   }
 }
 
-export async function tmuxSend(sessionName: string, extraArgs: string[]): Promise<void> {
-  const args = [...TMUX_ARGS, "send-keys", "-t", sessionName, ...extraArgs];
+export async function tmuxSend(
+  sessionName: string,
+  extraArgs: string[],
+  // Issue #199 AC1: socket selector (see ensurePaneNotInMode). Defaults to the
+  // claude-hub socket; `[]` targets the default socket (claudeHubExit).
+  socketArgs: readonly string[] = TMUX_ARGS
+): Promise<void> {
+  const args = [...socketArgs, "send-keys", "-t", sessionName, ...extraArgs];
   const PER_CALL_TIMEOUT = 7000;
   try {
     execFileSync(TMUX_PATH, args, { timeout: PER_CALL_TIMEOUT });
@@ -118,7 +130,7 @@ export async function tmuxSend(sessionName: string, extraArgs: string[]): Promis
     console.warn(
       `[Relay] tmux send-keys transient error for ${sessionName} (${isModeErr ? "not-in-a-mode" : summary.code}), recovering...`
     );
-    await ensurePaneNotInMode(sessionName);
+    await ensurePaneNotInMode(sessionName, socketArgs);
     await new Promise((r) => setTimeout(r, 250));
     try {
       execFileSync(TMUX_PATH, args, { timeout: PER_CALL_TIMEOUT });
@@ -154,15 +166,20 @@ export async function tmuxSend(sessionName: string, extraArgs: string[]): Promis
  */
 export async function sendToPane(
   tmuxSessionName: string,
-  text: string
+  text: string,
+  // Issue #199 AC1: socket selector. Defaults to the Supervisor's `-L
+  // claude-hub` socket; pass `[]` to reach the claudeHubExit session on the
+  // default socket. The send sequence (mode-exit/Escape/-l/C-m) is identical on
+  // either socket, so this stays the single source of truth (no dead copy).
+  socketArgs: readonly string[] = TMUX_ARGS
 ): Promise<void> {
   const literalText = text.replace(/[\\r\\n]+/g, " ");
-  await ensurePaneNotInMode(tmuxSessionName);
-  await tmuxSend(tmuxSessionName, ["Escape"]);
+  await ensurePaneNotInMode(tmuxSessionName, socketArgs);
+  await tmuxSend(tmuxSessionName, ["Escape"], socketArgs);
   await new Promise((r) => setTimeout(r, 50));
-  await tmuxSend(tmuxSessionName, ["-l", literalText]);
+  await tmuxSend(tmuxSessionName, ["-l", literalText], socketArgs);
   await new Promise((r) => setTimeout(r, 100));
-  await tmuxSend(tmuxSessionName, ["C-m"]);
+  await tmuxSend(tmuxSessionName, ["C-m"], socketArgs);
 }
 
 /**

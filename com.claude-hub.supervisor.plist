@@ -22,6 +22,17 @@
     <dict>
         <key>PATH</key>
         <string>/Users/harieshokunin/.local/bin:/Users/harieshokunin/.bun/bin:/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin</string>
+        <!-- Issue #199 AC1: claudeHubExit primary channel id. When set, `/session
+             compact` invoked in that channel routes to the claudeHubExit tmux
+             session (default socket) instead of showing the thread-only hint.
+             Left BLANK in source on purpose: channel ids are not committed
+             (Issue #63 fail-closed). Fill the real id in the installed plist
+             (~/Library/LaunchAgents/com.claude-hub.supervisor.plist) — use the
+             same value as the hijoguchi plist's HIJOGUCHI_CHANNEL_ID — then
+             `launchctl kickstart -k gui/$(id -u)/com.claude-hub.supervisor`.
+             Blank = feature disabled (fail-safe). -->
+        <key>HIJOGUCHI_CHANNEL_ID</key>
+        <string></string>
     </dict>
 
     <key>KeepAlive</key>
