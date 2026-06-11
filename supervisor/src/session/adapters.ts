@@ -112,6 +112,22 @@ export interface SessionEffects {
 const TMUX_CALL_TIMEOUT_MS = 2000;
 const TMUX_NEW_SESSION_TIMEOUT_MS = 10_000;
 
+/**
+ * Issue #222 (gemini PR #226 review): a timeout (ETIMEDOUT) is the very
+ * degradation signal we are bounding — surface it via console.warn so a tmux
+ * server stall stays observable, while keeping the expected errors (no server /
+ * no session / no pane) silent as before. Returns true when the error was a
+ * timeout. newSession is excluded: it has no catch and rethrows, so its caller
+ * already sees the ETIMEDOUT.
+ */
+function warnIfTmuxTimeout(op: string, name: string, err: unknown): boolean {
+  if ((err as NodeJS.ErrnoException | undefined)?.code === "ETIMEDOUT") {
+    console.warn(`[tmux] ${op} timed out for ${name} after ${TMUX_CALL_TIMEOUT_MS}ms`);
+    return true;
+  }
+  return false;
+}
+
 export const realTmuxAdapter: TmuxAdapter = {
   newSession(name, command) {
     // Issue #147: previous `execSync(\`tmux new-session ... '${command}'\`)`
@@ -136,8 +152,9 @@ export const realTmuxAdapter: TmuxAdapter = {
         stdio: "ignore",
         timeout: TMUX_CALL_TIMEOUT_MS,
       });
-    } catch {
-      // No existing session
+    } catch (err) {
+      // No existing session (expected) — but surface a tmux stall.
+      warnIfTmuxTimeout("kill-session", name, err);
     }
   },
   hasSession(name) {
@@ -147,7 +164,8 @@ export const realTmuxAdapter: TmuxAdapter = {
         timeout: TMUX_CALL_TIMEOUT_MS,
       });
       return true;
-    } catch {
+    } catch (err) {
+      warnIfTmuxTimeout("has-session", name, err);
       return false;
     }
   },
@@ -162,7 +180,8 @@ export const realTmuxAdapter: TmuxAdapter = {
       ).trim();
       const pid = parseInt(output.split("\n")[0] ?? "", 10);
       return isNaN(pid) ? null : pid;
-    } catch {
+    } catch (err) {
+      warnIfTmuxTimeout("list-panes", name, err);
       return null;
     }
   },
@@ -178,7 +197,8 @@ export const realTmuxAdapter: TmuxAdapter = {
         [...TMUX_ARGS, "capture-pane", "-p", "-t", name],
         { encoding: "utf8", stdio: ["ignore", "pipe", "ignore"], timeout: TMUX_CALL_TIMEOUT_MS }
       );
-    } catch {
+    } catch (err) {
+      warnIfTmuxTimeout("capture-pane", name, err);
       return "";
     }
   },
@@ -190,8 +210,9 @@ export const realTmuxAdapter: TmuxAdapter = {
         stdio: "ignore",
         timeout: TMUX_CALL_TIMEOUT_MS,
       });
-    } catch {
-      // Caller's poll loop retries or proceeds.
+    } catch (err) {
+      // Caller's poll loop retries or proceeds — but surface a tmux stall.
+      warnIfTmuxTimeout("send-keys", name, err);
     }
   },
 };

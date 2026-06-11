@@ -4,6 +4,7 @@ import {
   expect,
   mock,
   beforeEach,
+  spyOn,
 } from "bun:test";
 
 /**
@@ -233,8 +234,27 @@ describe("realTmuxAdapter tmux call timeouts (#222)", () => {
   });
 
   test("getPid passes a positive timeout", () => {
-    realTmuxAdapter.getPid("claude-test");
-    expect(lastTimeout()).toBeGreaterThan(0);
+    // getPid calls .trim() on the result, so feed a string (not the default
+    // Buffer) to exercise its success path rather than masking a TypeError in
+    // its catch (gemini PR #226 review).
+    const pidMock = mock(
+      (_file: string, _args: readonly string[]): string => "12345\n"
+    );
+    mock.module("child_process", () => ({
+      ...realChildProcess,
+      execFileSync: pidMock,
+    }));
+    return import("../../src/session/adapters").then(({ realTmuxAdapter: a }) => {
+      expect(a.getPid("claude-test")).toBe(12345);
+      const calls = pidMock.mock.calls as ReadonlyArray<readonly unknown[]>;
+      const opts = calls[calls.length - 1]?.[2] as { timeout?: number } | undefined;
+      expect(opts?.timeout).toBeGreaterThan(0);
+      // Restore the call-recording mock for subsequent tests.
+      mock.module("child_process", () => ({
+        ...realChildProcess,
+        execFileSync: mockExecFileSync,
+      }));
+    });
   });
 
   test("capturePane passes a positive timeout", () => {
@@ -245,5 +265,51 @@ describe("realTmuxAdapter tmux call timeouts (#222)", () => {
   test("sendKeys passes a positive timeout", () => {
     realTmuxAdapter.sendKeys("claude-test", ["C-m"]);
     expect(lastTimeout()).toBeGreaterThan(0);
+  });
+
+  test("warns on ETIMEDOUT so the degradation stays observable (#222)", () => {
+    const timeoutErr = Object.assign(new Error("ETIMEDOUT"), {
+      code: "ETIMEDOUT",
+    });
+    const timeoutMock = mock((_file: string, _args: readonly string[]): Buffer => {
+      throw timeoutErr;
+    });
+    mock.module("child_process", () => ({
+      ...realChildProcess,
+      execFileSync: timeoutMock,
+    }));
+    const warnSpy = spyOn(console, "warn").mockImplementation(() => {});
+    return import("../../src/session/adapters").then(({ realTmuxAdapter: a }) => {
+      // Degrades to the existing error path ("") AND logs the stall.
+      expect(a.capturePane("claude-test")).toBe("");
+      expect(warnSpy).toHaveBeenCalledTimes(1);
+      expect(String(warnSpy.mock.calls[0]?.[0])).toContain("timed out");
+      warnSpy.mockRestore();
+      mock.module("child_process", () => ({
+        ...realChildProcess,
+        execFileSync: mockExecFileSync,
+      }));
+    });
+  });
+
+  test("does NOT warn for expected non-timeout errors (no pane / no server)", () => {
+    const noPaneErr = new Error("can't find pane: claude-test");
+    const errMock = mock((_file: string, _args: readonly string[]): Buffer => {
+      throw noPaneErr;
+    });
+    mock.module("child_process", () => ({
+      ...realChildProcess,
+      execFileSync: errMock,
+    }));
+    const warnSpy = spyOn(console, "warn").mockImplementation(() => {});
+    return import("../../src/session/adapters").then(({ realTmuxAdapter: a }) => {
+      expect(a.capturePane("claude-test")).toBe("");
+      expect(warnSpy).not.toHaveBeenCalled();
+      warnSpy.mockRestore();
+      mock.module("child_process", () => ({
+        ...realChildProcess,
+        execFileSync: mockExecFileSync,
+      }));
+    });
   });
 });
