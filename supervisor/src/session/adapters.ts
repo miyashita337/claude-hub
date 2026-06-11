@@ -100,6 +100,34 @@ export interface SessionEffects {
   worktree: WorktreeAdapter;
 }
 
+// Issue #222: bound every synchronous tmux call so a wedged tmux server (whose
+// capture-pane / send-keys ETIMEDOUT rate climbs over Supervisor uptime) cannot
+// block the Node event loop indefinitely. An unbounded execFileSync stall here
+// starves relay HTTP response handling, surfacing as delayed / 5-min-timed-out
+// Discord delivery rather than hard failures (the #222 symptom). 2s matches the
+// existing ceilings in dialog-watchdog.ts / relay.ts; on timeout each call below
+// degrades to its existing error path. new-session is a one-shot start path and
+// gets a more generous ceiling so a momentarily busy server does not abort a
+// genuine session start.
+const TMUX_CALL_TIMEOUT_MS = 2000;
+const TMUX_NEW_SESSION_TIMEOUT_MS = 10_000;
+
+/**
+ * Issue #222 (gemini PR #226 review): a timeout (ETIMEDOUT) is the very
+ * degradation signal we are bounding — surface it via console.warn so a tmux
+ * server stall stays observable, while keeping the expected errors (no server /
+ * no session / no pane) silent as before. Returns true when the error was a
+ * timeout. newSession is excluded: it has no catch and rethrows, so its caller
+ * already sees the ETIMEDOUT.
+ */
+function warnIfTmuxTimeout(op: string, name: string, err: unknown): boolean {
+  if ((err as NodeJS.ErrnoException | undefined)?.code === "ETIMEDOUT") {
+    console.warn(`[tmux] ${op} timed out for ${name} after ${TMUX_CALL_TIMEOUT_MS}ms`);
+    return true;
+  }
+  return false;
+}
+
 export const realTmuxAdapter: TmuxAdapter = {
   newSession(name, command) {
     // Issue #147: previous `execSync(\`tmux new-session ... '${command}'\`)`
@@ -110,7 +138,9 @@ export const realTmuxAdapter: TmuxAdapter = {
     // arguments and exited immediately. Using execFileSync with an argv array
     // avoids shell parsing entirely: tmux receives `command` as a single
     // argument and invokes /bin/sh -c on it once, inside the new session.
-    execFileSync(TMUX_PATH, [...TMUX_ARGS, "new-session", "-d", "-s", name, command]);
+    execFileSync(TMUX_PATH, [...TMUX_ARGS, "new-session", "-d", "-s", name, command], {
+      timeout: TMUX_NEW_SESSION_TIMEOUT_MS,
+    });
   },
   killSession(name) {
     // PR #148 review (gemini critical): use execFileSync + argv array so an
@@ -120,18 +150,22 @@ export const realTmuxAdapter: TmuxAdapter = {
     try {
       execFileSync(TMUX_PATH, [...TMUX_ARGS, "kill-session", "-t", name], {
         stdio: "ignore",
+        timeout: TMUX_CALL_TIMEOUT_MS,
       });
-    } catch {
-      // No existing session
+    } catch (err) {
+      // No existing session (expected) — but surface a tmux stall.
+      warnIfTmuxTimeout("kill-session", name, err);
     }
   },
   hasSession(name) {
     try {
       execFileSync(TMUX_PATH, [...TMUX_ARGS, "has-session", "-t", name], {
         stdio: "ignore",
+        timeout: TMUX_CALL_TIMEOUT_MS,
       });
       return true;
-    } catch {
+    } catch (err) {
+      warnIfTmuxTimeout("has-session", name, err);
       return false;
     }
   },
@@ -142,11 +176,12 @@ export const realTmuxAdapter: TmuxAdapter = {
       const output = execFileSync(
         TMUX_PATH,
         [...TMUX_ARGS, "list-panes", "-t", name, "-F", "#{pane_pid}"],
-        { encoding: "utf8", stdio: ["ignore", "pipe", "ignore"] }
+        { encoding: "utf8", stdio: ["ignore", "pipe", "ignore"], timeout: TMUX_CALL_TIMEOUT_MS }
       ).trim();
       const pid = parseInt(output.split("\n")[0] ?? "", 10);
       return isNaN(pid) ? null : pid;
-    } catch {
+    } catch (err) {
+      warnIfTmuxTimeout("list-panes", name, err);
       return null;
     }
   },
@@ -160,9 +195,10 @@ export const realTmuxAdapter: TmuxAdapter = {
       return execFileSync(
         TMUX_PATH,
         [...TMUX_ARGS, "capture-pane", "-p", "-t", name],
-        { encoding: "utf8", stdio: ["ignore", "pipe", "ignore"] }
+        { encoding: "utf8", stdio: ["ignore", "pipe", "ignore"], timeout: TMUX_CALL_TIMEOUT_MS }
       );
-    } catch {
+    } catch (err) {
+      warnIfTmuxTimeout("capture-pane", name, err);
       return "";
     }
   },
@@ -172,9 +208,11 @@ export const realTmuxAdapter: TmuxAdapter = {
     try {
       execFileSync(TMUX_PATH, [...TMUX_ARGS, "send-keys", "-t", name, ...keys], {
         stdio: "ignore",
+        timeout: TMUX_CALL_TIMEOUT_MS,
       });
-    } catch {
-      // Caller's poll loop retries or proceeds.
+    } catch (err) {
+      // Caller's poll loop retries or proceeds — but surface a tmux stall.
+      warnIfTmuxTimeout("send-keys", name, err);
     }
   },
 };
