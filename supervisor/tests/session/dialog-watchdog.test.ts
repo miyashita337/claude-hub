@@ -1,5 +1,8 @@
 import { test, expect, describe } from "bun:test";
-import { startDialogWatchdog } from "../../src/session/dialog-watchdog";
+import {
+  startDialogWatchdog,
+  nextPollInterval,
+} from "../../src/session/dialog-watchdog";
 import type { DialogMatch } from "../../src/session/dialog-detect";
 
 /**
@@ -195,5 +198,82 @@ describe("dialog-watchdog", () => {
     });
     watchdog.stop();
     expect(() => watchdog.stop()).not.toThrow();
+  });
+});
+
+/**
+ * Issue #222: tmux capture-pane ETIMEDOUT backoff. When the shared tmux
+ * server (`-L claude-hub`) is overloaded by MAX_SESSIONS concurrent
+ * watchdogs polling every 5s, capture-pane exceeds its timeout and throws.
+ * The watchdog must exponentially back off the failing session's poll
+ * (self-throttle) instead of hammering the slow server, then reset to the
+ * base interval once a capture succeeds.
+ */
+describe("dialog-watchdog tmux backoff (#222)", () => {
+  test("nextPollInterval: resets to base on a successful capture", () => {
+    expect(nextPollInterval(20_000, 5_000, 30_000, true)).toBe(5_000);
+    expect(nextPollInterval(5_000, 5_000, 30_000, true)).toBe(5_000);
+  });
+
+  test("nextPollInterval: doubles on capture failure", () => {
+    expect(nextPollInterval(5_000, 5_000, 30_000, false)).toBe(10_000);
+    expect(nextPollInterval(10_000, 5_000, 30_000, false)).toBe(20_000);
+  });
+
+  test("nextPollInterval: caps at max backoff", () => {
+    expect(nextPollInterval(20_000, 5_000, 30_000, false)).toBe(30_000);
+    expect(nextPollInterval(30_000, 5_000, 30_000, false)).toBe(30_000);
+  });
+
+  test("backs off when capture throws (fewer calls than a clean poll)", async () => {
+    let throwingCalls = 0;
+    const throwing = startDialogWatchdog({
+      tmuxSessionName: "test-timeout",
+      pollIntervalMs: SHORT_TICK_MS,
+      maxBackoffMs: SHORT_TICK_MS * 8,
+      capture: () => {
+        throwingCalls++;
+        const err = new Error("spawnSync tmux ETIMEDOUT");
+        (err as NodeJS.ErrnoException).code = "ETIMEDOUT";
+        throw err;
+      },
+      sendKeys: () => {},
+    });
+
+    let cleanCalls = 0;
+    const clean = startDialogWatchdog({
+      tmuxSessionName: "test-clean-baseline",
+      pollIntervalMs: SHORT_TICK_MS,
+      capture: () => {
+        cleanCalls++;
+        return "no dialog\n";
+      },
+      sendKeys: () => {},
+    });
+
+    await wait(SHORT_TICK_MS * 12);
+    throwing.stop();
+    clean.stop();
+
+    // The clean poller fires at the base rate every tick; the throwing one
+    // backs off exponentially, so it must run materially fewer captures.
+    expect(throwingCalls).toBeGreaterThan(0);
+    expect(throwingCalls).toBeLessThan(cleanCalls);
+  });
+
+  test("a throwing capture never triggers a false auto-accept", async () => {
+    const accepts: DialogMatch[] = [];
+    const watchdog = startDialogWatchdog({
+      tmuxSessionName: "test-timeout-noaccept",
+      pollIntervalMs: SHORT_TICK_MS,
+      capture: () => {
+        throw new Error("spawnSync tmux ETIMEDOUT");
+      },
+      sendKeys: () => {},
+      onAutoAccept: (m) => accepts.push(m),
+    });
+    await wait(SHORT_TICK_MS * 4);
+    watchdog.stop();
+    expect(accepts.length).toBe(0);
   });
 });

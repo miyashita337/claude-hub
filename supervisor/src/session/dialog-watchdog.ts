@@ -28,6 +28,36 @@ import {
 
 const POLL_INTERVAL_MS = 5_000;
 const MAX_AUTO_ACCEPT_ATTEMPTS = 2;
+/**
+ * Issue #222: ceiling for the per-session exponential backoff applied when
+ * `capture-pane` times out. With MAX_SESSIONS watchdogs polling the shared
+ * `-L claude-hub` tmux server every 5s, accumulated load pushes capture-pane
+ * past its timeout (observed ETIMEDOUT bursts that cascade into relay delay).
+ * Backing off a failing session's poll lets the server recover; a successful
+ * capture resets it to {@link POLL_INTERVAL_MS}.
+ */
+const MAX_BACKOFF_MS = 30_000;
+/**
+ * Issue #222: `capture-pane` timeout. Raised from 2s to 3s so a transient
+ * stall on the shared tmux server is not misclassified as a failure on every
+ * tick (which would otherwise trigger backoff prematurely).
+ */
+const CAPTURE_TIMEOUT_MS = 3_000;
+
+/**
+ * Compute the next poll interval. On a successful capture, reset to `base`;
+ * on a failure (e.g. ETIMEDOUT under tmux load), exponentially back off
+ * (double) up to `max`. Pure — unit-tested without timers (Issue #222).
+ */
+export function nextPollInterval(
+  current: number,
+  base: number,
+  max: number,
+  capturedOk: boolean
+): number {
+  if (capturedOk) return base;
+  return Math.min(current * 2, max);
+}
 
 export interface DialogWatchdogOptions {
   /** tmux session name (e.g., `claude-<threadId12>`). */
@@ -46,6 +76,10 @@ export interface DialogWatchdogOptions {
   onAutoAccept?: (match: DialogMatch) => void;
   /** Override poll interval — tests use 50ms to keep runtime tight. */
   pollIntervalMs?: number;
+  /** Override the max backoff ceiling for capture-pane ETIMEDOUT backoff —
+   *  tests shrink this to keep runtime tight. Defaults to
+   *  {@link MAX_BACKOFF_MS} (Issue #222). */
+  maxBackoffMs?: number;
   /** Override max auto-accept attempts — tests can drop to 1 for speed. */
   maxAutoAcceptAttempts?: number;
   /** Inject a custom capture function — tests pass a fake to avoid spawning
@@ -66,18 +100,20 @@ function captureViaTmux(sessionName: string): string {
     return execFileSync(
       TMUX_PATH,
       [...TMUX_ARGS, "capture-pane", "-p", "-t", sessionName],
-      { timeout: 2000 }
+      { timeout: CAPTURE_TIMEOUT_MS }
     ).toString();
   } catch (err) {
-    // Pane gone / tmux server transient error — return empty so detect
-    // returns null and we silently no-op until next tick. Surfacing the
-    // error here would spam the supervisor log; a dead pane will be
-    // observed by the SessionManager watcher (manager.ts watchTmuxSession).
+    // Pane gone / server stopped: the session ended — return empty so detect
+    // returns null and the watchdog stays at its base interval until it is
+    // stopped (a dead pane is observed by manager.ts watchTmuxSession).
+    // Any OTHER failure (notably ETIMEDOUT while the shared tmux server is
+    // overloaded) is re-thrown so the caller can back off this session's
+    // poll instead of hammering the slow server every tick (Issue #222).
     const msg = err instanceof Error ? err.message : String(err);
-    if (!/no server running|can't find session/i.test(msg)) {
-      console.warn(`[Dialog] capture-pane failed for ${sessionName}:`, msg);
+    if (/no server running|can't find session/i.test(msg)) {
+      return "";
     }
-    return "";
+    throw err;
   }
 }
 
@@ -115,6 +151,7 @@ export function startDialogWatchdog(
     onHeartbeat,
     onAutoAccept,
     pollIntervalMs = POLL_INTERVAL_MS,
+    maxBackoffMs = MAX_BACKOFF_MS,
     maxAutoAcceptAttempts = MAX_AUTO_ACCEPT_ATTEMPTS,
     capture = captureViaTmux,
     sendKeys = sendKeysViaTmux,
@@ -131,10 +168,28 @@ export function startDialogWatchdog(
   // overlapping ticks. The outer try/catch also prevents an unhandled
   // PromiseRejection if `capture` / `detectDialog` / `sendKeys` throws
   // (review: gemini-code-assist on PR #143, comment 3179498219).
+  let currentInterval = pollIntervalMs;
+
   const tick = async (): Promise<void> => {
     if (stopped) return;
+    let capturedOk = true;
     try {
-      const pane = capture(tmuxSessionName);
+      let pane: string;
+      try {
+        pane = capture(tmuxSessionName);
+      } catch (err) {
+        // capture-pane failed — typically ETIMEDOUT while the shared tmux
+        // server is overloaded by many concurrent watchdogs (Issue #222).
+        // Skip detection this tick; the finally block backs off this
+        // session's poll so we stop hammering the slow server.
+        capturedOk = false;
+        const msg = err instanceof Error ? err.message : String(err);
+        console.warn(
+          `[Dialog] capture-pane failed for ${tmuxSessionName}:`,
+          msg
+        );
+        return;
+      }
       const match = detectDialog(pane);
 
       if (!match) {
@@ -199,12 +254,18 @@ export function startDialogWatchdog(
       );
     } finally {
       if (!stopped) {
-        timer = setTimeout(() => void tick(), pollIntervalMs);
+        currentInterval = nextPollInterval(
+          currentInterval,
+          pollIntervalMs,
+          maxBackoffMs,
+          capturedOk
+        );
+        timer = setTimeout(() => void tick(), currentInterval);
       }
     }
   };
 
-  timer = setTimeout(() => void tick(), pollIntervalMs);
+  timer = setTimeout(() => void tick(), currentInterval);
 
   return {
     stop(): void {
