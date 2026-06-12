@@ -18,12 +18,13 @@
 # #   body    : keyword | clean   | mixed
 # #   state   : fresh   | restart
 # #
-# # Expected routing (from scripts/hijoguchi-system-prompt.md):
+# # Expected routing (from scripts/hijoguchi-system-prompt.md, revised in #230):
 # #   respond if ANY of:
 # #     c1 = (channel == primary)
 # #     c2 = (mention == self)
-# #     c3 = (body contains maintenance keyword)
-# #   silence otherwise.
+# #   silence otherwise. (#230 removed the old c3 "body contains maintenance
+# #   keyword" trigger: in non-primary channels a self-mention is now required,
+# #   and judgment-based "this is really a maintenance topic" expansion is banned.)
 # #
 # # Test targets the *rendered system-prompt content* — we cannot deterministically
 # # test live LLM behaviour, so each test asserts a structural invariant that,
@@ -35,8 +36,8 @@
 # #   P0-03 ; P0 ; channel=primary,expansion(env)     ; env override HIJOGUCHI_CHANNEL_ID expands
 # #   P0-04 ; P0 ; mention=self,encoding              ; rendered prompt has 条件2 heading
 # #   P0-05 ; P0 ; mention=self,expansion(env)        ; HIJOGUCHI_BOT_MENTION expands
-# #   P0-06 ; P0 ; body=keyword,encoding              ; rendered prompt has 条件3 heading
-# #   P0-07 ; P0 ; body=keyword,coverage              ; all 5 maintenance keywords listed
+# #   P0-06 ; P0 ; mention-gate(#230)                 ; response basis limited to 条件1/条件2
+# #   P0-07 ; P0 ; non-mention silence(#230)          ; maintenance topic w/o mention → silence
 # #   P0-08 ; P0 ; silence(none of c1/c2/c3)          ; 応答しない条件 section present
 # #   P0-09 ; P0 ; silence,explicit                   ; "完全に沈黙" phrase present
 # #   P0-10 ; P0 ; fail-closed,missing-prompt         ; missing prompt → exit != 0
@@ -52,7 +53,7 @@
 # #   P1-08 ; P1 ; chat_id-format                     ; chat_id key referenced in 条件1
 # #   P2-01 ; P2 ; side-effect-isolation              ; render-only creates no logs/
 # #   P2-02 ; P2 ; render-only-exit                   ; render-only exits 0
-# #   P2-03 ; P2 ; keyword-case-insensitive           ; 大文字・小文字 statement present
+# #   P2-03 ; P2 ; anti-expansion(#230 AC-3)          ; judgment-based expansion prohibited
 # #   P2-04 ; P2 ; bot-name                           ; claudeHubExit name present
 # #   P2-05 ; P2 ; action-verb                        ; 応答可 action verb present
 #
@@ -180,17 +181,17 @@ P0_05_bot_mention_env_override_expanded() {
     bash "${TARGET}" 2>&1 | grep -Fq "${marker}"
 }
 
-P0_06_condition3_heading() {
-  render_default | grep -Fq '### 条件3: claude-hub 保守議題'
+# #230 case B (mention → respond): the rendered prompt must state that the
+# only valid basis for responding is 条件1 (primary) or 条件2 (self-mention),
+# so a self-mention is the response trigger in non-primary channels.
+P0_06_response_basis_limited() {
+  render_default | grep -Fq '応答の根拠は 条件1'
 }
 
-P0_07_all_five_keywords_present() {
-  local out; out="$(render_default)"
-  echo "${out}" | grep -Fq 'supervisor' && \
-    echo "${out}" | grep -Fq 'tmux' && \
-    echo "${out}" | grep -Fq 'hijoguchi' && \
-    echo "${out}" | grep -Fq 'claude-hub' && \
-    echo "${out}" | grep -Fq 'claudeHubExit'
+# #230 case A (non-primary + no mention → silence): even a claude-hub
+# maintenance topic must not be answered without a self-mention.
+P0_07_nonmention_silence_rule() {
+  render_default | grep -Fq '自分宛メンションが無ければ応答してはならない'
 }
 
 P0_08_silence_section_present() {
@@ -285,8 +286,9 @@ P2_02_render_only_exit_zero() {
   HIJOGUCHI_RENDER_ONLY=1 bash "${TARGET}" >/dev/null 2>&1
 }
 
-P2_03_keyword_case_insensitive_statement() {
-  render_default | grep -Fq '大文字・小文字を区別しない'
+# #230 AC-3: prohibit judgment-based ("実質保守議題だから") response expansion.
+P2_03_judgment_expansion_prohibited() {
+  render_default | grep -Fq '判断ベースで応答を拡大してはならない'
 }
 
 P2_04_bot_name_claudehubexit_present() {
@@ -303,8 +305,8 @@ run P0 "P0-02 channel_id default expanded"       P0_02_channel_id_default_expand
 run P0 "P0-03 channel_id env override expanded"  P0_03_channel_id_env_override_expanded
 run P0 "P0-04 condition2 heading"                P0_04_condition2_heading
 run P0 "P0-05 bot_mention env override expanded" P0_05_bot_mention_env_override_expanded
-run P0 "P0-06 condition3 heading"                P0_06_condition3_heading
-run P0 "P0-07 all 5 keywords present"            P0_07_all_five_keywords_present
+run P0 "P0-06 response basis limited c1/c2 (#230)" P0_06_response_basis_limited
+run P0 "P0-07 non-mention silence rule (#230)"   P0_07_nonmention_silence_rule
 run P0 "P0-08 silence section present"           P0_08_silence_section_present
 run P0 "P0-09 silence explicit phrase"           P0_09_silence_explicit_phrase
 run P0 "P0-10 missing prompt fails"              P0_10_missing_prompt_fails
@@ -322,7 +324,7 @@ run P1 "P1-08 chat_id key in condition1"         P1_08_chat_id_key_in_condition1
 
 run P2 "P2-01 render-only no log-dir side effect" P2_01_render_only_no_log_dir_side_effect
 run P2 "P2-02 render-only exit 0"                 P2_02_render_only_exit_zero
-run P2 "P2-03 keyword case-insensitive statement" P2_03_keyword_case_insensitive_statement
+run P2 "P2-03 judgment-based expansion prohibited (#230 AC-3)" P2_03_judgment_expansion_prohibited
 run P2 "P2-04 bot name claudeHubExit present"     P2_04_bot_name_claudehubexit_present
 run P2 "P2-05 action verb 応答可 present"          P2_05_action_verb_respond_allowed
 
