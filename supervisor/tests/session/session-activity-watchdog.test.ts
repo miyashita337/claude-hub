@@ -3,6 +3,7 @@ import {
   classifyActivity,
   buildActivityWarning,
   createActivityTracker,
+  longLivedBand,
   getActivityThresholds,
   ActivityWatchdog,
   type ActivityThresholds,
@@ -90,15 +91,46 @@ describe("buildActivityWarning", () => {
   });
 });
 
+describe("longLivedBand (#221 escalating re-arm)", () => {
+  test("returns 0 below the long-lived threshold", () => {
+    expect(longLivedBand(5 * HOUR, 6 * HOUR)).toBe(0);
+    expect(longLivedBand(6 * HOUR - 1, 6 * HOUR)).toBe(0);
+  });
+
+  test("band increases at each doubling of the threshold", () => {
+    expect(longLivedBand(6 * HOUR, 6 * HOUR)).toBe(1); // 1x
+    expect(longLivedBand(11 * HOUR, 6 * HOUR)).toBe(1); // <2x stays band 1
+    expect(longLivedBand(12 * HOUR, 6 * HOUR)).toBe(2); // 2x
+    expect(longLivedBand(24 * HOUR, 6 * HOUR)).toBe(3); // 4x
+    expect(longLivedBand(48 * HOUR, 6 * HOUR)).toBe(4); // 8x
+  });
+
+  test("non-finite age or non-positive threshold -> 0 (defensive)", () => {
+    expect(longLivedBand(NaN, 6 * HOUR)).toBe(0);
+    expect(longLivedBand(Infinity, 6 * HOUR)).toBe(0);
+    expect(longLivedBand(10 * HOUR, 0)).toBe(0);
+  });
+});
+
 describe("createActivityTracker (de-dup, Journey AC #1/#3)", () => {
-  test("long_lived warns once, then de-dups on later ticks (AC3 one-shot)", () => {
+  test("long_lived de-dups within a band but re-fires at each new age band (#221)", () => {
     const tr = createActivityTracker(T);
     const w = tr.check({ ageMs: 6 * HOUR, idleMs: 1 * MIN });
     expect(w).not.toBeNull();
     expect(w!.level).toBe("long_lived");
-    // later ticks (even older) do not re-warn
+    // same band (6h..<12h) -> de-dup
     expect(tr.check({ ageMs: 7 * HOUR, idleMs: 1 * MIN })).toBeNull();
-    expect(tr.check({ ageMs: 24 * HOUR, idleMs: 1 * MIN })).toBeNull();
+    expect(tr.check({ ageMs: 11 * HOUR, idleMs: 1 * MIN })).toBeNull();
+    // next band at 12h (2x) -> re-fires (#221: no longer silent for life)
+    expect(tr.check({ ageMs: 12 * HOUR, idleMs: 1 * MIN })!.level).toBe(
+      "long_lived"
+    );
+    // next band at 24h (4x) -> re-fires again
+    expect(tr.check({ ageMs: 24 * HOUR, idleMs: 1 * MIN })!.level).toBe(
+      "long_lived"
+    );
+    // same band (24h..<48h) -> de-dup
+    expect(tr.check({ ageMs: 30 * HOUR, idleMs: 1 * MIN })).toBeNull();
   });
 
   test("quiet warns once per episode and re-arms after activity resumes (AC1)", () => {

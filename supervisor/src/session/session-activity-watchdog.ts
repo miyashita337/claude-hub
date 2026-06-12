@@ -122,9 +122,12 @@ export function buildActivityWarning(
 
 export interface ActivityTracker {
   /**
-   * Feed the latest sample. Returns a warning the first time a signal appears,
-   * then stays silent so a steady condition is not re-warned every tick:
-   *   - long_lived warns once for the session's lifetime (one-shot),
+   * Feed the latest sample. Returns a warning when a signal first appears,
+   * then de-dups so a steady condition is not re-warned every tick:
+   *   - long_lived re-fires on entry to each escalating age band (6h → 12h →
+   *     24h → 48h …, doubling) so a multi-day session keeps surfacing instead
+   *     of going silent after the first nudge (Issue #221); same-band ticks
+   *     de-dup,
    *   - quiet warns once per quiet *episode* — when activity resumes (idle drops
    *     below the threshold) the episode resets so a later silence re-warns.
    * The two signals are tracked independently.
@@ -136,24 +139,42 @@ export interface ActivityTracker {
  * Per-session de-dup tracker. The watchdog holds one per live thread and drops
  * it when the session disappears. Thresholds are snapshotted at creation.
  */
+/**
+ * Escalating "age band" for the long_lived signal (Issue #221). Returns 0 below
+ * the threshold, then 1 at `longLivedMs`, 2 at 2×, 3 at 4×, … (doubling). The
+ * tracker re-fires long_lived each time the band increases, so a session kept
+ * alive for days keeps surfacing (6h → 12h → 24h → 48h …) instead of going
+ * permanently silent after the first nudge — the #221 one-shot bug.
+ */
+export function longLivedBand(ageMs: number, longLivedMs: number): number {
+  if (!Number.isFinite(ageMs) || longLivedMs <= 0 || ageMs < longLivedMs) {
+    return 0;
+  }
+  return Math.floor(Math.log2(ageMs / longLivedMs)) + 1;
+}
+
 export function createActivityTracker(
   thresholds: ActivityThresholds = getActivityThresholds()
 ): ActivityTracker {
-  let longLivedWarned = false;
+  // Highest long_lived age band already warned (Issue #221). 0 = none yet.
+  let warnedBand = 0;
   let quietWarned = false;
 
   return {
     check(sample) {
       const { ageMs, idleMs } = sample;
-      const longLived =
-        Number.isFinite(ageMs) && ageMs >= thresholds.longLivedMs;
+      const band = longLivedBand(ageMs, thresholds.longLivedMs);
+      const longLived = band > 0;
       const quiet = Number.isFinite(idleMs) && idleMs >= thresholds.quietMs;
 
       // Re-arm the quiet episode as soon as the session is active again.
       if (!quiet) quietWarned = false;
 
-      if (longLived && !longLivedWarned) {
-        longLivedWarned = true;
+      // Fire long_lived on entry to a *new* (higher) age band so a multi-day
+      // session keeps surfacing (6h → 12h → 24h …) instead of going silent
+      // after the first nudge (Issue #221). Same-band ticks de-dup.
+      if (longLived && band > warnedBand) {
+        warnedBand = band;
         // Suppress an *immediately* redundant quiet follow-up: when a session is
         // both long-lived and already quiet, the long_lived nudge covers it, so
         // don't also fire quiet on the next tick. We only mark quiet warned when
