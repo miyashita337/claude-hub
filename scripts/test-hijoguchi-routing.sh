@@ -185,7 +185,12 @@ P0_05_bot_mention_env_override_expanded() {
 # only valid basis for responding is 条件1 (primary) or 条件2 (self-mention),
 # so a self-mention is the response trigger in non-primary channels.
 P0_06_response_basis_limited() {
-  render_default | grep -Fq '応答の根拠は 条件1'
+  # #230: assert the response basis is explicitly 条件1 AND 条件2 only, and that
+  # the old 条件3 (keyword auto-trigger) heading does NOT reappear — so a future
+  # regression that re-adds 条件3 fails here instead of silently passing.
+  local out; out="$(render_default)"
+  echo "${out}" | grep -Fq '応答の根拠は 条件1 (Primary チャンネル) か 条件2 (自分宛メンション) のみ' && \
+    ! echo "${out}" | grep -Fq '### 条件3'
 }
 
 # #230 case A (non-primary + no mention → silence): even a claude-hub
