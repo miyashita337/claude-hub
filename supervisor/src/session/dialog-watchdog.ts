@@ -59,6 +59,13 @@ export function nextPollInterval(
   return Math.min(current * 2, max);
 }
 
+/**
+ * Opaque handle returned by {@link DialogWatchdogOptions.setTimer}. The real
+ * implementation returns a `setTimeout` handle; an injected virtual clock
+ * returns its own numeric id (Issue #190).
+ */
+export type WatchdogTimerHandle = ReturnType<typeof setTimeout> | number;
+
 export interface DialogWatchdogOptions {
   /** tmux session name (e.g., `claude-<threadId12>`). */
   tmuxSessionName: string;
@@ -88,6 +95,23 @@ export interface DialogWatchdogOptions {
   /** Inject a custom send-keys function — tests pass a recorder to assert
    *  the right keys were sent. Defaults to {@link sendKeysViaTmux}. */
   sendKeys?: (sessionName: string, keys: string[]) => void;
+  /**
+   * Inject the timer primitives that space out poll ticks. Tests pass a
+   * virtual clock to drive ticks in deterministic virtual time, eliminating
+   * the wall-clock `setTimeout` waits that made the watchdog tests flaky
+   * under CI/dev-machine load (Issue #190). Production omits both and gets
+   * real `setTimeout`/`clearTimeout`, so runtime behaviour is unchanged.
+   *
+   * `setTimer` receives the async tick itself (not a void-wrapped wrapper) so
+   * a virtual clock can `await` full tick completion — including the
+   * reschedule performed in the tick's `finally` — before the test asserts.
+   */
+  setTimer?: (
+    callback: () => Promise<void>,
+    delayMs: number
+  ) => WatchdogTimerHandle;
+  /** Companion to {@link setTimer}; defaults to `clearTimeout`. */
+  clearTimer?: (handle: WatchdogTimerHandle) => void;
 }
 
 export interface DialogWatchdog {
@@ -155,13 +179,16 @@ export function startDialogWatchdog(
     maxAutoAcceptAttempts = MAX_AUTO_ACCEPT_ATTEMPTS,
     capture = captureViaTmux,
     sendKeys = sendKeysViaTmux,
+    setTimer = (cb, ms) => setTimeout(() => void cb(), ms),
+    clearTimer = (handle) =>
+      clearTimeout(handle as ReturnType<typeof setTimeout>),
   } = options;
 
   let lastKind: string | null = null;
   let consecutiveAttempts = 0;
   let heartbeatFired = false;
   let stopped = false;
-  let timer: ReturnType<typeof setTimeout> | null = null;
+  let timerHandle: WatchdogTimerHandle | null = null;
 
   // Recursive setTimeout instead of setInterval: each tick is awaited end-to-end
   // before scheduling the next, so a slow `await onHeartbeat(...)` cannot cause
@@ -260,20 +287,20 @@ export function startDialogWatchdog(
           maxBackoffMs,
           capturedOk
         );
-        timer = setTimeout(() => void tick(), currentInterval);
+        timerHandle = setTimer(tick, currentInterval);
       }
     }
   };
 
-  timer = setTimeout(() => void tick(), currentInterval);
+  timerHandle = setTimer(tick, currentInterval);
 
   return {
     stop(): void {
       if (stopped) return;
       stopped = true;
-      if (timer) {
-        clearTimeout(timer);
-        timer = null;
+      if (timerHandle !== null) {
+        clearTimer(timerHandle);
+        timerHandle = null;
       }
     },
   };
