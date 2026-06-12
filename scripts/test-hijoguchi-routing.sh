@@ -18,12 +18,14 @@
 # #   body    : keyword | clean   | mixed
 # #   state   : fresh   | restart
 # #
-# # Expected routing (from scripts/hijoguchi-system-prompt.md):
-# #   respond if ANY of:
+# # Expected routing (from scripts/hijoguchi-system-prompt.md, updated #230):
+# #   respond if EITHER of:
 # #     c1 = (channel == primary)
 # #     c2 = (mention == self)
-# #     c3 = (body contains maintenance keyword)
-# #   silence otherwise.
+# #   c3 = (body contains maintenance keyword) is DEFINITIONAL ONLY — NOT an
+# #        independent trigger. In a non-primary channel a maintenance keyword
+# #        without a self-mention still results in silence (#230 mention-gating).
+# #   silence otherwise (recognize-only; no reply, no reaction).
 # #
 # # Test targets the *rendered system-prompt content* — we cannot deterministically
 # # test live LLM behaviour, so each test asserts a structural invariant that,
@@ -42,6 +44,9 @@
 # #   P0-10 ; P0 ; fail-closed,missing-prompt         ; missing prompt → exit != 0
 # #   P0-11 ; P0 ; fail-closed,unresolved-token       ; unresolved {{FOO}} → exit != 0
 # #   P0-12 ; P0 ; state=restart(AC-5 regate)         ; two fresh renders byte-identical
+# #   P0-13 ; P0 ; non-primary mention-required(#230)  ; "## 非 Primary チャンネルはメンション必須" section present
+# #   P0-14 ; P0 ; expansion-ban(#230)                 ; "## 判断ベースの拡大応答の禁止" section present
+# #   P0-15 ; P0 ; recognize-only silence(#230)        ; "認識のみ" + 拡大解釈禁止文言 present
 # #   P1-01 ; P1 ; template-hygiene                   ; no residual {{...}} with default env
 # #   P1-02 ; P1 ; source-hygiene                     ; prompt.md has no hardcoded prod ID
 # #   P1-03 ; P1 ; source-placeholder                 ; prompt.md has {{HIJOGUCHI_CHANNEL_ID}}
@@ -226,6 +231,25 @@ P0_12_restart_idempotent_ac5_regate() {
   [ "${a}" = "${b}" ] && [ -n "${a}" ]
 }
 
+# #230 mention-gating: non-primary channels respond only on self-mention.
+P0_13_non_primary_mention_required_section() {
+  render_default | grep -Fq '## 非 Primary チャンネルはメンション必須'
+}
+
+# #230: judgment-based expansion (responding because it "feels" like a
+# maintenance topic) is explicitly banned.
+P0_14_expansion_ban_section() {
+  render_default | grep -Fq '## 判断ベースの拡大応答の禁止'
+}
+
+# #230: non-mention messages are recognize-only (no reply/reaction), and the
+# expansion ban phrase is present so the LLM applies conditions mechanically.
+P0_15_recognize_only_no_mention_silence() {
+  local out; out="$(render_default)"
+  echo "${out}" | grep -Fq '認識のみ' && \
+    echo "${out}" | grep -Fq '判断ベース・文脈ベースの拡大解釈'
+}
+
 # ==========================================================================
 # P1 — Important secondary (8 cases)
 # ==========================================================================
@@ -310,6 +334,9 @@ run P0 "P0-09 silence explicit phrase"           P0_09_silence_explicit_phrase
 run P0 "P0-10 missing prompt fails"              P0_10_missing_prompt_fails
 run P0 "P0-11 unresolved token fails"            P0_11_unresolved_token_fails
 run P0 "P0-12 restart idempotent (AC-5 regate)"  P0_12_restart_idempotent_ac5_regate
+run P0 "P0-13 non-primary mention-required"       P0_13_non_primary_mention_required_section
+run P0 "P0-14 expansion ban section"              P0_14_expansion_ban_section
+run P0 "P0-15 recognize-only no-mention silence"  P0_15_recognize_only_no_mention_silence
 
 run P1 "P1-01 no residual {{}} placeholders"     P1_01_no_residual_placeholders
 run P1 "P1-02 source no hardcoded prod id"       P1_02_source_no_hardcoded_prod_channel_id

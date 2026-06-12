@@ -19,8 +19,8 @@ const SCRIPT_PATH = resolve(REPO_ROOT, "scripts/test-hijoguchi-routing.sh");
 // still catching a runaway hang.
 const TIMEOUT_MS = 60_000;
 
-describe("hijoguchi routing — P0 (critical path × 12)", () => {
-  test("shell harness exits 0 for --priority p0 (12/12 PASS)", async () => {
+describe("hijoguchi routing — P0 (critical path × 15)", () => {
+  test("shell harness exits 0 for --priority p0 (15/15 PASS)", async () => {
     const result = await $`bash ${SCRIPT_PATH} --priority p0`.quiet().nothrow();
     const stdout = result.stdout.toString();
     const stderr = result.stderr.toString();
@@ -30,13 +30,13 @@ describe("hijoguchi routing — P0 (critical path × 12)", () => {
       console.error("--- routing-test stderr ---\n" + stderr);
     }
     expect(result.exitCode).toBe(0);
-    expect(stdout).toContain("PASS: 12/12");
+    expect(stdout).toContain("PASS: 15/15");
     expect(stdout).toContain("ALL TESTS PASSED");
   }, TIMEOUT_MS);
 });
 
-describe("hijoguchi routing — full matrix × 25", () => {
-  test("shell harness exits 0 for default (25/25 PASS)", async () => {
+describe("hijoguchi routing — full matrix × 28", () => {
+  test("shell harness exits 0 for default (28/28 PASS)", async () => {
     const result = await $`bash ${SCRIPT_PATH}`.quiet().nothrow();
     const stdout = result.stdout.toString();
     const stderr = result.stderr.toString();
@@ -46,6 +46,6 @@ describe("hijoguchi routing — full matrix × 25", () => {
       console.error("--- routing-test stderr ---\n" + stderr);
     }
     expect(result.exitCode).toBe(0);
-    expect(stdout).toContain("PASS: 25/25");
+    expect(stdout).toContain("PASS: 28/28");
   }, TIMEOUT_MS);
 });
