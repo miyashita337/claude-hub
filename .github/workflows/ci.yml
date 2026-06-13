@@ -117,6 +117,20 @@ jobs:
                    tests/hijoguchi-routing/p0.test.ts \
                    tests/e2e/ac-verification.test.ts
 
+      # #238 regression: realTmuxAdapter.hasSession must treat a tmux
+      # control-channel ETIMEDOUT as "alive" (assume the session survives),
+      # never as a silent teardown. This file is the unit gate for that fix
+      # (PR #239). It uses mock.module("child_process"), which is
+      # process-global in Bun and would leak into the curated list above, so it
+      # runs as its OWN `bun test` process. No `|| true` — it must gate the
+      # build (RW-029: a silently-green CI is worse than a red one). Not run
+      # with --coverage so it does not overwrite the lcov.info produced above.
+      - name: Run mock-isolated session tests (#238 hasSession ETIMEDOUT)
+        env:
+          SUPERVISOR_DB_PATH: ":memory:"
+          TMUX_PATH: /usr/bin/tmux
+        run: bun test tests/session/adapters-hassession.test.ts
+
       - name: Upload coverage to Codecov
         if: always()
         uses: codecov/codecov-action@v5
