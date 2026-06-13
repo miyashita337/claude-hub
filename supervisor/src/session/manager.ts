@@ -30,12 +30,40 @@ import {
 } from "./adapters";
 import {
   createContextBudgetTracker,
+  type ContextBudgetLevel,
   type ContextBudgetWarning,
 } from "./context-budget";
+import {
+  createSelfHealer,
+  type SelfHealAction,
+} from "./self-heal";
 import { compactClaudeHubExit } from "./primary-compact";
 
 const CLAUDE_PATH = resolve(homedir(), ".local", "bin", "claude");
 const TMUX_SESSION_PREFIX = "claude-";
+
+/**
+ * Non-empty intent for an auto-compact (Issue #206). RW-032: a bare `/compact`
+ * produces a bad compact, so the auto path — like the manual command — always
+ * carries an intent that preserves the working state and names the trigger.
+ */
+export const AUTO_COMPACT_INTENT =
+  "コンテキスト肥大化による tool 破損を回避するため直近の作業状態と次アクションを保持して自動圧縮 (#206)";
+
+/**
+ * Outcome of a self-heal evaluation (Issue #206). `message` is ready to post to
+ * the Discord thread (it already reflects whatever auto-action was taken), and
+ * `page` marks red/critical so the caller pages Pushover. Returned only when the
+ * session crossed up into a new band; null otherwise (no spam).
+ */
+export interface SelfHealOutcome {
+  level: ContextBudgetLevel;
+  action: SelfHealAction;
+  message: string;
+  tokens: number;
+  /** True for red/critical → caller should page Pushover. */
+  page: boolean;
+}
 
 /**
  * Authoritative liveness verdict produced by {@link SessionManager.livenessOf}
@@ -931,6 +959,101 @@ export class SessionManager {
       session.contextBudgetTracker = createContextBudgetTracker();
     }
     return session.contextBudgetTracker.check(tokens);
+  }
+
+  /**
+   * Issue #206: self-healing on top of the #204 notify-only budget warning.
+   *
+   * Reuses {@link contextBudgetWarning} (so the de-dup tracker advances exactly
+   * once) and, when a session crosses up into red, automatically relays a
+   * `/session compact` — the safe fire-and-forget primitive ({@link
+   * compactSession}). A per-session cap (RW-043) bounds how many auto-compacts
+   * fire so a rebounding context cannot loop forever; at the cap we stop and
+   * prompt manual intervention. critical stays notify-only here: the right
+   * remedy is a resume-backed restart, whose EXECUTION is deferred to a focused
+   * follow-up (RW-047 resume-timing risk + new-thread orchestration).
+   *
+   * Best-effort and self-contained: an auto-compact failure is folded into the
+   * returned message (never thrown) so the relay loop is unaffected. Returns the
+   * outcome the caller posts to the thread, or null when no band was crossed.
+   */
+  async contextBudgetSelfHeal(
+    threadId: string,
+    tokens: number | undefined
+  ): Promise<SelfHealOutcome | null> {
+    const warning = this.contextBudgetWarning(threadId, tokens);
+    if (!warning) return null;
+
+    const session = this.sessions.get(threadId);
+    // contextBudgetWarning only returns non-null when the session exists, but
+    // guard anyway so a race (stop between the two lookups) fails safe.
+    if (!session) return null;
+    if (!session.selfHealer) {
+      session.selfHealer = createSelfHealer();
+    }
+
+    const decision = session.selfHealer.decide(warning.level);
+    const page = warning.level === "red" || warning.level === "critical";
+
+    // Structured, greppable log for every band crossing (observability, AC item
+    // 4). Secrets-free: only threadId + numeric/level fields.
+    console.warn(
+      `[self-heal] thread=${threadId} level=${warning.level} tokens=${warning.tokens} action=${decision.action} count=${decision.actionCount}/${decision.cap}`
+    );
+
+    if (decision.action === "compact") {
+      try {
+        await this.compactSession(threadId, AUTO_COMPACT_INTENT);
+        return {
+          level: warning.level,
+          action: "compact",
+          tokens: warning.tokens,
+          page,
+          message:
+            `🩹 コンテキストが ${Math.floor(warning.tokens / 1000)}k に到達したため自動で ` +
+            `\`/compact\` を実行しました（${decision.actionCount}/${decision.cap} 回目, #206）。` +
+            `圧縮後も高止まりする場合は手動で \`/session compact\` するか新セッションへ切替えてください。`,
+        };
+      } catch (err) {
+        // Auto-compact failed (e.g. tmux pane gone) — fall back to the manual
+        // recommendation so the user still acts.
+        return {
+          level: warning.level,
+          action: "compact",
+          tokens: warning.tokens,
+          page,
+          message:
+            `⚠️ 自動 \`/compact\` を試みましたが失敗しました（${err instanceof Error ? err.message : String(err)}）。` +
+            `手動で \`/session compact\` を実行してください (#206)。`,
+        };
+      }
+    }
+
+    if (decision.action === "cap-reached") {
+      return {
+        level: warning.level,
+        action: "cap-reached",
+        tokens: warning.tokens,
+        page,
+        message:
+          `🛑 自動リカバリの上限（${decision.cap} 回）に達しました。これ以上は自動対応しません。` +
+          `手動で \`/session compact\` するか新セッションへ切替えてください (#206)。`,
+      };
+    }
+
+    // "notify" (critical) and "none" (yellow): keep the #204 warning text. For
+    // critical, append the manual-restart guidance (auto-restart is a follow-up).
+    const message =
+      decision.action === "notify"
+        ? `${warning.message}\n↳ 自動 restart は安全性のため手動運用です。\`/session resume\` で復帰してください (#206)。`
+        : warning.message;
+    return {
+      level: warning.level,
+      action: decision.action,
+      tokens: warning.tokens,
+      page,
+      message,
+    };
   }
 
   /**

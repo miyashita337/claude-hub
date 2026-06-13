@@ -220,19 +220,22 @@ export async function startBot(token: string): Promise<void> {
         // per-thread budget check so this path warns too. The tracker is shared
         // with the main relay path, so de-dup holds across both.
         try {
-          const budget = sessionManager.contextBudgetWarning(
+          // Issue #206: self-heal on the late-response path too (shares the
+          // per-session tracker + healer, so de-dup and the cap hold across both
+          // paths). The manager performs any auto-action; we only deliver it.
+          const outcome = await sessionManager.contextBudgetSelfHeal(
             event.threadId,
             event.contextTokens
           );
-          if (budget) {
+          if (outcome) {
             console.warn(
-              `[Bot] context-budget ${budget.level} on thread ${event.threadId} (late): ${budget.tokens} tokens`
+              `[Bot] context-budget ${outcome.level} on thread ${event.threadId} (late): ${outcome.tokens} tokens (action=${outcome.action})`
             );
-            await channel.send(budget.message);
-            if (budget.level === "red" || budget.level === "critical") {
+            await channel.send(outcome.message);
+            if (outcome.page) {
               await notifyPushover(
                 "Claude Code: コンテキスト肥大化",
-                `${channel.name ?? event.threadId} (${budget.level}, ${Math.floor(budget.tokens / 1000)}k tokens) — /session compact 推奨 (#204)`
+                `${channel.name ?? event.threadId} (${outcome.level}, ${Math.floor(outcome.tokens / 1000)}k tokens, action=${outcome.action}) — #206 self-heal`
               ).catch((err) =>
                 console.warn(`[Bot] context-budget pushover failed (late):`, err)
               );
@@ -240,7 +243,7 @@ export async function startBot(token: string): Promise<void> {
           }
         } catch (budgetErr) {
           console.warn(
-            `[Bot] context-budget check failed (late) for thread ${event.threadId}:`,
+            `[Bot] context-budget self-heal failed (late) for thread ${event.threadId}:`,
             budgetErr
           );
         }
@@ -663,19 +666,22 @@ export async function startBot(token: string): Promise<void> {
         // page Pushover for red/critical) once per band crossing. Best-effort:
         // a failure here must never affect the already-delivered response.
         try {
-          const budget = sessionManager.contextBudgetWarning(
+          // Issue #206: self-heal — auto-compact on red (capped), notify on
+          // critical. The manager performs any auto-action and returns the
+          // ready-to-post message; we only deliver it (+ page on red/critical).
+          const outcome = await sessionManager.contextBudgetSelfHeal(
             threadId,
             result.contextTokens
           );
-          if (budget) {
+          if (outcome) {
             console.warn(
-              `[Bot] context-budget ${budget.level} on thread ${threadId}: ${budget.tokens} tokens`
+              `[Bot] context-budget ${outcome.level} on thread ${threadId}: ${outcome.tokens} tokens (action=${outcome.action})`
             );
-            await thread.send(budget.message);
-            if (budget.level === "red" || budget.level === "critical") {
+            await thread.send(outcome.message);
+            if (outcome.page) {
               await notifyPushover(
                 "Claude Code: コンテキスト肥大化",
-                `${thread.name ?? threadId} (${budget.level}, ${Math.floor(budget.tokens / 1000)}k tokens) — /session compact 推奨 (#204)`
+                `${thread.name ?? threadId} (${outcome.level}, ${Math.floor(outcome.tokens / 1000)}k tokens, action=${outcome.action}) — #206 self-heal`
               ).catch((err) =>
                 console.warn(`[Bot] context-budget pushover failed:`, err)
               );
@@ -683,7 +689,7 @@ export async function startBot(token: string): Promise<void> {
           }
         } catch (budgetErr) {
           console.warn(
-            `[Bot] context-budget check failed for thread ${threadId}:`,
+            `[Bot] context-budget self-heal failed for thread ${threadId}:`,
             budgetErr
           );
         }

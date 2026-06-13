@@ -4,11 +4,16 @@ import {
   describe,
   beforeEach,
   afterEach,
+  spyOn,
 } from "bun:test";
 import { mkdirSync } from "fs";
 import { tmpdir } from "os";
 import { resolve } from "path";
-import { SessionManager, buildClaudeFlags } from "../../src/session/manager";
+import {
+  SessionManager,
+  buildClaudeFlags,
+  AUTO_COMPACT_INTENT,
+} from "../../src/session/manager";
 import {
   createFakeEffects,
   type FakeSessionEffects,
@@ -122,6 +127,107 @@ describe("SessionManager (thread-based)", () => {
       expect(manager.contextBudgetWarning("thread-cbA", 320_000)?.level).toBe("yellow");
       // B is independent: it still gets its own first-crossing warning.
       expect(manager.contextBudgetWarning("thread-cbB", 320_000)?.level).toBe("yellow");
+    });
+  });
+
+  describe("contextBudgetSelfHeal (#206)", () => {
+    afterEach(() => {
+      delete process.env.CONTEXT_SELF_HEAL_MAX_ACTIONS;
+    });
+
+    test("null when no band is crossed (below yellow / unknown thread)", async () => {
+      await manager.start(primaryConfig, "sh-0");
+      expect(await manager.contextBudgetSelfHeal("sh-0", 100_000)).toBeNull();
+      expect(await manager.contextBudgetSelfHeal("nope", 500_000)).toBeNull();
+    });
+
+    test("yellow → notify only, no auto-compact", async () => {
+      const t = "sh-yellow";
+      await manager.start(primaryConfig, t);
+      const compactSpy = spyOn(manager, "compactSession").mockResolvedValue(
+        undefined
+      );
+      const outcome = await manager.contextBudgetSelfHeal(t, 320_000);
+      expect(outcome?.level).toBe("yellow");
+      expect(outcome?.action).toBe("none");
+      expect(outcome?.page).toBe(false);
+      expect(compactSpy).not.toHaveBeenCalled();
+      compactSpy.mockRestore();
+    });
+
+    test("AC item 1: red → auto /compact with the non-empty AUTO_COMPACT_INTENT, pages", async () => {
+      const t = "sh-red";
+      await manager.start(primaryConfig, t);
+      const compactSpy = spyOn(manager, "compactSession").mockResolvedValue(
+        undefined
+      );
+
+      const outcome = await manager.contextBudgetSelfHeal(t, 410_000);
+
+      expect(outcome?.level).toBe("red");
+      expect(outcome?.action).toBe("compact");
+      expect(outcome?.page).toBe(true);
+      expect(compactSpy).toHaveBeenCalledTimes(1);
+      // RW-032: the relayed intent is never empty.
+      expect(compactSpy.mock.calls[0]).toEqual([t, AUTO_COMPACT_INTENT]);
+      expect(AUTO_COMPACT_INTENT.trim().length).toBeGreaterThan(0);
+      expect(outcome?.message).toContain("自動");
+      compactSpy.mockRestore();
+    });
+
+    test("auto-compact failure is folded into the message, never thrown", async () => {
+      const t = "sh-red-fail";
+      await manager.start(primaryConfig, t);
+      const compactSpy = spyOn(manager, "compactSession").mockRejectedValue(
+        new Error("tmux session dead")
+      );
+
+      const outcome = await manager.contextBudgetSelfHeal(t, 410_000);
+
+      expect(outcome?.action).toBe("compact");
+      expect(outcome?.message).toContain("失敗");
+      expect(outcome?.message).toContain("tmux session dead");
+      compactSpy.mockRestore();
+    });
+
+    test("AC item 3: critical → notify only (no auto-compact), restart guidance present", async () => {
+      const t = "sh-critical";
+      await manager.start(primaryConfig, t);
+      const compactSpy = spyOn(manager, "compactSession").mockResolvedValue(
+        undefined
+      );
+
+      const outcome = await manager.contextBudgetSelfHeal(t, 850_000);
+
+      expect(outcome?.level).toBe("critical");
+      expect(outcome?.action).toBe("notify");
+      expect(outcome?.page).toBe(true);
+      expect(compactSpy).not.toHaveBeenCalled();
+      expect(outcome?.message).toContain("/session resume");
+      compactSpy.mockRestore();
+    });
+
+    test("AC item 2: rebounding red hits the cap, then stops auto-compacting", async () => {
+      process.env.CONTEXT_SELF_HEAL_MAX_ACTIONS = "1"; // healer created with cap 1
+      const t = "sh-cap";
+      await manager.start(primaryConfig, t);
+      const compactSpy = spyOn(manager, "compactSession").mockResolvedValue(
+        undefined
+      );
+
+      // 1st red crossing → compact (consumes the single slot).
+      expect((await manager.contextBudgetSelfHeal(t, 410_000))?.action).toBe(
+        "compact"
+      );
+      // Drop below yellow resets the de-dup episode so the next climb re-fires.
+      expect(await manager.contextBudgetSelfHeal(t, 100_000)).toBeNull();
+      // 2nd red crossing → cap reached, no further compact.
+      const capped = await manager.contextBudgetSelfHeal(t, 420_000);
+      expect(capped?.action).toBe("cap-reached");
+      expect(capped?.message).toContain("上限");
+
+      expect(compactSpy).toHaveBeenCalledTimes(1); // never exceeded the cap
+      compactSpy.mockRestore();
     });
   });
 
