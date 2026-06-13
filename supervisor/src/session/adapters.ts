@@ -165,7 +165,15 @@ export const realTmuxAdapter: TmuxAdapter = {
       });
       return true;
     } catch (err) {
-      warnIfTmuxTimeout("has-session", name, err);
+      // Issue #238: a tmux *timeout* (ETIMEDOUT) under server contention is NOT
+      // proof the session exited — it means liveness is undeterminable. This is
+      // a liveness gate (watchTmuxSession tears the session down when false), so
+      // a false "exited" orphans the user's live work. Treat "unknown" as "still
+      // alive". A genuine "no such session" surfaces as a non-timeout error and
+      // still returns false, so real exits are detected as before.
+      if (warnIfTmuxTimeout("has-session", name, err)) {
+        return true;
+      }
       return false;
     }
   },
