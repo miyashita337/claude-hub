@@ -244,3 +244,31 @@ describe("tmuxSend integration (Issue #73 / AC-7)", () => {
     }
   });
 });
+
+// Issue #74: integration coverage for the send-failure catch in relayMessage.
+// The pure-function unit test (relay-send-failure.test.ts) locks
+// buildSendFailureResult; this exercises the real production path where
+// sendToPane throws (here: a nonexistent tmux session → "can't find session"),
+// proving the raw tmux error never reaches the returned chunk.
+describe("relayMessage send failure (#74)", () => {
+  itmux(
+    "returns a clean notice with no raw tmux internals when send-keys fails",
+    async () => {
+      const relay = await import("../../src/session/relay");
+      const result = await relay.relayMessage(
+        `relay-test-missing-${process.pid}-${Date.now()}`,
+        "thread-irrelevant",
+        "hello"
+      );
+      expect(result.chunks).toHaveLength(1);
+      expect(result.chunks[0]).toBe(relay.SEND_FAILURE_USER_MESSAGE);
+      // The screenshot symptom / raw tmux strings must never reach Discord.
+      expect(result.chunks[0]).not.toMatch(/not in a mode/i);
+      expect(result.chunks[0]).not.toMatch(/can't find (session|pane)/i);
+      expect(result.chunks[0]).not.toMatch(/send-keys|tmux/i);
+      // Raw cause is still preserved for diagnostics.
+      expect(result.error).toBeTruthy();
+      expect(result.text).toBe("");
+    }
+  );
+});
