@@ -233,6 +233,34 @@ export interface RelayMessageOptions {
   onDialogStuck?: (info: DialogStuckInfo) => void | Promise<void>;
 }
 
+/**
+ * Issue #74: user-facing notice when relaying a message to the tmux pane fails
+ * outright (i.e. after the in-call retry in {@link tmuxSend}). The raw failure
+ * is typically a copy-mode `not in a mode` or an ETIMEDOUT under tmux load
+ * (Issue #73 / RW-019). Previously the catch path interpolated `${err}` — the
+ * raw `tmux send-keys ...` command line plus the bare `not in a mode` string —
+ * straight into a Discord chunk, so the thread showed bogus "responses" (the
+ * #74 screenshot: `not in a mode` posted 5×). This message is deliberately
+ * free of tmux internals; the raw cause is preserved in logs + `RelayResult.error`.
+ */
+export const SEND_FAILURE_USER_MESSAGE =
+  "⚠️ メッセージを Claude Code セッションに送信できませんでした（セッションが応答不能、または画面が一時的に固まっている可能性があります）。少し待って再送するか、`/session restart` で再開してください。";
+
+/**
+ * Build the {@link RelayResult} for a send-keys failure. Pure + exported so a
+ * unit test can lock that raw tmux internals never reach the user-facing chunk
+ * while the diagnostic cause is still carried in `error` (Issue #74). By the
+ * time this fires, {@link tmuxSend} has already retried once after exiting any
+ * stuck copy-mode (Issue #73 / RW-019), so the failure is non-transient.
+ */
+export function buildSendFailureResult(err: unknown): RelayResult {
+  return {
+    text: "",
+    chunks: [SEND_FAILURE_USER_MESSAGE],
+    error: String(err),
+  };
+}
+
 export async function relayMessage(
   tmuxSessionName: string,
   threadId: string,
@@ -286,11 +314,15 @@ export async function relayMessage(
     tracker.markEnd("b");
     tracker.setError("b");
     tracker.flush();
-    return {
-      text: "",
-      chunks: [`⚠️ Claude Code へのメッセージ送信に失敗: ${err}`],
-      error: String(err),
-    };
+    // Issue #74: keep the raw tmux cause in logs + `RelayResult.error`, but
+    // NEVER forward it into the Discord chunk (it would surface as a bogus
+    // `not in a mode` "response"). buildSendFailureResult returns a clean,
+    // actionable notice instead.
+    console.error(
+      `[Relay] sendToPane failed for ${tmuxSessionName}:`,
+      summarizeExecError(err)
+    );
+    return buildSendFailureResult(err);
   }
 
   // Segment (c): tmux send 完了 → waitForRelay 開始までの隙間 (大体ゼロ、
