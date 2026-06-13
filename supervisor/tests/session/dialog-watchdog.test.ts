@@ -302,6 +302,30 @@ describe("dialog-watchdog", () => {
     expect(captureCount).toBe(countAtStop);
   });
 
+  // Issue #190 (CodeRabbit): setTimer/clearTimer are a pair. Supplying only
+  // one would let stop() cancel an injected timer with the wrong primitive
+  // (timer leak). The constructor must reject the half-injected case.
+  test("throws if only one of setTimer/clearTimer is provided", () => {
+    expect(() =>
+      startDialogWatchdog({
+        tmuxSessionName: "test-pair-set-only",
+        capture: () => "",
+        sendKeys: () => {},
+        setTimer: (cb, ms) => setTimeout(() => void cb(), ms),
+        // clearTimer intentionally omitted
+      })
+    ).toThrow(/both/);
+    expect(() =>
+      startDialogWatchdog({
+        tmuxSessionName: "test-pair-clear-only",
+        capture: () => "",
+        sendKeys: () => {},
+        // setTimer intentionally omitted
+        clearTimer: () => {},
+      })
+    ).toThrow(/both/);
+  });
+
   test("stop() is idempotent", () => {
     const clock = createVirtualClock();
     const watchdog = startDialogWatchdog({

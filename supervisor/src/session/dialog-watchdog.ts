@@ -170,6 +170,16 @@ function sendKeysViaTmux(sessionName: string, keys: string[]): void {
 export function startDialogWatchdog(
   options: DialogWatchdogOptions
 ): DialogWatchdog {
+  // setTimer / clearTimer is a pair: an injected timer can only be cancelled
+  // by its injected clearTimer. Supplying just one would let stop() call the
+  // default clearTimeout on an injected handle (or vice versa), which silently
+  // fails to cancel the poll loop → timer leak / phantom re-execution. Reject
+  // the half-injected case fail-fast at construction (Issue #190, CodeRabbit).
+  if ((options.setTimer === undefined) !== (options.clearTimer === undefined)) {
+    throw new Error(
+      "startDialogWatchdog: setTimer and clearTimer must both be provided or both omitted"
+    );
+  }
   const {
     tmuxSessionName,
     onHeartbeat,
