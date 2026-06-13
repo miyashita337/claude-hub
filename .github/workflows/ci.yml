@@ -45,6 +45,13 @@ jobs:
       - name: Check CHANNEL_MAP ↔ access policy template sync
         run: bun scripts/check-access-policy.ts --ci
 
+      # Issue #27 (Task 3): block synchronous child-process calls (execSync /
+      # execFileSync / spawnSync) inside setTimeout/setInterval callbacks — they
+      # freeze the single-process Supervisor event loop on every tick. AST-based,
+      # so comments mentioning execSync (manager.ts has several) don't false-fire.
+      - name: Lint - no blocking exec inside timer callbacks (#27)
+        run: bun scripts/lint-blocking-in-timers.ts
+
   unit-test:
     name: Unit Tests
     runs-on: ubuntu-latest
@@ -101,6 +108,7 @@ jobs:
                    tests/session/dialog-detect.test.ts \
                    tests/session/dialog-watchdog.test.ts \
                    tests/session/relay-send-failure.test.ts \
+                   tests/scripts/lint-blocking-in-timers.test.ts \
                    tests/session/notify-pushover.test.ts \
                    tests/session/dialog-stuck-handler.test.ts \
                    tests/session/stall-heartbeat.test.ts \

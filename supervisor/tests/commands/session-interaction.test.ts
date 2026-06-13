@@ -1,54 +1,105 @@
 import { test, expect, describe } from "bun:test";
+import type { ChatInputCommandInteraction } from "discord.js";
+import { safeRespond } from "../../src/commands/safe-respond";
 
 /**
- * Tests for #27: session command handlers should check interaction state
- * before calling reply/editReply to prevent 40060 errors.
+ * Issue #27 (Task 2, root-fix): the six command handlers used to duplicate
+ * `if (interaction.deferred || interaction.replied) { editReply } else { reply }`
+ * in every catch block. A forgotten copy → Discord `40060` ("already
+ * acknowledged") → the global handler swallows it → the user silently gets no
+ * response. `safeRespond` centralizes the routing so the guard cannot be
+ * forgotten.
  *
- * Before fix: handleStart/Stop catch blocks call editReply without checking
- * if deferReply succeeded, causing "Interaction has already been acknowledged" (40060).
- * After fix: catch blocks check interaction.deferred/replied before calling editReply.
+ * These are behavioral tests against a recording fake interaction (replacing the
+ * previous source-text grep, which was a fragile form-check). They lock the
+ * acknowledged-state routing deterministically without a live Discord gateway.
  */
 
-describe("session command interaction safety (#27)", () => {
-  test("session.ts handles catch without pre-check for deferred state", async () => {
-    // Read source and verify that catch blocks have replied/deferred guards
-    const source = await Bun.file(
-      "src/commands/session.ts"
-    ).text();
+interface RecordedCall {
+  api: "reply" | "editReply";
+  payload: Record<string, unknown>;
+}
 
-    // Find all catch blocks that call editReply
-    const editReplyCalls = source.match(/catch[\s\S]*?editReply/g) ?? [];
+function makeFakeInteraction(state: {
+  deferred: boolean;
+  replied: boolean;
+}): { interaction: ChatInputCommandInteraction; calls: RecordedCall[] } {
+  const calls: RecordedCall[] = [];
+  const interaction = {
+    deferred: state.deferred,
+    replied: state.replied,
+    async reply(payload: Record<string, unknown>) {
+      calls.push({ api: "reply", payload });
+    },
+    async editReply(payload: Record<string, unknown>) {
+      calls.push({ api: "editReply", payload });
+    },
+  } as unknown as ChatInputCommandInteraction;
+  return { interaction, calls };
+}
 
-    // Each catch block with editReply should also have a replied/deferred check
-    for (const block of editReplyCalls) {
-      const hasGuard =
-        block.includes("interaction.replied") ||
-        block.includes("interaction.deferred") ||
-        block.includes("safeReply");
-      expect(hasGuard).toBe(true);
-    }
+describe("safeRespond acknowledged-state routing (#27)", () => {
+  test("not acknowledged → reply (never editReply)", async () => {
+    const { interaction, calls } = makeFakeInteraction({
+      deferred: false,
+      replied: false,
+    });
+    await safeRespond(interaction, { content: "hello" });
+    expect(calls).toHaveLength(1);
+    expect(calls[0]!.api).toBe("reply");
+    expect(calls[0]!.payload.content).toBe("hello");
   });
 
-  test("session.ts deferReply calls are followed by try-catch with safe editReply", async () => {
-    const source = await Bun.file(
-      "src/commands/session.ts"
-    ).text();
+  test("deferred → editReply (never a second reply → no 40060)", async () => {
+    const { interaction, calls } = makeFakeInteraction({
+      deferred: true,
+      replied: false,
+    });
+    await safeRespond(interaction, { content: "done" });
+    expect(calls).toHaveLength(1);
+    expect(calls[0]!.api).toBe("editReply");
+    expect(calls[0]!.payload.content).toBe("done");
+  });
 
-    // Count deferReply calls
-    const deferCalls = (source.match(/deferReply/g) ?? []).length;
-    expect(deferCalls).toBeGreaterThan(0);
+  test("already replied → editReply (never a second reply → no 40060)", async () => {
+    const { interaction, calls } = makeFakeInteraction({
+      deferred: false,
+      replied: true,
+    });
+    await safeRespond(interaction, { content: "again" });
+    expect(calls).toHaveLength(1);
+    expect(calls[0]!.api).toBe("editReply");
+  });
 
-    // Each function that calls deferReply should have error handling
-    // that checks deferred state before editReply
-    const functions = source.match(
-      /async function handle\w+[\s\S]*?^}/gm
-    ) ?? [];
+  test("ephemeral applies flags:64 only on the fresh reply path", async () => {
+    const fresh = makeFakeInteraction({ deferred: false, replied: false });
+    await safeRespond(fresh.interaction, { content: "x", ephemeral: true });
+    expect(fresh.calls[0]!.payload.flags).toBe(64);
 
-    for (const fn of functions) {
-      if (!fn.includes("deferReply")) continue;
-      // Should have a catch that handles the case where deferReply failed
-      const hasCatch = fn.includes("catch");
-      expect(hasCatch).toBe(true);
-    }
+    // editReply cannot change ephemerality (set at defer time) — flag must NOT
+    // be forwarded, or discord.js rejects the unknown option.
+    const deferred = makeFakeInteraction({ deferred: true, replied: false });
+    await safeRespond(deferred.interaction, { content: "x", ephemeral: true });
+    expect(deferred.calls[0]!.payload.flags).toBeUndefined();
+  });
+
+  test("ephemeral omitted → no flags on reply", async () => {
+    const { interaction, calls } = makeFakeInteraction({
+      deferred: false,
+      replied: false,
+    });
+    await safeRespond(interaction, { content: "x" });
+    expect(calls[0]!.payload.flags).toBeUndefined();
+  });
+
+  test("embeds are forwarded on both paths", async () => {
+    const fakeEmbed = { name: "e" } as unknown as import("discord.js").EmbedBuilder;
+    const fresh = makeFakeInteraction({ deferred: false, replied: false });
+    await safeRespond(fresh.interaction, { embeds: [fakeEmbed] });
+    expect((fresh.calls[0]!.payload.embeds as unknown[])).toHaveLength(1);
+
+    const deferred = makeFakeInteraction({ deferred: true, replied: false });
+    await safeRespond(deferred.interaction, { embeds: [fakeEmbed] });
+    expect((deferred.calls[0]!.payload.embeds as unknown[])).toHaveLength(1);
   });
 });

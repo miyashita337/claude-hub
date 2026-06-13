@@ -10,6 +10,7 @@ import { CHANNEL_MAP, MAX_SESSIONS } from "../config/channels";
 import { buildThreadTitle, markTitleStopped } from "../session/thread-title";
 import { buildStatusReply } from "../session/status-reply";
 import { evaluateAccess } from "../config/access-policy";
+import { safeRespond } from "./safe-respond";
 
 export function createSessionCommand() {
   return new SlashCommandBuilder()
@@ -142,11 +143,7 @@ async function handleCompact(
       });
     } catch (err) {
       const msg = `❌ compact の送信に失敗: ${err instanceof Error ? err.message : String(err)}`;
-      if (interaction.deferred || interaction.replied) {
-        await interaction.editReply({ content: msg });
-      } else {
-        await interaction.reply({ content: msg, flags: 64 });
-      }
+      await safeRespond(interaction, { content: msg, ephemeral: true });
     }
     return;
   }
@@ -189,11 +186,7 @@ async function handleCompact(
     });
   } catch (err) {
     const msg = `❌ compact の送信に失敗: ${err instanceof Error ? err.message : String(err)}`;
-    if (interaction.deferred || interaction.replied) {
-      await interaction.editReply({ content: msg });
-    } else {
-      await interaction.reply({ content: msg, flags: 64 });
-    }
+    await safeRespond(interaction, { content: msg, ephemeral: true });
   }
 }
 
@@ -374,11 +367,7 @@ async function handleStart(
       }
     }
     const msg = `❌ セッション起動に失敗: ${err instanceof Error ? err.message : String(err)}`;
-    if (interaction.deferred || interaction.replied) {
-      await interaction.editReply({ content: msg });
-    } else {
-      await interaction.reply({ content: msg, flags: 64 });
-    }
+    await safeRespond(interaction, { content: msg, ephemeral: true });
   }
 }
 
@@ -550,11 +539,7 @@ async function handleResume(
       }
     }
     const msg = `❌ セッション復帰に失敗: ${err instanceof Error ? err.message : String(err)}`;
-    if (interaction.deferred || interaction.replied) {
-      await interaction.editReply({ content: msg });
-    } else {
-      await interaction.reply({ content: msg, flags: 64 });
-    }
+    await safeRespond(interaction, { content: msg, ephemeral: true });
   }
 }
 
@@ -609,11 +594,7 @@ async function handleStop(
     });
   } catch (err) {
     const msg = `❌ セッション停止に失敗: ${err instanceof Error ? err.message : String(err)}`;
-    if (interaction.deferred || interaction.replied) {
-      await interaction.editReply({ content: msg });
-    } else {
-      await interaction.reply({ content: msg, flags: 64 });
-    }
+    await safeRespond(interaction, { content: msg, ephemeral: true });
   }
 }
 
@@ -659,11 +640,7 @@ async function handleList(
     await interaction.reply({ embeds: [embed] });
   } catch (err) {
     const msg = `❌ セッション一覧の取得に失敗: ${err instanceof Error ? err.message : String(err)}`;
-    if (interaction.deferred || interaction.replied) {
-      await interaction.editReply({ content: msg });
-    } else {
-      await interaction.reply({ content: msg, flags: 64 });
-    }
+    await safeRespond(interaction, { content: msg, ephemeral: true });
   }
 }
 
