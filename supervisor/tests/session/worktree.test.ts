@@ -7,6 +7,7 @@ import {
   resolveWorktreePath,
   WORKTREE_SUBDIR,
   type GitGhRunner,
+  type WorktreeStatus,
 } from "../../src/session/worktree";
 
 /**
@@ -21,6 +22,10 @@ import {
 class FakeRunner implements GitGhRunner {
   existing = new Set<string>(); // worktree paths that already exist (Q4)
   branches = new Set<string>(); // refs that resolve (Q1)
+  // Q4 validation (#158): path → registered-worktree status. Defaults to
+  // "not a registered worktree" (residue) when a path exists on disk but was
+  // not created by the fake's add* methods.
+  statuses = new Map<string, WorktreeStatus>();
   defaultBranchName = "main";
   calls: string[] = [];
 
@@ -35,6 +40,8 @@ class FakeRunner implements GitGhRunner {
   addWorktreeFromBranch(_dir: string, path: string, branch: string): void {
     this.calls.push(`addFromBranch:${branch}`);
     this.existing.add(path);
+    // Creating a worktree registers it on `branch` (models real git).
+    this.statuses.set(path, { registered: true, branch });
   }
   addWorktreeNewBranch(
     _dir: string,
@@ -44,13 +51,19 @@ class FakeRunner implements GitGhRunner {
   ): void {
     this.calls.push(`addNewBranch:${branch}:${base}`);
     this.existing.add(path);
+    this.statuses.set(path, { registered: true, branch });
   }
   removeWorktree(_dir: string, path: string): void {
     this.calls.push(`remove:${path}`);
     this.existing.delete(path);
+    this.statuses.delete(path);
   }
   pathExists(path: string): boolean {
     return this.existing.has(path);
+  }
+  worktreeStatus(_dir: string, path: string): WorktreeStatus {
+    this.calls.push(`worktreeStatus:${path}`);
+    return this.statuses.get(path) ?? { registered: false };
   }
 }
 
@@ -123,15 +136,62 @@ describe("ensureWorktree", () => {
     expect(runner.calls.some((c) => c.startsWith("addNewBranch"))).toBe(false);
   });
 
-  test("AC-3 / Q4: existing worktree → reuse, no git add", () => {
+  test("AC-3 / Q4: existing valid worktree on the expected branch → reuse, no git add", () => {
     const path = resolveWorktreePath(REPO, "feature-foo");
     runner.existing.add(path);
+    runner.statuses.set(path, { registered: true, branch: "feature-foo" });
 
     const result = ensureWorktree(REPO, "feature-foo", runner);
 
     expect(result.reused).toBe(true);
     expect(result.path).toBe(path);
     expect(runner.calls.some((c) => c.startsWith("add"))).toBe(false);
+    // Reuse is validated, not assumed (#158).
+    expect(runner.calls).toContain(`worktreeStatus:${path}`);
+  });
+
+  // --- #158: reuse must be validated, never silently assumed -------------
+
+  test("#158 AC-1: path exists but is NOT a registered worktree (residue) → explicit error, no silent reuse", () => {
+    const path = resolveWorktreePath(REPO, "feature-foo");
+    runner.existing.add(path); // dir present on disk...
+    // ...but no status entry → worktreeStatus reports {registered:false}.
+
+    expect(() => ensureWorktree(REPO, "feature-foo", runner)).toThrow(
+      /git worktree ではありません|残骸/,
+    );
+    // Must not fall through to creating/reusing.
+    expect(runner.calls.some((c) => c.startsWith("add"))).toBe(false);
+  });
+
+  test("#158 AC-1: path is a worktree but checked out on a DIFFERENT branch → explicit error", () => {
+    const path = resolveWorktreePath(REPO, "feature-foo");
+    runner.existing.add(path);
+    runner.statuses.set(path, { registered: true, branch: "some-other-branch" });
+
+    expect(() => ensureWorktree(REPO, "feature-foo", runner)).toThrow(
+      /branch.*一致|期待 branch/,
+    );
+    expect(runner.calls.some((c) => c.startsWith("add"))).toBe(false);
+  });
+
+  test("#158: a detached-HEAD worktree (no branch) → explicit error, not silent reuse", () => {
+    const path = resolveWorktreePath(REPO, "feature-foo");
+    runner.existing.add(path);
+    runner.statuses.set(path, { registered: true, branch: null });
+
+    expect(() => ensureWorktree(REPO, "feature-foo", runner)).toThrow();
+    expect(runner.calls.some((c) => c.startsWith("add"))).toBe(false);
+  });
+
+  test("#158 AC-2: valid worktree on the expected branch → reuse succeeds (no regression)", () => {
+    const path = resolveWorktreePath(REPO, "feat/foo-bar");
+    runner.existing.add(path);
+    runner.statuses.set(path, { registered: true, branch: "feat/foo-bar" });
+
+    const result = ensureWorktree(REPO, "feat/foo-bar", runner);
+    expect(result.reused).toBe(true);
+    expect(result.path).toBe(path);
   });
 
   test("is idempotent: second ensure of the same branch reuses", () => {
