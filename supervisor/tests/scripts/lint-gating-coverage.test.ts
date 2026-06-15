@@ -1,0 +1,135 @@
+import { test, expect, describe } from "bun:test";
+import { existsSync } from "fs";
+import { resolve } from "path";
+import {
+  analyzeCoverage,
+  extractGatedFiles,
+  hasFailure,
+  EXCLUSIONS,
+  type Exclusion,
+} from "../../scripts/lint-gating-coverage";
+
+/**
+ * Issue #248: the gating-coverage lint must (AC-1) fail when a test file is
+ * neither gated in ci.yml nor excluded, (AC-2) pass when every existing test
+ * file under tests/ is gated or excluded, and (AC-3) fail when an exclusion
+ * entry has no reason. The final "real repo" test makes AC-2 a live regression
+ * guard against future gate omissions.
+ */
+
+describe("extractGatedFiles", () => {
+  test("collects every tests/*.test.ts passed to a bun test step", () => {
+    const yaml = `      - name: Run tests
+        run: |
+          bun test --coverage \\
+                   tests/session/relay.test.ts \\
+                   tests/infra/db.test.ts
+      - name: Isolated
+        run: bun test tests/session/adapters-hassession.test.ts`;
+    const gated = extractGatedFiles(yaml);
+    expect(gated.has("tests/session/relay.test.ts")).toBe(true);
+    expect(gated.has("tests/infra/db.test.ts")).toBe(true);
+    expect(gated.has("tests/session/adapters-hassession.test.ts")).toBe(true);
+    expect(gated.size).toBe(3);
+  });
+
+  test("ignores a test file mentioned only in a comment (not a real run arg)", () => {
+    // The "Local-only tests" note must NOT be read as gating.
+    const yaml = `      # Local-only: tests/session/iterm2.test.ts needs project-colors.json
+      - name: Run tests
+        run: bun test tests/session/relay.test.ts`;
+    const gated = extractGatedFiles(yaml);
+    expect(gated.has("tests/session/relay.test.ts")).toBe(true);
+    expect(gated.has("tests/session/iterm2.test.ts")).toBe(false);
+  });
+});
+
+describe("analyzeCoverage", () => {
+  const exclusions: Exclusion[] = [
+    { file: "tests/session/iterm2.test.ts", reason: "local-only config" },
+  ];
+
+  test("AC-1: a file neither gated nor excluded is reported as ungated", () => {
+    const r = analyzeCoverage({
+      testFiles: ["tests/session/new-feature.test.ts", "tests/session/relay.test.ts"],
+      gated: new Set(["tests/session/relay.test.ts"]),
+      exclusions,
+    });
+    expect(r.ungated).toEqual(["tests/session/new-feature.test.ts"]);
+    expect(hasFailure(r)).toBe(true);
+  });
+
+  test("AC-2: every file gated or excluded → no violation", () => {
+    const r = analyzeCoverage({
+      testFiles: ["tests/session/relay.test.ts", "tests/session/iterm2.test.ts"],
+      gated: new Set(["tests/session/relay.test.ts"]),
+      exclusions,
+    });
+    expect(r.ungated).toEqual([]);
+    expect(hasFailure(r)).toBe(false);
+  });
+
+  test("AC-3: an exclusion with a blank reason fails", () => {
+    const r = analyzeCoverage({
+      testFiles: ["tests/session/x.test.ts"],
+      gated: new Set<string>(),
+      exclusions: [{ file: "tests/session/x.test.ts", reason: "   " }],
+    });
+    expect(r.emptyReason).toEqual(["tests/session/x.test.ts"]);
+    expect(hasFailure(r)).toBe(true);
+  });
+
+  test("a stale exclusion (missing file) fails", () => {
+    const r = analyzeCoverage({
+      testFiles: [],
+      gated: new Set<string>(),
+      exclusions: [{ file: "tests/session/deleted.test.ts", reason: "gone" }],
+      fileExists: () => false,
+    });
+    expect(r.staleExclusions).toEqual(["tests/session/deleted.test.ts"]);
+    expect(hasFailure(r)).toBe(true);
+  });
+
+  test("an exclusion that is also gated is flagged redundant (warning, not failure)", () => {
+    const r = analyzeCoverage({
+      testFiles: ["tests/session/relay.test.ts"],
+      gated: new Set(["tests/session/relay.test.ts"]),
+      exclusions: [{ file: "tests/session/relay.test.ts", reason: "was excluded once" }],
+    });
+    expect(r.redundant).toEqual(["tests/session/relay.test.ts"]);
+    expect(hasFailure(r)).toBe(false);
+  });
+});
+
+describe("real repository (AC-2 regression guard)", () => {
+  test("every tests/**/*.test.ts is gated in ci.yml or justifiably excluded", async () => {
+    const root = resolve(import.meta.dir, "../.."); // supervisor/
+    const ciYaml = await Bun.file(resolve(root, "../.github/workflows/ci.yml")).text();
+    const gated = extractGatedFiles(ciYaml);
+
+    const { Glob } = await import("bun");
+    const testFiles = [...new Glob("tests/**/*.test.ts").scanSync(root)].sort();
+    expect(testFiles.length).toBeGreaterThan(0);
+
+    const report = analyzeCoverage({
+      testFiles,
+      gated,
+      exclusions: EXCLUSIONS,
+      fileExists: (f) => existsSync(resolve(root, f)),
+    });
+
+    // Surface the offending files in the assertion message, not just a count.
+    expect({
+      ungated: report.ungated,
+      emptyReason: report.emptyReason,
+      staleExclusions: report.staleExclusions,
+    }).toEqual({ ungated: [], emptyReason: [], staleExclusions: [] });
+  });
+
+  test("this lint's own test file is gated (no self-exemption)", async () => {
+    const root = resolve(import.meta.dir, "../..");
+    const ciYaml = await Bun.file(resolve(root, "../.github/workflows/ci.yml")).text();
+    const gated = extractGatedFiles(ciYaml);
+    expect(gated.has("tests/scripts/lint-gating-coverage.test.ts")).toBe(true);
+  });
+});

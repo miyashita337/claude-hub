@@ -52,6 +52,12 @@ jobs:
       - name: Lint - no blocking exec inside timer callbacks (#27)
         run: bun scripts/lint-blocking-in-timers.ts
 
+      # Issue #248 (RW-029 / F1 class): every tests/**/*.test.ts must be gated in
+      # this file or justifiably excluded in scripts/lint-gating-coverage.ts.
+      # Prevents a newly-added test from being silently never-run in CI.
+      - name: Lint - CI test gating coverage (#248)
+        run: bun scripts/lint-gating-coverage.ts
+
   unit-test:
     name: Unit Tests
     runs-on: ubuntu-latest
@@ -115,7 +121,33 @@ jobs:
                    tests/session/context-budget.test.ts \
                    tests/session/session-activity-watchdog.test.ts \
                    tests/hijoguchi-routing/p0.test.ts \
-                   tests/e2e/ac-verification.test.ts
+                   tests/e2e/ac-verification.test.ts \
+                   tests/scripts/lint-gating-coverage.test.ts \
+                   tests/commands/session-compact.test.ts \
+                   tests/commands/session-start-access.test.ts \
+                   tests/commands/session-start-branch.test.ts \
+                   tests/commands/session-thread-title.test.ts \
+                   tests/config/access-policy.test.ts \
+                   tests/config/check-access-policy.test.ts \
+                   tests/discord/in-memory-client.test.ts \
+                   tests/discord/real-client.test.ts \
+                   tests/guards/access-enforcement-wired.test.ts \
+                   tests/hooks/ask-user-relay.test.ts \
+                   tests/hooks/auto-approve-permission.test.ts \
+                   tests/hooks/progress-relay.test.ts \
+                   tests/scripts/cleanup-idle-claude.test.ts \
+                   tests/scripts/setup-agent-base.test.ts \
+                   tests/session/ask-user-relay.test.ts \
+                   tests/session/dispatch.test.ts \
+                   tests/session/dispatch-run.test.ts \
+                   tests/session/dispatch-integration.test.ts \
+                   tests/session/latency-logger.test.ts \
+                   tests/session/manager-input-ready.test.ts \
+                   tests/session/progress-buffer.test.ts \
+                   tests/session/salvage-reply.test.ts \
+                   tests/session/slash-prefix.test.ts \
+                   tests/session/thread-title.test.ts \
+                   tests/session/worktree.test.ts
 
       # #238 regression: realTmuxAdapter.hasSession must treat a tmux
       # control-channel ETIMEDOUT as "alive" (assume the session survives),
@@ -130,6 +162,23 @@ jobs:
           SUPERVISOR_DB_PATH: ":memory:"
           TMUX_PATH: /usr/bin/tmux
         run: bun test tests/session/adapters-hassession.test.ts
+
+      # adapters.test.ts and tmux.test.ts each call mock.module("child_process"),
+      # which is process-global in Bun and pollutes any file sharing the process
+      # (running the three mock.module files together yields cross-file failures).
+      # So each gets its OWN `bun test` process — same isolation rationale as the
+      # #238 step above (#248: these were previously ungated → never run in CI).
+      - name: Run mock-isolated adapters tests (#248)
+        env:
+          SUPERVISOR_DB_PATH: ":memory:"
+          TMUX_PATH: /usr/bin/tmux
+        run: bun test tests/session/adapters.test.ts
+
+      - name: Run mock-isolated tmux tests (#248)
+        env:
+          SUPERVISOR_DB_PATH: ":memory:"
+          TMUX_PATH: /usr/bin/tmux
+        run: bun test tests/session/tmux.test.ts
 
       - name: Upload coverage to Codecov
         if: always()
@@ -190,7 +239,7 @@ jobs:
         env:
           SUPERVISOR_DB_PATH: ":memory:"
           TMUX_PATH: /usr/bin/tmux
-        run: bun test tests/e2e/ac-verification.test.ts tests/session/relay.test.ts
+        run: bun test tests/e2e/ac-verification.test.ts tests/session/relay.test.ts tests/e2e/dialog-stall.test.ts
         working-directory: supervisor
 
   # Local-only tests (require tmux/Claude CLI or local config):
