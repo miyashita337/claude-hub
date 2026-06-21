@@ -27,19 +27,22 @@ export class FakeTmuxAdapter implements TmuxAdapter {
   /** When set, sendKeys() throws to simulate a failure during prompt confirm. */
   failOnSendKeys = false;
 
-  newSession(name: string, command: string): void {
+  // Issue #227 (PR-3): the TmuxAdapter interface methods are now async, so the
+  // fakes return Promises too. The in-memory bookkeeping stays synchronous; the
+  // `async` keyword just wraps the result so `await fake.x()` matches production.
+  async newSession(name: string, command: string): Promise<void> {
     this.sessions.set(name, { command, pid: this.pidCounter++ });
   }
 
-  killSession(name: string): void {
+  async killSession(name: string): Promise<void> {
     this.sessions.delete(name);
   }
 
-  hasSession(name: string): boolean {
+  async hasSession(name: string): Promise<boolean> {
     return this.sessions.has(name);
   }
 
-  getPid(name: string): number | null {
+  async getPid(name: string): Promise<number | null> {
     return this.sessions.get(name)?.pid ?? null;
   }
 
@@ -47,11 +50,11 @@ export class FakeTmuxAdapter implements TmuxAdapter {
     this.ensureSocketConfiguredCalls += 1;
   }
 
-  capturePane(name: string): string {
+  async capturePane(name: string): Promise<string> {
     return this.paneContent.get(name) ?? "";
   }
 
-  sendKeys(name: string, keys: string[]): void {
+  async sendKeys(name: string, keys: string[]): Promise<void> {
     this.sendKeysCalls.push({ name, keys });
     if (this.failOnSendKeys) {
       throw new Error("sendKeys failed");

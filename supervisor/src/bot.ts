@@ -90,7 +90,8 @@ export async function startBot(token: string): Promise<void> {
   // signal pages at most once per episode.
   const activityWatchdog = new ActivityWatchdog({
     entries: () => sessionManager.entries(),
-    isAlive: (threadId) => sessionManager.livenessOf(threadId) === "alive",
+    isAlive: async (threadId) =>
+      (await sessionManager.livenessOf(threadId)) === "alive",
     notify: async (threadId, warning) => {
       try {
         const channel = await client.channels.fetch(threadId);
@@ -479,7 +480,7 @@ export async function startBot(token: string): Promise<void> {
         );
         return;
       }
-      const salvage = buildSalvageReply(sessionManager, threadId);
+      const salvage = await buildSalvageReply(sessionManager, threadId);
       try {
         await (message.channel as ThreadChannel).send(salvage);
       } catch (err) {
@@ -508,7 +509,7 @@ export async function startBot(token: string): Promise<void> {
           .toLowerCase();
         if (withoutMention === "status") {
           try {
-            await thread.send(buildStatusReply(sessionManager, threadId));
+            await thread.send(await buildStatusReply(sessionManager, threadId));
           } catch (err) {
             console.error(
               `[Bot] Failed to send status reply in thread ${threadId}:`,

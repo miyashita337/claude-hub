@@ -210,9 +210,11 @@ export interface ActivityWatchdogDeps {
   entries(): IterableIterator<[string, WatchdogSession]>;
   /**
    * Authoritative liveness for a thread. Dead sessions are skipped — the reaper
-   * owns terminating them; warning about a dead session would be noise.
+   * owns terminating them; warning about a dead session would be noise. May be
+   * sync or async: `check()` awaits it, so the async `sessionManager.livenessOf`
+   * (Issue #227 PR-3) and a sync test fake both satisfy this.
    */
-  isAlive(threadId: string): boolean;
+  isAlive(threadId: string): boolean | Promise<boolean>;
   /** Deliver a warning (best-effort; throwing is caught per-session). */
   notify(threadId: string, warning: ActivityWarning): void | Promise<void>;
   thresholds?: ActivityThresholds;
@@ -280,7 +282,7 @@ export class ActivityWatchdog {
 
       let alive: boolean;
       try {
-        alive = this.deps.isAlive(threadId);
+        alive = await this.deps.isAlive(threadId);
       } catch (err) {
         console.warn(
           `[ActivityWatchdog] isAlive(${threadId}) threw:`,

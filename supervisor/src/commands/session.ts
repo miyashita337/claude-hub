@@ -206,7 +206,7 @@ async function handleStatus(
   // (#168) + claude_session_id. Runs outside the message-relay path, so it can
   // never hijack a real work message.
   await interaction.reply({
-    content: buildStatusReply(sessionManager, channel.id),
+    content: await buildStatusReply(sessionManager, channel.id),
   });
 }
 
@@ -435,7 +435,7 @@ async function handleResume(
   // this claude session id and crosses pid + tmux reality. This is a fast-path
   // UX check — `resumeSession` re-checks under the single-flight lock to close
   // the TOCTOU (穴 C).
-  if (sessionManager.livenessOfClaudeSession(sessionId) === "alive") {
+  if ((await sessionManager.livenessOfClaudeSession(sessionId)) === "alive") {
     await interaction.reply({
       content:
         "⚠️ この session は既に稼働中です。稼働中のスレッドで操作してください（`/session list` で確認できます）。",
