@@ -10,17 +10,21 @@
  * This module adds a generic transport: an *allowed source* posts a single
  * message to a known department channel:
  *
- *   /dispatch <branch> <issueNumber> [impl|pdca]
- *       e.g.  /dispatch corp-dispatch-42 42          (defaults to /impl)
- *             /dispatch corp-dispatch-341 341 pdca   (Epic → /pdca)
+ *   /dispatch <branch> <issueNumber> [selector]
+ *       e.g.  /dispatch corp-dispatch-42 42            (omitted → /impl)
+ *             /dispatch corp-dispatch-341 341 pdca     (Epic → /pdca)
+ *             /dispatch corp-dispatch-243 243 article  (dept playbook → /article)
  *
  * claude-hub then starts a session in that channel's mapped repo on `<branch>`
  * and injects `/<command> <issueNumber>` as the session's first prompt. The
- * optional 3rd token selects `impl` (default — a single Issue) or `pdca`
- * (Epic-aware: the agent-base `/pdca` flow walks the Epic's child Issues). The
- * feature is intentionally generic — it hardcodes no corp-specific names; any
- * source enumerated in the access policy (`dispatchFrom` /
- * `DISPATCH_ALLOWED_SOURCE_IDS`) can drive it.
+ * optional 3rd token is a *goal selector* (corp #52 M2) from a closed set:
+ * `no-template` (or omitted / legacy `impl`) → `/impl` (one raw Issue), `pdca` →
+ * the Epic-aware agent-base `/pdca` walk, and `article` / `devcycle` → the dept
+ * goal playbooks (`/article`, `/devcycle`). The selector set is fail-closed
+ * (unknown tokens are rejected, not guessed) and mirrors corp's typed
+ * `DispatchSelector`. *Who* may dispatch stays generic — it hardcodes no
+ * corp-specific source; any source enumerated in the access policy
+ * (`dispatchFrom` / `DISPATCH_ALLOWED_SOURCE_IDS`) can drive it.
  *
  * Authorization (who may dispatch) lives in `config/access-policy.ts`
  * (`isDispatchSourceAllowed`, fail-closed). This module owns parsing and the
@@ -34,13 +38,45 @@ import { resolveWorktreePath } from "./worktree";
 export const DISPATCH_PREFIX = "/dispatch";
 
 /**
- * Slash command the dispatched session runs first. `impl` = one Issue (default);
- * `pdca` = the Epic-aware agent-base `/pdca` flow that walks child Issues.
+ * Dispatch goal selector — the optional 3rd token of
+ * `/dispatch <branch> <N> <selector>` (corp #52 M2 / #261). A **closed** set:
+ * the parser is fail-closed, so any token outside this union is rejected rather
+ * than guessed (a typo never silently runs the wrong flow). Mirrors corp's typed
+ * `DispatchSelector`; legacy `impl` is kept for the pre-M2 wire format.
+ *   - `no-template` (or legacy `impl`, or omitted) → the raw single-Issue flow
+ *   - `pdca`                                        → the Epic-aware /pdca walk
+ *   - `article` / `devcycle`                        → the dept goal playbooks
  */
-export type DispatchMode = "impl" | "pdca";
+export type DispatchSelector =
+  | "impl"
+  | "no-template"
+  | "pdca"
+  | "article"
+  | "devcycle";
+
+const DISPATCH_SELECTORS: readonly DispatchSelector[] = [
+  "impl",
+  "no-template",
+  "pdca",
+  "article",
+  "devcycle",
+];
+
+/**
+ * Slash command (without the leading `/`) injected as the session's first
+ * prompt. `no-template` / legacy `impl` collapse to `impl`; the others are the
+ * same-named command. Always a fixed literal (never user text) so
+ * `/<command> <issueNumber>` is safe to inject.
+ */
+export type DispatchCommand = "impl" | "pdca" | "article" | "devcycle";
+
+/** Map a validated selector to the slash command to inject. */
+function selectorToCommand(selector: DispatchSelector): DispatchCommand {
+  return selector === "no-template" ? "impl" : selector;
+}
 
 export type ParsedDispatch =
-  | { kind: "ok"; branch: string; issueNumber: number; command: DispatchMode }
+  | { kind: "ok"; branch: string; issueNumber: number; command: DispatchCommand }
   | { kind: "not_dispatch" }
   | { kind: "error"; reason: string };
 
@@ -53,15 +89,18 @@ export type ParsedDispatch =
 const BRANCH_VALIDATION_ROOT = "/__dispatch_branch_validation__";
 
 /**
- * Parse a `/dispatch <branch> <issueNumber> [impl|pdca]` message. Returns:
+ * Parse a `/dispatch <branch> <issueNumber> [selector]` message. Returns:
  *   - `not_dispatch` when the content is not a `/dispatch` command (caller
  *     falls through to the normal relay path),
  *   - `error` with a coarse, identifier-free reason for a malformed command,
- *   - `ok` with a validated branch, positive-integer issue number and command
- *     mode (defaults to `impl` when the optional 3rd token is omitted).
+ *   - `ok` with a validated branch, positive-integer issue number and the
+ *     injectable `command` derived from the optional selector (defaults to
+ *     `impl` when omitted; see {@link selectorToCommand}).
  *
- * Branch validation reuses {@link resolveWorktreePath} (RW-045) so metachar /
- * traversal rejection cannot drift from the worktree path logic.
+ * Selector validation is fail-closed: a present 3rd token must match
+ * {@link SELECTOR_SLUG}, so a malformed token never reaches the injected
+ * command. Branch validation reuses {@link resolveWorktreePath} (RW-045) so
+ * metachar / traversal rejection cannot drift from the worktree path logic.
  */
 export function parseDispatchCommand(content: string): ParsedDispatch {
   const trimmed = content.trim();
@@ -75,28 +114,30 @@ export function parseDispatchCommand(content: string): ParsedDispatch {
   const rest = trimmed.slice(DISPATCH_PREFIX.length).trim();
   const parts = rest.length > 0 ? rest.split(/\s+/) : [];
 
-  // Shape: `<branch> <issueNumber>` (mode defaults to impl) or
-  //        `<branch> <issueNumber> <impl|pdca>`.
+  // Shape: `<branch> <issueNumber>` (selector defaults to no-template=impl) or
+  //        `<branch> <issueNumber> <selector>`.
   if (parts.length !== 2 && parts.length !== 3) {
     return {
       kind: "error",
-      reason: "形式が不正です。/dispatch <branch> <issueNumber> [impl|pdca] で指定してください。",
+      reason: "形式が不正です。/dispatch <branch> <issueNumber> [selector] で指定してください。",
     };
   }
 
-  const [branch, issueArg, modeArg] = parts as [string, string, string?];
+  const [branch, issueArg, selectorArg] = parts as [string, string, string?];
 
-  // Mode: optional 3rd token, default impl (backward compatible). Fail-closed on
-  // any unrecognized command so a typo never silently runs the wrong flow.
-  let command: DispatchMode = "impl";
-  if (modeArg !== undefined) {
-    if (modeArg !== "impl" && modeArg !== "pdca") {
+  // Selector: optional 3rd token, default impl (backward compatible). Fail-closed
+  // on any token outside the closed DispatchSelector set so a typo never silently
+  // runs the wrong flow, then map it to the slash command to inject.
+  let command: DispatchCommand = "impl";
+  if (selectorArg !== undefined) {
+    if (!(DISPATCH_SELECTORS as readonly string[]).includes(selectorArg)) {
       return {
         kind: "error",
-        reason: "mode は impl または pdca を指定してください。",
+        reason:
+          "selector は impl / no-template / pdca / article / devcycle のいずれかを指定してください。",
       };
     }
-    command = modeArg;
+    command = selectorToCommand(selectorArg as DispatchSelector);
   }
 
   // Issue number: positive integer only (no decimals, signs, or trailing text).
@@ -140,8 +181,9 @@ export interface DispatchSessionManager {
   /**
    * Wait until the freshly started session's Ink TUI is ready to accept input.
    * Resolves true when the input-ready marker is observed, false on timeout or a
-   * dead pane. {@link runDispatch} injects the slash command (`/impl` or `/pdca`)
-   * only after this so the slash-picker doesn't swallow the leading `/` while the
+   * dead pane. {@link runDispatch} injects the slash command (`/<command>`, e.g.
+   * `/impl`, `/pdca`, `/article`) only after this so the slash-picker doesn't
+   * swallow the leading `/` while the
    * TUI is still booting (RW-025 / RW-047 timing class).
    */
   waitForInputReady(threadId: string): Promise<boolean>;
@@ -157,7 +199,7 @@ export interface RunDispatchArgs {
   config: unknown;
   branch: string;
   issueNumber: number;
-  command: DispatchMode;
+  command: DispatchCommand;
   sessionManager: DispatchSessionManager;
   createThread: DispatchThreadFactory;
 }
@@ -169,7 +211,8 @@ export type RunDispatchResult =
 /**
  * Orchestrate a validated dispatch: create the thread, start the session in the
  * channel's repo on `branch`, then inject `/<command> <issueNumber>` as the
- * first prompt (`command` is `impl` or `pdca`). `start()` does not accept an
+ * first prompt (`command` is the selector-derived slug, e.g. `impl` / `pdca` /
+ * `article`). `start()` does not accept an
  * initial command (it only launches the pane), so the command is injected via
  * `sendMessage` after the session is registered — the same path a user's first
  * thread message would take.

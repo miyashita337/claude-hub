@@ -48,9 +48,30 @@ describe("parseDispatchCommand", () => {
     }
   });
 
-  test("an unrecognized mode token → error (fail-closed)", () => {
-    const r = parseDispatchCommand("/dispatch corp-dispatch-42 42 bogus");
-    expect(r.kind).toBe("error");
+  // #261 (corp #52 M2): the 3rd token is a goal selector mapped to the injected
+  // command. `no-template` collapses to /impl; playbook selectors are same-named.
+  test("`no-template` selector maps to the impl command (raw single Issue)", () => {
+    const r = parseDispatchCommand("/dispatch corp-dispatch-42 42 no-template");
+    expect(r.kind).toBe("ok");
+    if (r.kind === "ok") expect(r.command).toBe("impl");
+  });
+
+  test("`article` selector maps to the /article playbook command", () => {
+    const r = parseDispatchCommand("/dispatch corp-dispatch-243 243 article");
+    expect(r.kind).toBe("ok");
+    if (r.kind === "ok") expect(r.command).toBe("article");
+  });
+
+  test("`devcycle` selector maps to the /devcycle playbook command", () => {
+    const r = parseDispatchCommand("/dispatch corp-dispatch-376 376 devcycle");
+    expect(r.kind).toBe("ok");
+    if (r.kind === "ok") expect(r.command).toBe("devcycle");
+  });
+
+  test("an unrecognized selector token → error (fail-closed, closed set)", () => {
+    // Outside {impl,no-template,pdca,article,devcycle}: rejected, never guessed.
+    expect(parseDispatchCommand("/dispatch corp-dispatch-42 42 bogus").kind).toBe("error");
+    expect(parseDispatchCommand("/dispatch corp-dispatch-42 42 Article").kind).toBe("error");
   });
 
   test("tolerates extra surrounding whitespace", () => {
@@ -187,6 +208,21 @@ describe("runDispatch readiness ordering (RW-025/047)", () => {
     expect(r.ok).toBe(true);
     if (r.ok) expect(r.injected).toBe("/pdca 341");
     expect(calls).toEqual(["start", "waitForInputReady", "send:/pdca 341"]);
+  });
+
+  test("article playbook selector injects /article after readiness (#261)", async () => {
+    const { sm, calls } = recordingManager(true);
+    const r = await runDispatch({
+      config: {},
+      branch: "corp-dispatch-243",
+      issueNumber: 243,
+      command: "article",
+      sessionManager: sm,
+      createThread: async () => ({ id: "thread-1" }),
+    });
+    expect(r.ok).toBe(true);
+    if (r.ok) expect(r.injected).toBe("/article 243");
+    expect(calls).toEqual(["start", "waitForInputReady", "send:/article 243"]);
   });
 
   test("injects anyway when readiness times out (best-effort, no silent drop)", async () => {
