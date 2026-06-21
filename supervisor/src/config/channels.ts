@@ -152,3 +152,9 @@ export const IDLE_CHECK_INTERVAL_MS = 60 * 60 * 1000; // 1 hour
 export const GRACEFUL_KILL_TIMEOUT_MS = 15_000; // 15 seconds
 export const RESOURCE_CHECK_INTERVAL_MS = 30_000; // 30 seconds
 export const MAX_MEMORY_PER_SESSION_MB = 2048; // 2GB
+// GoalWatcher (corp #52 M3, spec §7): poll dispatch sessions' Issue labels for
+// `done` and auto-stop after a grace window. 2-min poll keeps gh well under any
+// rate limit (only dispatch sessions are polled); the 3-min grace gives the
+// chairman time to cancel by speaking in the thread before teardown.
+export const GOAL_CHECK_INTERVAL_MS = 2 * 60 * 1000; // 2 minutes
+export const GOAL_GRACE_MS = 3 * 60 * 1000; // 3 minutes
