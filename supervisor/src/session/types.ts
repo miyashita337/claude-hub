@@ -1,6 +1,5 @@
 import type { ChildProcess } from "child_process";
 import type { ContextBudgetTracker } from "./context-budget";
-import type { SelfHealer } from "./self-heal";
 
 export interface SessionInfo {
   id: string;
@@ -35,12 +34,6 @@ export interface SessionInfo {
    * high-context session is warned only when it crosses up into a new band.
    */
   contextBudgetTracker?: ContextBudgetTracker;
-  /**
-   * Per-session self-heal planner (Issue #206). Lazily created alongside the
-   * tracker; decides the auto-action (compact / notify / cap-reached) for each
-   * band crossing and enforces the per-session auto-action cap (RW-043).
-   */
-  selfHealer?: SelfHealer;
 }
 
 /**
@@ -62,4 +55,4 @@ export interface SessionHealthInfo {
   lastActivityAt: string;
 }
 
-export type StopReason = "manual" | "idle_timeout" | "resource_limit" | "error" | "tmux_exited" | "supervisor_restart";
+export type StopReason = "manual" | "idle_timeout" | "resource_limit" | "error" | "tmux_exited" | "supervisor_restart" | "self_heal_restart";

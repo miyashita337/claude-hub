@@ -9,19 +9,25 @@
  *   - red      → auto `/session compact` (the safe, fire-and-forget primitive
  *                already used by #200). Fires at a turn boundary (the Stop-hook
  *                relay completion), so it never interrupts an in-flight turn.
- *   - critical → notify only, for now. The right remedy at critical is a
- *                resume-backed *restart*, but auto-restart needs new-thread
- *                orchestration and carries the RW-047 resume-timing risk, so its
- *                EXECUTION is deferred to a focused follow-up. critical keeps the
- *                strong #204 warning (manual `/session resume`).
- *   - any band → a per-session cap bounds how many auto-actions fire, so a
- *                context that rebounds right back above the threshold after a
- *                compact cannot loop forever (RW-043 cap mechanism). When the
- *                cap is hit we stop auto-acting and prompt manual intervention.
+ *   - critical → resume-backed *restart* in a fresh thread (#244, the follow-up
+ *                #206 deferred). The planner only DECIDES `restart`; the actual
+ *                orchestration (stop → new thread → `claude --resume`) lives in
+ *                self-heal-restart.ts / bot.ts because it needs Discord. A
+ *                restart that cannot proceed (or fails) degrades to the manual
+ *                `/session resume` guidance — never a silent failure (RW-047).
+ *   - any band → a cap bounds how many auto-actions fire, so a context that
+ *                rebounds right back above the threshold after a compact OR a
+ *                restart cannot loop forever (RW-043 cap mechanism). compact and
+ *                restart share ONE cap (合算); once it is hit we stop auto-acting
+ *                and prompt manual intervention.
  *
- * The planner is a tiny per-session state machine (mirrors the de-dup tracker in
- * context-budget.ts) so it is unit-testable without a live session, and the
- * SessionManager owns the actual side effects (compact / Discord / log).
+ * The planner is a tiny state machine (mirrors the de-dup tracker in
+ * context-budget.ts) so it is unit-testable without a live session. The
+ * SessionManager owns the actual side effects (compact / Discord / log) AND owns
+ * the planner's lifetime: it keys one planner per claude session id (not per
+ * thread), so the cap survives a self-heal restart — `claude --resume` reloads
+ * the full context and would re-cross critical, and a fresh planner would let it
+ * restart forever (#244 AC item 2). See SessionManager.selfHealers.
  */
 
 import type { ContextBudgetLevel } from "./context-budget";
@@ -31,7 +37,13 @@ export type SelfHealAction =
   | "none"
   /** Red band: perform an automatic `/session compact`. */
   | "compact"
-  /** Critical band: notify only (auto-restart execution deferred to follow-up). */
+  /** Critical band: perform a resume-backed restart in a fresh thread (#244). */
+  | "restart"
+  /**
+   * Critical band but the restart could not be executed (e.g. the claude
+   * session id was never captured): notify only and prompt manual
+   * `/session resume` — the #244 degrade path, never a silent failure.
+   */
   | "notify"
   /** Per-session auto-action cap reached: stop auto-acting, prompt manual. */
   | "cap-reached";
@@ -101,11 +113,13 @@ export function createSelfHealer(options: SelfHealOptions = {}): SelfHealer {
         return { action: "compact", level, actionCount, cap };
       }
 
-      // critical: auto-restart EXECUTION is deferred (RW-047 + new-thread
-      // orchestration). Notify only — and do NOT consume an auto-action, since
-      // compact is not the right remedy here and we want the cap to gate actual
-      // compacts, not critical notifications.
-      return { action: "notify", level, actionCount, cap };
+      // critical: a resume-backed restart in a fresh thread (#244). Consumes an
+      // auto-action so the per-session cap bounds compacts AND restarts together
+      // (RW-043, 合算): a context that keeps rebounding to critical can restart
+      // at most `cap` times (combined with any compacts) before we stop and
+      // prompt manual intervention (AC item 2 — no infinite restart loop).
+      actionCount += 1;
+      return { action: "restart", level, actionCount, cap };
     },
   };
 }

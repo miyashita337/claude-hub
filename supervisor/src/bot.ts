@@ -9,7 +9,11 @@ import {
   type ThreadChannel,
   type TextChannel,
 } from "discord.js";
-import { SessionManager } from "./session/manager";
+import { SessionManager, type SelfHealOutcome } from "./session/manager";
+import {
+  executeSelfHealRestart,
+  manualRestartGuidance,
+} from "./session/self-heal-restart";
 import { Reaper } from "./session/reaper";
 import { ActivityWatchdog } from "./session/session-activity-watchdog";
 import { ResourceMonitor } from "./session/resource-monitor";
@@ -47,6 +51,149 @@ import {
   runDispatch,
 } from "./session/dispatch";
 import { buildThreadTitle } from "./session/thread-title";
+
+/** Shared context for delivering a self-heal outcome to a thread (Issue #206/#244). */
+interface SelfHealCtx {
+  thread: ThreadChannel;
+  threadId: string;
+  sessionManager: SessionManager;
+  client: Client;
+}
+
+/**
+ * Deliver a self-heal outcome to its Discord thread (Issue #206), executing the
+ * resume-backed restart when the planner chose it (Issue #244). Shared by the
+ * main relay tail and the late-response path so both behave identically. The
+ * outcome message is always posted first — for a restart it is the immediate
+ * "restarting…" announce, which matters because the resume picker poll can take
+ * minutes before the new thread is live.
+ */
+async function deliverSelfHealOutcome(
+  outcome: SelfHealOutcome,
+  ctx: SelfHealCtx
+): Promise<void> {
+  const { thread, threadId } = ctx;
+  console.warn(
+    `[Bot] context-budget ${outcome.level} on thread ${threadId}: ${outcome.tokens} tokens (action=${outcome.action})`
+  );
+  await thread.send(outcome.message);
+  if (outcome.action === "restart" && outcome.restart) {
+    await runSelfHealRestart(outcome, ctx);
+  }
+  if (outcome.page) {
+    await notifyPushover(
+      "Claude Code: コンテキスト肥大化",
+      `${thread.name ?? threadId} (${outcome.level}, ${Math.floor(outcome.tokens / 1000)}k tokens, action=${outcome.action}) — self-heal`
+    ).catch((err) =>
+      console.warn(`[Bot] context-budget pushover failed:`, err)
+    );
+  }
+}
+
+/**
+ * Drive the resume-backed restart for a critical-context session (Issue #244):
+ * resolve the channel config + parent text channel, then hand the real Discord /
+ * SessionManager side effects to {@link executeSelfHealRestart} (which owns the
+ * stop→create→resume ordering and the degrade-to-manual path). Defaults ON; the
+ * `CONTEXT_SELF_HEAL_RESTART=0` env is an emergency off-switch that degrades to
+ * manual `/session resume` guidance without a redeploy.
+ */
+async function runSelfHealRestart(
+  outcome: SelfHealOutcome,
+  ctx: SelfHealCtx
+): Promise<void> {
+  const { thread, threadId, sessionManager, client } = ctx;
+  const r = outcome.restart;
+  if (!r) return;
+
+  const flag = process.env.CONTEXT_SELF_HEAL_RESTART;
+  if (flag === "0" || flag === "false") {
+    await thread
+      .send(
+        manualRestartGuidance(
+          r.claudeSessionId,
+          "自動 restart は無効化されています (CONTEXT_SELF_HEAL_RESTART=0)"
+        )
+      )
+      .catch((err) =>
+        console.warn(`[Bot] self-heal restart (disabled) notice failed:`, err)
+      );
+    return;
+  }
+
+  const config = CHANNEL_MAP.get(r.channelName);
+  const parent = thread.parent;
+  if (
+    !config ||
+    !parent ||
+    !parent.isTextBased() ||
+    parent.isDMBased() ||
+    !("threads" in parent)
+  ) {
+    await thread
+      .send(
+        manualRestartGuidance(
+          r.claudeSessionId,
+          "新スレッドを作成できない構成のため"
+        )
+      )
+      .catch((err) =>
+        console.warn(`[Bot] self-heal restart (no-thread) notice failed:`, err)
+      );
+    return;
+  }
+  const textChannel = parent as TextChannel;
+
+  const result = await executeSelfHealRestart({
+    claudeSessionId: r.claudeSessionId,
+    tokens: outcome.tokens,
+    stopOld: () => sessionManager.stop(threadId, "self_heal_restart"),
+    createThread: async () => {
+      // Sequence suffix only when another session is already live on the same
+      // branch (mirrors handleResume / dispatch).
+      const sameBranchCount = sessionManager
+        .listRunningByChannel(r.channelName)
+        .filter((s) => s.branch === (r.branch ?? undefined)).length;
+      const threadName = buildThreadTitle(
+        "resume",
+        r.branch,
+        config.displayName,
+        sameBranchCount + 1
+      );
+      const nt = await textChannel.threads.create({
+        name: threadName,
+        autoArchiveDuration: 10080, // 7 days
+      });
+      return { id: nt.id, mention: `<#${nt.id}>` };
+    },
+    resume: async (newThreadId) => {
+      await sessionManager.resumeSession(
+        config,
+        newThreadId,
+        r.claudeSessionId,
+        r.projectDir,
+        r.branch
+      );
+    },
+    notifyOld: async (m) => {
+      await thread.send(m);
+    },
+    notifyNew: async (id, m) => {
+      const c = await client.channels.fetch(id);
+      if (c?.isThread()) await c.send(m);
+    },
+  });
+
+  if (!result.ok) {
+    console.warn(
+      `[Bot] self-heal restart degraded for thread ${threadId}: ${result.error ?? "unknown"}`
+    );
+  } else {
+    console.log(
+      `[Bot] self-heal restart: thread ${threadId} → ${result.newThreadId}`
+    );
+  }
+}
 
 export async function startBot(token: string): Promise<void> {
   // Issue #255: page-ability check at boot. If Pushover creds are missing, the
@@ -226,26 +373,21 @@ export async function startBot(token: string): Promise<void> {
         // per-thread budget check so this path warns too. The tracker is shared
         // with the main relay path, so de-dup holds across both.
         try {
-          // Issue #206: self-heal on the late-response path too (shares the
+          // Issue #206/#244: self-heal on the late-response path too (shares the
           // per-session tracker + healer, so de-dup and the cap hold across both
-          // paths). The manager performs any auto-action; we only deliver it.
+          // paths). The manager decides; deliverSelfHealOutcome posts the message
+          // and drives the resume-backed restart when chosen.
           const outcome = await sessionManager.contextBudgetSelfHeal(
             event.threadId,
             event.contextTokens
           );
           if (outcome) {
-            console.warn(
-              `[Bot] context-budget ${outcome.level} on thread ${event.threadId} (late): ${outcome.tokens} tokens (action=${outcome.action})`
-            );
-            await channel.send(outcome.message);
-            if (outcome.page) {
-              await notifyPushover(
-                "Claude Code: コンテキスト肥大化",
-                `${channel.name ?? event.threadId} (${outcome.level}, ${Math.floor(outcome.tokens / 1000)}k tokens, action=${outcome.action}) — #206 self-heal`
-              ).catch((err) =>
-                console.warn(`[Bot] context-budget pushover failed (late):`, err)
-              );
-            }
+            await deliverSelfHealOutcome(outcome, {
+              thread: channel,
+              threadId: event.threadId,
+              sessionManager,
+              client,
+            });
           }
         } catch (budgetErr) {
           console.warn(
@@ -672,26 +814,21 @@ export async function startBot(token: string): Promise<void> {
         // page Pushover for red/critical) once per band crossing. Best-effort:
         // a failure here must never affect the already-delivered response.
         try {
-          // Issue #206: self-heal — auto-compact on red (capped), notify on
-          // critical. The manager performs any auto-action and returns the
-          // ready-to-post message; we only deliver it (+ page on red/critical).
+          // Issue #206/#244: self-heal — auto-compact on red (capped),
+          // resume-backed restart on critical. The manager decides;
+          // deliverSelfHealOutcome posts the message, drives the restart when
+          // chosen, and pages Pushover on red/critical.
           const outcome = await sessionManager.contextBudgetSelfHeal(
             threadId,
             result.contextTokens
           );
           if (outcome) {
-            console.warn(
-              `[Bot] context-budget ${outcome.level} on thread ${threadId}: ${outcome.tokens} tokens (action=${outcome.action})`
-            );
-            await thread.send(outcome.message);
-            if (outcome.page) {
-              await notifyPushover(
-                "Claude Code: コンテキスト肥大化",
-                `${thread.name ?? threadId} (${outcome.level}, ${Math.floor(outcome.tokens / 1000)}k tokens, action=${outcome.action}) — #206 self-heal`
-              ).catch((err) =>
-                console.warn(`[Bot] context-budget pushover failed:`, err)
-              );
-            }
+            await deliverSelfHealOutcome(outcome, {
+              thread,
+              threadId,
+              sessionManager,
+              client,
+            });
           }
         } catch (budgetErr) {
           console.warn(
