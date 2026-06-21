@@ -19,6 +19,10 @@ import {
  *   - AC-4 (empty branch → error):                   "rejects ..."
  */
 
+// Issue #227 (PR-4): GitGhRunner's git/gh methods are async now (the production
+// runner uses the async `execFile`). The fake mirrors that — the in-memory
+// bookkeeping stays synchronous, the `async` keyword just wraps the result so
+// `await ensureWorktree(...)` matches production. `pathExists` stays sync.
 class FakeRunner implements GitGhRunner {
   existing = new Set<string>(); // worktree paths that already exist (Q4)
   branches = new Set<string>(); // refs that resolve (Q1)
@@ -29,31 +33,31 @@ class FakeRunner implements GitGhRunner {
   defaultBranchName = "main";
   calls: string[] = [];
 
-  branchExists(_dir: string, branch: string): boolean {
+  async branchExists(_dir: string, branch: string): Promise<boolean> {
     this.calls.push(`branchExists:${branch}`);
     return this.branches.has(branch);
   }
-  defaultBranch(_dir: string): string {
+  async defaultBranch(_dir: string): Promise<string> {
     this.calls.push(`defaultBranch`);
     return this.defaultBranchName;
   }
-  addWorktreeFromBranch(_dir: string, path: string, branch: string): void {
+  async addWorktreeFromBranch(_dir: string, path: string, branch: string): Promise<void> {
     this.calls.push(`addFromBranch:${branch}`);
     this.existing.add(path);
     // Creating a worktree registers it on `branch` (models real git).
     this.statuses.set(path, { registered: true, branch });
   }
-  addWorktreeNewBranch(
+  async addWorktreeNewBranch(
     _dir: string,
     path: string,
     branch: string,
     base: string,
-  ): void {
+  ): Promise<void> {
     this.calls.push(`addNewBranch:${branch}:${base}`);
     this.existing.add(path);
     this.statuses.set(path, { registered: true, branch });
   }
-  removeWorktree(_dir: string, path: string): void {
+  async removeWorktree(_dir: string, path: string): Promise<void> {
     this.calls.push(`remove:${path}`);
     this.existing.delete(path);
     this.statuses.delete(path);
@@ -61,7 +65,7 @@ class FakeRunner implements GitGhRunner {
   pathExists(path: string): boolean {
     return this.existing.has(path);
   }
-  worktreeStatus(_dir: string, path: string): WorktreeStatus {
+  async worktreeStatus(_dir: string, path: string): Promise<WorktreeStatus> {
     this.calls.push(`worktreeStatus:${path}`);
     return this.statuses.get(path) ?? { registered: false };
   }
@@ -116,9 +120,9 @@ describe("ensureWorktree", () => {
     runner = new FakeRunner();
   });
 
-  test("AC-1: unknown branch → creates worktree from default branch", () => {
+  test("AC-1: unknown branch → creates worktree from default branch", async () => {
     runner.defaultBranchName = "main";
-    const result = ensureWorktree(REPO, "feature-foo", runner);
+    const result = await ensureWorktree(REPO, "feature-foo", runner);
 
     expect(result.reused).toBe(false);
     expect(result.baseBranch).toBe("main");
@@ -126,9 +130,9 @@ describe("ensureWorktree", () => {
     expect(runner.calls).toContain("addNewBranch:feature-foo:main");
   });
 
-  test("Q1: existing branch → checkout into worktree (no new branch)", () => {
+  test("Q1: existing branch → checkout into worktree (no new branch)", async () => {
     runner.branches.add("existing-branch");
-    const result = ensureWorktree(REPO, "existing-branch", runner);
+    const result = await ensureWorktree(REPO, "existing-branch", runner);
 
     expect(result.reused).toBe(false);
     expect(result.baseBranch).toBeUndefined();
@@ -136,12 +140,12 @@ describe("ensureWorktree", () => {
     expect(runner.calls.some((c) => c.startsWith("addNewBranch"))).toBe(false);
   });
 
-  test("AC-3 / Q4: existing valid worktree on the expected branch → reuse, no git add", () => {
+  test("AC-3 / Q4: existing valid worktree on the expected branch → reuse, no git add", async () => {
     const path = resolveWorktreePath(REPO, "feature-foo");
     runner.existing.add(path);
     runner.statuses.set(path, { registered: true, branch: "feature-foo" });
 
-    const result = ensureWorktree(REPO, "feature-foo", runner);
+    const result = await ensureWorktree(REPO, "feature-foo", runner);
 
     expect(result.reused).toBe(true);
     expect(result.path).toBe(path);
@@ -152,79 +156,80 @@ describe("ensureWorktree", () => {
 
   // --- #158: reuse must be validated, never silently assumed -------------
 
-  test("#158 AC-1: path exists but is NOT a registered worktree (residue) → explicit error, no silent reuse", () => {
+  test("#158 AC-1: path exists but is NOT a registered worktree (residue) → explicit error, no silent reuse", async () => {
     const path = resolveWorktreePath(REPO, "feature-foo");
     runner.existing.add(path); // dir present on disk...
     // ...but no status entry → worktreeStatus reports {registered:false}.
 
-    expect(() => ensureWorktree(REPO, "feature-foo", runner)).toThrow(
+    await expect(ensureWorktree(REPO, "feature-foo", runner)).rejects.toThrow(
       /git worktree ではありません|残骸/,
     );
     // Must not fall through to creating/reusing.
     expect(runner.calls.some((c) => c.startsWith("add"))).toBe(false);
   });
 
-  test("#158 AC-1: path is a worktree but checked out on a DIFFERENT branch → explicit error", () => {
+  test("#158 AC-1: path is a worktree but checked out on a DIFFERENT branch → explicit error", async () => {
     const path = resolveWorktreePath(REPO, "feature-foo");
     runner.existing.add(path);
     runner.statuses.set(path, { registered: true, branch: "some-other-branch" });
 
-    expect(() => ensureWorktree(REPO, "feature-foo", runner)).toThrow(
+    await expect(ensureWorktree(REPO, "feature-foo", runner)).rejects.toThrow(
       /branch.*一致|期待 branch/,
     );
     expect(runner.calls.some((c) => c.startsWith("add"))).toBe(false);
   });
 
-  test("#158: a detached-HEAD worktree (no branch) → explicit error, not silent reuse", () => {
+  test("#158: a detached-HEAD worktree (no branch) → explicit error, not silent reuse", async () => {
     const path = resolveWorktreePath(REPO, "feature-foo");
     runner.existing.add(path);
     runner.statuses.set(path, { registered: true, branch: null });
 
-    expect(() => ensureWorktree(REPO, "feature-foo", runner)).toThrow();
+    await expect(ensureWorktree(REPO, "feature-foo", runner)).rejects.toThrow();
     expect(runner.calls.some((c) => c.startsWith("add"))).toBe(false);
   });
 
-  test("#158 AC-2: valid worktree on the expected branch → reuse succeeds (no regression)", () => {
+  test("#158 AC-2: valid worktree on the expected branch → reuse succeeds (no regression)", async () => {
     const path = resolveWorktreePath(REPO, "feat/foo-bar");
     runner.existing.add(path);
     runner.statuses.set(path, { registered: true, branch: "feat/foo-bar" });
 
-    const result = ensureWorktree(REPO, "feat/foo-bar", runner);
+    const result = await ensureWorktree(REPO, "feat/foo-bar", runner);
     expect(result.reused).toBe(true);
     expect(result.path).toBe(path);
   });
 
-  test("is idempotent: second ensure of the same branch reuses", () => {
-    ensureWorktree(REPO, "feature-foo", runner); // creates
-    const second = ensureWorktree(REPO, "feature-foo", runner);
+  test("is idempotent: second ensure of the same branch reuses", async () => {
+    await ensureWorktree(REPO, "feature-foo", runner); // creates
+    const second = await ensureWorktree(REPO, "feature-foo", runner);
     expect(second.reused).toBe(true);
   });
 
-  test("uses dynamic default branch (Q2: master/develop mixed repos)", () => {
+  test("uses dynamic default branch (Q2: master/develop mixed repos)", async () => {
     runner.defaultBranchName = "develop";
-    const result = ensureWorktree(REPO, "new-feat", runner);
+    const result = await ensureWorktree(REPO, "new-feat", runner);
     expect(result.baseBranch).toBe("develop");
     expect(runner.calls).toContain("addNewBranch:new-feat:develop");
   });
 
-  test("AC-4: empty / whitespace branch throws", () => {
-    expect(() => ensureWorktree(REPO, "", runner)).toThrow(/必須/);
-    expect(() => ensureWorktree(REPO, "   ", runner)).toThrow(/必須/);
+  test("AC-4: empty / whitespace branch throws", async () => {
+    // ensureWorktree is async now → a thrown error becomes a rejected Promise.
+    await expect(ensureWorktree(REPO, "", runner)).rejects.toThrow(/必須/);
+    await expect(ensureWorktree(REPO, "   ", runner)).rejects.toThrow(/必須/);
   });
 
-  test("trims surrounding whitespace from branch name", () => {
-    const result = ensureWorktree(REPO, "  feature-foo  ", runner);
+  test("trims surrounding whitespace from branch name", async () => {
+    const result = await ensureWorktree(REPO, "  feature-foo  ", runner);
     expect(result.path).toBe(resolve(REPO, WORKTREE_SUBDIR, "feature-foo"));
   });
 });
 
 describe("removeWorktree", () => {
-  test("delegates to the runner (Q3)", () => {
+  test("delegates to the runner (Q3)", async () => {
     const runner = new FakeRunner();
     const path = resolveWorktreePath(REPO, "feature-foo");
     runner.existing.add(path);
 
-    removeWorktree(REPO, path, runner);
+    await removeWorktree(REPO, path, runner);
 
     expect(runner.calls).toContain(`remove:${path}`);
     expect(runner.pathExists(path)).toBe(false);
@@ -244,18 +249,18 @@ describe("recreateWorktreeForExistingBranch (#217)", () => {
     runner = new FakeRunner();
   });
 
-  test("Q4: worktree path already present → true, no git add", () => {
+  test("Q4: worktree path already present → true, no git add", async () => {
     const path = resolveWorktreePath(REPO, "feat-217");
     runner.existing.add(path);
-    expect(recreateWorktreeForExistingBranch(REPO, "feat-217", runner)).toBe(
+    expect(await recreateWorktreeForExistingBranch(REPO, "feat-217", runner)).toBe(
       true,
     );
     expect(runner.calls.some((c) => c.startsWith("add"))).toBe(false);
   });
 
-  test("Q1: existing branch, missing worktree → checks out from branch, true", () => {
+  test("Q1: existing branch, missing worktree → checks out from branch, true", async () => {
     runner.branches.add("feat-217");
-    expect(recreateWorktreeForExistingBranch(REPO, "feat-217", runner)).toBe(
+    expect(await recreateWorktreeForExistingBranch(REPO, "feat-217", runner)).toBe(
       true,
     );
     expect(runner.calls).toContain("addFromBranch:feat-217");
@@ -263,16 +268,16 @@ describe("recreateWorktreeForExistingBranch (#217)", () => {
     expect(runner.calls.some((c) => c.startsWith("addNewBranch"))).toBe(false);
   });
 
-  test("branch gone → false WITHOUT creating a new branch (no Q2)", () => {
-    expect(recreateWorktreeForExistingBranch(REPO, "deleted", runner)).toBe(
+  test("branch gone → false WITHOUT creating a new branch (no Q2)", async () => {
+    expect(await recreateWorktreeForExistingBranch(REPO, "deleted", runner)).toBe(
       false,
     );
     expect(runner.calls).toContain("branchExists:deleted");
     expect(runner.calls.some((c) => c.startsWith("add"))).toBe(false);
   });
 
-  test("empty / whitespace branch → false, no git calls", () => {
-    expect(recreateWorktreeForExistingBranch(REPO, "   ", runner)).toBe(false);
+  test("empty / whitespace branch → false, no git calls", async () => {
+    expect(await recreateWorktreeForExistingBranch(REPO, "   ", runner)).toBe(false);
     expect(runner.calls.length).toBe(0);
   });
 });

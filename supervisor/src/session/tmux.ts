@@ -1,4 +1,7 @@
-import { execFileSync } from "child_process";
+import { execFile } from "child_process";
+import { promisify } from "util";
+
+const execFileAsync = promisify(execFile);
 
 export const TMUX_PATH = process.env.TMUX_PATH ?? "/opt/homebrew/bin/tmux";
 
@@ -27,7 +30,7 @@ if (!SOCKET_NAME_PATTERN.test(rawSocket)) {
 }
 export const TMUX_SOCKET = rawSocket;
 
-/** argv prefix for all execFileSync tmux calls. */
+/** argv prefix for all tmux calls (passed to the async execFile). */
 export const TMUX_ARGS: readonly string[] = ["-L", TMUX_SOCKET];
 
 /**
@@ -36,8 +39,8 @@ export const TMUX_ARGS: readonly string[] = ["-L", TMUX_SOCKET];
  * `write text`, which the interactive shell in the new tab runs on attach
  * (see {@link ./iterm2}.openTab). Safe because `TMUX_SOCKET` has been
  * validated against `SOCKET_NAME_PATTERN`. Direct tmux calls use argv via
- * `execFileSync` (Issue #97); do not introduce new template-string execSync
- * uses of this constant.
+ * the async `execFile` (Issue #97 / #227 PR-4); do not introduce new
+ * template-string exec uses of this constant.
  */
 export const TMUX_CMD = `${TMUX_PATH} -L ${TMUX_SOCKET}`;
 
@@ -68,16 +71,19 @@ export const TMUX_CMD = `${TMUX_PATH} -L ${TMUX_SOCKET}`;
  *
  * @see docs: Issue #73 / Epic #79 / Sub #80 (H1) / Sub #81 (H2)
  */
-export function ensureSocketConfigured(): void {
+export async function ensureSocketConfigured(): Promise<void> {
   try {
     // argv form (no shell): tmux's OWN command parser (not the shell) treats a
     // standalone ";" token as a separator between chained subcommands, so the
-    // three set-option calls still run in one tmux invocation. execFileSync
-    // passes argv directly, eliminating the shell parse step entirely (Issue
-    // #97). NOTE: do not "simplify" by joining these into one string — the
-    // chaining depends on ";" being its own argv element. Every token here is
-    // a hard-coded literal so there is no injection surface to begin with.
-    execFileSync(
+    // three set-option calls still run in one tmux invocation. execFile passes
+    // argv directly, eliminating the shell parse step entirely (Issue #97).
+    // Issue #227 (PR-4): async (not a synchronous exec) so a wedged tmux server
+    // cannot block the Bun single event loop. NOTE: do not "simplify" by joining these
+    // into one string — the chaining depends on ";" being its own argv element.
+    // Every token here is a hard-coded literal so there is no injection surface
+    // to begin with. execFile buffers stdout/stderr (not inherited), matching the
+    // prior stdio: "pipe" so tmux's stderr never leaks to the terminal.
+    await execFileAsync(
       TMUX_PATH,
       [
         ...TMUX_ARGS,
@@ -85,12 +91,12 @@ export function ensureSocketConfigured(): void {
         "set-option", "-g", "mode-keys", "emacs", ";",
         "set-option", "-g", "history-limit", "10000",
       ],
-      { timeout: 3000, stdio: "pipe" }
+      { timeout: 3000 }
     );
   } catch (err) {
-    // execFileSync surfaces tmux's stderr ("no server running" on the very
-    // first call, before any server exists) via err.stderr rather than
-    // err.message — check both so the expected first-call case stays silent.
+    // execFile surfaces tmux's stderr ("no server running" on the very first
+    // call, before any server exists) via err.stderr rather than err.message —
+    // check both so the expected first-call case stays silent.
     const e = err as NodeJS.ErrnoException & { stderr?: Buffer | string };
     const stderr = e?.stderr != null ? e.stderr.toString() : "";
     const msg = `${err instanceof Error ? err.message : String(err)} ${stderr}`;

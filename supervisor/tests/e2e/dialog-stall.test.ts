@@ -103,7 +103,7 @@ function wait(ms: number): Promise<void> {
   return new Promise((r) => setTimeout(r, ms));
 }
 
-beforeAll(() => {
+beforeAll(async () => {
   if (!hasTmux) return;
   try {
     execFileSync(TMUX_PATH, [...TMUX_ARGS, "start-server"], {
@@ -112,7 +112,8 @@ beforeAll(() => {
   } catch {
     // server may already be running
   }
-  ensureSocketConfigured();
+  // Issue #227 (PR-4): ensureSocketConfigured is async now — await it.
+  await ensureSocketConfigured();
 });
 
 describe("Issue #57 dialog stall — E2E with real tmux", () => {

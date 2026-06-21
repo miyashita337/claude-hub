@@ -46,7 +46,11 @@ export class FakeTmuxAdapter implements TmuxAdapter {
     return this.sessions.get(name)?.pid ?? null;
   }
 
-  ensureSocketConfigured(): void {
+  // Issue #227 (PR-4): ensureSocketConfigured is async now. The counter bump
+  // runs synchronously (before the first await), so existing
+  // `ensureSocketConfiguredCalls` assertions still hold even when the call is
+  // not awaited (e.g. the constructor's fire-and-forget invocation).
+  async ensureSocketConfigured(): Promise<void> {
     this.ensureSocketConfiguredCalls += 1;
   }
 
@@ -146,7 +150,11 @@ export class FakeWorktreeAdapter implements WorktreeAdapter {
   /** When set, ensure() throws to simulate a git worktree failure. */
   failOnEnsure = false;
 
-  ensure(mainRepoDir: string, branch: string): EnsureWorktreeResult {
+  // Issue #227 (PR-4): the WorktreeAdapter interface methods are now async, so
+  // the fakes return Promises too. The in-memory bookkeeping stays synchronous;
+  // the `async` keyword just wraps the result so `await fake.x()` matches
+  // production (a `failOnEnsure` throw becomes a rejected Promise as before).
+  async ensure(mainRepoDir: string, branch: string): Promise<EnsureWorktreeResult> {
     this.ensureCalls.push({ mainRepoDir, branch });
     if (this.failOnEnsure) {
       throw new Error("git worktree add failed");
@@ -159,12 +167,12 @@ export class FakeWorktreeAdapter implements WorktreeAdapter {
     return { path, reused };
   }
 
-  remove(mainRepoDir: string, worktreePath: string): void {
+  async remove(mainRepoDir: string, worktreePath: string): Promise<void> {
     this.removeCalls.push({ mainRepoDir, worktreePath });
     this.existingPaths.delete(worktreePath);
   }
 
-  recreateForBranch(mainRepoDir: string, branch: string): boolean {
+  async recreateForBranch(mainRepoDir: string, branch: string): Promise<boolean> {
     this.recreateForBranchCalls.push({ mainRepoDir, branch });
     const path = resolveWorktreePath(mainRepoDir, branch.trim());
     if (this.existingPaths.has(path)) return true; // Q4: already present

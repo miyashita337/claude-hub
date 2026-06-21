@@ -90,14 +90,15 @@ function killPane(name: string): void {
   }
 }
 
-beforeAll(() => {
+beforeAll(async () => {
   if (hasTmux) {
     try {
       execFileSync(TMUX_PATH, [...TMUX_ARGS, "start-server"], { timeout: TMUX_OP_TIMEOUT });
     } catch {
       /* new-session will start the server on demand */
     }
-    ensureSocketConfigured();
+    // Issue #227 (PR-4): ensureSocketConfigured is async now — await it.
+    await ensureSocketConfigured();
   }
   startRelayServer();
 });

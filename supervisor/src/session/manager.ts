@@ -283,7 +283,12 @@ export class SessionManager {
       options.inputReadyPollIntervalMs ?? 1000;
     this.watchIntervalMs = options.watchIntervalMs ?? 10_000;
 
-    this.effects.tmux.ensureSocketConfigured();
+    // Issue #227 (PR-4): ensureSocketConfigured is async now. The constructor
+    // cannot await, so fire-and-forget it — it is idempotent and re-applied in
+    // start()/resume() once the tmux server is definitely up (the eager call
+    // here is a no-op before the first new-session). `void` discards the Promise;
+    // the function catches its own errors, so there is no unhandled rejection.
+    void this.effects.tmux.ensureSocketConfigured();
     this.effects.relayServer.start();
     // Issue #227 (PR-3): recoverFromDb is async now (it awaits tmux has/kill).
     // The constructor cannot await, so we keep the recovery promise for tests
@@ -455,7 +460,7 @@ export class SessionManager {
     let worktree: SessionInfo["worktree"];
     const trimmedBranch = branch?.trim();
     if (trimmedBranch) {
-      const result = this.effects.worktree.ensure(config.dir, trimmedBranch);
+      const result = await this.effects.worktree.ensure(config.dir, trimmedBranch);
       projectDir = result.path;
       worktree = {
         mainRepoDir: config.dir,
@@ -516,7 +521,7 @@ export class SessionManager {
     await this.effects.tmux.newSession(tmuxName, claudeCmd);
     // Apply server-wide options now that the server is definitely running.
     // The constructor's eager call is a no-op before the first new-session.
-    this.effects.tmux.ensureSocketConfigured();
+    await this.effects.tmux.ensureSocketConfigured();
 
     // Wait briefly for process to start. start() is async (Issue #99) so this
     // uses a non-blocking setTimeout instead of the previous
@@ -669,7 +674,7 @@ export class SessionManager {
       if (!existsSync(projectDir)) {
         const trimmedBranch = branch?.trim();
         const recovered = trimmedBranch
-          ? this.recoverWorktreeForResume(config.dir, projectDir, trimmedBranch)
+          ? await this.recoverWorktreeForResume(config.dir, projectDir, trimmedBranch)
           : false;
         if (recovered && existsSync(projectDir) && trimmedBranch) {
           // We rebuilt the worktree, so THIS resumed session now owns its
@@ -762,7 +767,7 @@ export class SessionManager {
     ].join(" && ");
 
     await this.effects.tmux.newSession(tmuxName, claudeCmd);
-    this.effects.tmux.ensureSocketConfigured();
+    await this.effects.tmux.ensureSocketConfigured();
 
     let pid: number | null = null;
     for (let i = 0; i < 5; i++) {
@@ -1183,7 +1188,7 @@ export class SessionManager {
     // cwd. Only the last session on the worktree removes it (PR #157 review,
     // CodeRabbit Major).
     if (session.worktree && !this.isWorktreePathInUse(session.worktree.path)) {
-      this.removeWorktreeBestEffort(session.worktree);
+      await this.removeWorktreeBestEffort(session.worktree);
     } else if (session.worktree) {
       console.log(
         `[SessionManager] Worktree ${session.worktree.path} still in use by another session; not removing`
@@ -1200,13 +1205,13 @@ export class SessionManager {
    * fabricating unrelated content. Failures are swallowed → false, leaving the
    * caller's existsSync re-check to decide the outcome deterministically.
    */
-  private recoverWorktreeForResume(
+  private async recoverWorktreeForResume(
     mainRepoDir: string,
     projectDir: string,
     branch: string
-  ): boolean {
+  ): Promise<boolean> {
     try {
-      const ok = this.effects.worktree.recreateForBranch(mainRepoDir, branch);
+      const ok = await this.effects.worktree.recreateForBranch(mainRepoDir, branch);
       if (ok) {
         console.log(
           `[SessionManager] Re-created worktree for branch '${branch}' to resume: ${projectDir}`
@@ -1239,12 +1244,12 @@ export class SessionManager {
    * worktree must never block session teardown, so a removal error is logged
    * and ignored. No-op when the session had no worktree.
    */
-  private removeWorktreeBestEffort(
+  private async removeWorktreeBestEffort(
     worktree: SessionInfo["worktree"]
-  ): void {
+  ): Promise<void> {
     if (!worktree) return;
     try {
-      this.effects.worktree.remove(worktree.mainRepoDir, worktree.path);
+      await this.effects.worktree.remove(worktree.mainRepoDir, worktree.path);
       console.log(
         `[SessionManager] Removed worktree ${worktree.path} (branch '${worktree.branch}' preserved)`
       );

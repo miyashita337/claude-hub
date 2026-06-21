@@ -153,14 +153,15 @@ function paneInMode(session: string): boolean {
 // server-startup latency (which can blow through short timeouts on CI). Also
 // applies the Supervisor socket's global options (mouse off / mode-keys
 // emacs) so tests exercise the production configuration.
-beforeAll(() => {
+beforeAll(async () => {
   if (!hasTmux) return;
   try {
     execFileSync(TMUX_PATH, [...TMUX_ARGS, "start-server"], { timeout: TMUX_OP_TIMEOUT });
   } catch {
     // non-fatal; new-session will start the server on demand
   }
-  ensureSocketConfigured();
+  // Issue #227 (PR-4): ensureSocketConfigured is async now — await it.
+  await ensureSocketConfigured();
 });
 
 describe("tmuxSend integration (Issue #73 / AC-7)", () => {
