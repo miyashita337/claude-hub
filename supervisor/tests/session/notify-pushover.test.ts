@@ -1,5 +1,8 @@
-import { test, expect, describe, mock } from "bun:test";
-import { notifyPushover } from "../../src/session/notify-pushover";
+import { test, expect, describe, mock, spyOn } from "bun:test";
+import {
+  notifyPushover,
+  warnIfPushoverUnconfigured,
+} from "../../src/session/notify-pushover";
 
 describe("notifyPushover", () => {
   test("skips (returns false) when credentials are unset", async () => {
@@ -72,5 +75,37 @@ describe("notifyPushover", () => {
       fetchImpl: fetchSpy as unknown as typeof fetch,
     });
     expect(ok).toBe(false);
+  });
+});
+
+// Issue #255 (proposal C): warn at startup when Pushover is unconfigured so the
+// operator knows paging is disabled, rather than discovering it only when a
+// stall silently fails to page.
+describe("warnIfPushoverUnconfigured (Issue #255)", () => {
+  test("returns true and stays quiet when both credentials are set", () => {
+    const warnSpy = spyOn(console, "warn").mockImplementation(() => {});
+    try {
+      const ok = warnIfPushoverUnconfigured({ token: "tok", userKey: "usr" });
+      expect(ok).toBe(true);
+      expect(warnSpy).toHaveBeenCalledTimes(0);
+    } finally {
+      warnSpy.mockRestore();
+    }
+  });
+
+  test.each([
+    ["both unset", {}],
+    ["only token", { token: "tok" }],
+    ["only userKey", { userKey: "usr" }],
+  ])("returns false and warns when %s", (_label, env) => {
+    const warnSpy = spyOn(console, "warn").mockImplementation(() => {});
+    try {
+      const ok = warnIfPushoverUnconfigured(env);
+      expect(ok).toBe(false);
+      expect(warnSpy).toHaveBeenCalledTimes(1);
+      expect(String(warnSpy.mock.calls[0]![0])).toContain("paging is disabled");
+    } finally {
+      warnSpy.mockRestore();
+    }
   });
 });

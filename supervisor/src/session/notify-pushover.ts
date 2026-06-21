@@ -30,6 +30,22 @@ function readEnv(): PushoverEnv {
 }
 
 /**
+ * Issue #255: surface a *startup* warning when Pushover is unconfigured, so the
+ * operator learns at boot that stall / dialog paging is disabled — rather than
+ * discovering it only when a stall silently fails to page (the #255
+ * observability gap, where many `[Pushover] skipped` lines went unnoticed
+ * because nothing flagged the missing credentials up front). Returns `true` when
+ * both credentials are present. `env` is injectable for tests.
+ */
+export function warnIfPushoverUnconfigured(env: PushoverEnv = readEnv()): boolean {
+  if (env.token && env.userKey) return true;
+  console.warn(
+    "[Pushover] startup: PUSHOVER_TOKEN / PUSHOVER_USER_KEY not set — stall/dialog paging is disabled (Issue #255)"
+  );
+  return false;
+}
+
+/**
  * Send a Pushover notification. Returns `true` only when the API accepted the
  * message (`status: 1`). Returns `false` when credentials are absent or the
  * request fails — both are logged, never thrown.

@@ -63,13 +63,16 @@ if [ -z "$QUESTION" ]; then
 fi
 
 # Forward to the supervisor and wait for the user's reply. --max-time matches
-# the relay-server's DEFAULT_ASK_TIMEOUT_MS plus a small buffer for the round
-# trip; the server itself enforces the real timeout.
+# the relay-server's DEFAULT_ASK_TIMEOUT_MS (300s since Issue #255) plus a small
+# buffer for the round trip; the server itself enforces the real timeout.
+# INVARIANT: this MUST stay >= DEFAULT_ASK_TIMEOUT_MS/1000, or curl gives up
+# before the server and the user's late reply is wasted. relay-server.test.ts
+# locks `--max-time*1000 >= DEFAULT_ASK_TIMEOUT_MS`.
 RESPONSE=$(jq -n --arg q "$QUESTION" '{question: $q}' | \
   curl -s -X POST "$ASK_URL" \
     -H "Content-Type: application/json" \
     -d @- \
-    --max-time 130)
+    --max-time 310)
 CURL_EXIT=$?
 
 if [ $CURL_EXIT -ne 0 ] || [ -z "$RESPONSE" ]; then

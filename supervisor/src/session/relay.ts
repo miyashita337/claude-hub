@@ -7,7 +7,7 @@ import { persistAttachments } from "./attachment-store";
 import { TMUX_PATH, TMUX_ARGS } from "./tmux";
 import { createLatencyTracker } from "./latency-logger";
 import { startDialogWatchdog } from "./dialog-watchdog";
-import { scheduleStallHeartbeat } from "./stall-heartbeat";
+import { scheduleStallHeartbeat, DEFAULT_STALL_DELAY_MS } from "./stall-heartbeat";
 import { createPageOnce } from "./dialog-stuck-handler";
 import type { DialogStuckInfo } from "./dialog-stuck-handler";
 import { ATTACHMENT_DIR } from "./gc-attachments";
@@ -21,8 +21,42 @@ import { ATTACHMENT_DIR } from "./gc-attachments";
  */
 const execFileAsync = promisify(execFile);
 
-/** How long to wait for Claude Code Stop hook to fire (ms) */
-const RELAY_TIMEOUT_MS = 5 * 60_000;
+/**
+ * How long to wait for the Claude Code Stop hook to POST the response (ms).
+ *
+ * Issue #255: the old fixed 5-min ceiling was *shorter* than a normal dispatch
+ * agent turn (multi-`bash`/`gh` research easily runs 10-20 min). The relay then
+ * gave up on a *live* session and surfaced a false "応答がタイムアウト", even
+ * though the Stop hook eventually POSTs and the late-response path forwards it.
+ * The default is raised and made tunable via the `RELAY_TIMEOUT_MS` env (ms).
+ *
+ * Invariant: the effective timeout MUST stay strictly above
+ * {@link DEFAULT_STALL_DELAY_MS} so the 3-min stall heartbeat still fires
+ * *while* the relay is waiting (it pages the user that a long turn is in
+ * progress). {@link RELAY_TIMEOUT_FLOOR_MS} enforces this in code, replacing the
+ * comment-only contract that previously lived in stall-heartbeat.ts.
+ */
+export const DEFAULT_RELAY_TIMEOUT_MS = 15 * 60_000;
+/** Lowest effective relay timeout: keeps the stall heartbeat strictly earlier. */
+export const RELAY_TIMEOUT_FLOOR_MS = DEFAULT_STALL_DELAY_MS + 60_000;
+/** Upper bound so a malformed env can't pin a relay for an unbounded time. */
+export const RELAY_TIMEOUT_CEILING_MS = 60 * 60_000;
+
+/**
+ * Resolve the relay timeout from `env.RELAY_TIMEOUT_MS` (ms), falling back to
+ * {@link DEFAULT_RELAY_TIMEOUT_MS} for absent / non-numeric / non-positive
+ * values, then clamping into [floor, ceiling]. Pure + exported so a unit test
+ * can lock the default, the clamp, and the stall-heartbeat invariant.
+ */
+export function readRelayTimeoutMs(env: NodeJS.ProcessEnv = process.env): number {
+  const raw = env.RELAY_TIMEOUT_MS;
+  const parsed = raw !== undefined ? Number(raw) : NaN;
+  const value =
+    Number.isFinite(parsed) && parsed > 0 ? parsed : DEFAULT_RELAY_TIMEOUT_MS;
+  return Math.min(RELAY_TIMEOUT_CEILING_MS, Math.max(RELAY_TIMEOUT_FLOOR_MS, value));
+}
+
+const RELAY_TIMEOUT_MS = readRelayTimeoutMs();
 
 export interface AttachmentInfo {
   url: string;
@@ -245,7 +279,8 @@ export async function sendToPane(
  * polls the pane every 5s. Dialogs that slip past `--dangerously-skip-
  * permissions` (Plan mode confirmation, AskUserQuestion, MCP elicitation,
  * Bash interactive y/n) cause the TUI to stall silently — without
- * detection the relay simply times out at RELAY_TIMEOUT_MS (5 min). The
+ * detection the relay simply times out at RELAY_TIMEOUT_MS (default 15 min,
+ * env-tunable since Issue #255). The
  * watchdog auto-accepts known kinds and, if the dialog persists, fires
  * `onDialogStuck` so the caller can post a heartbeat to Discord.
  */

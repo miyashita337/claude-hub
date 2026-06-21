@@ -3,7 +3,7 @@
  *
  * Existing safeguards each cover a *different timescale* and leave a gap:
  *   - the stall heartbeat ({@link import("./stall-heartbeat")}) is per relay turn
- *     (3 min, below the 5-min relay timeout),
+ *     (3 min, below the relay timeout — RELAY_TIMEOUT_MS, default 15 min),
  *   - the reaper ({@link import("./reaper").Reaper}) only acts after 7 days idle,
  *   - the context-budget monitor ({@link import("./context-budget")}) fires on
  *     high token counts reported by the Stop hook (#204).
