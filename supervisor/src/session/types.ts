@@ -1,5 +1,6 @@
 import type { ChildProcess } from "child_process";
 import type { ContextBudgetTracker } from "./context-budget";
+import type { SelfHealer } from "./self-heal";
 
 export interface SessionInfo {
   id: string;
@@ -34,6 +35,12 @@ export interface SessionInfo {
    * high-context session is warned only when it crosses up into a new band.
    */
   contextBudgetTracker?: ContextBudgetTracker;
+  /**
+   * Per-session self-heal planner (Issue #206). Lazily created alongside the
+   * tracker; decides the auto-action (compact / notify / cap-reached) for each
+   * band crossing and enforces the per-session auto-action cap (RW-043).
+   */
+  selfHealer?: SelfHealer;
 }
 
 /**
