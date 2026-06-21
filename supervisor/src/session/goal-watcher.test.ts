@@ -56,7 +56,11 @@ interface ThreadStub {
   renamedTo: string | null;
 }
 
-function makeClient(thread?: ThreadStub): Client {
+function makeClient(
+  thread?: ThreadStub,
+  opts: { cached?: boolean } = {}
+): Client {
+  const cached = opts.cached ?? true;
   const channel = thread
     ? {
         isThread: () => true,
@@ -76,7 +80,12 @@ function makeClient(thread?: ThreadStub): Client {
       }
     : undefined;
   return {
-    channels: { cache: { get: () => channel } },
+    channels: {
+      // When `cached` is false the thread is absent from the cache (eviction /
+      // restart) and only the API fetch resolves it (PR #270 gemini HIGH).
+      cache: { get: () => (cached ? channel : undefined) },
+      fetch: async () => channel,
+    },
   } as unknown as Client;
 }
 
@@ -128,6 +137,33 @@ describe("GoalWatcher.check", () => {
     expect(stopCalls).toEqual([{ threadId: "t372", reason: "goal_complete" }]);
     expect(thread.archived).toBe(true);
     expect(thread.renamedTo).not.toBeNull();
+    expect(thread.sent.length).toBe(1);
+  });
+
+  test("AC-4 (cache miss): an evicted thread is fetched from the API and still archived", async () => {
+    const sessions = new Map<string, SessionInfo>([
+      ["t5", makeSession({ threadId: "t5", branch: "corp-dispatch-5" })],
+    ]);
+    const { manager, stopCalls } = makeManager(sessions);
+    const thread: ThreadStub = {
+      name: "🟢 corp-dispatch-5",
+      sent: [],
+      archived: false,
+      renamedTo: null,
+    };
+    let clock = 0;
+    // cached: false → cache.get returns undefined, only channels.fetch resolves it.
+    const watcher = new GoalWatcher(manager, makeClient(thread, { cached: false }), {
+      fetchIssueLabels: async () => ["done"],
+      now: () => clock,
+      graceMs: 50,
+    });
+
+    await watcher.check(); // open grace
+    clock = 100;
+    await watcher.check(); // stop + notify via API-fetched thread
+    expect(stopCalls).toEqual([{ threadId: "t5", reason: "goal_complete" }]);
+    expect(thread.archived).toBe(true);
     expect(thread.sent.length).toBe(1);
   });
 

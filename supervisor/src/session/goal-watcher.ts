@@ -25,6 +25,16 @@ export const DISPATCH_BRANCH_RE = /^corp-dispatch-(\d+)$/;
  */
 const DONE_LABEL = "done";
 
+/**
+ * Hard timeout for the `gh issue view` call (PR #270 gemini MEDIUM). Without it
+ * a hung gh (network stall, SSH/GPG prompt, rate-limit wedge) would leave its
+ * promise pending forever, which keeps {@link GoalWatcher.check}'s `isChecking`
+ * re-entry guard stuck `true` and disables every future tick. On timeout
+ * `execFile` kills the child and rejects, so the fail-soft `catch` returns `[]`
+ * and the watcher keeps running.
+ */
+const GH_FETCH_TIMEOUT_MS = 15_000;
+
 export interface GoalWatcherDeps {
   /**
    * Fetch the GitHub label names for Issue `issueNumber`, resolved from the git
@@ -71,7 +81,7 @@ async function realFetchIssueLabels(
         "--jq",
         ".labels[].name",
       ],
-      { cwd: repoDir, encoding: "utf8" }
+      { cwd: repoDir, encoding: "utf8", timeout: GH_FETCH_TIMEOUT_MS }
     );
     return stdout
       .split("\n")
@@ -243,9 +253,19 @@ export class GoalWatcher {
    */
   private async notifyThread(threadId: string): Promise<void> {
     try {
-      const thread = this.client.channels.cache.get(threadId) as
+      // Cache-first, then API fetch (PR #270 gemini HIGH). `done` is detected
+      // long after the thread was created (label poll + grace window), so on a
+      // long-running supervisor — or after a restart — the thread may have been
+      // evicted from the cache. Without the fetch fallback the completion notice
+      // / rename / archive would be silently skipped, failing AC-4.
+      let thread = this.client.channels.cache.get(threadId) as
         | ThreadChannel
         | undefined;
+      if (!thread) {
+        thread = (await this.client.channels
+          .fetch(threadId)
+          .catch(() => undefined)) as ThreadChannel | undefined;
+      }
 
       if (thread?.isThread()) {
         await thread.send(
