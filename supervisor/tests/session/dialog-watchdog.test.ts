@@ -158,7 +158,9 @@ describe("dialog-watchdog", () => {
       pollIntervalMs: SHORT_TICK_MS,
       maxAutoAcceptAttempts: 1,
       capture: () => "rm dangerous\nDo you want to proceed? (y/N)\n",
-      sendKeys: (_, keys) => sentKeys.push(keys),
+      sendKeys: (_, keys) => {
+        sentKeys.push(keys);
+      },
       setTimer: clock.setTimer,
       clearTimer: clock.clearTimer,
     });
@@ -181,7 +183,9 @@ describe("dialog-watchdog", () => {
       maxAutoAcceptAttempts: 1,
       capture: () =>
         "● How is Claude doing this session? (optional)\n  1: Bad    2: Fine   3: Good   0: Dismiss\n",
-      sendKeys: (_, keys) => sentKeys.push(keys),
+      sendKeys: (_, keys) => {
+        sentKeys.push(keys);
+      },
       onAutoAccept: (m) => accepts.push(m),
       setTimer: clock.setTimer,
       clearTimer: clock.clearTimer,
@@ -426,5 +430,73 @@ describe("dialog-watchdog tmux backoff (#222)", () => {
     await clock.advance(SHORT_TICK_MS * 4);
     watchdog.stop();
     expect(accepts.length).toBe(0);
+  });
+});
+
+/**
+ * Issue #227 (PR-2 / #250) AC-3: the watchdog's poll tick must NOT block the
+ * Bun single event loop while a tmux `capture-pane` / `send-keys` is in flight.
+ * PR-2 moved `captureViaTmux` / `sendKeysViaTmux` to async `execFile` and made
+ * the tick `await` the (now-async) capture/send seams.
+ *
+ * This exercises the public injection seam with REAL timers (no virtual clock):
+ * the first capture "parks" (its promise is held), and we prove a separately
+ * scheduled `setTimeout(0)` runs WHILE the tick is suspended at `await
+ * capture(...)`. A synchronous capture would have driven the whole tick to
+ * completion before any competing timer callback could interleave, so the
+ * ordering asserted here is impossible without the async conversion.
+ */
+describe("dialog-watchdog poll is non-blocking (#227 / #250 AC-3)", () => {
+  test("a poll tick yields the event loop while capture is in flight", async () => {
+    const order: string[] = [];
+    let captureCount = 0;
+    let releaseCapture: ((text: string) => void) | null = null;
+
+    const watchdog = startDialogWatchdog({
+      tmuxSessionName: "nonblock",
+      pollIntervalMs: 1, // first tick fires almost immediately (real timer)
+      maxAutoAcceptAttempts: 1,
+      capture: () => {
+        captureCount++;
+        if (captureCount === 1) {
+          // Park: the tick suspends here until the test releases it. While
+          // suspended the loop must stay free if capture is truly awaited.
+          return new Promise<string>((resolve) => {
+            order.push("capture-invoked");
+            releaseCapture = (text) => resolve(text);
+          });
+        }
+        // Later ticks: clean pane, resolve immediately (no dangling promise).
+        return "";
+      },
+      sendKeys: () => {
+        order.push("sendKeys");
+      },
+    });
+
+    // Let the first tick start and park inside capture.
+    await new Promise<void>((r) => setTimeout(r, 15));
+    // Competing macrotask: with a blocking sync capture, the tick would have
+    // finished before this 0ms timer could interleave.
+    await new Promise<void>((r) =>
+      setTimeout(() => {
+        order.push("competing");
+        r();
+      }, 0)
+    );
+
+    // capture started + competing ran, and the tick is STILL parked (no
+    // sendKeys yet) → the event loop stayed free during the tmux call.
+    expect(order).toContain("capture-invoked");
+    expect(order).toContain("competing");
+    expect(order).not.toContain("sendKeys");
+
+    // Release with a known dialog so the tick resumes and reaches await sendKeys.
+    expect(releaseCapture).not.toBeNull();
+    releaseCapture!("Permission required\n  ❯ Yes\n    No\n");
+    await new Promise<void>((r) => setTimeout(r, 15));
+    expect(order).toContain("sendKeys");
+
+    watchdog.stop();
   });
 });

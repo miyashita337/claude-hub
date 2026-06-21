@@ -1,4 +1,5 @@
-import { execFileSync } from "child_process";
+import { execFile } from "child_process";
+import { promisify } from "util";
 import { TMUX_PATH, TMUX_ARGS } from "./tmux";
 import {
   detectDialog,
@@ -43,6 +44,15 @@ const MAX_BACKOFF_MS = 30_000;
  * tick (which would otherwise trigger backoff prematurely).
  */
 const CAPTURE_TIMEOUT_MS = 3_000;
+
+/**
+ * Issue #227 (PR-2): the watchdog polls every relay-in-flight session every 5s
+ * on the shared `-L claude-hub` tmux server. Running capture/send via the
+ * *async* `execFile` keeps each poll off the Bun event loop, so N concurrent
+ * watchdogs no longer accumulate N synchronous blocks per tick (the dominant
+ * starvation source #227 named). `promisify(execFile)` resolves `{ stdout, stderr }`.
+ */
+const execFileAsync = promisify(execFile);
 
 /**
  * Compute the next poll interval. On a successful capture, reset to `base`;
@@ -90,11 +100,14 @@ export interface DialogWatchdogOptions {
   /** Override max auto-accept attempts — tests can drop to 1 for speed. */
   maxAutoAcceptAttempts?: number;
   /** Inject a custom capture function — tests pass a fake to avoid spawning
-   *  tmux. Defaults to {@link captureViaTmux}. */
-  capture?: (sessionName: string) => string;
+   *  tmux. Defaults to {@link captureViaTmux}. May be sync or async: the tick
+   *  awaits it, so a sync fake (returning a string) stays compatible while the
+   *  production default is now async (Issue #227 PR-2). */
+  capture?: (sessionName: string) => string | Promise<string>;
   /** Inject a custom send-keys function — tests pass a recorder to assert
-   *  the right keys were sent. Defaults to {@link sendKeysViaTmux}. */
-  sendKeys?: (sessionName: string, keys: string[]) => void;
+   *  the right keys were sent. Sync or async; the tick awaits it
+   *  (Issue #227 PR-2). Defaults to {@link sendKeysViaTmux}. */
+  sendKeys?: (sessionName: string, keys: string[]) => void | Promise<void>;
   /**
    * Inject the timer primitives that space out poll ticks. Tests pass a
    * virtual clock to drive ticks in deterministic virtual time, eliminating
@@ -119,13 +132,14 @@ export interface DialogWatchdog {
   stop(): void;
 }
 
-function captureViaTmux(sessionName: string): string {
+async function captureViaTmux(sessionName: string): Promise<string> {
   try {
-    return execFileSync(
+    const { stdout } = await execFileAsync(
       TMUX_PATH,
       [...TMUX_ARGS, "capture-pane", "-p", "-t", sessionName],
       { timeout: CAPTURE_TIMEOUT_MS }
-    ).toString();
+    );
+    return stdout.toString();
   } catch (err) {
     // Pane gone / server stopped: the session ended — return empty so detect
     // returns null and the watchdog stays at its base interval until it is
@@ -141,10 +155,10 @@ function captureViaTmux(sessionName: string): string {
   }
 }
 
-function sendKeysViaTmux(sessionName: string, keys: string[]): void {
+async function sendKeysViaTmux(sessionName: string, keys: string[]): Promise<void> {
   for (const key of keys) {
     try {
-      execFileSync(
+      await execFileAsync(
         TMUX_PATH,
         [...TMUX_ARGS, "send-keys", "-t", sessionName, key],
         { timeout: 2000 }
@@ -213,7 +227,7 @@ export function startDialogWatchdog(
     try {
       let pane: string;
       try {
-        pane = capture(tmuxSessionName);
+        pane = await capture(tmuxSessionName);
       } catch (err) {
         // capture-pane failed — typically ETIMEDOUT while the shared tmux
         // server is overloaded by many concurrent watchdogs (Issue #222).
@@ -257,7 +271,7 @@ export function startDialogWatchdog(
           `[Dialog] auto-accepted: ${match.kind} (attempt ${consecutiveAttempts}/${maxAutoAcceptAttempts}) on ${tmuxSessionName}`
         );
         try {
-          sendKeys(tmuxSessionName, keys);
+          await sendKeys(tmuxSessionName, keys);
         } catch (err) {
           console.warn(
             `[Dialog] auto-accept send-keys threw for ${tmuxSessionName}:`,
