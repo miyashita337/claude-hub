@@ -17,14 +17,14 @@
  *
  * claude-hub then starts a session in that channel's mapped repo on `<branch>`
  * and injects `/<command> <issueNumber>` as the session's first prompt. The
- * optional 3rd token is a *goal selector* (corp #52 M2): `no-template` (or
- * omitted / legacy `impl`) → `/impl` (one raw Issue), `pdca` → the Epic-aware
- * agent-base `/pdca` walk, and any other playbook name (`article`, `devcycle`,
- * …) → the same-named slash command (`/<selector>`). The feature is
- * intentionally generic — it hardcodes no corp-specific or dept-specific
- * playbook names; corp's typed `DispatchSelector` is the source of valid
- * tokens, and any source enumerated in the access policy (`dispatchFrom` /
- * `DISPATCH_ALLOWED_SOURCE_IDS`) can drive it.
+ * optional 3rd token is a *goal selector* (corp #52 M2) from a closed set:
+ * `no-template` (or omitted / legacy `impl`) → `/impl` (one raw Issue), `pdca` →
+ * the Epic-aware agent-base `/pdca` walk, and `article` / `devcycle` → the dept
+ * goal playbooks (`/article`, `/devcycle`). The selector set is fail-closed
+ * (unknown tokens are rejected, not guessed) and mirrors corp's typed
+ * `DispatchSelector`. *Who* may dispatch stays generic — it hardcodes no
+ * corp-specific source; any source enumerated in the access policy
+ * (`dispatchFrom` / `DISPATCH_ALLOWED_SOURCE_IDS`) can drive it.
  *
  * Authorization (who may dispatch) lives in `config/access-policy.ts`
  * (`isDispatchSourceAllowed`, fail-closed). This module owns parsing and the
@@ -38,34 +38,41 @@ import { resolveWorktreePath } from "./worktree";
 export const DISPATCH_PREFIX = "/dispatch";
 
 /**
- * Slash command (without the leading `/`) injected as the dispatched session's
- * first prompt. Derived from the dispatch *selector* (3rd token):
- *   - omitted / `impl` / `no-template` → `impl`  (one raw Issue)
- *   - `pdca`                            → `pdca`  (Epic-aware agent-base walk)
- *   - any playbook name (`article`, `devcycle`, …) → itself (`/<name> <N>`)
- * Always a validated slug ({@link SELECTOR_SLUG}, no shell metacharacters) so
- * `/<command> <issueNumber>` is safe to inject. Generic by design — no
- * dept-specific playbook names are hardcoded; corp's typed `DispatchSelector`
- * is the source of valid tokens.
+ * Dispatch goal selector — the optional 3rd token of
+ * `/dispatch <branch> <N> <selector>` (corp #52 M2 / #261). A **closed** set:
+ * the parser is fail-closed, so any token outside this union is rejected rather
+ * than guessed (a typo never silently runs the wrong flow). Mirrors corp's typed
+ * `DispatchSelector`; legacy `impl` is kept for the pre-M2 wire format.
+ *   - `no-template` (or legacy `impl`, or omitted) → the raw single-Issue flow
+ *   - `pdca`                                        → the Epic-aware /pdca walk
+ *   - `article` / `devcycle`                        → the dept goal playbooks
  */
-export type DispatchCommand = string;
+export type DispatchSelector =
+  | "impl"
+  | "no-template"
+  | "pdca"
+  | "article"
+  | "devcycle";
+
+const DISPATCH_SELECTORS: readonly DispatchSelector[] = [
+  "impl",
+  "no-template",
+  "pdca",
+  "article",
+  "devcycle",
+];
 
 /**
- * Accepted selector-token charset: a lowercase slug (`article`, `no-template`,
- * `pdca`, …). The fail-closed guard — anything with shell metacharacters,
- * uppercase, leading digit/dash or empty is rejected before it can become the
- * injected `/<command>` (defence-in-depth alongside the RW-045 branch guard).
+ * Slash command (without the leading `/`) injected as the session's first
+ * prompt. `no-template` / legacy `impl` collapse to `impl`; the others are the
+ * same-named command. Always a fixed literal (never user text) so
+ * `/<command> <issueNumber>` is safe to inject.
  */
-const SELECTOR_SLUG = /^[a-z][a-z0-9-]*$/;
+export type DispatchCommand = "impl" | "pdca" | "article" | "devcycle";
 
-/**
- * Map a (slug-validated) dispatch selector token to the slash command to inject.
- * `no-template` (and legacy `impl` / the omitted default) run the raw
- * single-Issue flow; every other selector becomes the same-named slash command
- * (`pdca` → `pdca`, `article` → `article`, …).
- */
-function selectorToCommand(selector: string): DispatchCommand {
-  return selector === "no-template" || selector === "impl" ? "impl" : selector;
+/** Map a validated selector to the slash command to inject. */
+function selectorToCommand(selector: DispatchSelector): DispatchCommand {
+  return selector === "no-template" ? "impl" : selector;
 }
 
 export type ParsedDispatch =
@@ -118,21 +125,19 @@ export function parseDispatchCommand(content: string): ParsedDispatch {
 
   const [branch, issueArg, selectorArg] = parts as [string, string, string?];
 
-  // Selector: optional 3rd token. Omitted → impl (backward compatible). A present
-  // token must be a lowercase slug (fail-closed: metachars / uppercase / empty
-  // are rejected so a malformed token never reaches the injected `/<command>`).
-  // Known tokens map via selectorToCommand; any other slug is treated as a
-  // playbook name (`/<name> <N>`) — generic, no dept names hardcoded here.
+  // Selector: optional 3rd token, default impl (backward compatible). Fail-closed
+  // on any token outside the closed DispatchSelector set so a typo never silently
+  // runs the wrong flow, then map it to the slash command to inject.
   let command: DispatchCommand = "impl";
   if (selectorArg !== undefined) {
-    if (!SELECTOR_SLUG.test(selectorArg)) {
+    if (!(DISPATCH_SELECTORS as readonly string[]).includes(selectorArg)) {
       return {
         kind: "error",
         reason:
-          "selector が不正です（英小文字スラッグのみ。例 impl / pdca / article / devcycle / no-template）。",
+          "selector は impl / no-template / pdca / article / devcycle のいずれかを指定してください。",
       };
     }
-    command = selectorToCommand(selectorArg);
+    command = selectorToCommand(selectorArg as DispatchSelector);
   }
 
   // Issue number: positive integer only (no decimals, signs, or trailing text).
