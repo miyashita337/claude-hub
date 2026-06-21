@@ -8,7 +8,12 @@ import {
   tmuxSend,
   ensurePaneNotInMode,
   flattenForSendKeys,
+  readRelayTimeoutMs,
+  DEFAULT_RELAY_TIMEOUT_MS,
+  RELAY_TIMEOUT_FLOOR_MS,
+  RELAY_TIMEOUT_CEILING_MS,
 } from "../../src/session/relay";
+import { DEFAULT_STALL_DELAY_MS } from "../../src/session/stall-heartbeat";
 import { TMUX_ARGS, ensureSocketConfigured } from "../../src/session/tmux";
 
 // Issue #210: the newline-flatten regex was double-escaped (`/[\\r\\n]+/`) so it
@@ -271,4 +276,50 @@ describe("relayMessage send failure (#74)", () => {
       expect(result.text).toBe("");
     }
   );
+});
+
+// Issue #255 (proposal A): the relay timeout is env-tunable with a raised
+// default, but must always stay above the stall heartbeat so a long *live*
+// dispatch turn is paged (3 min) before — never instead of — the relay giving
+// up. readRelayTimeoutMs is the single choke point that enforces this.
+describe("readRelayTimeoutMs (Issue #255)", () => {
+  test("default (env unset) is the raised 15-min default", () => {
+    expect(readRelayTimeoutMs({})).toBe(DEFAULT_RELAY_TIMEOUT_MS);
+    expect(DEFAULT_RELAY_TIMEOUT_MS).toBe(15 * 60_000);
+  });
+
+  test("invariant: default and floor both stay strictly above the stall delay", () => {
+    // If this ever inverts, the stall heartbeat would never fire before the
+    // relay timed out — the exact silent-stall regression #255 guards against.
+    expect(RELAY_TIMEOUT_FLOOR_MS).toBeGreaterThan(DEFAULT_STALL_DELAY_MS);
+    expect(DEFAULT_RELAY_TIMEOUT_MS).toBeGreaterThan(DEFAULT_STALL_DELAY_MS);
+  });
+
+  test("a valid positive env value (within bounds) is honored", () => {
+    expect(readRelayTimeoutMs({ RELAY_TIMEOUT_MS: "600000" })).toBe(600_000);
+  });
+
+  test("a value below the floor is clamped up to the floor", () => {
+    // 1s would put the relay below the 3-min stall heartbeat.
+    expect(readRelayTimeoutMs({ RELAY_TIMEOUT_MS: "1000" })).toBe(
+      RELAY_TIMEOUT_FLOOR_MS,
+    );
+  });
+
+  test("a value above the ceiling is clamped down to the ceiling", () => {
+    expect(readRelayTimeoutMs({ RELAY_TIMEOUT_MS: "999999999" })).toBe(
+      RELAY_TIMEOUT_CEILING_MS,
+    );
+  });
+
+  test.each([
+    ["non-numeric", "abc"],
+    ["zero", "0"],
+    ["negative", "-5"],
+    ["empty", ""],
+  ])("falls back to the default for %s env values", (_label, raw) => {
+    expect(readRelayTimeoutMs({ RELAY_TIMEOUT_MS: raw })).toBe(
+      DEFAULT_RELAY_TIMEOUT_MS,
+    );
+  });
 });

@@ -14,9 +14,11 @@
  * without coupling to Claude Code's churning TUI (RW-027).
  */
 
-// MUST stay below RELAY_TIMEOUT_MS in relay.ts (5 min): the stall heartbeat
+// MUST stay below the effective relay timeout (relay.ts): the stall heartbeat
 // has to fire *while* the relay is still waiting, otherwise the relay times
-// out first and the heartbeat never pages.
+// out first and the heartbeat never pages. Since Issue #255 the relay timeout
+// is env-tunable, so relay.ts derives RELAY_TIMEOUT_FLOOR_MS from this value to
+// enforce `stall < relay` in code rather than relying on this comment alone.
 export const DEFAULT_STALL_DELAY_MS = 3 * 60_000;
 
 export interface StallHeartbeat {

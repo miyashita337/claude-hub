@@ -17,7 +17,7 @@ import { createSessionCommand, createSessionHandler } from "./commands/session";
 import { CHANNEL_MAP, MAX_SESSIONS } from "./config/channels";
 import type { AttachmentInfo } from "./session/relay";
 import { buildDialogStuckHandler } from "./session/dialog-stuck-handler";
-import { notifyPushover } from "./session/notify-pushover";
+import { notifyPushover, warnIfPushoverUnconfigured } from "./session/notify-pushover";
 import { updateSessionClaudeId } from "./infra/db";
 import {
   buildSalvageReply,
@@ -49,6 +49,11 @@ import {
 import { buildThreadTitle } from "./session/thread-title";
 
 export async function startBot(token: string): Promise<void> {
+  // Issue #255: page-ability check at boot. If Pushover creds are missing, the
+  // stall heartbeat / dialog watchdog pages silently drop, so warn the operator
+  // up front instead of leaving it to be noticed only when a stall fails to page.
+  warnIfPushoverUnconfigured();
+
   const client = new Client({
     intents: [
       GatewayIntentBits.Guilds,

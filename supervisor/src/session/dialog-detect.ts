@@ -9,7 +9,8 @@
  * permission dialogs but cannot intercept these other dialog families.
  *
  * Without detection, the relay silently times out at RELAY_TIMEOUT_MS
- * (5 min) and the user perceives the bot as dead. This module exposes a
+ * (default 15 min, env-tunable) and the user perceives the bot as dead.
+ * This module exposes a
  * pure function `detectDialog(paneText)` that callers (relay watchdog,
  * tests) can invoke against `tmux capture-pane -p` output.
  *

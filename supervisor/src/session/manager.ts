@@ -937,8 +937,8 @@ export class SessionManager {
    * Issue #200: relay a `/compact <intent>` into the session's TUI as a
    * fire-and-forget send. Unlike {@link sendMessage}, this does NOT wait for a
    * relay (Stop-hook) response: the `/compact` built-in compacts context and
-   * does not POST to the relay server, so waiting would only burn the 5-min
-   * RELAY_TIMEOUT_MS. The caller acks immediately.
+   * does not POST to the relay server, so waiting would only burn
+   * RELAY_TIMEOUT_MS (default 15 min). The caller acks immediately.
    *
    * `intent` is always non-empty by contract (the command layer substitutes a
    * default) — a bare `/compact` is never sent (RW-032: bad-compact prevention).

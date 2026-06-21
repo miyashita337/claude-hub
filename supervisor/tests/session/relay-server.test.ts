@@ -1,4 +1,6 @@
 import { test, expect, describe, afterEach } from "bun:test";
+import { readFileSync } from "fs";
+import { resolve } from "path";
 import {
   startRelayServer,
   stopRelayServer,
@@ -7,6 +9,9 @@ import {
   onLateResponse,
   onProgress,
   onSessionsQuery,
+  RELAY_TIMEOUT_USER_MESSAGE,
+  DEFAULT_ASK_TIMEOUT_MS,
+  MAX_ASK_TIMEOUT_MS,
   type LateResponseEvent,
   type ProgressEvent,
 } from "../../src/session/relay-server";
@@ -93,6 +98,21 @@ describe("relay-server", () => {
     startRelayServer();
 
     const result = await waitForRelay("thread-timeout", 100);
+    expect(result.error).toBe("Response timeout");
+  });
+
+  // Issue #255 (proposal B): the timeout chunk must NOT assert the session died
+  // — it is usually still alive and the late-response path forwards the result.
+  test("timeout chunk reassures the session may still be running (Issue #255)", async () => {
+    startRelayServer();
+
+    const result = await waitForRelay("thread-timeout-msg", 100);
+    expect(result.chunks).toEqual([RELAY_TIMEOUT_USER_MESSAGE]);
+    // Wording acceptance: mentions the session may still be running.
+    expect(result.chunks[0]).toContain("稼働中");
+    // Must drop the old "応答がタイムアウトしました" dead-session assertion.
+    expect(result.chunks[0]).not.toContain("応答がタイムアウトしました");
+    // `error` stays machine-stable for callers that key on it.
     expect(result.error).toBe("Response timeout");
   });
 
@@ -387,5 +407,36 @@ describe("relay-server", () => {
       body: JSON.stringify({}),
     });
     expect(res.status).toBe(404);
+  });
+});
+
+// Issue #255 (proposal E): the AskUserQuestion relay timeout was raised
+// 120s → 300s so a 会長 answering on mobile Discord isn't dropped after 2 min.
+// The server default and the curl `--max-time` in hooks/ask-user-relay.sh are a
+// coupled pair (RW-035-style implicit contract); lock both here so they can't
+// drift apart and re-break the late reply.
+describe("ask timeout (Issue #255, proposal E)", () => {
+  test("DEFAULT_ASK_TIMEOUT_MS is raised to at least 300s and stays <= MAX", () => {
+    expect(DEFAULT_ASK_TIMEOUT_MS).toBeGreaterThanOrEqual(300_000);
+    expect(DEFAULT_ASK_TIMEOUT_MS).toBeLessThanOrEqual(MAX_ASK_TIMEOUT_MS);
+  });
+
+  test("ask-user-relay.sh --max-time covers the server default (curl must not give up first)", () => {
+    const hookPath = resolve(
+      import.meta.dir,
+      "../../hooks/ask-user-relay.sh",
+    );
+    const hook = readFileSync(hookPath, "utf8");
+    const match = hook.match(/--max-time\s+(\d+)/);
+    expect(match).not.toBeNull();
+    const maxTimeSeconds = Number(match![1]);
+    // INVARIANT (lower bound): curl budget (s) * 1000 must be >= the server
+    // default (ms), otherwise curl aborts before the user can answer and the
+    // reply is wasted.
+    expect(maxTimeSeconds * 1000).toBeGreaterThanOrEqual(DEFAULT_ASK_TIMEOUT_MS);
+    // INVARIANT (upper bound): curl must not wait beyond the server's hard cap —
+    // the server can never answer later than MAX_ASK_TIMEOUT_MS, so a larger
+    // --max-time would just hang the hook with no chance of a reply.
+    expect(maxTimeSeconds * 1000).toBeLessThanOrEqual(MAX_ASK_TIMEOUT_MS);
   });
 });

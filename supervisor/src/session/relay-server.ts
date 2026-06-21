@@ -66,12 +66,28 @@ interface PendingAsk {
 const pendingRequests = new Map<string, PendingRequest>();
 const pendingAsks = new Map<string, PendingAsk>();
 
-// /ask/:threadId default timeout. Mirrors the 120s budget from the example in
-// Issue #12 body so users have time to type a real answer on mobile Discord.
-const DEFAULT_ASK_TIMEOUT_MS = 120_000;
+// /ask/:threadId default timeout. Issue #255: raised 120s → 300s. The incident
+// dropped an AskUserQuestion after only 2 min unanswered, so a 会長 answering on
+// mobile Discord lost the question. INVARIANT: the curl `--max-time` in
+// hooks/ask-user-relay.sh MUST stay >= this / 1000 (otherwise curl gives up
+// before the server, and the late reply is wasted). A test in
+// relay-server.test.ts reads the hook and locks `--max-time*1000 >= DEFAULT`.
+export const DEFAULT_ASK_TIMEOUT_MS = 300_000;
 // Cap user-supplied timeouts so a malformed hook payload can't pin a request
 // indefinitely. 10 minutes is well above any realistic Discord round-trip.
-const MAX_ASK_TIMEOUT_MS = 600_000;
+export const MAX_ASK_TIMEOUT_MS = 600_000;
+
+/**
+ * Issue #255: user-facing notice when the relay gives up waiting for the Stop
+ * hook. The old text ("⚠️ Claude Code からの応答がタイムアウトしました。")
+ * asserted the session had died. In practice the session is usually still
+ * *alive* — a long dispatch turn merely exceeded the relay ceiling — and the
+ * Stop hook's late POST is forwarded via the late-response path. Word it so the
+ * user does not think the turn was lost. The `error` field stays
+ * "Response timeout" for callers / tests that key on it.
+ */
+export const RELAY_TIMEOUT_USER_MESSAGE =
+  "⏳ 制限時間内に応答が返りませんでした。セッションは稼働中の可能性があり、完了すると結果を追って転送します。しばらく待っても返らない場合は再送してください。";
 
 let server: ReturnType<typeof Bun.serve> | null = null;
 let relayPort = 0;
@@ -412,7 +428,7 @@ export function waitForRelay(
   return new Promise<RelayResult>((resolve) => {
     const timer = setTimeout(() => {
       pendingRequests.delete(threadId);
-      resolve({ text: "", chunks: ["⚠️ Claude Code からの応答がタイムアウトしました。"], error: "Response timeout" });
+      resolve({ text: "", chunks: [RELAY_TIMEOUT_USER_MESSAGE], error: "Response timeout" });
     }, timeoutMs);
 
     pendingRequests.set(threadId, { resolve, timer });
