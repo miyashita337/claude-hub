@@ -11,6 +11,7 @@ import { buildThreadTitle, markTitleStopped } from "../session/thread-title";
 import { buildStatusReply } from "../session/status-reply";
 import { evaluateAccess } from "../config/access-policy";
 import { safeRespond } from "./safe-respond";
+import { keepAttachment, KeepError } from "../session/keep-attachment";
 
 export function createSessionCommand() {
   return new SlashCommandBuilder()
@@ -68,6 +69,21 @@ export function createSessionCommand() {
             .setDescription("圧縮時に保持したい意図（省略時は既定の意図文を付与）")
             .setRequired(false)
         )
+    )
+    .addSubcommand((sub) =>
+      sub
+        .setName("keep")
+        // Issue #193: persist an attachment past the 30-day GC. Namespaced under
+        // /session for the same reason as compact (#200): a top-level /keep would
+        // risk colliding with another bot in the same guild. Declared optional at
+        // the Discord layer so a missing arg reaches the handler's usage hint.
+        .setDescription("添付素材を永続アーカイブへ退避（30日GCの対象外にする）")
+        .addStringOption((opt) =>
+          opt
+            .setName("filename")
+            .setDescription("退避するファイル名（tmp/attachments 直下のファイル名）")
+            .setRequired(false)
+        )
     );
 }
 
@@ -115,8 +131,49 @@ export function createSessionHandler(sessionManager: SessionManager) {
       case "compact":
         await handleCompact(interaction, sessionManager);
         break;
+      case "keep":
+        await handleKeep(interaction);
+        break;
     }
   };
+}
+
+async function handleKeep(
+  interaction: ChatInputCommandInteraction
+): Promise<void> {
+  // Issue #193: move an attachment out of the GC-swept tmp dir into the
+  // persistent archive. The archive is global (not per-thread), so this needs
+  // no session/thread binding — only a valid filename.
+  const filename = interaction.options.getString("filename")?.trim() ?? "";
+  if (!filename) {
+    await interaction.reply({
+      content:
+        "❌ filename が必須です。`/session keep <filename>` で実行してください" +
+        "（`tmp/attachments` 直下のファイル名を指定）。",
+      flags: 64,
+    });
+    return;
+  }
+
+  await interaction.deferReply();
+
+  try {
+    const result = keepAttachment(filename);
+    await interaction.editReply({
+      content:
+        `📦 添付素材を永続アーカイブへ退避しました（30日GCの対象外）:\n` +
+        `\`${result.archivedPath}\``,
+    });
+  } catch (err) {
+    if (err instanceof KeepError) {
+      // Expected, user-actionable failure (missing / invalid filename): report
+      // the reason and never treat a typo as a silent success (AC item 3).
+      await interaction.editReply({ content: `❌ ${err.message}` });
+      return;
+    }
+    const msg = `❌ 退避に失敗: ${err instanceof Error ? err.message : String(err)}`;
+    await safeRespond(interaction, { content: msg, ephemeral: true });
+  }
 }
 
 async function handleCompact(
