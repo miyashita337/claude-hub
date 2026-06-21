@@ -15,6 +15,7 @@ import {
   manualRestartGuidance,
 } from "./session/self-heal-restart";
 import { Reaper } from "./session/reaper";
+import { GoalWatcher } from "./session/goal-watcher";
 import { ActivityWatchdog } from "./session/session-activity-watchdog";
 import { ResourceMonitor } from "./session/resource-monitor";
 import { createSessionCommand, createSessionHandler } from "./commands/session";
@@ -236,6 +237,11 @@ export async function startBot(token: string): Promise<void> {
     });
   }
   const reaper = new Reaper(sessionManager, client);
+  // corp #52 M3 (spec §7): auto-stop dispatch-origin sessions (branch
+  // `corp-dispatch-<N>`) once their Issue carries the `done` label, after a
+  // grace window the chairman can cancel by speaking. Frees the shared session
+  // slot on goal completion instead of waiting for the 7-day reaper.
+  const goalWatcher = new GoalWatcher(sessionManager, client);
   // Issue #209: nudge the owner when a live session has been running for hours
   // (long_lived, AC3) or has gone silent (quiet, AC1) — the gap between the
   // per-turn stall heartbeat and the 7-day reaper. De-dup is internal so each
@@ -325,6 +331,7 @@ export async function startBot(token: string): Promise<void> {
     }
 
     reaper.start();
+    goalWatcher.start();
     activityWatchdog.start();
     resourceMonitor.start();
 
@@ -918,6 +925,7 @@ export async function startBot(token: string): Promise<void> {
   const shutdown = async () => {
     console.log("[Bot] Shutdown signal received");
     reaper.stop();
+    goalWatcher.stop();
     activityWatchdog.stop();
     resourceMonitor.stop();
     // Drain pending progress buffers before tearing down the Discord client
