@@ -1,5 +1,5 @@
 import { execFileSync } from "child_process";
-import { existsSync } from "fs";
+import { existsSync, realpathSync } from "fs";
 import { resolve, sep } from "path";
 
 /**
@@ -29,6 +29,20 @@ import { resolve, sep } from "path";
 /** Subdirectory (relative to the main repo) that holds per-branch worktrees. */
 export const WORKTREE_SUBDIR = ".claude/worktrees";
 
+/**
+ * Result of inspecting an on-disk path for Q4 reuse (Issue #158).
+ *
+ *   - `{ registered: false }`  the path exists but is NOT a path registered in
+ *     `git worktree list` — i.e. residue from an interrupted `git worktree
+ *     remove`, or a manually-created directory. Reusing it would run claude in
+ *     a non-worktree dir (silent failure).
+ *   - `{ registered: true, branch }`  the path is a registered worktree;
+ *     `branch` is the checked-out local branch, or `null` for a detached HEAD.
+ */
+export type WorktreeStatus =
+  | { registered: false }
+  | { registered: true; branch: string | null };
+
 export interface GitGhRunner {
   /** True if `branch` is an existing *local branch* in the repo at `mainRepoDir`. */
   branchExists(mainRepoDir: string, branch: string): boolean;
@@ -51,6 +65,12 @@ export interface GitGhRunner {
   removeWorktree(mainRepoDir: string, worktreePath: string): void;
   /** Filesystem existence check for the worktree path (Q4 reuse). */
   pathExists(path: string): boolean;
+  /**
+   * Inspect whether `worktreePath` is a *registered* git worktree and, if so,
+   * which branch it has checked out (Issue #158). Used to validate Q4 reuse
+   * instead of trusting a bare directory existence check.
+   */
+  worktreeStatus(mainRepoDir: string, worktreePath: string): WorktreeStatus;
 }
 
 export interface EnsureWorktreeResult {
@@ -118,8 +138,24 @@ export function ensureWorktree(
   }
   const worktreePath = resolveWorktreePath(mainRepoDir, trimmed);
 
-  // Q4: existing worktree → reuse.
+  // Q4: existing worktree → reuse, but only after validating it is a real
+  // worktree on the expected branch (Issue #158). A bare existence check would
+  // happily reuse an interrupted-`worktree remove` residue or a manually
+  // created directory, running claude in a non-worktree / wrong-branch cwd —
+  // a silent failure. Reject those explicitly instead.
   if (runner.pathExists(worktreePath)) {
+    const status = runner.worktreeStatus(mainRepoDir, worktreePath);
+    if (!status.registered) {
+      throw new Error(
+        `worktree 再利用先がディレクトリとして存在しますが有効な git worktree ではありません（中断した worktree remove の残骸 / 手動作成の可能性）: ${worktreePath}。手動で削除してから再実行してください。`,
+      );
+    }
+    if (status.branch !== trimmed) {
+      const actual = status.branch ?? "(detached HEAD)";
+      throw new Error(
+        `worktree 再利用先が期待 branch '${trimmed}' と一致しません（実際: '${actual}'）: ${worktreePath}。手動で確認・修正してから再実行してください。`,
+      );
+    }
     return { path: worktreePath, reused: true };
   }
 
@@ -292,4 +328,58 @@ export const realGitGhRunner: GitGhRunner = {
   pathExists(path) {
     return existsSync(path);
   },
+  worktreeStatus(mainRepoDir, worktreePath) {
+    // Parse `git worktree list --porcelain`. Each worktree is a block of
+    // newline-separated attribute lines, blocks separated by a blank line:
+    //   worktree /abs/path
+    //   HEAD <sha>
+    //   branch refs/heads/<name>     (omitted / replaced by `detached`)
+    // A path present on disk but absent from this listing is not a registered
+    // worktree (Issue #158: residue / manual dir).
+    let out: string;
+    try {
+      out = execFileSync(
+        "git",
+        ["-C", mainRepoDir, "worktree", "list", "--porcelain"],
+        { encoding: "utf8", stdio: ["ignore", "pipe", "ignore"] },
+      ).toString();
+    } catch {
+      // Not a git repo / git unavailable → treat as unregistered (caller errors).
+      return { registered: false };
+    }
+
+    const target = realpathOrResolve(worktreePath);
+    for (const block of out.split(/\n\s*\n/)) {
+      const lines = block.split("\n");
+      const wtLine = lines.find((l) => l.startsWith("worktree "));
+      if (!wtLine) continue;
+      const wtPath = realpathOrResolve(wtLine.slice("worktree ".length).trim());
+      if (wtPath !== target) continue;
+
+      const branchLine = lines.find((l) => l.startsWith("branch "));
+      if (branchLine) {
+        const ref = branchLine.slice("branch ".length).trim();
+        const branch = ref.startsWith("refs/heads/")
+          ? ref.slice("refs/heads/".length)
+          : ref;
+        return { registered: true, branch };
+      }
+      // No `branch` line (`detached` present, or bare HEAD): no checked-out branch.
+      return { registered: true, branch: null };
+    }
+    return { registered: false };
+  },
 };
+
+/**
+ * Normalize a path for comparison against `git worktree list` output, which
+ * records canonical (symlink-resolved) absolute paths. Falls back to `resolve`
+ * when the path cannot be realpath'd (e.g. it no longer exists).
+ */
+function realpathOrResolve(p: string): string {
+  try {
+    return realpathSync(resolve(p));
+  } catch {
+    return resolve(p);
+  }
+}
