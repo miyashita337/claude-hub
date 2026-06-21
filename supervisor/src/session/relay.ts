@@ -1,4 +1,5 @@
-import { execFileSync } from "child_process";
+import { execFile } from "child_process";
+import { promisify } from "util";
 import { resolve } from "path";
 import { mkdirSync, writeFileSync } from "fs";
 import { waitForRelay, type RelayResult } from "./relay-server";
@@ -10,6 +11,15 @@ import { scheduleStallHeartbeat } from "./stall-heartbeat";
 import { createPageOnce } from "./dialog-stuck-handler";
 import type { DialogStuckInfo } from "./dialog-stuck-handler";
 import { ATTACHMENT_DIR } from "./gc-attachments";
+
+/**
+ * Issue #227 (PR-1): the relay send hot path runs tmux via the *async*
+ * `execFile` so a stalled tmux server cannot freeze the Bun single event loop.
+ * The previous synchronous exec blocked the whole Supervisor for up to the
+ * per-call timeout on every send; under the dialog-watchdog's 5s poll (#222)
+ * those blocks accumulated. `promisify(execFile)` resolves to `{ stdout, stderr }`.
+ */
+const execFileAsync = promisify(execFile);
 
 /** How long to wait for Claude Code Stop hook to fire (ms) */
 const RELAY_TIMEOUT_MS = 5 * 60_000;
@@ -48,16 +58,37 @@ async function downloadAttachment(attachment: AttachmentInfo): Promise<string> {
  * We retry once after a 250ms pause so a flaky moment doesn't surface to
  * the user as a `send-keys` failure.
  */
-/** Summarize an execFileSync error without leaking message content from spawnargs. */
-function summarizeExecError(err: unknown): { code?: string; status?: number; signal?: string } {
-  const e = err as NodeJS.ErrnoException & { status?: number; signal?: string };
-  return { code: e.code, status: e.status, signal: e.signal };
+/** Summarize an execFile error without leaking message content from spawnargs. */
+function summarizeExecError(err: unknown): {
+  code?: string | number;
+  killed?: boolean;
+  signal?: string | null;
+} {
+  const e = err as NodeJS.ErrnoException & {
+    code?: string | number;
+    killed?: boolean;
+    signal?: string | null;
+  };
+  return { code: e.code, killed: e.killed, signal: e.signal };
 }
 
 function getExecStderr(err: unknown): string {
   const e = err as { stderr?: Buffer | string };
   if (!e.stderr) return "";
   return typeof e.stderr === "string" ? e.stderr : e.stderr.toString();
+}
+
+/**
+ * Detect a tmux call that was aborted by its own `timeout` option, normalising
+ * across the sync→async migration (#227). The synchronous exec threw an error
+ * with `.code === "ETIMEDOUT"`; the async `execFile` path instead kills the child
+ * with `killSignal` (default SIGTERM) and sets `.killed === true` (with
+ * `.code` left null). Accept both so `tmuxSend`'s transient-retry behavior
+ * (Issue #73 / RW-019) is byte-for-byte identical after the migration.
+ */
+function isExecTimeout(err: unknown): boolean {
+  const e = err as NodeJS.ErrnoException & { killed?: boolean };
+  return e.code === "ETIMEDOUT" || e.killed === true;
 }
 
 /**
@@ -78,11 +109,12 @@ export async function ensurePaneNotInMode(
 ): Promise<void> {
   let mode: string;
   try {
-    mode = execFileSync(
+    const { stdout } = await execFileAsync(
       TMUX_PATH,
       [...socketArgs, "display-message", "-t", sessionName, "-p", "#{pane_in_mode}"],
       { timeout: 2000 }
-    ).toString().trim();
+    );
+    mode = stdout.toString().trim();
   } catch (err) {
     console.warn(
       `[Relay] pane_in_mode check failed for ${sessionName}:`,
@@ -93,9 +125,11 @@ export async function ensurePaneNotInMode(
   if (mode !== "1") return;
   console.warn(`[Relay] pane ${sessionName} in copy-mode, cancelling before send-keys`);
   try {
-    execFileSync(TMUX_PATH, [...socketArgs, "send-keys", "-t", sessionName, "-X", "cancel"], {
-      timeout: 2000,
-    });
+    await execFileAsync(
+      TMUX_PATH,
+      [...socketArgs, "send-keys", "-t", sessionName, "-X", "cancel"],
+      { timeout: 2000 }
+    );
   } catch (err) {
     // Pane may have exited mode between check and cancel — safe to ignore.
     console.warn(
@@ -115,25 +149,26 @@ export async function tmuxSend(
   const args = [...socketArgs, "send-keys", "-t", sessionName, ...extraArgs];
   const PER_CALL_TIMEOUT = 7000;
   try {
-    execFileSync(TMUX_PATH, args, { timeout: PER_CALL_TIMEOUT });
+    await execFileAsync(TMUX_PATH, args, { timeout: PER_CALL_TIMEOUT });
     return;
   } catch (err) {
     const summary = summarizeExecError(err);
     const stderr = getExecStderr(err);
     const isModeErr = /not in a mode/i.test(stderr);
-    if (summary.code !== "ETIMEDOUT" && !isModeErr) {
+    const isTimeout = isExecTimeout(err);
+    if (!isTimeout && !isModeErr) {
       console.error(`[Relay] tmux send-keys failed:`, summary);
       throw err;
     }
-    // Transient: tmux briefly stalled (ETIMEDOUT) OR pane was in copy-mode
+    // Transient: tmux briefly stalled (timeout) OR pane was in copy-mode
     // (`not in a mode`). Exit any stuck mode and try once more.
     console.warn(
-      `[Relay] tmux send-keys transient error for ${sessionName} (${isModeErr ? "not-in-a-mode" : summary.code}), recovering...`
+      `[Relay] tmux send-keys transient error for ${sessionName} (${isModeErr ? "not-in-a-mode" : "timeout"}), recovering...`
     );
     await ensurePaneNotInMode(sessionName, socketArgs);
     await new Promise((r) => setTimeout(r, 250));
     try {
-      execFileSync(TMUX_PATH, args, { timeout: PER_CALL_TIMEOUT });
+      await execFileAsync(TMUX_PATH, args, { timeout: PER_CALL_TIMEOUT });
     } catch (retryErr) {
       console.error(
         `[Relay] tmux send-keys retry also failed for ${sessionName}:`,

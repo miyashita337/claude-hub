@@ -180,6 +180,17 @@ jobs:
           TMUX_PATH: /usr/bin/tmux
         run: bun test tests/session/tmux.test.ts
 
+      # #227 (PR-1 / #249) AC-3: relay.ts's tmux send hot path must stay
+      # non-blocking after the execFileSync→execFile migration. This file mocks
+      # child_process.execFile via mock.module (process-global in Bun), so it
+      # runs as its OWN `bun test` process — same isolation rationale as the
+      # mock-isolated steps above. No `|| true`: it gates the build.
+      - name: Run mock-isolated relay non-blocking test (#227 / #249)
+        env:
+          SUPERVISOR_DB_PATH: ":memory:"
+          TMUX_PATH: /usr/bin/tmux
+        run: bun test tests/session/relay-nonblocking.test.ts
+
       - name: Upload coverage to Codecov
         if: always()
         uses: codecov/codecov-action@v5
