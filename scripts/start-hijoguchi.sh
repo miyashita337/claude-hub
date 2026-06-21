@@ -210,8 +210,14 @@ fi
 # hook — the hook would then always skip and the idle timer would never warm,
 # resetting the session on a fixed schedule regardless of activity. `env` sets
 # the vars on the claude process directly, independent of server state.
-CLAUDE_CMD=$(printf 'env CLAUDE_HUB_HIJOGUCHI_SESSION=1 CLAUDE_HUB_STATE_DIR=%q LAST_MSG_TS_FILE=%q ' \
-  "${CLAUDE_HUB_STATE_DIR}" "${LAST_MSG_TS_FILE}")
+# HIJOGUCHI_CHANNEL_ID / HIJOGUCHI_BOT_MENTION are forwarded explicitly (not via
+# export) for the same reason as the activity-tracking vars above: when the tmux
+# server pre-exists, the claude pane inherits the server's cached env, so the
+# in-session mechanical mention gate (#267: hijoguchi-discord-gate.sh /
+# hijoguchi-record-channel-context.sh) would not see them and would fail open /
+# misclassify. The `env` prefix sets them on the claude process directly.
+CLAUDE_CMD=$(printf 'env CLAUDE_HUB_HIJOGUCHI_SESSION=1 CLAUDE_HUB_STATE_DIR=%q LAST_MSG_TS_FILE=%q HIJOGUCHI_CHANNEL_ID=%q HIJOGUCHI_BOT_MENTION=%q ' \
+  "${CLAUDE_HUB_STATE_DIR}" "${LAST_MSG_TS_FILE}" "${HIJOGUCHI_CHANNEL_ID}" "${HIJOGUCHI_BOT_MENTION}")
 CLAUDE_CMD+=$(printf '%q ' "${CLAUDE_ARGV[@]}")
 
 # Opt-in introspection for tests: print the fully-built launch command (incl.

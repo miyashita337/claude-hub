@@ -89,6 +89,17 @@ claudeHubExit Bot は `~/.claude/channels/discord/access.json` で access 制御
 - **Primary**: claude-hub の保守チャンネル。常時やり取りが発生するため mention 不要で allowFrom も空
 - **Non-primary**: 他プロジェクト thread。基本 Channel-Supervisor が担当するため claudeHubExit は普段応答しないが、Supervisor 障害時に owner が mention して問い合わせる経路として残す。非 owner からの mention は silent drop される
 
+### 機械ゲート（#267 backstop）
+
+access.json の `requireMention` と `scripts/hijoguchi-system-prompt.md` の沈黙ルールは「メッセージが LLM に届く／届いた後に LLM が沈黙を選ぶ」前提のため、いずれかが破れると claudeHubExit が非 primary で誤応答する（#230 の system-prompt ゲートが #267 で再破綻：Channel-Supervisor のセッションスレッドに届いた非メンション `/resume-session` に 👀 + 返信した）。
+
+これを LLM 判断に依存しない形で塞ぐため、**PreToolUse の機械ゲート**を追加した（投稿の直前で決定的に DENY する）:
+
+- `scripts/hijoguchi-record-channel-context.sh`（UserPromptSubmit）: 受信した Discord メッセージごとに「chat_id」と「自分宛メンション有無」を `${CLAUDE_HUB_STATE_DIR}/channel-ctx/<chat_id>` に記録する（記録のみ・常に exit 0）。
+- `scripts/hijoguchi-discord-gate.sh`（PreToolUse: `reply`/`react`/`edit_message`）: 投稿先が **primary 以外** かつ **直近の受信が非メンション**なら **exit 2 で DENY**。primary は常時許可、非 primary はメンション時のみ許可（= 条件1/2 を機械化）。記録欠如は fail-closed で DENY。
+- いずれも `CLAUDE_HUB_HIJOGUCHI_SESSION=1` の claudeHubExit セッションにのみ適用（`start-hijoguchi.sh` が `HIJOGUCHI_CHANNEL_ID` / `HIJOGUCHI_BOT_MENTION` を `env` 前置で in-session hook へ転送）。
+- 仕様メモ: 非 primary では **本文に明示の mention タグ**を要求する（plugin の reply-implicit mention は本文に現れないため honor しない＝ #230 条件2 より厳格な fail-safe）。回帰テスト: `scripts/test-hijoguchi-discord-gate.sh`。
+
 ### 反映
 
 access.json は毎メッセージ読み込まれるため、編集は即反映。Bot 再起動不要。
