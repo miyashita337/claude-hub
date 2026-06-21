@@ -64,12 +64,15 @@ function summarizeExecError(err: unknown): {
   killed?: boolean;
   signal?: string | null;
 } {
-  const e = err as NodeJS.ErrnoException & {
-    code?: string | number;
-    killed?: boolean;
-    signal?: string | null;
-  };
-  return { code: e.code, killed: e.killed, signal: e.signal };
+  if (err && typeof err === "object") {
+    const e = err as NodeJS.ErrnoException & {
+      code?: string | number;
+      killed?: boolean;
+      signal?: string | null;
+    };
+    return { code: e.code, killed: e.killed, signal: e.signal };
+  }
+  return {};
 }
 
 function getExecStderr(err: unknown): string {
@@ -87,8 +90,11 @@ function getExecStderr(err: unknown): string {
  * (Issue #73 / RW-019) is byte-for-byte identical after the migration.
  */
 function isExecTimeout(err: unknown): boolean {
-  const e = err as NodeJS.ErrnoException & { killed?: boolean };
-  return e.code === "ETIMEDOUT" || e.killed === true;
+  if (err && typeof err === "object") {
+    const e = err as NodeJS.ErrnoException & { killed?: boolean };
+    return e.code === "ETIMEDOUT" || e.killed === true;
+  }
+  return false;
 }
 
 /**
