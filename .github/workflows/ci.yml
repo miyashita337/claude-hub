@@ -226,6 +226,9 @@ jobs:
       - name: Run routing matrix (25 cases, P0×12 gating)
         run: bash scripts/test-hijoguchi-routing.sh
 
+      - name: Run claudeHubExit mechanical mention gate tests (#267)
+        run: bash scripts/test-hijoguchi-discord-gate.sh
+
   # E2E verification of the Discord ↔ Supervisor ↔ Claude Code relay chain.
   # Covers AC-4/5/6/7 hermetically (tmux + mock claude + relay-server HTTP).
   # AC-1/2/3 require a live Discord bot token and are documented as manual
