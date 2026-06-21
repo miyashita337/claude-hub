@@ -96,6 +96,77 @@ export function dimColor(hexColor: string): string {
   return `#${dr.toString(16).padStart(2, "0")}${dg.toString(16).padStart(2, "0")}${db.toString(16).padStart(2, "0")}`;
 }
 
+/**
+ * Escape a value for safe interpolation into an AppleScript double-quoted
+ * string literal. AppleScript uses backslash as the in-literal escape
+ * character, so backslash must be escaped before the double quote — otherwise
+ * a value containing `"` could terminate the literal early and inject
+ * arbitrary AppleScript (Issue #183; same family as RW-045: untrusted input →
+ * exec string). This is the single choke point for every value placed inside
+ * an osascript `-e` string literal in this module.
+ */
+export function escapeAppleScriptString(value: string): string {
+  return value.replace(/\\/g, "\\\\").replace(/"/g, '\\"');
+}
+
+/**
+ * Build the AppleScript that opens a new iTerm2 tab and attaches to the tmux
+ * session. `tmuxSessionName` and `tabTitle` are escaped at the choke point so
+ * channel/session names cannot break out of the string literals (Issue #183).
+ */
+export function buildOpenTabAppleScript(
+  tmuxSessionName: string,
+  tabTitle: string,
+  r: number,
+  g: number,
+  b: number
+): string {
+  const attachCmd = escapeAppleScriptString(
+    `${TMUX_CMD} attach -t ${tmuxSessionName}`
+  );
+  const title = escapeAppleScriptString(tabTitle);
+  return [
+    'tell application "iTerm2"',
+    "  tell current window",
+    "    create tab with default profile",
+    "    tell current session",
+    `      write text "${attachCmd}"`,
+    `      set name to "${title}"`,
+    `      set background color to {${r}, ${g}, ${b}}`,
+    "    end tell",
+    "  end tell",
+    "end tell",
+  ].join("\n");
+}
+
+/**
+ * Build the AppleScript that renames an iTerm2 tab from its "(running)" title
+ * to "(stopped)". Both the comparison and the new name are escaped at the
+ * choke point so channel names cannot break out of the literals (Issue #183).
+ */
+export function buildMarkTabStoppedAppleScript(
+  tabName: string,
+  newName: string
+): string {
+  const escTab = escapeAppleScriptString(tabName);
+  const escNew = escapeAppleScriptString(newName);
+  return [
+    'tell application "iTerm2"',
+    "  repeat with w in windows",
+    "    repeat with t in tabs of w",
+    "      try",
+    `        if name of current session of t is "${escTab}" then`,
+    "          tell current session of t",
+    `            set name to "${escNew}"`,
+    "          end tell",
+    "        end if",
+    "      end try",
+    "    end repeat",
+    "  end repeat",
+    "end tell",
+  ].join("\n");
+}
+
 export interface OpenTabOptions {
   tmuxSessionName: string;
   channelName: string;
@@ -151,18 +222,17 @@ export function openTab(opts: OpenTabOptions): void {
   // documented in Issue #73. With Supervisor's dedicated socket (mouse off
   // + mode-keys emacs) the accidental-input risk is already mitigated, so
   // we no longer enter copy-mode on attach.
-  const script = [
-    'tell application "iTerm2"',
-    "  tell current window",
-    "    create tab with default profile",
-    "    tell current session",
-    `      write text "${TMUX_CMD} attach -t ${opts.tmuxSessionName}"`,
-    `      set name to "${tabTitle}"`,
-    `      set background color to {${r}, ${g}, ${b}}`,
-    "    end tell",
-    "  end tell",
-    "end tell",
-  ].join("\n");
+  //
+  // Issue #183: tmuxSessionName / tabTitle are escaped at the
+  // escapeAppleScriptString choke point inside buildOpenTabAppleScript so a
+  // value containing `"` cannot break out of the AppleScript string literals.
+  const script = buildOpenTabAppleScript(
+    opts.tmuxSessionName,
+    tabTitle,
+    r,
+    g,
+    b
+  );
 
   try {
     // argv form (no shell): the AppleScript is passed as a single -e argument,
@@ -199,22 +269,11 @@ export function markTabStopped(channelName: string, tmuxSessionName?: string): v
     return;
   }
 
-  // Also update iTerm2 tab name via AppleScript (fire-and-forget, non-blocking)
-  const script = [
-    'tell application "iTerm2"',
-    "  repeat with w in windows",
-    "    repeat with t in tabs of w",
-    "      try",
-    `        if name of current session of t is "${tabName}" then`,
-    "          tell current session of t",
-    `            set name to "${newName}"`,
-    "          end tell",
-    "        end if",
-    "      end try",
-    "    end repeat",
-    "  end repeat",
-    "end tell",
-  ].join("\n");
+  // Also update iTerm2 tab name via AppleScript (fire-and-forget, non-blocking).
+  // Issue #183: tabName / newName are escaped at the escapeAppleScriptString
+  // choke point inside buildMarkTabStoppedAppleScript so a channelName
+  // containing `"` cannot break out of the AppleScript string literals.
+  const script = buildMarkTabStoppedAppleScript(tabName, newName);
 
   const osascriptProc = spawn("osascript", ["-e", script], {
     stdio: "ignore",
