@@ -192,6 +192,13 @@ export interface SessionManagerOptions {
    */
   inputReadyPollAttempts?: number;
   inputReadyPollIntervalMs?: number;
+  /**
+   * Override the {@link SessionManager.watchTmuxSession} poll interval. Tests
+   * shrink this (e.g. to a few ms) to drive the async re-entry guard
+   * deterministically without waiting the production 10s (Issue #227 PR-3).
+   * Defaults to 10_000.
+   */
+  watchIntervalMs?: number;
 }
 
 export class SessionManager {
@@ -225,6 +232,7 @@ export class SessionManager {
   private readonly resumePromptPollIntervalMs: number;
   private readonly inputReadyPollAttempts: number;
   private readonly inputReadyPollIntervalMs: number;
+  private readonly watchIntervalMs: number;
 
   constructor(options: SessionManagerOptions = {}) {
     this.effects = {
@@ -245,11 +253,24 @@ export class SessionManager {
       options.inputReadyPollAttempts ?? INPUT_READY_POLL_ATTEMPTS;
     this.inputReadyPollIntervalMs =
       options.inputReadyPollIntervalMs ?? 1000;
+    this.watchIntervalMs = options.watchIntervalMs ?? 10_000;
 
     this.effects.tmux.ensureSocketConfigured();
     this.effects.relayServer.start();
-    this.recoverFromDb();
+    // Issue #227 (PR-3): recoverFromDb is async now (it awaits tmux has/kill).
+    // The constructor cannot await, so we keep the recovery promise for tests
+    // and any caller that needs to wait for startup orphan-cleanup to finish.
+    this.recovery = this.recoverFromDb();
   }
+
+  /**
+   * Startup orphan-recovery promise (Issue #227 PR-3). Resolves once
+   * {@link recoverFromDb} has finished reconciling DB `running` rows against
+   * live tmux sessions. Awaitable by tests that assert post-recovery state;
+   * production fire-and-forgets it (recovery only kills stale tmux + marks rows
+   * stopped, which races nothing the first relay depends on).
+   */
+  readonly recovery: Promise<void>;
 
   count(): number {
     return this.sessions.size;
@@ -278,13 +299,15 @@ export class SessionManager {
    *   - row.status === "running" + (pid dead OR tmux missing) → `dead`
    *     (DB says running but reality contradicts — answer is the reality)
    */
-  livenessOf(threadId: string): Liveness {
+  async livenessOf(threadId: string): Promise<Liveness> {
     const row = getSessionByThreadId(threadId);
     if (!row) return "unknown";
     if (row.status !== "running") return "dead";
     if (row.pid == null) return "dead";
     const pidAlive = this.effects.process.isAlive(row.pid);
-    const tmuxAlive = this.effects.tmux.hasSession(
+    // Issue #227 (PR-3): hasSession is async now, so livenessOf is too. All
+    // callers (salvage / resume guards) already await this verdict.
+    const tmuxAlive = await this.effects.tmux.hasSession(
       this.tmuxSessionName(threadId)
     );
     return pidAlive && tmuxAlive ? "alive" : "dead";
@@ -301,7 +324,7 @@ export class SessionManager {
    * genuinely-live session still rejects. Returns `unknown` when no row exists
    * for the id (callers treat `unknown` as "not alive → resume may proceed").
    */
-  livenessOfClaudeSession(claudeSessionId: string): Liveness {
+  async livenessOfClaudeSession(claudeSessionId: string): Promise<Liveness> {
     const row = getSessionByClaudeSessionId(claudeSessionId);
     if (!row || row.thread_id == null) return "unknown";
     return this.livenessOf(row.thread_id);
@@ -426,7 +449,7 @@ export class SessionManager {
     const tmuxName = this.tmuxSessionName(threadId);
 
     // Kill existing tmux session if any
-    this.effects.tmux.killSession(tmuxName);
+    await this.effects.tmux.killSession(tmuxName);
 
     // Build the claude command — unset ANTHROPIC_API_KEY to use Claude Max subscription
     // encodeURIComponent: Discord thread IDs are numeric today, but encode at
@@ -462,7 +485,7 @@ export class SessionManager {
 
     // Launch via tmux (provides a real TTY). Uses Supervisor's dedicated
     // -L claude-hub socket (see ./tmux.ts) so user config is not inherited.
-    this.effects.tmux.newSession(tmuxName, claudeCmd);
+    await this.effects.tmux.newSession(tmuxName, claudeCmd);
     // Apply server-wide options now that the server is definitely running.
     // The constructor's eager call is a no-op before the first new-session.
     this.effects.tmux.ensureSocketConfigured();
@@ -473,7 +496,7 @@ export class SessionManager {
     // the single-process Discord bot's event loop. Mirrors resumeSession().
     let pid: number | null = null;
     for (let i = 0; i < 5; i++) {
-      pid = this.effects.tmux.getPid(tmuxName);
+      pid = await this.effects.tmux.getPid(tmuxName);
       if (pid) break;
       await new Promise((resolve) => setTimeout(resolve, 500));
     }
@@ -601,7 +624,7 @@ export class SessionManager {
       // between the handler's check and our insert: a session that became alive
       // (or was already alive) is rejected; a stale `status='running'` row whose
       // process is dead is treated as dead and resume proceeds.
-      if (this.livenessOfClaudeSession(claudeSessionId) === "alive") {
+      if ((await this.livenessOfClaudeSession(claudeSessionId)) === "alive") {
         throw new Error(
           "この session は既に稼働中です。稼働中のスレッドで操作してください（多重 resume 防止）。"
         );
@@ -683,7 +706,7 @@ export class SessionManager {
   ): Promise<SessionInfo> {
     const sessionId = randomUUID();
     const tmuxName = this.tmuxSessionName(threadId);
-    this.effects.tmux.killSession(tmuxName);
+    await this.effects.tmux.killSession(tmuxName);
 
     const relayUrl = `http://localhost:${this.effects.relayServer.getPort()}/relay/${encodeURIComponent(threadId)}`;
     const relayUrlFile = relayUrlFilePath(projectDir);
@@ -710,12 +733,12 @@ export class SessionManager {
       `exec ${CLAUDE_PATH} ${resumeFlags.join(" ")}`,
     ].join(" && ");
 
-    this.effects.tmux.newSession(tmuxName, claudeCmd);
+    await this.effects.tmux.newSession(tmuxName, claudeCmd);
     this.effects.tmux.ensureSocketConfigured();
 
     let pid: number | null = null;
     for (let i = 0; i < 5; i++) {
-      pid = this.effects.tmux.getPid(tmuxName);
+      pid = await this.effects.tmux.getPid(tmuxName);
       if (pid) break;
       // Async wait — resumeSession is async, so unlike start()'s synchronous
       // execSync("sleep") this does not block the single-process Discord bot's
@@ -778,7 +801,7 @@ export class SessionManager {
       });
     } catch (err) {
       this.sessions.delete(threadId);
-      this.effects.tmux.killSession(tmuxName);
+      await this.effects.tmux.killSession(tmuxName);
       this.cleanupRelayUrlFile(projectDir);
       throw err;
     }
@@ -820,11 +843,11 @@ export class SessionManager {
    */
   private async confirmResumePromptIfPresent(tmuxName: string): Promise<void> {
     for (let i = 0; i < this.resumePromptPollAttempts; i++) {
-      const pane = this.effects.tmux.capturePane(tmuxName);
+      const pane = await this.effects.tmux.capturePane(tmuxName);
       if (RESUME_PROMPT_RE.test(pane)) {
         // Down moves from option 1 (summary, highlighted) to option 2 (full
         // session as-is); C-m confirms. See Issue #163.
-        this.effects.tmux.sendKeys(tmuxName, ["Down", "C-m"]);
+        await this.effects.tmux.sendKeys(tmuxName, ["Down", "C-m"]);
         return;
       }
       // Reached the normal input prompt with no picker — stop polling instead
@@ -857,8 +880,8 @@ export class SessionManager {
   async waitForInputReady(threadId: string): Promise<boolean> {
     const tmuxName = this.tmuxSessionName(threadId);
     for (let i = 0; i < this.inputReadyPollAttempts; i++) {
-      if (!this.effects.tmux.hasSession(tmuxName)) return false;
-      const pane = this.effects.tmux.capturePane(tmuxName);
+      if (!(await this.effects.tmux.hasSession(tmuxName))) return false;
+      const pane = await this.effects.tmux.capturePane(tmuxName);
       if (INPUT_READY_RE.test(pane)) return true;
       await new Promise((resolve) =>
         setTimeout(resolve, this.inputReadyPollIntervalMs)
@@ -893,7 +916,7 @@ export class SessionManager {
     const tmuxName = this.tmuxSessionName(threadId);
 
     // Check tmux session is alive
-    if (!this.effects.tmux.hasSession(tmuxName)) {
+    if (!(await this.effects.tmux.hasSession(tmuxName))) {
       return {
         text: "",
         chunks: ["⚠️ Claude Code セッションが終了しています。`/session start` で再起動してください。"],
@@ -960,7 +983,7 @@ export class SessionManager {
     }
 
     const tmuxName = this.tmuxSessionName(threadId);
-    if (!this.effects.tmux.hasSession(tmuxName)) {
+    if (!(await this.effects.tmux.hasSession(tmuxName))) {
       throw new Error("tmux session dead");
     }
 
@@ -1014,8 +1037,11 @@ export class SessionManager {
 
     // Wait for graceful shutdown, then force kill tmux session
     await new Promise<void>((resolve) => {
-      setTimeout(() => {
-        this.effects.tmux.killSession(tmuxName);
+      setTimeout(async () => {
+        // Issue #227 (PR-3): killSession is now async; await it before resolving
+        // so the graceful-kill wait still completes only after the tmux session
+        // is actually gone (ordering unchanged from the sync version).
+        await this.effects.tmux.killSession(tmuxName);
         resolve();
       }, this.gracefulKillTimeoutMs);
     });
@@ -1145,40 +1171,52 @@ export class SessionManager {
     tmuxName: string,
     sessionId: string
   ): void {
-    const interval = setInterval(() => {
-      if (!this.effects.tmux.hasSession(tmuxName)) {
-        const session = this.sessions.get(threadId);
-        console.log(
-          `[SessionManager] tmux session ${tmuxName} exited`
-        );
-        this.sessions.delete(threadId);
-        if (session) {
-          this.effects.iterm2.markTabStopped(session.channelName, tmuxName);
-          this.cleanupRelayUrlFile(session.projectDir);
-          // Issue #154: the worktree is intentionally NOT removed here. An
-          // unexpected claude exit is not an explicit teardown — removing the
-          // worktree (git worktree remove --force) would discard any
-          // uncommitted work the user did not choose to drop. Only the explicit
-          // /session stop removes it (Q3); until then it is reused on restart
-          // of the same branch (Q4).
+    // Issue #227 (PR-3): hasSession is now async (it awaits a tmux call that can
+    // take up to TMUX_CALL_TIMEOUT_MS under load). A 10s poll could therefore
+    // fire the next tick before the previous tick's check resolves, letting two
+    // ticks both observe "exited" and run teardown twice. `isChecking` is a
+    // re-entry guard: a tick that overlaps a still-running check simply skips.
+    let isChecking = false;
+    const interval = setInterval(async () => {
+      if (isChecking) return;
+      isChecking = true;
+      try {
+        if (!(await this.effects.tmux.hasSession(tmuxName))) {
+          const session = this.sessions.get(threadId);
+          console.log(
+            `[SessionManager] tmux session ${tmuxName} exited`
+          );
+          this.sessions.delete(threadId);
+          if (session) {
+            this.effects.iterm2.markTabStopped(session.channelName, tmuxName);
+            this.cleanupRelayUrlFile(session.projectDir);
+            // Issue #154: the worktree is intentionally NOT removed here. An
+            // unexpected claude exit is not an explicit teardown — removing the
+            // worktree (git worktree remove --force) would discard any
+            // uncommitted work the user did not choose to drop. Only the explicit
+            // /session stop removes it (Q3); until then it is reused on restart
+            // of the same branch (Q4).
+          }
+          updateSessionStatus(sessionId, "stopped", "tmux_exited");
+          this.clearWatcher(threadId);
         }
-        updateSessionStatus(sessionId, "stopped", "tmux_exited");
-        this.clearWatcher(threadId);
+      } finally {
+        isChecking = false;
       }
-    }, 10_000); // Check every 10 seconds
+    }, this.watchIntervalMs); // Check every 10 seconds (overridable in tests)
     this.watchers.set(threadId, interval);
   }
 
-  private recoverFromDb(): void {
+  private async recoverFromDb(): Promise<void> {
     const rows = getRunningSessions();
     for (const row of rows) {
       if (row.thread_id) {
         const tmuxName = this.tmuxSessionName(row.thread_id);
-        if (this.effects.tmux.hasSession(tmuxName)) {
+        if (await this.effects.tmux.hasSession(tmuxName)) {
           console.log(
             `[SessionManager] Found running tmux session ${tmuxName}, killing (supervisor restart)`
           );
-          this.effects.tmux.killSession(tmuxName);
+          await this.effects.tmux.killSession(tmuxName);
         }
       }
       this.cleanupRelayUrlFile(row.project_dir);

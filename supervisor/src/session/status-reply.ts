@@ -22,11 +22,11 @@ import { getSessionByThreadId } from "../infra/db";
  *   - dead + claude_session_id    → stopped; offer `/session resume <id>`
  *   - dead + id missing           → pre-#167 row; suggest /session start
  */
-export function buildSalvageReply(
+export async function buildSalvageReply(
   sessionManager: SessionManager,
   threadId: string
-): string {
-  const verdict = sessionManager.livenessOf(threadId);
+): Promise<string> {
+  const verdict = await sessionManager.livenessOf(threadId);
   if (verdict === "unknown") {
     return "ℹ️ このスレッドにはセッション履歴がありません。`/session start` で開始してください。";
   }
@@ -76,17 +76,17 @@ export function buildSalvageReply(
  * not "Supervisor lost tracking". Dead/unknown reuse the salvage wording so the
  * resume guidance stays identical.
  */
-export function buildStatusReply(
+export async function buildStatusReply(
   sessionManager: SessionManager,
   threadId: string
-): string {
+): Promise<string> {
   // "稼働中" only when the session is BOTH live AND tracked in memory — i.e. the
   // Supervisor can actually relay to it. If livenessOf is alive but the session
   // is no longer tracked (has() === false), the user cannot interact with it;
   // fall through to the salvage wording which says the Supervisor lost tracking
   // (gemini HIGH review, PR #179).
   if (
-    sessionManager.livenessOf(threadId) === "alive" &&
+    (await sessionManager.livenessOf(threadId)) === "alive" &&
     sessionManager.has(threadId)
   ) {
     const row = getSessionByThreadId(threadId);
@@ -99,5 +99,5 @@ export function buildStatusReply(
     );
   }
   // not tracked (lost tracking), dead, or unknown → salvage wording covers all.
-  return buildSalvageReply(sessionManager, threadId);
+  return await buildSalvageReply(sessionManager, threadId);
 }

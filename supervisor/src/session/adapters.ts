@@ -1,4 +1,5 @@
-import { execFileSync } from "child_process";
+import { execFile } from "child_process";
+import { promisify } from "util";
 import {
   openTab as realOpenTab,
   markTabStopped as realMarkTabStopped,
@@ -31,23 +32,28 @@ import {
  */
 
 export interface TmuxAdapter {
-  newSession(name: string, command: string): void;
-  killSession(name: string): void;
-  hasSession(name: string): boolean;
-  getPid(name: string): number | null;
+  // Issue #227 (PR-3): every tmux call below runs via the *async* `execFile`
+  // so a wedged tmux server can never block the Bun single event loop. The
+  // return types are Promise — this interface flip is atomic (TypeScript types
+  // cannot be migrated incrementally), so all consumers await. `ensureSocketConfigured`
+  // stays sync: it delegates to tmux.ts (converted separately in PR-4).
+  newSession(name: string, command: string): Promise<void>;
+  killSession(name: string): Promise<void>;
+  hasSession(name: string): Promise<boolean>;
+  getPid(name: string): Promise<number | null>;
   ensureSocketConfigured(): void;
   /**
    * Capture the visible pane content (`tmux capture-pane -p`). Returns "" on
    * error. Used by the resume flow (Issue #161) to detect Claude Code's
    * interactive "Resume from summary" prompt so it can be auto-confirmed.
    */
-  capturePane(name: string): string;
+  capturePane(name: string): Promise<string>;
   /**
    * Send raw keys to the pane (`tmux send-keys -t <name> <keys...>`).
    * Best-effort: a transient failure is swallowed (the caller's poll loop
    * retries or proceeds). Used to confirm the resume prompt with `C-m` (Enter).
    */
-  sendKeys(name: string, keys: string[]): void;
+  sendKeys(name: string, keys: string[]): Promise<void>;
 }
 
 export interface ItermAdapter {
@@ -102,7 +108,7 @@ export interface SessionEffects {
 
 // Issue #222: bound every synchronous tmux call so a wedged tmux server (whose
 // capture-pane / send-keys ETIMEDOUT rate climbs over Supervisor uptime) cannot
-// block the Node event loop indefinitely. An unbounded execFileSync stall here
+// block the Node event loop indefinitely. An unbounded synchronous tmux stall here
 // starves relay HTTP response handling, surfacing as delayed / 5-min-timed-out
 // Discord delivery rather than hard failures (the #222 symptom). 2s matches the
 // existing ceilings in dialog-watchdog.ts / relay.ts; on timeout each call below
@@ -121,35 +127,43 @@ const TMUX_NEW_SESSION_TIMEOUT_MS = 10_000;
  * already sees the ETIMEDOUT.
  */
 function warnIfTmuxTimeout(op: string, name: string, err: unknown): boolean {
-  if ((err as NodeJS.ErrnoException | undefined)?.code === "ETIMEDOUT") {
+  // Issue #227 (PR-3): after the sync→async migration a `timeout` no longer
+  // surfaces as `code === "ETIMEDOUT"` (that was the *sync* spawn shape). The
+  // async `execFile` kills the child with `killSignal` (default SIGTERM) and
+  // sets `killed === true` with `code` left null. Accept both so the #238
+  // contract (a tmux timeout means "liveness unknown" → hasSession returns
+  // true, never a false teardown) holds identically after the migration.
+  const e = err as (NodeJS.ErrnoException & { killed?: boolean }) | undefined;
+  if (e?.code === "ETIMEDOUT" || e?.killed === true) {
     console.warn(`[tmux] ${op} timed out for ${name} after ${TMUX_CALL_TIMEOUT_MS}ms`);
     return true;
   }
   return false;
 }
 
+const execFileAsync = promisify(execFile);
+
 export const realTmuxAdapter: TmuxAdapter = {
-  newSession(name, command) {
+  async newSession(name, command) {
     // Issue #147: previous `execSync(\`tmux new-session ... '${command}'\`)`
     // wrapped the entire command in single quotes. When `command` itself
     // contained single quotes (e.g. `--mcp-config '{"mcpServers":{}}'` added
     // in #104), the outer quotes closed prematurely, exposing the inner JSON
     // to bash word-splitting and quote stripping — claude received malformed
-    // arguments and exited immediately. Using execFileSync with an argv array
+    // arguments and exited immediately. Using execFile with an argv array
     // avoids shell parsing entirely: tmux receives `command` as a single
     // argument and invokes /bin/sh -c on it once, inside the new session.
-    execFileSync(TMUX_PATH, [...TMUX_ARGS, "new-session", "-d", "-s", name, command], {
+    await execFileAsync(TMUX_PATH, [...TMUX_ARGS, "new-session", "-d", "-s", name, command], {
       timeout: TMUX_NEW_SESSION_TIMEOUT_MS,
     });
   },
-  killSession(name) {
-    // PR #148 review (gemini critical): use execFileSync + argv array so an
+  async killSession(name) {
+    // PR #148 review (gemini critical): use execFile + argv array so an
     // attacker-controlled `name` cannot inject shell metacharacters via the
-    // template literal. `stdio: "ignore"` matches the previous `2>/dev/null`
-    // (silence the expected "no session" error).
+    // template literal. execFile does not inherit stdio, so the expected
+    // "no session" error is silenced as before (previous `2>/dev/null`).
     try {
-      execFileSync(TMUX_PATH, [...TMUX_ARGS, "kill-session", "-t", name], {
-        stdio: "ignore",
+      await execFileAsync(TMUX_PATH, [...TMUX_ARGS, "kill-session", "-t", name], {
         timeout: TMUX_CALL_TIMEOUT_MS,
       });
     } catch (err) {
@@ -157,10 +171,9 @@ export const realTmuxAdapter: TmuxAdapter = {
       warnIfTmuxTimeout("kill-session", name, err);
     }
   },
-  hasSession(name) {
+  async hasSession(name) {
     try {
-      execFileSync(TMUX_PATH, [...TMUX_ARGS, "has-session", "-t", name], {
-        stdio: "ignore",
+      await execFileAsync(TMUX_PATH, [...TMUX_ARGS, "has-session", "-t", name], {
         timeout: TMUX_CALL_TIMEOUT_MS,
       });
       return true;
@@ -177,15 +190,16 @@ export const realTmuxAdapter: TmuxAdapter = {
       return false;
     }
   },
-  getPid(name) {
-    // stdio: ["ignore", "pipe", "ignore"] — we need stdout to read the pid,
-    // but stderr is discarded just like the previous `2>/dev/null`.
+  async getPid(name) {
+    // execFile captures stdout (the pid) and discards stderr to the buffer
+    // (not inherited) just like the previous `2>/dev/null`.
     try {
-      const output = execFileSync(
+      const { stdout } = await execFileAsync(
         TMUX_PATH,
         [...TMUX_ARGS, "list-panes", "-t", name, "-F", "#{pane_pid}"],
-        { encoding: "utf8", stdio: ["ignore", "pipe", "ignore"], timeout: TMUX_CALL_TIMEOUT_MS }
-      ).trim();
+        { encoding: "utf8", timeout: TMUX_CALL_TIMEOUT_MS }
+      );
+      const output = stdout.trim();
       const pid = parseInt(output.split("\n")[0] ?? "", 10);
       return isNaN(pid) ? null : pid;
     } catch (err) {
@@ -196,26 +210,26 @@ export const realTmuxAdapter: TmuxAdapter = {
   ensureSocketConfigured() {
     realEnsureSocketConfigured();
   },
-  capturePane(name) {
-    // stdio: ["ignore", "pipe", "ignore"] — read stdout, discard stderr (the
-    // "can't find pane" case is handled by the catch returning "").
+  async capturePane(name) {
+    // execFile reads stdout; stderr is buffered (not inherited) — the
+    // "can't find pane" case is handled by the catch returning "".
     try {
-      return execFileSync(
+      const { stdout } = await execFileAsync(
         TMUX_PATH,
         [...TMUX_ARGS, "capture-pane", "-p", "-t", name],
-        { encoding: "utf8", stdio: ["ignore", "pipe", "ignore"], timeout: TMUX_CALL_TIMEOUT_MS }
+        { encoding: "utf8", timeout: TMUX_CALL_TIMEOUT_MS }
       );
+      return stdout;
     } catch (err) {
       warnIfTmuxTimeout("capture-pane", name, err);
       return "";
     }
   },
-  sendKeys(name, keys) {
-    // execFileSync + argv array: no shell, so `keys` cannot inject
+  async sendKeys(name, keys) {
+    // execFile + argv array: no shell, so `keys` cannot inject
     // metacharacters. Best-effort — swallow transient tmux errors.
     try {
-      execFileSync(TMUX_PATH, [...TMUX_ARGS, "send-keys", "-t", name, ...keys], {
-        stdio: "ignore",
+      await execFileAsync(TMUX_PATH, [...TMUX_ARGS, "send-keys", "-t", name, ...keys], {
         timeout: TMUX_CALL_TIMEOUT_MS,
       });
     } catch (err) {

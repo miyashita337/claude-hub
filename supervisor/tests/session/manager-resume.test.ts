@@ -404,8 +404,8 @@ describe("SessionManager resume single-flight & liveness (#171)", () => {
 
   test("穴 A: a genuinely-live session (pid alive + tmux present) rejects resume", async () => {
     const oldThread = "alive-old-thread";
-    effects.tmux.newSession(tmuxNameForThread(oldThread), "exec claude");
-    const oldPid = effects.tmux.getPid(tmuxNameForThread(oldThread))!;
+    await effects.tmux.newSession(tmuxNameForThread(oldThread), "exec claude");
+    const oldPid = (await effects.tmux.getPid(tmuxNameForThread(oldThread)))!;
     effects.process.alivePids.add(oldPid);
     insertSession({
       id: "live-run",
@@ -430,9 +430,9 @@ describe("SessionManager resume single-flight & liveness (#171)", () => {
     ).rejects.toThrow(/稼働中/);
     expect(manager.has("alive-new-thread")).toBe(false);
     // No new tmux session for the rejected resume (only the pre-existing one).
-    expect(effects.tmux.hasSession(tmuxNameForThread("alive-new-thread"))).toBe(
-      false
-    );
+    expect(
+      await effects.tmux.hasSession(tmuxNameForThread("alive-new-thread"))
+    ).toBe(false);
   });
 
   test("the in-flight lock is released after a successful resume (a later resume of the same id is not falsely blocked)", async () => {

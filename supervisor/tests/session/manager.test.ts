@@ -149,10 +149,10 @@ describe("SessionManager (thread-based)", () => {
     expect(manager.sessionsHealth()).toEqual([]);
   });
 
-  test("sessionsHealth() maps threadId to claude-<threadId[..12]> tmux name", () => {
+  test("sessionsHealth() maps threadId to claude-<threadId[..12]> tmux name", async () => {
     // A >12-char threadId proves the slice; AC-4 asserts this exact mapping.
     const threadId = "1234567890123456789";
-    manager.start(primaryConfig, threadId);
+    await manager.start(primaryConfig, threadId);
 
     const health = manager.sessionsHealth();
     expect(health).toHaveLength(1);
@@ -166,9 +166,9 @@ describe("SessionManager (thread-based)", () => {
     expect(row.startedAt).toBe(new Date(row.startedAt).toISOString());
   });
 
-  test("sessionsHealth() reflects all running sessions and excludes secrets", () => {
-    manager.start(primaryConfig, "thread-a");
-    manager.start(secondaryConfig, "thread-b");
+  test("sessionsHealth() reflects all running sessions and excludes secrets", async () => {
+    await manager.start(primaryConfig, "thread-a");
+    await manager.start(secondaryConfig, "thread-b");
 
     const health = manager.sessionsHealth();
     expect(health).toHaveLength(2);
@@ -556,5 +556,65 @@ describe("SessionManager.compactSession (#200)", () => {
     await expect(
       manager.compactSession("no-such-thread", "保持して圧縮")
     ).rejects.toThrow(/セッションが見つかりません/);
+  });
+});
+
+/**
+ * Issue #227 (PR-3 / #251) AC-4: `watchTmuxSession` now `await`s the async
+ * `hasSession`. A poll that takes longer than the watch interval (tmux under
+ * load) would let the next tick fire before the previous check resolves —
+ * without a guard, two ticks could both observe "exited" and run teardown
+ * twice. The `isChecking` re-entry guard must serialize the checks.
+ */
+describe("watchTmuxSession async re-entry guard (#227 / #251 AC-4)", () => {
+  test("a slow hasSession poll never double-fires teardown across overlapping ticks", async () => {
+    const localEffects = createFakeEffects();
+    const config = makeChannelConfig({ channelName: "channel-watch-guard" });
+    const threadId = "thread-watch-guard";
+    const localManager = new SessionManager({
+      effects: localEffects,
+      gracefulKillTimeoutMs: 0,
+      // Tick faster than hasSession resolves so a second tick fires while the
+      // first is still awaiting — the exact overlap the re-entry guard covers.
+      watchIntervalMs: 10,
+    });
+
+    try {
+      await localManager.start(config, threadId);
+
+      // Replace hasSession with a slow check reporting the session as GONE
+      // (false → teardown path) that records max observed concurrency. At 60ms
+      // per check vs a 10ms tick, multiple ticks elapse during one in-flight
+      // check — so maxConcurrent > 1 would prove the guard failed.
+      let concurrent = 0;
+      let maxConcurrent = 0;
+      localEffects.tmux.hasSession = async () => {
+        concurrent++;
+        maxConcurrent = Math.max(maxConcurrent, concurrent);
+        await new Promise((r) => setTimeout(r, 60));
+        concurrent--;
+        return false;
+      };
+
+      // markTabStopped fires exactly once per teardown — count it.
+      let teardownCount = 0;
+      const realMark = localEffects.iterm2.markTabStopped.bind(
+        localEffects.iterm2
+      );
+      localEffects.iterm2.markTabStopped = (channelName, tmuxSessionName) => {
+        teardownCount++;
+        realMark(channelName, tmuxSessionName);
+      };
+
+      // Let several 10ms ticks elapse across the 60ms check.
+      await new Promise((r) => setTimeout(r, 120));
+
+      // Re-entry guard held: only ONE check ran at a time...
+      expect(maxConcurrent).toBe(1);
+      // ...so teardown fired at most once despite overlapping ticks.
+      expect(teardownCount).toBeLessThanOrEqual(1);
+    } finally {
+      await localManager.shutdownAll();
+    }
   });
 });

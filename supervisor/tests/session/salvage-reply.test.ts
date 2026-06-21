@@ -32,13 +32,13 @@ describe("buildSalvageReply (#169)", () => {
   // tmux name is deterministic: "claude-" + first 12 chars of threadId.
   const tmuxNameFor = (threadId: string) => `claude-${threadId.slice(0, 12)}`;
 
-  test("no DB row → reports no history and suggests /session start", () => {
-    const reply = buildSalvageReply(manager, "thread-never-seen");
+  test("no DB row → reports no history and suggests /session start", async () => {
+    const reply = await buildSalvageReply(manager, "thread-never-seen");
     expect(reply).toContain("セッション履歴がありません");
     expect(reply).toContain("/session start");
   });
 
-  test("dead session with claude_session_id → offers a resume command", () => {
+  test("dead session with claude_session_id → offers a resume command", async () => {
     const claudeId = "11111111-1111-1111-1111-111111111111";
     insertSession({
       id: "s-dead",
@@ -53,14 +53,14 @@ describe("buildSalvageReply (#169)", () => {
     });
     updateSessionStatus("s-dead", "stopped", "process_dead");
 
-    const reply = buildSalvageReply(manager, "thread-dead");
+    const reply = await buildSalvageReply(manager, "thread-dead");
     expect(reply).toContain("停止しています");
     expect(reply).toContain("process_dead");
     expect(reply).toContain(claudeId);
     expect(reply).toContain(`/session resume ${claudeId}`);
   });
 
-  test("dead session without claude_session_id → degrades to /session start (pre-#167)", () => {
+  test("dead session without claude_session_id → degrades to /session start (pre-#167)", async () => {
     insertSession({
       id: "s-noid",
       channel_name: "agent-base",
@@ -74,7 +74,7 @@ describe("buildSalvageReply (#169)", () => {
     });
     updateSessionStatus("s-noid", "stopped", "tmux_exited");
 
-    const reply = buildSalvageReply(manager, "thread-noid");
+    const reply = await buildSalvageReply(manager, "thread-noid");
     expect(reply).toContain("停止しています");
     expect(reply).toContain("未記録");
     expect(reply).toContain("/session start");
@@ -83,7 +83,7 @@ describe("buildSalvageReply (#169)", () => {
 
   // verdict === "alive": running row + pid alive + tmux session present, but
   // Supervisor lost in-memory tracking (e.g. restart). gemini review on #178.
-  test("alive (process up, Supervisor lost tracking) with id → suggests resume with the id", () => {
+  test("alive (process up, Supervisor lost tracking) with id → suggests resume with the id", async () => {
     const claudeId = "22222222-2222-2222-2222-222222222222";
     const threadId = "thread-alive";
     insertSession({
@@ -98,15 +98,15 @@ describe("buildSalvageReply (#169)", () => {
       status: "running",
     });
     effects.process.alivePids.add(5151);
-    effects.tmux.newSession(tmuxNameFor(threadId), "x");
-    expect(manager.livenessOf(threadId)).toBe("alive");
+    await effects.tmux.newSession(tmuxNameFor(threadId), "x");
+    expect(await manager.livenessOf(threadId)).toBe("alive");
 
-    const reply = buildSalvageReply(manager, threadId);
+    const reply = await buildSalvageReply(manager, threadId);
     expect(reply).toContain("管理を見失っています");
     expect(reply).toContain(`/session resume ${claudeId}`);
   });
 
-  test("alive without id → suggests start (resume is not actionable without an id)", () => {
+  test("alive without id → suggests start (resume is not actionable without an id)", async () => {
     const threadId = "thread-alivnoid";
     insertSession({
       id: "s-alive-noid",
@@ -120,10 +120,10 @@ describe("buildSalvageReply (#169)", () => {
       status: "running",
     });
     effects.process.alivePids.add(5252);
-    effects.tmux.newSession(tmuxNameFor(threadId), "x");
-    expect(manager.livenessOf(threadId)).toBe("alive");
+    await effects.tmux.newSession(tmuxNameFor(threadId), "x");
+    expect(await manager.livenessOf(threadId)).toBe("alive");
 
-    const reply = buildSalvageReply(manager, threadId);
+    const reply = await buildSalvageReply(manager, threadId);
     expect(reply).toContain("管理を見失っています");
     expect(reply).toContain("/session start");
     expect(reply).not.toContain("/session resume");
@@ -147,7 +147,7 @@ describe("buildStatusReply (#170)", () => {
 
   const tmuxNameFor = (threadId: string) => `claude-${threadId.slice(0, 12)}`;
 
-  test("alive (running + tracked) → reports 稼働中 with the id (not lost-tracking wording)", () => {
+  test("alive (running + tracked) → reports 稼働中 with the id (not lost-tracking wording)", async () => {
     const claudeId = "33333333-3333-3333-3333-333333333333";
     const threadId = "thread-st-live";
     insertSession({
@@ -162,7 +162,7 @@ describe("buildStatusReply (#170)", () => {
       status: "running",
     });
     effects.process.alivePids.add(6161);
-    effects.tmux.newSession(tmuxNameFor(threadId), "x");
+    await effects.tmux.newSession(tmuxNameFor(threadId), "x");
     // "稼働中" requires the session to also be tracked in memory (has() true),
     // not just live by pid/tmux (gemini HIGH review, PR #179). Register a
     // minimal in-memory entry — has() only checks key presence.
@@ -171,13 +171,13 @@ describe("buildStatusReply (#170)", () => {
       { threadId }
     );
 
-    const reply = buildStatusReply(manager, threadId);
+    const reply = await buildStatusReply(manager, threadId);
     expect(reply).toContain("稼働中");
     expect(reply).toContain(claudeId);
     expect(reply).not.toContain("見失って");
   });
 
-  test("alive by pid/tmux but NOT tracked in memory → lost-tracking wording, not 稼働中", () => {
+  test("alive by pid/tmux but NOT tracked in memory → lost-tracking wording, not 稼働中", async () => {
     const threadId = "thread-st-untracked";
     insertSession({
       id: "st-untracked",
@@ -191,16 +191,16 @@ describe("buildStatusReply (#170)", () => {
       status: "running",
     });
     effects.process.alivePids.add(6363);
-    effects.tmux.newSession(tmuxNameFor(threadId), "x");
+    await effects.tmux.newSession(tmuxNameFor(threadId), "x");
     // Deliberately do NOT register in the in-memory map: has() === false.
-    expect(manager.livenessOf(threadId)).toBe("alive");
+    expect(await manager.livenessOf(threadId)).toBe("alive");
 
-    const reply = buildStatusReply(manager, threadId);
+    const reply = await buildStatusReply(manager, threadId);
     expect(reply).toContain("見失って");
     expect(reply).not.toContain("稼働中です");
   });
 
-  test("dead → reuses salvage wording (停止 + resume command)", () => {
+  test("dead → reuses salvage wording (停止 + resume command)", async () => {
     const claudeId = "44444444-4444-4444-4444-444444444444";
     const threadId = "thread-st-dead";
     insertSession({
@@ -216,13 +216,13 @@ describe("buildStatusReply (#170)", () => {
     });
     updateSessionStatus("st-dead", "stopped", "process_dead");
 
-    const reply = buildStatusReply(manager, threadId);
+    const reply = await buildStatusReply(manager, threadId);
     expect(reply).toContain("停止しています");
     expect(reply).toContain(`/session resume ${claudeId}`);
   });
 
-  test("unknown (no row) → no history", () => {
-    const reply = buildStatusReply(manager, "thread-st-none");
+  test("unknown (no row) → no history", async () => {
+    const reply = await buildStatusReply(manager, "thread-st-none");
     expect(reply).toContain("セッション履歴がありません");
   });
 });

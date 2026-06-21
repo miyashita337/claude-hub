@@ -65,46 +65,46 @@ describe("SessionManager.livenessOf (#168)", () => {
     await manager?.shutdownAll();
   });
 
-  test("AC-3: DB 行なし → unknown", () => {
-    expect(manager.livenessOf("thread-never-existed")).toBe("unknown");
+  test("AC-3: DB 行なし → unknown", async () => {
+    expect(await manager.livenessOf("thread-never-existed")).toBe("unknown");
   });
 
-  test("AC-1: DB running + pid 死 → dead に矯正", () => {
+  test("AC-1: DB running + pid 死 → dead に矯正", async () => {
     const threadId = "thread-zombie";
     insertSession(rowFor("z1", threadId, "running", 9999));
     // pid 9999 NOT in alivePids → fake reports dead.
     // tmux session NOT created → also missing. Either signal alone forces dead.
-    expect(manager.livenessOf(threadId)).toBe("dead");
+    expect(await manager.livenessOf(threadId)).toBe("dead");
   });
 
-  test("AC-2: pid 生存 + tmux 有 → alive", () => {
+  test("AC-2: pid 生存 + tmux 有 → alive", async () => {
     const threadId = "thread-live";
     insertSession(rowFor("a1", threadId, "running", 4242));
     effects.process.alivePids.add(4242);
-    effects.tmux.newSession(tmuxNameFor(threadId), "echo ok");
-    expect(manager.livenessOf(threadId)).toBe("alive");
+    await effects.tmux.newSession(tmuxNameFor(threadId), "echo ok");
+    expect(await manager.livenessOf(threadId)).toBe("alive");
   });
 
-  test("DB running + pid 生だが tmux 無し → dead (reality wins)", () => {
+  test("DB running + pid 生だが tmux 無し → dead (reality wins)", async () => {
     // Defends the matrix: liveness=alive must require BOTH signals.
     const threadId = "thread-half-alive";
     insertSession(rowFor("h1", threadId, "running", 7777));
     effects.process.alivePids.add(7777);
     // tmux session deliberately NOT created
-    expect(manager.livenessOf(threadId)).toBe("dead");
+    expect(await manager.livenessOf(threadId)).toBe("dead");
   });
 
-  test("DB stopped → dead (DB authoritative when explicitly stopped)", () => {
+  test("DB stopped → dead (DB authoritative when explicitly stopped)", async () => {
     const threadId = "thread-stopped";
     insertSession(rowFor("s1", threadId, "stopped", 1234));
     // Even if pid+tmux happened to be reused/alive, an explicitly stopped row
     // means we should NOT call it alive — answer the stopped status.
     effects.process.alivePids.add(1234);
-    effects.tmux.newSession(tmuxNameFor(threadId), "echo ok");
-    expect(manager.livenessOf(threadId)).toBe("dead");
+    await effects.tmux.newSession(tmuxNameFor(threadId), "echo ok");
+    expect(await manager.livenessOf(threadId)).toBe("dead");
   });
 
-  test("livenessOf reads the latest row (older stopped does not mask newer running)", () => {
+  test("livenessOf reads the latest row (older stopped does not mask newer running)", async () => {
     // Cross-test with AC-4: getSessionByThreadId picks `started_at DESC LIMIT 1`,
     // so an older stopped row must not flip a newer running row to dead.
     const threadId = "thread-rerun";
@@ -115,8 +115,8 @@ describe("SessionManager.livenessOf (#168)", () => {
       rowFor("new", threadId, "running", 2222, "2026-05-31T10:00:00.000Z")
     );
     effects.process.alivePids.add(2222);
-    effects.tmux.newSession(tmuxNameFor(threadId), "echo ok");
-    expect(manager.livenessOf(threadId)).toBe("alive");
+    await effects.tmux.newSession(tmuxNameFor(threadId), "echo ok");
+    expect(await manager.livenessOf(threadId)).toBe("alive");
   });
 });
 
@@ -152,34 +152,34 @@ describe("SessionManager.livenessOfClaudeSession (#171)", () => {
     await manager?.shutdownAll();
   });
 
-  test("no row for the id → unknown (caller treats as not-alive)", () => {
-    expect(manager.livenessOfClaudeSession(CID)).toBe("unknown");
+  test("no row for the id → unknown (caller treats as not-alive)", async () => {
+    expect(await manager.livenessOfClaudeSession(CID)).toBe("unknown");
   });
 
-  test("running + pid alive + tmux present → alive", () => {
+  test("running + pid alive + tmux present → alive", async () => {
     const threadId = "thread-cid-live";
     insertSession(rowWithClaudeId("c1", threadId, CID, "running", 5151));
     effects.process.alivePids.add(5151);
-    effects.tmux.newSession(tmuxNameFor(threadId), "echo ok");
-    expect(manager.livenessOfClaudeSession(CID)).toBe("alive");
+    await effects.tmux.newSession(tmuxNameFor(threadId), "echo ok");
+    expect(await manager.livenessOfClaudeSession(CID)).toBe("alive");
   });
 
-  test("穴 A: DB status=running but pid dead → dead (stale status must not block resume)", () => {
+  test("穴 A: DB status=running but pid dead → dead (stale status must not block resume)", async () => {
     const threadId = "thread-cid-zombie";
     insertSession(rowWithClaudeId("c2", threadId, CID, "running", 6262));
     // pid 6262 NOT alive, no tmux → reality wins → dead.
-    expect(manager.livenessOfClaudeSession(CID)).toBe("dead");
+    expect(await manager.livenessOfClaudeSession(CID)).toBe("dead");
   });
 
-  test("explicitly stopped row → dead", () => {
+  test("explicitly stopped row → dead", async () => {
     const threadId = "thread-cid-stopped";
     insertSession(rowWithClaudeId("c3", threadId, CID, "stopped", 7373));
     effects.process.alivePids.add(7373);
-    effects.tmux.newSession(tmuxNameFor(threadId), "echo ok");
-    expect(manager.livenessOfClaudeSession(CID)).toBe("dead");
+    await effects.tmux.newSession(tmuxNameFor(threadId), "echo ok");
+    expect(await manager.livenessOfClaudeSession(CID)).toBe("dead");
   });
 
-  test("resolves the LATEST row for the id (older dead run does not mask a newer alive one)", () => {
+  test("resolves the LATEST row for the id (older dead run does not mask a newer alive one)", async () => {
     // A single claude session accumulates rows across resumes; the newest run is
     // what "is it alive now" cares about (getSessionByClaudeSessionId DESC LIMIT 1).
     insertSession(
@@ -189,7 +189,7 @@ describe("SessionManager.livenessOfClaudeSession (#171)", () => {
       rowWithClaudeId("new", "thread-new", CID, "running", 2222, "2026-05-31T10:00:00.000Z")
     );
     effects.process.alivePids.add(2222);
-    effects.tmux.newSession(tmuxNameFor("thread-new"), "echo ok");
-    expect(manager.livenessOfClaudeSession(CID)).toBe("alive");
+    await effects.tmux.newSession(tmuxNameFor("thread-new"), "echo ok");
+    expect(await manager.livenessOfClaudeSession(CID)).toBe("alive");
   });
 });
