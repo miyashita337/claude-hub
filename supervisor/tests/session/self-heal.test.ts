@@ -7,9 +7,10 @@ import { createSelfHealer } from "../../src/session/self-heal";
  * tracker) and returns the auto-action to take.
  *
  * Journey AC mapping:
- *   - item 1: red → "compact"
- *   - item 2: a rebounding context hits the cap → "cap-reached" (no infinite loop)
- *   - item 3: critical → "notify" (auto-restart execution deferred to follow-up)
+ *   - item 1: critical → "restart" (resume-backed restart, #244)
+ *   - item 2: a rebounding context hits the shared cap → "cap-reached" so
+ *             compacts AND restarts together cannot loop forever
+ *   - item 3: the restart execution / degrade is covered in self-heal-restart.test.ts
  */
 describe("createSelfHealer (#206)", () => {
   test("yellow → none (notify only, no auto-action consumed)", () => {
@@ -27,12 +28,14 @@ describe("createSelfHealer (#206)", () => {
     expect(d.cap).toBe(3);
   });
 
-  test("AC item 3: critical → notify (restart execution deferred), no count consumed", () => {
+  test("AC item 1: critical → restart, consumes an auto-action (#244)", () => {
     const h = createSelfHealer({ maxAutoActions: 3 });
     const d = h.decide("critical");
-    expect(d.action).toBe("notify");
-    // critical does not consume an auto-action — the cap gates compacts only.
-    expect(d.actionCount).toBe(0);
+    expect(d.action).toBe("restart");
+    // #244: unlike the old notify-only behaviour, a restart consumes a slot so
+    // the shared cap bounds restarts too (RW-043).
+    expect(d.actionCount).toBe(1);
+    expect(d.cap).toBe(3);
   });
 
   test("AC item 2: repeated red rebounds hit the cap, then stop auto-acting", () => {
@@ -46,11 +49,22 @@ describe("createSelfHealer (#206)", () => {
     expect(h.decide("red").action).toBe("cap-reached");
   });
 
+  test("AC item 2: compact and restart share ONE cap (合算), then cap-reached", () => {
+    const h = createSelfHealer({ maxAutoActions: 2 });
+    expect(h.decide("red").action).toBe("compact"); // 1 (compact)
+    expect(h.decide("critical").action).toBe("restart"); // 2 (restart) — same cap
+    const capped = h.decide("critical"); // 3rd would exceed → cap-reached
+    expect(capped.action).toBe("cap-reached");
+    expect(capped.actionCount).toBe(2);
+    // No infinite restart loop: stays capped on subsequent criticals.
+    expect(h.decide("critical").action).toBe("cap-reached");
+  });
+
   test("critical after the cap is reached → cap-reached (no further auto-action)", () => {
     const h = createSelfHealer({ maxAutoActions: 1 });
     expect(h.decide("red").action).toBe("compact"); // consumes the only slot
     // Now at cap: even a critical escalation reports cap-reached, prompting
-    // manual intervention rather than silently doing nothing.
+    // manual intervention rather than restarting forever.
     expect(h.decide("critical").action).toBe("cap-reached");
   });
 

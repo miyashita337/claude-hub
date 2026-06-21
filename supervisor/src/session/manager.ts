@@ -36,6 +36,7 @@ import {
 import {
   createSelfHealer,
   type SelfHealAction,
+  type SelfHealer,
 } from "./self-heal";
 import { compactClaudeHubExit } from "./primary-compact";
 
@@ -63,6 +64,20 @@ export interface SelfHealOutcome {
   tokens: number;
   /** True for red/critical → caller should page Pushover. */
   page: boolean;
+  /**
+   * Present only when {@link action} is `"restart"` (Issue #244). The manager
+   * cannot create a Discord thread, so it hands the caller (bot.ts) everything
+   * the resume-backed restart needs, captured BEFORE the old session is stopped.
+   * `claudeSessionId` is guaranteed non-empty here (the restart branch downgrades
+   * to `"notify"` when it is missing), so the caller can always build a valid
+   * `/session resume <id>` even on the degrade path.
+   */
+  restart?: {
+    claudeSessionId: string;
+    channelName: string;
+    projectDir: string;
+    branch: string | null;
+  };
 }
 
 /**
@@ -234,6 +249,19 @@ export class SessionManager {
   private sessions = new Map<string, SessionInfo>();
   /** Map<threadId, intervalHandle> — watchdogs to clear on stop/shutdown */
   private watchers = new Map<string, ReturnType<typeof setInterval>>();
+  /**
+   * Map<claudeSessionId, SelfHealer> — the per-CONVERSATION self-heal planner
+   * (Issue #206/#244). Keyed by claude session id, NOT threadId, so the
+   * auto-action cap survives a self-heal restart: a critical restart stops the
+   * old session and `claude --resume`s the SAME id into a fresh thread, which
+   * reloads the full ~800k context and would re-cross critical immediately. A
+   * fresh per-thread planner would reset the cap and restart forever (RW-043);
+   * keying by claude session id makes compacts AND restarts share ONE bounded
+   * budget across the whole conversation's restart chain (AC item 2). Entries
+   * are removed on a terminal stop / tmux exit (but NOT on a self_heal_restart
+   * stop, which must carry the count forward to the resumed session).
+   */
+  private readonly selfHealers = new Map<string, SelfHealer>();
   /**
    * threadIds with a start currently in flight (review #185 gemini HIGH).
    * Since {@link start} is async (it awaits the PID poll), the dup-check and
@@ -1001,6 +1029,13 @@ export class SessionManager {
    * remedy is a resume-backed restart, whose EXECUTION is deferred to a focused
    * follow-up (RW-047 resume-timing risk + new-thread orchestration).
    *
+   * critical now resolves to a resume-backed restart (Issue #244): the planner
+   * returns `restart` and this hands the caller (bot.ts) the session identity
+   * (claude session id / channel / cwd / branch) it needs to drive the
+   * stop→new-thread→resume orchestration, captured BEFORE any stop. When the
+   * claude session id is not yet known the restart degrades to the manual
+   * `/session resume` guidance (action `notify`) rather than acting blindly.
+   *
    * Best-effort and self-contained: an auto-compact failure is folded into the
    * returned message (never thrown) so the relay loop is unaffected. Returns the
    * outcome the caller posts to the thread, or null when no band was crossed.
@@ -1016,11 +1051,20 @@ export class SessionManager {
     // contextBudgetWarning only returns non-null when the session exists, but
     // guard anyway so a race (stop between the two lookups) fails safe.
     if (!session) return null;
-    if (!session.selfHealer) {
-      session.selfHealer = createSelfHealer();
+
+    // Resolve the per-CONVERSATION planner, keyed by claude session id so the
+    // auto-action cap survives a self-heal restart (see {@link selfHealers}).
+    // Fall back to threadId only when the id was not captured (a session that
+    // never responded) — such a session can't be resumed anyway, so the
+    // restart branch below degrades to manual.
+    const healerKey = session.claudeSessionId ?? threadId;
+    let healer = this.selfHealers.get(healerKey);
+    if (!healer) {
+      healer = createSelfHealer();
+      this.selfHealers.set(healerKey, healer);
     }
 
-    const decision = session.selfHealer.decide(warning.level);
+    const decision = healer.decide(warning.level);
     const page = warning.level === "red" || warning.level === "critical";
 
     // Structured, greppable log for every band crossing (observability, AC item
@@ -1069,18 +1113,50 @@ export class SessionManager {
       };
     }
 
-    // "notify" (critical) and "none" (yellow): keep the #204 warning text. For
-    // critical, append the manual-restart guidance (auto-restart is a follow-up).
-    const message =
-      decision.action === "notify"
-        ? `${warning.message}\n↳ 自動 restart は安全性のため手動運用です。\`/session resume\` で復帰してください (#206)。`
-        : warning.message;
+    if (decision.action === "restart") {
+      // Capture the session identity NOW — bot.ts stops this session before
+      // resuming, after which `this.sessions.get(threadId)` is gone (#244).
+      const claudeSessionId = session.claudeSessionId;
+      if (claudeSessionId) {
+        return {
+          level: warning.level,
+          action: "restart",
+          tokens: warning.tokens,
+          page,
+          message:
+            `🔄 コンテキストが ${Math.floor(warning.tokens / 1000)}k（critical）に到達したため、` +
+            `会話を引き継いで自動 restart します（${decision.actionCount}/${decision.cap} 回目, #244）。`,
+          restart: {
+            claudeSessionId,
+            channelName: session.channelName,
+            projectDir: session.projectDir,
+            branch: session.branch ?? null,
+          },
+        };
+      }
+      // No claude session id captured yet → resume has nothing to target. Degrade
+      // to the manual-restart guidance instead of acting blindly (#244, no silent
+      // failure). `notify` is delivered as-is by the caller (no restart payload).
+      return {
+        level: warning.level,
+        action: "notify",
+        tokens: warning.tokens,
+        page,
+        message:
+          `${warning.message}\n↳ 自動 restart は session id 未取得のため実行できませんでした。` +
+          `\`/session list\` で session_id を確認し \`/session resume <session_id>\` で復帰してください (#244)。`,
+      };
+    }
+
+    // "none" (yellow) — keep the #204 notify-only warning text. (red→compact,
+    // critical→restart, and cap-reached all returned above; a degraded restart
+    // returns "notify" inline above with its own guidance.)
     return {
       level: warning.level,
       action: decision.action,
       tokens: warning.tokens,
       page,
-      message,
+      message: warning.message,
     };
   }
 
@@ -1176,6 +1252,14 @@ export class SessionManager {
 
     this.clearWatcher(threadId);
     this.sessions.delete(threadId);
+    // Issue #244: drop the per-conversation self-heal planner on a TERMINAL stop
+    // so its cap does not leak. A `self_heal_restart` stop is NOT terminal — the
+    // conversation is about to be `claude --resume`d into a fresh thread, so the
+    // planner (and its accumulated auto-action count) must carry forward to bound
+    // the restart chain (AC item 2). All other reasons end the conversation here.
+    if (reason !== "self_heal_restart") {
+      this.selfHealers.delete(session.claudeSessionId ?? threadId);
+    }
     this.effects.iterm2.markTabStopped(session.channelName, tmuxName);
     updateSessionStatus(session.id, "stopped", reason);
     this.cleanupRelayUrlFile(session.projectDir);
@@ -1282,6 +1366,9 @@ export class SessionManager {
       clearInterval(handle);
     }
     this.watchers.clear();
+    // Defensive — stop("manual") already drops each, but clear any orphan left
+    // by a failed-then-unresumed self_heal_restart (Issue #244).
+    this.selfHealers.clear();
     this.effects.relayServer.stop();
     console.log("[SessionManager] All sessions stopped.");
   }
@@ -1318,6 +1405,10 @@ export class SessionManager {
           if (session) {
             this.effects.iterm2.markTabStopped(session.channelName, tmuxName);
             this.cleanupRelayUrlFile(session.projectDir);
+            // Issue #244: an unexpected exit ends this conversation generation —
+            // drop its self-heal planner so the cap map does not leak. A later
+            // manual /session resume legitimately starts a fresh planner.
+            this.selfHealers.delete(session.claudeSessionId ?? threadId);
             // Issue #154: the worktree is intentionally NOT removed here. An
             // unexpected claude exit is not an explicit teardown — removing the
             // worktree (git worktree remove --force) would discard any

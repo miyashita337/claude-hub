@@ -190,9 +190,9 @@ describe("SessionManager (thread-based)", () => {
       compactSpy.mockRestore();
     });
 
-    test("AC item 3: critical → notify only (no auto-compact), restart guidance present", async () => {
+    test("#244: critical → restart, hands back the session identity (no auto-compact)", async () => {
       const t = "sh-critical";
-      await manager.start(primaryConfig, t);
+      const info = await manager.start(primaryConfig, t);
       const compactSpy = spyOn(manager, "compactSession").mockResolvedValue(
         undefined
       );
@@ -200,11 +200,50 @@ describe("SessionManager (thread-based)", () => {
       const outcome = await manager.contextBudgetSelfHeal(t, 850_000);
 
       expect(outcome?.level).toBe("critical");
-      expect(outcome?.action).toBe("notify");
+      expect(outcome?.action).toBe("restart");
       expect(outcome?.page).toBe(true);
       expect(compactSpy).not.toHaveBeenCalled();
-      expect(outcome?.message).toContain("/session resume");
+      // The restart payload carries everything bot.ts needs to resume, captured
+      // before the stop (claude session id is pinned at start, #167).
+      expect(outcome?.restart?.claudeSessionId).toBe(info.claudeSessionId!);
+      expect(outcome?.restart?.channelName).toBe(primaryConfig.channelName);
+      expect(outcome?.restart?.projectDir).toBe(info.projectDir);
       compactSpy.mockRestore();
+    });
+
+    test("#244 AC item 2: the auto-action cap survives a self_heal_restart (keyed by claude session id), bounding the restart chain", async () => {
+      process.env.CONTEXT_SELF_HEAL_MAX_ACTIONS = "1"; // one auto-action total
+      // Dedicated manager with a no-op resume prompt poll so resumeSession does
+      // not pay the production picker wait.
+      const m = new SessionManager({
+        effects,
+        gracefulKillTimeoutMs: 0,
+        resumePromptPollAttempts: 0,
+      });
+      try {
+        const tA = "sh-rs-A";
+        const a = await m.start(primaryConfig, tA);
+        const cid = a.claudeSessionId!;
+
+        // 1st critical on the original session → restart (consumes the only slot).
+        const first = await m.contextBudgetSelfHeal(tA, 850_000);
+        expect(first?.action).toBe("restart");
+        expect(first?.restart?.claudeSessionId).toBe(cid);
+
+        // Self-heal restart stops the old session WITHOUT dropping the planner…
+        await m.stop(tA, "self_heal_restart");
+        // …and resumes the SAME claude session id into a fresh thread.
+        const tB = "sh-rs-B";
+        await m.resumeSession(primaryConfig, tB, cid, primaryConfig.dir);
+
+        // The resumed session reloads the full context and re-crosses critical.
+        // Because the planner is keyed by claude session id, the cap is already
+        // spent → cap-reached, NOT another restart (no infinite restart loop).
+        const second = await m.contextBudgetSelfHeal(tB, 860_000);
+        expect(second?.action).toBe("cap-reached");
+      } finally {
+        await m.shutdownAll();
+      }
     });
 
     test("AC item 2: rebounding red hits the cap, then stops auto-compacting", async () => {
