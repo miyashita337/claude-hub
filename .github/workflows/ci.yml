@@ -52,6 +52,14 @@ jobs:
       - name: Lint - no blocking exec inside timer callbacks (#27)
         run: bun scripts/lint-blocking-in-timers.ts
 
+      # Issue #227 (PR-4): no synchronous child-process exec (execSync /
+      # execFileSync / spawnSync) anywhere under src/session/**. PR-1/2/3 made
+      # the hot paths async; this keeps the whole session tree sync-exec-free so
+      # a regression cannot silently reintroduce an event-loop-blocking call.
+      # AST-based, so comments citing the migration don't false-fire.
+      - name: Lint - no synchronous exec in src/session (#227 PR-4)
+        run: bun scripts/lint-no-sync-exec.ts
+
       # Issue #248 (RW-029 / F1 class): every tests/**/*.test.ts must be gated in
       # this file or justifiably excluded in scripts/lint-gating-coverage.ts.
       # Prevents a newly-added test from being silently never-run in CI.
@@ -115,6 +123,7 @@ jobs:
                    tests/session/dialog-watchdog.test.ts \
                    tests/session/relay-send-failure.test.ts \
                    tests/scripts/lint-blocking-in-timers.test.ts \
+                   tests/scripts/lint-no-sync-exec.test.ts \
                    tests/session/notify-pushover.test.ts \
                    tests/session/dialog-stuck-handler.test.ts \
                    tests/session/stall-heartbeat.test.ts \
@@ -147,7 +156,10 @@ jobs:
                    tests/session/salvage-reply.test.ts \
                    tests/session/slash-prefix.test.ts \
                    tests/session/thread-title.test.ts \
-                   tests/session/worktree.test.ts
+                   tests/session/worktree.test.ts \
+                   tests/session/keep-attachment.test.ts \
+                   tests/commands/session-keep.test.ts \
+                   tests/session/self-heal.test.ts
 
       # #238 regression: realTmuxAdapter.hasSession must treat a tmux
       # control-channel ETIMEDOUT as "alive" (assume the session survives),

@@ -1,9 +1,12 @@
-import { execFileSync, spawn } from "child_process";
+import { execFile, spawn } from "child_process";
 import { readFileSync } from "fs";
 import { resolve, basename } from "path";
 import { homedir } from "os";
 import { createHash } from "crypto";
+import { promisify } from "util";
 import { TMUX_PATH, TMUX_ARGS, TMUX_CMD } from "./tmux";
+
+const execFileAsync = promisify(execFile);
 
 const PROJECT_COLORS_PATH = resolve(
   homedir(),
@@ -71,15 +74,17 @@ export function resolveColor(projectName: string): string {
   return `#${r.toString(16).padStart(2, "0")}${g.toString(16).padStart(2, "0")}${b.toString(16).padStart(2, "0")}`;
 }
 
-export function isItermRunning(): boolean {
+export async function isItermRunning(): Promise<boolean> {
   try {
-    // argv form (no shell): pgrep exits 1 when nothing matches, which
-    // execFileSync surfaces as a throw → caught below as "not running".
-    const result = execFileSync("pgrep", ["-x", "iTerm2"], {
+    // argv form (no shell): pgrep exits 1 when nothing matches, which the async
+    // execFile surfaces as a rejection → caught below as "not running". Issue
+    // #227 (PR-4): async (not a synchronous exec) so the pgrep call never blocks
+    // the single event loop.
+    const { stdout } = await execFileAsync("pgrep", ["-x", "iTerm2"], {
       encoding: "utf8",
       timeout: 3000,
-    }).trim();
-    return result.length > 0;
+    });
+    return stdout.trim().length > 0;
   } catch {
     return false;
   }
@@ -173,8 +178,8 @@ export interface OpenTabOptions {
   projectDir: string;
 }
 
-export function openTab(opts: OpenTabOptions): void {
-  if (!isItermRunning()) {
+export async function openTab(opts: OpenTabOptions): Promise<void> {
+  if (!(await isItermRunning())) {
     console.log(
       `[iTerm2] iTerm2 is not running, skipping tab creation for ${opts.channelName}`
     );
@@ -189,11 +194,13 @@ export function openTab(opts: OpenTabOptions): void {
   // Chain all five window-config commands into ONE tmux invocation via bare
   // ";" separators (tmux's own command parser treats ";" as a separator — see
   // ensureSocketConfigured in tmux.ts), cutting five process spawns to one.
-  // stdio: "ignore" matches the fire-and-forget tmux calls in adapters.ts —
-  // failures are non-fatal (the session may have already exited) and tmux's
-  // stderr must not leak to the Supervisor's terminal.
+  // Issue #227 (PR-4): async (not a synchronous exec) so a wedged tmux server
+  // cannot block the event loop. execFile buffers stdout/stderr (not inherited),
+  // matching the prior stdio: "ignore" — failures are non-fatal (the session
+  // may have already exited) and tmux's stderr must not leak to the
+  // Supervisor's terminal.
   try {
-    execFileSync(
+    await execFileAsync(
       TMUX_PATH,
       [
         ...TMUX_ARGS,
@@ -203,7 +210,7 @@ export function openTab(opts: OpenTabOptions): void {
         "set-option", "-t", opts.tmuxSessionName, "set-titles-string", "#{window_name}", ";",
         "select-pane", "-t", opts.tmuxSessionName, "-T", tabTitle,
       ],
-      { timeout: 3000, stdio: "ignore" }
+      { timeout: 3000 }
     );
   } catch {
     // tmux session may have already exited
@@ -237,8 +244,10 @@ export function openTab(opts: OpenTabOptions): void {
   try {
     // argv form (no shell): the AppleScript is passed as a single -e argument,
     // so the prior manual single-quote escaping is no longer needed (Issue
-    // #97). Matches markTabStopped's spawn(osascript, ["-e", script]).
-    execFileSync("osascript", ["-e", script], {
+    // #97). Matches markTabStopped's spawn(osascript, ["-e", script]). Issue
+    // #227 (PR-4): async (not a synchronous exec) so a slow osascript cannot
+    // block the event loop.
+    await execFileAsync("osascript", ["-e", script], {
       timeout: 5000,
     });
     console.log(`[iTerm2] Opened tab for ${opts.channelName}`);
@@ -250,7 +259,10 @@ export function openTab(opts: OpenTabOptions): void {
   }
 }
 
-export function markTabStopped(channelName: string, tmuxSessionName?: string): void {
+export async function markTabStopped(
+  channelName: string,
+  tmuxSessionName?: string
+): Promise<void> {
   const tabName = `${channelName} (running)`;
   const newName = `${channelName} (stopped)`;
   // The actual tmux session name is `claude-${threadId.slice(0,12)}` (see
@@ -259,13 +271,17 @@ export function markTabStopped(channelName: string, tmuxSessionName?: string): v
   // The fallback exists for legacy callers without a threadId in scope.
   const tmuxName = tmuxSessionName ?? `claude-${channelName}`;
 
-  // Update tmux window name if session still exists (fire-and-forget)
+  // Update tmux window name if session still exists (fire-and-forget spawn,
+  // unchanged: spawn is already async/non-blocking — #27).
   const renameProc = spawn(TMUX_PATH, [...TMUX_ARGS, "rename-window", "-t", tmuxName, newName], {
     stdio: "ignore",
   });
   setTimeout(() => renameProc.kill("SIGKILL"), 3000);
 
-  if (!isItermRunning()) {
+  // Issue #227 (PR-4): isItermRunning is async now; await it. markTabStopped is
+  // itself called fire-and-forget by realItermAdapter, so this stays
+  // non-blocking from the caller's perspective.
+  if (!(await isItermRunning())) {
     return;
   }
 

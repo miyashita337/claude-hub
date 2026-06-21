@@ -35,13 +35,14 @@ export interface TmuxAdapter {
   // Issue #227 (PR-3): every tmux call below runs via the *async* `execFile`
   // so a wedged tmux server can never block the Bun single event loop. The
   // return types are Promise — this interface flip is atomic (TypeScript types
-  // cannot be migrated incrementally), so all consumers await. `ensureSocketConfigured`
-  // stays sync: it delegates to tmux.ts (converted separately in PR-4).
+  // cannot be migrated incrementally), so all consumers await.
+  // Issue #227 (PR-4): `ensureSocketConfigured` is now async too (tmux.ts moved
+  // to the async `execFile`), so it returns Promise<void> as well.
   newSession(name: string, command: string): Promise<void>;
   killSession(name: string): Promise<void>;
   hasSession(name: string): Promise<boolean>;
   getPid(name: string): Promise<number | null>;
-  ensureSocketConfigured(): void;
+  ensureSocketConfigured(): Promise<void>;
   /**
    * Capture the visible pane content (`tmux capture-pane -p`). Returns "" on
    * error. Used by the resume flow (Issue #161) to detect Claude Code's
@@ -85,17 +86,20 @@ export interface ProcessAdapter {
  * in-memory fake so {@link SessionManager} unit tests never run git.
  */
 export interface WorktreeAdapter {
+  // Issue #227 (PR-4): the underlying git/gh calls moved to the async
+  // `execFile` (worktree.ts) so a wedged subprocess never blocks the event
+  // loop. These methods therefore return Promises and all callers await.
   /** Create or reuse the worktree for `branch` under `mainRepoDir`. */
-  ensure(mainRepoDir: string, branch: string): EnsureWorktreeResult;
+  ensure(mainRepoDir: string, branch: string): Promise<EnsureWorktreeResult>;
   /** Remove the worktree (branch is preserved). */
-  remove(mainRepoDir: string, worktreePath: string): void;
+  remove(mainRepoDir: string, worktreePath: string): Promise<void>;
   /**
    * Re-create the worktree for an *existing* branch only — resume recovery
    * (Issue #217). Returns true when the worktree exists afterwards, false when
    * the branch is gone (caller surfaces a clear error). Never creates a new
    * branch from the default branch.
    */
-  recreateForBranch(mainRepoDir: string, branch: string): boolean;
+  recreateForBranch(mainRepoDir: string, branch: string): Promise<boolean>;
 }
 
 export interface SessionEffects {
@@ -207,8 +211,8 @@ export const realTmuxAdapter: TmuxAdapter = {
       return null;
     }
   },
-  ensureSocketConfigured() {
-    realEnsureSocketConfigured();
+  async ensureSocketConfigured() {
+    await realEnsureSocketConfigured();
   },
   async capturePane(name) {
     // execFile reads stdout; stderr is buffered (not inherited) — the
@@ -240,11 +244,17 @@ export const realTmuxAdapter: TmuxAdapter = {
 };
 
 export const realItermAdapter: ItermAdapter = {
+  // Issue #227 (PR-4): realOpenTab / realMarkTabStopped became async (their
+  // internal pgrep / tmux / osascript calls moved to the async `execFile`). The
+  // ItermAdapter interface intentionally stays void: tab cosmetics are
+  // fire-and-forget and must not gate session start/stop. `void` discards the
+  // Promise; both functions catch their own errors internally (try/catch around
+  // every exec), so there is no unhandled rejection.
   openTab(opts) {
-    realOpenTab(opts);
+    void realOpenTab(opts);
   },
   markTabStopped(channelName, tmuxSessionName) {
-    realMarkTabStopped(channelName, tmuxSessionName);
+    void realMarkTabStopped(channelName, tmuxSessionName);
   },
 };
 
@@ -275,11 +285,13 @@ export const realProcessAdapter: ProcessAdapter = {
 };
 
 export const realWorktreeAdapter: WorktreeAdapter = {
+  // Issue #227 (PR-4): worktree.ts moved to the async `execFile`, so these
+  // delegate to async functions and return the Promise to the caller.
   ensure(mainRepoDir, branch) {
     return ensureWorktree(mainRepoDir, branch, realGitGhRunner);
   },
   remove(mainRepoDir, worktreePath) {
-    removeWorktree(mainRepoDir, worktreePath, realGitGhRunner);
+    return removeWorktree(mainRepoDir, worktreePath, realGitGhRunner);
   },
   recreateForBranch(mainRepoDir, branch) {
     return recreateWorktreeForExistingBranch(

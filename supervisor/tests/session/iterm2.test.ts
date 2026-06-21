@@ -48,8 +48,10 @@ describe("dimColor", () => {
 });
 
 describe("isItermRunning", () => {
-  test("returns a boolean", () => {
-    const result = isItermRunning();
+  // Issue #227 (PR-4): isItermRunning is async now (pgrep moved to the async
+  // `execFile`), so it returns Promise<boolean> — await it before asserting.
+  test("resolves to a boolean", async () => {
+    const result = await isItermRunning();
     expect(typeof result).toBe("boolean");
   });
 });

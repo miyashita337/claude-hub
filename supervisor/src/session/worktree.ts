@@ -1,6 +1,9 @@
-import { execFileSync } from "child_process";
+import { execFile } from "child_process";
 import { existsSync, realpathSync } from "fs";
 import { resolve, sep } from "path";
+import { promisify } from "util";
+
+const execFileAsync = promisify(execFile);
 
 /**
  * Per-branch git worktree management for supervisor sessions (Issue #154).
@@ -20,10 +23,15 @@ import { resolve, sep } from "path";
  *
  * Low-level git/gh calls go through {@link GitGhRunner} so the branching logic
  * in {@link ensureWorktree} is unit-testable with an in-memory fake (no real
- * git/gh). The real runner uses `execFileSync` with an argv array — never a
- * shell string — so a branch name can never inject shell metacharacters
+ * git/gh). The real runner uses the async `execFile` with an argv array — never
+ * a shell string — so a branch name can never inject shell metacharacters
  * (Q6 "git に任せる": validation is delegated to git, but the filesystem path
  * is additionally guarded against traversal and shell-injection below).
+ *
+ * Issue #227 (PR-4): every git/gh call below runs via the *async* `execFile`
+ * (not a synchronous exec) so a wedged git/gh subprocess can never block the Bun
+ * single event loop. The runner methods therefore return Promises; this is a
+ * pure sync→async migration — the Q1/Q2/Q4 branching logic is unchanged.
  */
 
 /** Subdirectory (relative to the main repo) that holds per-branch worktrees. */
@@ -44,25 +52,28 @@ export type WorktreeStatus =
   | { registered: true; branch: string | null };
 
 export interface GitGhRunner {
+  // Issue #227 (PR-4): the git/gh calls are async (`execFile`), so these return
+  // Promises. `pathExists` stays synchronous — it is a cheap `existsSync` with
+  // no subprocess to block on.
   /** True if `branch` is an existing *local branch* in the repo at `mainRepoDir`. */
-  branchExists(mainRepoDir: string, branch: string): boolean;
+  branchExists(mainRepoDir: string, branch: string): Promise<boolean>;
   /** Repo default branch (Q2 base for new branches). Falls back to "main". */
-  defaultBranch(mainRepoDir: string): string;
+  defaultBranch(mainRepoDir: string): Promise<string>;
   /** `git worktree add <worktreePath> <branch>` (existing branch, Q1). */
   addWorktreeFromBranch(
     mainRepoDir: string,
     worktreePath: string,
     branch: string,
-  ): void;
+  ): Promise<void>;
   /** `git worktree add -b <branch> --no-track <worktreePath> <base>` (Q2). */
   addWorktreeNewBranch(
     mainRepoDir: string,
     worktreePath: string,
     branch: string,
     base: string,
-  ): void;
+  ): Promise<void>;
   /** `git worktree remove <worktreePath> --force` (Q3). */
-  removeWorktree(mainRepoDir: string, worktreePath: string): void;
+  removeWorktree(mainRepoDir: string, worktreePath: string): Promise<void>;
   /** Filesystem existence check for the worktree path (Q4 reuse). */
   pathExists(path: string): boolean;
   /**
@@ -70,7 +81,7 @@ export interface GitGhRunner {
    * which branch it has checked out (Issue #158). Used to validate Q4 reuse
    * instead of trusting a bare directory existence check.
    */
-  worktreeStatus(mainRepoDir: string, worktreePath: string): WorktreeStatus;
+  worktreeStatus(mainRepoDir: string, worktreePath: string): Promise<WorktreeStatus>;
 }
 
 export interface EnsureWorktreeResult {
@@ -127,11 +138,11 @@ export function resolveWorktreePath(mainRepoDir: string, branch: string): string
  * an already-present worktree is reused (Q4), so calling this twice for the
  * same branch is safe.
  */
-export function ensureWorktree(
+export async function ensureWorktree(
   mainRepoDir: string,
   branch: string,
   runner: GitGhRunner,
-): EnsureWorktreeResult {
+): Promise<EnsureWorktreeResult> {
   const trimmed = branch.trim();
   if (!trimmed) {
     throw new Error("branch 引数が必須です");
@@ -144,7 +155,7 @@ export function ensureWorktree(
   // created directory, running claude in a non-worktree / wrong-branch cwd —
   // a silent failure. Reject those explicitly instead.
   if (runner.pathExists(worktreePath)) {
-    const status = runner.worktreeStatus(mainRepoDir, worktreePath);
+    const status = await runner.worktreeStatus(mainRepoDir, worktreePath);
     if (!status.registered) {
       throw new Error(
         `worktree 再利用先がディレクトリとして存在しますが有効な git worktree ではありません（中断した worktree remove の残骸 / 手動作成の可能性）: ${worktreePath}。手動で削除してから再実行してください。`,
@@ -160,14 +171,14 @@ export function ensureWorktree(
   }
 
   // Q1: existing local branch → checkout into a new worktree.
-  if (runner.branchExists(mainRepoDir, trimmed)) {
-    runner.addWorktreeFromBranch(mainRepoDir, worktreePath, trimmed);
+  if (await runner.branchExists(mainRepoDir, trimmed)) {
+    await runner.addWorktreeFromBranch(mainRepoDir, worktreePath, trimmed);
     return { path: worktreePath, reused: false };
   }
 
   // Q2: unknown branch → create from the repo's default branch.
-  const base = runner.defaultBranch(mainRepoDir);
-  runner.addWorktreeNewBranch(mainRepoDir, worktreePath, trimmed, base);
+  const base = await runner.defaultBranch(mainRepoDir);
+  await runner.addWorktreeNewBranch(mainRepoDir, worktreePath, trimmed, base);
   return { path: worktreePath, reused: false, baseBranch: base };
 }
 
@@ -184,11 +195,11 @@ export function ensureWorktree(
  * exists afterwards (Q4 already-present, or Q1 freshly checked out), false when
  * the branch is gone so the caller can surface a clear "cannot recover" error.
  */
-export function recreateWorktreeForExistingBranch(
+export async function recreateWorktreeForExistingBranch(
   mainRepoDir: string,
   branch: string,
   runner: GitGhRunner,
-): boolean {
+): Promise<boolean> {
   const trimmed = branch.trim();
   if (!trimmed) {
     return false;
@@ -202,8 +213,8 @@ export function recreateWorktreeForExistingBranch(
 
   // Q1: the branch still exists → check it out into a fresh worktree. A missing
   // branch falls through to `false` (no Q2 new-branch creation).
-  if (runner.branchExists(mainRepoDir, trimmed)) {
-    runner.addWorktreeFromBranch(mainRepoDir, worktreePath, trimmed);
+  if (await runner.branchExists(mainRepoDir, trimmed)) {
+    await runner.addWorktreeFromBranch(mainRepoDir, worktreePath, trimmed);
     return true;
   }
 
@@ -211,53 +222,53 @@ export function recreateWorktreeForExistingBranch(
 }
 
 /** Remove a worktree (Q3). Caller decides whether failures are fatal. */
-export function removeWorktree(
+export async function removeWorktree(
   mainRepoDir: string,
   worktreePath: string,
   runner: GitGhRunner,
-): void {
-  runner.removeWorktree(mainRepoDir, worktreePath);
+): Promise<void> {
+  await runner.removeWorktree(mainRepoDir, worktreePath);
 }
 
 /**
- * Production {@link GitGhRunner}. Every git/gh invocation uses execFileSync
- * with an argv array (no shell) so untrusted branch names are passed as a
- * single literal argument and cannot inject shell metacharacters.
+ * Production {@link GitGhRunner}. Every git/gh invocation uses the async
+ * `execFile` with an argv array (no shell) so untrusted branch names are passed
+ * as a single literal argument and cannot inject shell metacharacters. Issue
+ * #227 (PR-4): async (not a synchronous exec) so a wedged subprocess never blocks
+ * the event loop. `execFile` buffers stdout/stderr (they are not inherited),
+ * which preserves the prior `stdio` behaviour — the expected "no such ref" /
+ * "no server" errors stay off the Supervisor's terminal and a failure surfaces
+ * git's message via the rejected error's `.stderr`.
  */
 export const realGitGhRunner: GitGhRunner = {
-  branchExists(mainRepoDir, branch) {
+  async branchExists(mainRepoDir, branch) {
     try {
       // Restrict to local *branch* refs so revision expressions like `HEAD~1`
       // or `@{-1}` are not mistaken for an existing branch (which would create
       // a detached-HEAD worktree). exit 0 iff refs/heads/<branch> resolves.
-      execFileSync(
-        "git",
-        [
-          "-C",
-          mainRepoDir,
-          "show-ref",
-          "--verify",
-          "--quiet",
-          `refs/heads/${branch}`,
-        ],
-        { stdio: "ignore" },
-      );
+      await execFileAsync("git", [
+        "-C",
+        mainRepoDir,
+        "show-ref",
+        "--verify",
+        "--quiet",
+        `refs/heads/${branch}`,
+      ]);
       return true;
     } catch {
       return false;
     }
   },
-  defaultBranch(mainRepoDir) {
+  async defaultBranch(mainRepoDir) {
     // Primary: GitHub default branch (issue Q2). `:owner/:repo` is resolved by
     // gh from the repo at cwd.
     try {
-      const out = execFileSync(
+      const { stdout } = await execFileAsync(
         "gh",
         ["api", "repos/:owner/:repo", "--jq", ".default_branch"],
-        { cwd: mainRepoDir, encoding: "utf8", stdio: ["ignore", "pipe", "ignore"] },
-      )
-        .toString()
-        .trim();
+        { cwd: mainRepoDir, encoding: "utf8" },
+      );
+      const out = stdout.trim();
       if (out) return out;
     } catch {
       // gh unavailable, not authenticated, or repo has no GitHub remote.
@@ -268,23 +279,21 @@ export const realGitGhRunner: GitGhRunner = {
     // gemini). The gh path above is already fork-safe; this only runs when gh
     // is unavailable.
     try {
-      const remotes = execFileSync("git", ["-C", mainRepoDir, "remote"], {
+      const { stdout } = await execFileAsync("git", ["-C", mainRepoDir, "remote"], {
         encoding: "utf8",
-        stdio: ["ignore", "pipe", "ignore"],
-      })
-        .toString()
+      });
+      const remotes = stdout
         .split("\n")
         .map((r) => r.trim())
         .filter(Boolean);
       const remote = remotes.includes("origin") ? "origin" : remotes[0];
       if (remote) {
-        const ref = execFileSync(
+        const { stdout: refOut } = await execFileAsync(
           "git",
           ["-C", mainRepoDir, "symbolic-ref", "--short", `refs/remotes/${remote}/HEAD`],
-          { encoding: "utf8", stdio: ["ignore", "pipe", "ignore"] },
-        )
-          .toString()
-          .trim();
+          { encoding: "utf8" },
+        );
+        const ref = refOut.trim();
         const prefix = `${remote}/`;
         if (ref.startsWith(prefix)) return ref.slice(prefix.length);
       }
@@ -293,42 +302,44 @@ export const realGitGhRunner: GitGhRunner = {
     }
     return "main";
   },
-  addWorktreeFromBranch(mainRepoDir, worktreePath, branch) {
-    // stderr is piped so a failure surfaces git's message in the thrown error.
-    execFileSync(
-      "git",
-      ["-C", mainRepoDir, "worktree", "add", worktreePath, branch],
-      { stdio: ["ignore", "pipe", "pipe"] },
-    );
+  async addWorktreeFromBranch(mainRepoDir, worktreePath, branch) {
+    // A failure surfaces git's message via the rejected error's `.stderr`.
+    await execFileAsync("git", [
+      "-C",
+      mainRepoDir,
+      "worktree",
+      "add",
+      worktreePath,
+      branch,
+    ]);
   },
-  addWorktreeNewBranch(mainRepoDir, worktreePath, branch, base) {
-    execFileSync(
-      "git",
-      [
-        "-C",
-        mainRepoDir,
-        "worktree",
-        "add",
-        "-b",
-        branch,
-        "--no-track",
-        worktreePath,
-        base,
-      ],
-      { stdio: ["ignore", "pipe", "pipe"] },
-    );
+  async addWorktreeNewBranch(mainRepoDir, worktreePath, branch, base) {
+    await execFileAsync("git", [
+      "-C",
+      mainRepoDir,
+      "worktree",
+      "add",
+      "-b",
+      branch,
+      "--no-track",
+      worktreePath,
+      base,
+    ]);
   },
-  removeWorktree(mainRepoDir, worktreePath) {
-    execFileSync(
-      "git",
-      ["-C", mainRepoDir, "worktree", "remove", worktreePath, "--force"],
-      { stdio: ["ignore", "pipe", "pipe"] },
-    );
+  async removeWorktree(mainRepoDir, worktreePath) {
+    await execFileAsync("git", [
+      "-C",
+      mainRepoDir,
+      "worktree",
+      "remove",
+      worktreePath,
+      "--force",
+    ]);
   },
   pathExists(path) {
     return existsSync(path);
   },
-  worktreeStatus(mainRepoDir, worktreePath) {
+  async worktreeStatus(mainRepoDir, worktreePath) {
     // Parse `git worktree list --porcelain`. Each worktree is a block of
     // newline-separated attribute lines, blocks separated by a blank line:
     //   worktree /abs/path
@@ -338,11 +349,14 @@ export const realGitGhRunner: GitGhRunner = {
     // worktree (Issue #158: residue / manual dir).
     let out: string;
     try {
-      out = execFileSync(
+      // Issue #227 (PR-4): async execFile so the worktree-list call never blocks
+      // the event loop. stderr is buffered (not inherited) = the old 2>/dev/null.
+      const { stdout } = await execFileAsync(
         "git",
         ["-C", mainRepoDir, "worktree", "list", "--porcelain"],
-        { encoding: "utf8", stdio: ["ignore", "pipe", "ignore"] },
-      ).toString();
+        { encoding: "utf8" },
+      );
+      out = stdout.toString();
     } catch {
       // Not a git repo / git unavailable → treat as unregistered (caller errors).
       return { registered: false };
