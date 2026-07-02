@@ -242,8 +242,10 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - name: Install tmux
-        run: sudo apt-get update && sudo apt-get install -y tmux
+      - name: Install tmux + jq
+        # jq is required by tests/e2e/fixtures/claude-mock.sh for safe JSON
+        # encoding of the relay POST (the session-lifecycle E2E step below).
+        run: sudo apt-get update && sudo apt-get install -y tmux jq
 
       - uses: oven-sh/setup-bun@v2
         with:
@@ -267,6 +269,20 @@ jobs:
           SUPERVISOR_DB_PATH: ":memory:"
           TMUX_PATH: /usr/bin/tmux
         run: bun test tests/e2e/ac-verification.test.ts tests/session/relay.test.ts tests/e2e/dialog-stall.test.ts
+        working-directory: supervisor
+
+      # Supervisor ↔ tmux session lifecycle E2E (Issue #144 / #273). Runs as its
+      # OWN `bun test` process — same isolation rationale as the mock-isolated
+      # session tests above. The env below is what makes the suite ACTUALLY run
+      # (it self-skips without both vars). Test-only socket `claude-hub-test`
+      # keeps it isolated from any prod `claude-hub` server (RW-019).
+      - name: Run session lifecycle E2E
+        env:
+          SUPERVISOR_DB_PATH: ":memory:"
+          TMUX_PATH: /usr/bin/tmux
+          SUPERVISOR_TMUX_SOCKET: claude-hub-test
+          SUPERVISOR_CLAUDE_PATH: ${{ github.workspace }}/supervisor/tests/e2e/fixtures/claude-mock.sh
+        run: bun test tests/e2e/session-lifecycle.test.ts
         working-directory: supervisor
 
   # Local-only tests (require tmux/Claude CLI or local config):

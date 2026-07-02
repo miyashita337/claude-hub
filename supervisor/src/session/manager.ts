@@ -40,8 +40,20 @@ import {
 } from "./self-heal";
 import { compactClaudeHubExit } from "./primary-compact";
 
-const CLAUDE_PATH = resolve(homedir(), ".local", "bin", "claude");
+const DEFAULT_CLAUDE_PATH = resolve(homedir(), ".local", "bin", "claude");
 const TMUX_SESSION_PREFIX = "claude-";
+
+/**
+ * Resolve the `claude` executable path at use-time (not module-load-time) so the
+ * lifecycle E2E (Issue #144/#273) can point it at `fixtures/claude-mock.sh` via
+ * `SUPERVISOR_CLAUDE_PATH` set on the `bun test` process. `SUPERVISOR_CLAUDE_PATH`
+ * is operator-controlled (same trust level as `SUPERVISOR_TMUX_SOCKET`); callers
+ * embed the result quoted in the tmux command line so paths with spaces are safe.
+ */
+function claudePath(): string {
+  const envPath = process.env.SUPERVISOR_CLAUDE_PATH;
+  return envPath && envPath.length > 0 ? resolve(envPath) : DEFAULT_CLAUDE_PATH;
+}
 
 /**
  * Non-empty intent for an auto-compact (Issue #206). RW-032: a bare `/compact`
@@ -424,6 +436,15 @@ export class SessionManager {
   }
 
   private tmuxSessionName(threadId: string): string {
+    return SessionManager.tmuxSessionNameFor(threadId);
+  }
+
+  /**
+   * Public, deterministic mapping from threadId → tmux session name. Exposed so
+   * callers (e.g. the lifecycle E2E, Issue #144/#273) don't re-derive the
+   * `claude-<threadId12>` formula and silently break when it changes.
+   */
+  static tmuxSessionNameFor(threadId: string): string {
     // Use a short prefix + first 12 chars of threadId for tmux session name
     return `${TMUX_SESSION_PREFIX}${threadId.slice(0, 12)}`;
   }
@@ -541,7 +562,9 @@ export class SessionManager {
       // `--session-id <uuid>` only on fresh start; resume uses `--resume <id>`
       // (the two are mutually exclusive). claudeSessionId is a randomUUID() so
       // it is shell-safe to embed here.
-      `exec ${CLAUDE_PATH} --session-id ${claudeSessionId} ${buildClaudeFlags(config).join(" ")}`,
+      // Quote claudePath() so SUPERVISOR_CLAUDE_PATH values containing spaces
+      // (e.g. a test fixture under "/Users/Test User/...") don't word-split.
+      `exec "${claudePath()}" --session-id ${claudeSessionId} ${buildClaudeFlags(config).join(" ")}`,
     ].join(" && ");
 
     // Launch via tmux (provides a real TTY). Uses Supervisor's dedicated
@@ -791,7 +814,8 @@ export class SessionManager {
       `mkdir -p "${relayUrlDir}"`,
       `printf "%s" "${relayUrl}" > "${relayUrlFile}"`,
       `cd "${projectDir}"`,
-      `exec ${CLAUDE_PATH} ${resumeFlags.join(" ")}`,
+      // Quote claudePath() (space-safe); resume path mirrors start's exec above.
+      `exec "${claudePath()}" ${resumeFlags.join(" ")}`,
     ].join(" && ");
 
     await this.effects.tmux.newSession(tmuxName, claudeCmd);
