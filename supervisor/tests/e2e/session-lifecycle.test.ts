@@ -126,7 +126,11 @@ beforeAll(async () => {
 afterAll(async () => {
   if (!enabled) return;
   try {
-    await manager.shutdownAll();
+    // Guard: beforeAll may have thrown before `manager` was assigned (e.g. the
+    // SessionManager constructor failing), leaving it undefined here (gemini
+    // PR #274 review). shutdownAll is still best-effort; the tmux kill below runs
+    // regardless so a half-initialised run can't leak the test server.
+    if (manager) await manager.shutdownAll();
   } catch {
     // best-effort; still kill the tmux server below.
   }
