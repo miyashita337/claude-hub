@@ -240,11 +240,11 @@ export async function startBot(token: string): Promise<void> {
   // corp #52 M3 (spec §7): auto-stop dispatch-origin sessions (branch
   // `corp-dispatch-<N>`) once their Issue carries the `done` label, after a
   // grace window the chairman can cancel by speaking. Frees the shared session
-  // slot on goal completion instead of waiting for the 7-day reaper.
+  // slot on goal completion instead of waiting for the idle reaper.
   const goalWatcher = new GoalWatcher(sessionManager, client);
   // Issue #209: nudge the owner when a live session has been running for hours
   // (long_lived, AC3) or has gone silent (quiet, AC1) — the gap between the
-  // per-turn stall heartbeat and the 7-day reaper. De-dup is internal so each
+  // per-turn stall heartbeat and the idle reaper. De-dup is internal so each
   // signal pages at most once per episode.
   const activityWatchdog = new ActivityWatchdog({
     entries: () => sessionManager.entries(),

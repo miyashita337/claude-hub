@@ -49,8 +49,11 @@ export class Reaper {
         | undefined;
 
       if (thread?.isThread()) {
+        // Derive the day count from IDLE_TIMEOUT_MS so the message never drifts
+        // out of sync with the constant (it used to hardcode "7日").
+        const idleDays = Math.round(IDLE_TIMEOUT_MS / 1000 / 60 / 60 / 24);
         await thread.send(
-          `⏰ 7日間無操作のためセッションを自動終了しました。`
+          `⏰ ${idleDays}日間無操作のためセッションを自動終了しました。`
         );
 
         // Rename and archive. markTitleStopped also handles ♻️ resume threads,
