@@ -16,6 +16,7 @@ import {
 } from "./session/self-heal-restart";
 import { Reaper } from "./session/reaper";
 import { GoalWatcher } from "./session/goal-watcher";
+import { OrphanDispatchReaper } from "./session/orphan-dispatch-reaper";
 import { ActivityWatchdog } from "./session/session-activity-watchdog";
 import { ResourceMonitor } from "./session/resource-monitor";
 import { createSessionCommand, createSessionHandler } from "./commands/session";
@@ -242,6 +243,15 @@ export async function startBot(token: string): Promise<void> {
   // grace window the chairman can cancel by speaking. Frees the shared session
   // slot on goal completion instead of waiting for the idle reaper.
   const goalWatcher = new GoalWatcher(sessionManager, client);
+  // Issue #275 (option B): the self-contained claude-hub half of the dispatch
+  // lifecycle gap. A dispatch session (branch `corp-dispatch-<N>`) whose spawning
+  // corp CEO session exited but which never reached `done` is orphaned —
+  // GoalWatcher (done-only) skips it and the 30-day idle Reaper is far too slow,
+  // so it squats a MAX_SESSIONS slot (executor saturation). The supervisor cannot
+  // observe the corp CEO exit (corp is a separate process posting /dispatch
+  // messages), so this idle-based safety net reaps dispatch sessions idle past
+  // DISPATCH_ORPHAN_IDLE_MS while sparing any that are still actively working.
+  const orphanDispatchReaper = new OrphanDispatchReaper(sessionManager, client);
   // Issue #209: nudge the owner when a live session has been running for hours
   // (long_lived, AC3) or has gone silent (quiet, AC1) — the gap between the
   // per-turn stall heartbeat and the idle reaper. De-dup is internal so each
@@ -332,6 +342,7 @@ export async function startBot(token: string): Promise<void> {
 
     reaper.start();
     goalWatcher.start();
+    orphanDispatchReaper.start();
     activityWatchdog.start();
     resourceMonitor.start();
 
@@ -926,6 +937,7 @@ export async function startBot(token: string): Promise<void> {
     console.log("[Bot] Shutdown signal received");
     reaper.stop();
     goalWatcher.stop();
+    orphanDispatchReaper.stop();
     activityWatchdog.stop();
     resourceMonitor.stop();
     // Drain pending progress buffers before tearing down the Discord client

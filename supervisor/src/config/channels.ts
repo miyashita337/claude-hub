@@ -158,3 +158,14 @@ export const MAX_MEMORY_PER_SESSION_MB = 2048; // 2GB
 // chairman time to cancel by speaking in the thread before teardown.
 export const GOAL_CHECK_INTERVAL_MS = 2 * 60 * 1000; // 2 minutes
 export const GOAL_GRACE_MS = 3 * 60 * 1000; // 3 minutes
+// OrphanDispatchReaper (Issue #275, option B): a dispatch-origin session
+// (`corp-dispatch-<N>`) whose spawning corp CEO session exited but which never
+// reached `done` is orphaned — GoalWatcher (done-only) skips it and the 30-day
+// IDLE_TIMEOUT_MS reaper is far too slow, so it squats a MAX_SESSIONS slot
+// (executor saturation). This gives dispatch sessions a much shorter idle leash
+// than IDLE_TIMEOUT_MS while leaving human / interactive sessions on the 30-day
+// reaper. Idle-based only: an actively-working dispatch session keeps
+// `lastActivityAt` fresh (bot.ts touchActivity), so it is spared (#275 AC2). The
+// idle threshold is env-overridable (`DISPATCH_ORPHAN_IDLE_MS`) for ops tuning.
+export const DISPATCH_ORPHAN_IDLE_MS = 48 * 60 * 60 * 1000; // 48 hours
+export const DISPATCH_ORPHAN_CHECK_INTERVAL_MS = 30 * 60 * 1000; // 30 minutes
