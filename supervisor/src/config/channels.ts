@@ -147,7 +147,7 @@ if (CHANNEL_MAP.has("claude-hub")) {
 }
 
 export const MAX_SESSIONS = 10;
-export const IDLE_TIMEOUT_MS = 7 * 24 * 60 * 60 * 1000; // 7 days
+export const IDLE_TIMEOUT_MS = 30 * 24 * 60 * 60 * 1000; // 30 days
 export const IDLE_CHECK_INTERVAL_MS = 60 * 60 * 1000; // 1 hour
 export const GRACEFUL_KILL_TIMEOUT_MS = 15_000; // 15 seconds
 export const RESOURCE_CHECK_INTERVAL_MS = 30_000; // 30 seconds

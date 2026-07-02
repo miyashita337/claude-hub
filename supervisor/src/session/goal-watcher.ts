@@ -98,7 +98,7 @@ async function realFetchIssueLabels(
  * (`corp-dispatch-<N>`), and when the Issue carries the `done` label it stops
  * the session with reason `goal_complete` after a cancellable grace window. This
  * is the L4 saturation fix: completed dispatch sessions free their slot instead
- * of idling until the 7-day reaper.
+ * of idling until the idle reaper.
  *
  * Self-contained per spec §12 (no new corp→claude-hub structural coupling): it
  * reads only the branch naming convention + GitHub labels and reuses the
@@ -239,7 +239,7 @@ export class GoalWatcher {
       await this.sessionManager.stop(threadId, "goal_complete");
     } catch (err) {
       // Leave the thread untouched if the stop itself failed; the next tick (or
-      // the 7-day reaper) retries.
+      // the idle reaper) retries.
       console.error(`[GoalWatcher] Failed to stop ${threadId}:`, err);
       return;
     }
