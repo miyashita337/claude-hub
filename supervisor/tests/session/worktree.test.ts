@@ -6,6 +6,7 @@ import {
   recreateWorktreeForExistingBranch,
   resolveWorktreePath,
   WORKTREE_SUBDIR,
+  DEFAULT_REMOTE,
   type GitGhRunner,
   type WorktreeStatus,
 } from "../../src/session/worktree";
@@ -33,6 +34,17 @@ class FakeRunner implements GitGhRunner {
   defaultBranchName = "main";
   calls: string[] = [];
 
+  // Issue #277: model a stale local default branch vs. a fresh remote tip so a
+  // test can assert the new worktree's HEAD equals origin/<default> (behind=0).
+  // `git fetch` advances the remote-tracking ref to `remoteHead`; a base of
+  // `origin/<default>` resolves to `remoteHead`, a base of the bare local
+  // `<default>` resolves to the stale `localHead`.
+  localHead = "STALE_LOCAL_SHA";
+  remoteHead = "FRESH_ORIGIN_SHA";
+  fetchShouldFail = false;
+  // worktree path → the commit SHA its HEAD points at (set by add* methods).
+  heads = new Map<string, string>();
+
   async branchExists(_dir: string, branch: string): Promise<boolean> {
     this.calls.push(`branchExists:${branch}`);
     return this.branches.has(branch);
@@ -40,6 +52,13 @@ class FakeRunner implements GitGhRunner {
   async defaultBranch(_dir: string): Promise<string> {
     this.calls.push(`defaultBranch`);
     return this.defaultBranchName;
+  }
+  async fetchRemoteBranch(_dir: string, remote: string, branch: string): Promise<void> {
+    this.calls.push(`fetch:${remote}:${branch}`);
+    if (this.fetchShouldFail) {
+      throw new Error(`fatal: unable to access '${remote}': network down`);
+    }
+    // A successful fetch means `origin/<branch>` now resolves to the fresh tip.
   }
   async addWorktreeFromBranch(_dir: string, path: string, branch: string): Promise<void> {
     this.calls.push(`addFromBranch:${branch}`);
@@ -56,6 +75,9 @@ class FakeRunner implements GitGhRunner {
     this.calls.push(`addNewBranch:${branch}:${base}`);
     this.existing.add(path);
     this.statuses.set(path, { registered: true, branch });
+    // Resolve the base ref to the SHA the new HEAD would point at: a remote
+    // `origin/<x>` base lands on the fetched tip; a bare local base is stale.
+    this.heads.set(path, base.startsWith(`${DEFAULT_REMOTE}/`) ? this.remoteHead : this.localHead);
   }
   async removeWorktree(_dir: string, path: string): Promise<void> {
     this.calls.push(`remove:${path}`);
@@ -120,14 +142,58 @@ describe("ensureWorktree", () => {
     runner = new FakeRunner();
   });
 
-  test("AC-1: unknown branch → creates worktree from default branch", async () => {
+  test("AC-1: unknown branch → creates worktree from origin/<default> (Issue #277)", async () => {
     runner.defaultBranchName = "main";
     const result = await ensureWorktree(REPO, "feature-foo", runner);
 
     expect(result.reused).toBe(false);
-    expect(result.baseBranch).toBe("main");
+    // Base is the freshly-fetched REMOTE tip, not the bare local default.
+    expect(result.baseBranch).toBe("origin/main");
     expect(result.path).toBe(resolve(REPO, WORKTREE_SUBDIR, "feature-foo"));
-    expect(runner.calls).toContain("addNewBranch:feature-foo:main");
+    expect(runner.calls).toContain("addNewBranch:feature-foo:origin/main");
+  });
+
+  test("#277 AC-1: new-branch worktree HEAD equals origin/main (behind=0), fetched BEFORE add", async () => {
+    // Simulate a stale local main that lags origin/main (the #258 scenario).
+    runner.defaultBranchName = "main";
+    runner.localHead = "STALE_LOCAL_SHA";
+    runner.remoteHead = "FRESH_ORIGIN_SHA";
+
+    const result = await ensureWorktree(REPO, "corp-dispatch-277", runner);
+
+    // The worktree HEAD must land on the fresh origin tip → behind origin/main = 0.
+    expect(runner.heads.get(result.path)).toBe(runner.remoteHead);
+    expect(runner.heads.get(result.path)).not.toBe(runner.localHead);
+    // A fetch of origin/main must have happened, and BEFORE the worktree add
+    // (otherwise the base ref would still be stale).
+    const fetchIdx = runner.calls.indexOf(`fetch:${DEFAULT_REMOTE}:main`);
+    const addIdx = runner.calls.findIndex((c) => c.startsWith("addNewBranch"));
+    expect(fetchIdx).toBeGreaterThanOrEqual(0);
+    expect(addIdx).toBeGreaterThanOrEqual(0);
+    expect(fetchIdx).toBeLessThan(addIdx);
+  });
+
+  test("#277 AC-2: git fetch failure warns LOUDLY and does not silently continue", async () => {
+    runner.defaultBranchName = "main";
+    runner.fetchShouldFail = true;
+
+    const warnings: string[] = [];
+    const origWarn = console.warn;
+    console.warn = (...args: unknown[]) => {
+      warnings.push(args.map((a) => String(a)).join(" "));
+    };
+    let result;
+    try {
+      result = await ensureWorktree(REPO, "corp-dispatch-277", runner);
+    } finally {
+      console.warn = origWarn;
+    }
+
+    // Loud: a warning mentioning the failed fetch + stale-base risk is emitted.
+    expect(warnings.some((w) => /fetch/i.test(w) && /stale/i.test(w))).toBe(true);
+    // Not a hard block: it still creates the worktree on the best-available base.
+    expect(runner.calls).toContain("addNewBranch:corp-dispatch-277:origin/main");
+    expect(result?.baseBranch).toBe("origin/main");
   });
 
   test("Q1: existing branch → checkout into worktree (no new branch)", async () => {
@@ -207,8 +273,10 @@ describe("ensureWorktree", () => {
   test("uses dynamic default branch (Q2: master/develop mixed repos)", async () => {
     runner.defaultBranchName = "develop";
     const result = await ensureWorktree(REPO, "new-feat", runner);
-    expect(result.baseBranch).toBe("develop");
-    expect(runner.calls).toContain("addNewBranch:new-feat:develop");
+    // Base tracks the remote tip of the dynamic default branch (Issue #277).
+    expect(result.baseBranch).toBe("origin/develop");
+    expect(runner.calls).toContain("fetch:origin:develop");
+    expect(runner.calls).toContain("addNewBranch:new-feat:origin/develop");
   });
 
   test("AC-4: empty / whitespace branch throws", async () => {
