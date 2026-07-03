@@ -17,8 +17,10 @@ const execFileAsync = promisify(execFile);
  *
  * Design decisions (issue body):
  *   Q1 existing branch  → `git worktree add <path> <branch>` (checkout)
- *   Q2 unknown branch   → base = repo default branch, `git worktree add -b
- *                          <branch> --no-track <path> <base>`
+ *   Q2 unknown branch   → fetch `origin/<default>`, then base = `origin/<default>`,
+ *                          `git worktree add -b <branch> --no-track <path>
+ *                          origin/<default>` (Issue #277: base on the freshly
+ *                          fetched remote tip, not a stale local default branch)
  *   Q4 existing worktree → reuse as-is (idempotent, multi-session continue)
  *
  * Low-level git/gh calls go through {@link GitGhRunner} so the branching logic
@@ -36,6 +38,13 @@ const execFileAsync = promisify(execFile);
 
 /** Subdirectory (relative to the main repo) that holds per-branch worktrees. */
 export const WORKTREE_SUBDIR = ".claude/worktrees";
+
+/**
+ * Remote a new-branch worktree is fetched from / based on (Issue #277). corp
+ * dispatch satellites are all `origin`-remote clones, matching the issue's
+ * `git worktree add -b <branch> --no-track <path> origin/main` prescription.
+ */
+export const DEFAULT_REMOTE = "origin";
 
 /**
  * Result of inspecting an on-disk path for Q4 reuse (Issue #158).
@@ -59,6 +68,13 @@ export interface GitGhRunner {
   branchExists(mainRepoDir: string, branch: string): Promise<boolean>;
   /** Repo default branch (Q2 base for new branches). Falls back to "main". */
   defaultBranch(mainRepoDir: string): Promise<string>;
+  /**
+   * `git fetch <remote> <branch>` — refresh the remote-tracking ref before a
+   * new-branch worktree is cut from it (Issue #277). Rejects (loudly) on
+   * failure so the Q2 path can warn instead of silently basing a worktree on a
+   * stale `<remote>/<branch>`.
+   */
+  fetchRemoteBranch(mainRepoDir: string, remote: string, branch: string): Promise<void>;
   /** `git worktree add <worktreePath> <branch>` (existing branch, Q1). */
   addWorktreeFromBranch(
     mainRepoDir: string,
@@ -176,8 +192,29 @@ export async function ensureWorktree(
     return { path: worktreePath, reused: false };
   }
 
-  // Q2: unknown branch → create from the repo's default branch.
-  const base = await runner.defaultBranch(mainRepoDir);
+  // Q2: unknown branch → create from the FRESHLY-FETCHED remote default branch
+  // (Issue #277). Previously the base was the *local* default branch, which for
+  // corp dispatch worktrees could lag `origin/main` by many commits (never
+  // fetched before the worktree was cut). A session then ran on a stale base and
+  // could not see merged work. Fetch `origin/<default>` first, then base the new
+  // branch on `origin/<default>` so its HEAD equals the remote tip (behind = 0).
+  const defaultBranch = await runner.defaultBranch(mainRepoDir);
+  try {
+    await runner.fetchRemoteBranch(mainRepoDir, DEFAULT_REMOTE, defaultBranch);
+  } catch (err) {
+    // LOUD, never silent: warn that the base may be stale rather than quietly
+    // cutting a worktree from an un-refreshed remote-tracking ref (Issue #277
+    // AC-2). We still proceed on the best-available `origin/<default>` (a later
+    // `git worktree add` will itself fail loudly if that ref is absent), so a
+    // transient network blip does not hard-block a session start.
+    const reason = err instanceof Error ? err.message : String(err);
+    console.warn(
+      `[worktree] git fetch ${DEFAULT_REMOTE} ${defaultBranch} failed for ${mainRepoDir}: ${reason}. ` +
+        `New worktree for branch '${trimmed}' may be based on a STALE ${DEFAULT_REMOTE}/${defaultBranch} ` +
+        `— merged work could be invisible to this session.`,
+    );
+  }
+  const base = `${DEFAULT_REMOTE}/${defaultBranch}`;
   await runner.addWorktreeNewBranch(mainRepoDir, worktreePath, trimmed, base);
   return { path: worktreePath, reused: false, baseBranch: base };
 }
@@ -301,6 +338,20 @@ export const realGitGhRunner: GitGhRunner = {
       // No remote / no <remote>/HEAD configured.
     }
     return "main";
+  },
+  async fetchRemoteBranch(mainRepoDir, remote, branch) {
+    // Issue #277: refresh `<remote>/<branch>` before a new-branch worktree is
+    // cut from it. argv array (no shell) so `remote`/`branch` are literal args
+    // and cannot inject metacharacters. A failure rejects with git's message via
+    // the error's `.stderr`; ensureWorktree's Q2 catch turns that into a loud
+    // warning instead of silently continuing on a stale base.
+    await execFileAsync("git", [
+      "-C",
+      mainRepoDir,
+      "fetch",
+      remote,
+      branch,
+    ]);
   },
   async addWorktreeFromBranch(mainRepoDir, worktreePath, branch) {
     // A failure surfaces git's message via the rejected error's `.stderr`.
