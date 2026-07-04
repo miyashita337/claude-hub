@@ -26,7 +26,13 @@ function stub(name: string, body: string): string {
 describe("FakeExecutorAdapter", () => {
   test("records argv/cwd/env and fires onSpawn with a pid", async () => {
     const fake = new FakeExecutorAdapter();
-    fake.result = { exitCode: 0, stdout: "hi", stderr: "", timedOut: false };
+    fake.result = {
+      exitCode: 0,
+      stdout: "hi",
+      stderr: "",
+      timedOut: false,
+      durationMs: 5,
+    };
     const pids: number[] = [];
 
     const r = await fake.runHeadless({
@@ -89,6 +95,8 @@ describe("realExecutorAdapter (Bun.spawn)", () => {
     expect(r.timedOut).toBe(false);
     expect(r.stdout).toBe("hello-stdout");
     expect(pid).toBeGreaterThan(0);
+    // Wall-clock duration is measured and non-negative (#289).
+    expect(r.durationMs).toBeGreaterThanOrEqual(0);
   });
 
   test("surfaces a non-zero exit code as data (not a throw)", async () => {

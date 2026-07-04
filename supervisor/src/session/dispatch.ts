@@ -228,12 +228,17 @@ export interface DispatchSessionManager {
    * the captured output. Optional so a tmux-only fake still satisfies the
    * interface; {@link runDispatch} verifies it is present before taking the
    * headless branch (no silent fallback).
+   *
+   * `issueNumber` (Epic #75 Phase 4 / #289) is the target Issue the run posts
+   * its "Dispatch 実行レポート" comment to on completion; it is threaded through
+   * so the manager can post from the worktree cwd before teardown.
    */
   runHeadless?(
     config: unknown,
     threadId: string,
     initialCommand: string,
     branch?: string,
+    issueNumber?: number,
   ): Promise<DispatchHeadlessOutcome>;
 }
 
@@ -423,6 +428,7 @@ async function runDispatchHeadless(
       threadId,
       initialCommand,
       branch,
+      issueNumber,
     );
   } catch (err) {
     // Spawn / worktree failure — surface to the thread AND the caller.

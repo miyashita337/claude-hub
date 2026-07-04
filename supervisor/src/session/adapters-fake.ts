@@ -2,6 +2,7 @@ import type {
   ExecutorAdapter,
   HeadlessRunOptions,
   HeadlessRunResult,
+  IssueReporterAdapter,
   ItermAdapter,
   ProcessAdapter,
   RelayServerAdapter,
@@ -202,6 +203,7 @@ export class FakeExecutorAdapter implements ExecutorAdapter {
     stdout: "",
     stderr: "",
     timedOut: false,
+    durationMs: 0,
   };
   /** pid handed to onSpawn (incremented per call so concurrent runs differ). */
   spawnPid = 20_000;
@@ -220,6 +222,24 @@ export class FakeExecutorAdapter implements ExecutorAdapter {
   }
 }
 
+export class FakeIssueReporterAdapter implements IssueReporterAdapter {
+  /** Every postComment() call, so tests assert the report body / cwd / issue. */
+  postCommentCalls: { cwd: string; issueNumber: number; body: string }[] = [];
+  /** When set, postComment throws to simulate a `gh` failure (fail-soft path). */
+  failOnPost = false;
+
+  async postComment(opts: {
+    cwd: string;
+    issueNumber: number;
+    body: string;
+  }): Promise<void> {
+    this.postCommentCalls.push(opts);
+    if (this.failOnPost) {
+      throw new Error("gh issue comment failed");
+    }
+  }
+}
+
 export interface FakeSessionEffects extends SessionEffects {
   tmux: FakeTmuxAdapter;
   iterm2: FakeItermAdapter;
@@ -227,6 +247,7 @@ export interface FakeSessionEffects extends SessionEffects {
   process: FakeProcessAdapter;
   worktree: FakeWorktreeAdapter;
   executor: FakeExecutorAdapter;
+  issueReporter: FakeIssueReporterAdapter;
 }
 
 export function createFakeEffects(): FakeSessionEffects {
@@ -237,5 +258,6 @@ export function createFakeEffects(): FakeSessionEffects {
     process: new FakeProcessAdapter(),
     worktree: new FakeWorktreeAdapter(),
     executor: new FakeExecutorAdapter(),
+    issueReporter: new FakeIssueReporterAdapter(),
   };
 }

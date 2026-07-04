@@ -121,6 +121,23 @@ headless の argv は `buildHeadlessClaudeFlags()`（`supervisor/src/session/man
 - bot 側: `[Bot] Headless dispatch completed in channel <ch> (thread=..., exit=..., timedOut=...)`
 - 非ゼロ exit / タイムアウト / exit 0 だが stdout 空 は、いずれも**スレッドに明示投稿**する（サイレント成功にしない）。
 
+### 実行レポートコメント（Issue #289 / corp #75 Phase 4）
+
+headless 実行の完了時、対象 Issue へ実行レポートを `gh issue comment` で投稿する（部署 worktree cwd から実行）。これは **corp reconcile が parse する契約**（corp #76 が対向実装）で、見出しと `- key: value` 行の形を機械的に維持する:
+
+```
+## Dispatch 実行レポート
+
+- tokens: <合計 output tokens／取得不能なら行ごと省略>
+- duration_ms: <実行時間（wall-clock, ms）>
+- exit_code: <claude -p の exit code／kill/timeout 時は null>
+```
+
+- tokens は `claude -p --output-format json` の `usage.output_tokens` から取得（実行検証済み・v2.1.201）。取得できない（JSON parse 失敗等）場合は **tokens 行を省略**し捏造しない。`0` は実値として出力する。
+- 投稿失敗は **fail-soft**: `[SessionManager] Failed to post dispatch report ...` を warn ログに残し、セッション終端・実行結果は巻き込まない。
+- headless モード時のみ。tmux 経路には投稿しない。
+- 契約の単一 source: `supervisor/src/session/dispatch-report.ts`（`formatDispatchReport`）。
+
 ### 段階導入（WARN-first dogfood の写像）
 
 1. `DISPATCH_EXECUTOR_MODE=headless` を opt-in で有効化し、agent-base 向け dispatch（no-template / pdca）で数日 dogfood。

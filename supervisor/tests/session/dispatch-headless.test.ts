@@ -23,14 +23,15 @@ function harness(
     threadId: string;
     initialCommand: string;
     branch?: string;
+    issueNumber?: number;
   }> = [];
   const posts: Array<{ threadId: string; content: string }> = [];
   const manager: DispatchSessionManager = {
     start: async () => ({}),
     waitForInputReady: async () => true,
     sendMessage: async () => ({}),
-    runHeadless: async (_c, threadId, initialCommand, branch) => {
-      runHeadlessCalls.push({ threadId, initialCommand, branch });
+    runHeadless: async (_c, threadId, initialCommand, branch, issueNumber) => {
+      runHeadlessCalls.push({ threadId, initialCommand, branch, issueNumber });
       return typeof outcome === "function" ? outcome() : outcome;
     },
   };
@@ -81,7 +82,13 @@ describe("runDispatch headless", () => {
       expect(r.timedOut).toBe(false);
     }
     expect(runHeadlessCalls).toEqual([
-      { threadId: "thread-h", initialCommand: "/impl 42", branch: "corp-dispatch-42" },
+      {
+        threadId: "thread-h",
+        initialCommand: "/impl 42",
+        branch: "corp-dispatch-42",
+        // issueNumber threaded through so the manager posts the report (#289).
+        issueNumber: 42,
+      },
     ]);
     // A start notice, then the stdout, both to the created thread.
     expect(posts.length).toBeGreaterThanOrEqual(2);
