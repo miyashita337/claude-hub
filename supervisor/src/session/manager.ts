@@ -231,9 +231,25 @@ function headlessTimeoutMs(): number {
  * `initialCommand` is the first prompt (e.g. `/impl 42`) — a fixed literal built
  * from the validated selector + issue number, never free user text.
  */
+/**
+ * Resolve the dispatch model override (corp #81 Phase 6 / #298). Returns the
+ * trimmed `DISPATCH_CLAUDE_MODEL` value, or undefined when unset / blank /
+ * whitespace-only (all treated as "no override" → the environment's default
+ * model, current behaviour). No validation of the id here: an invalid model is
+ * surfaced by the run's non-zero exit (posted to the thread), NOT silently fixed
+ * up (#298 — no silent fallback).
+ */
+export function resolveDispatchModel(
+  env: Record<string, string | undefined> = process.env,
+): string | undefined {
+  const trimmed = env.DISPATCH_CLAUDE_MODEL?.trim();
+  return trimmed ? trimmed : undefined;
+}
+
 export function buildHeadlessClaudeFlags(
   config: ChannelConfig,
   initialCommand: string,
+  model?: string,
 ): string[] {
   const args = [
     "-p",
@@ -256,6 +272,15 @@ export function buildHeadlessClaudeFlags(
   if (profile === "none") {
     // Raw JSON (no surrounding quotes): argv is passed literally, no shell.
     args.push("--strict-mcp-config", "--mcp-config", '{"mcpServers":{}}');
+  }
+
+  // corp #81 Phase 6 (#298): pin the model only when explicitly requested. Absent
+  // → no `--model`, so the environment default is used (behaviour unchanged).
+  // `--model <model>` verified against `claude --help` (v2.1.201). Trim guards a
+  // whitespace-only value passed directly.
+  const trimmedModel = model?.trim();
+  if (trimmedModel) {
+    args.push("--model", trimmedModel);
   }
 
   return args;
@@ -902,7 +927,11 @@ export class SessionManager {
       const sessionId = randomUUID();
       const claudeSessionId = randomUUID();
       const args = [
-        ...buildHeadlessClaudeFlags(config, initialCommand),
+        ...buildHeadlessClaudeFlags(
+          config,
+          initialCommand,
+          resolveDispatchModel(),
+        ),
         // Pin the session id like launchStart so the DB row captures it
         // deterministically (Issue #167). randomUUID() is shell-safe, though
         // there is no shell here.

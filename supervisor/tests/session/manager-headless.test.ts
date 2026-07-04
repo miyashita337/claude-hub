@@ -2,7 +2,11 @@ import { test, expect, describe, beforeEach, afterEach } from "bun:test";
 import { mkdirSync } from "fs";
 import { tmpdir } from "os";
 import { resolve } from "path";
-import { SessionManager } from "../../src/session/manager";
+import {
+  SessionManager,
+  buildHeadlessClaudeFlags,
+  resolveDispatchModel,
+} from "../../src/session/manager";
 import {
   createFakeEffects,
   FakeExecutorAdapter,
@@ -257,5 +261,58 @@ describe("SessionManager.runHeadless", () => {
     expect(mgr.count()).toBe(0);
     expect(mgr.has("thread-fail")).toBe(false);
     await mgr.shutdownAll();
+  });
+
+  // corp #81 Phase 6 / #298: DISPATCH_CLAUDE_MODEL → headless --model.
+  describe("DISPATCH_CLAUDE_MODEL model override (#298)", () => {
+    test("resolveDispatchModel trims and treats blank/whitespace as unset", () => {
+      expect(resolveDispatchModel({})).toBeUndefined();
+      expect(resolveDispatchModel({ DISPATCH_CLAUDE_MODEL: "" })).toBeUndefined();
+      expect(resolveDispatchModel({ DISPATCH_CLAUDE_MODEL: "   " })).toBeUndefined();
+      expect(
+        resolveDispatchModel({ DISPATCH_CLAUDE_MODEL: "claude-opus-4-8" }),
+      ).toBe("claude-opus-4-8");
+      expect(
+        resolveDispatchModel({ DISPATCH_CLAUDE_MODEL: "  claude-opus-4-8  " }),
+      ).toBe("claude-opus-4-8");
+    });
+
+    test("buildHeadlessClaudeFlags adds --model <value> only when a model is given", () => {
+      const withModel = buildHeadlessClaudeFlags(config, "/impl 1", "claude-opus-4-8");
+      const i = withModel.indexOf("--model");
+      expect(i).toBeGreaterThanOrEqual(0);
+      expect(withModel[i + 1]).toBe("claude-opus-4-8");
+
+      // Unset / empty / whitespace-only → no --model (default model, unchanged).
+      expect(buildHeadlessClaudeFlags(config, "/impl 1")).not.toContain("--model");
+      expect(buildHeadlessClaudeFlags(config, "/impl 1", "")).not.toContain("--model");
+      expect(buildHeadlessClaudeFlags(config, "/impl 1", "   ")).not.toContain("--model");
+    });
+
+    test("runHeadless passes --model through when DISPATCH_CLAUDE_MODEL is set (fake adapter argv)", async () => {
+      const prev = process.env.DISPATCH_CLAUDE_MODEL;
+      process.env.DISPATCH_CLAUDE_MODEL = "claude-opus-4-8";
+      try {
+        await manager.runHeadless(config, "thread-model", "/impl 1", "corp-dispatch-1");
+        const call = effects.executor.runHeadlessCalls[0]!;
+        const i = call.args.indexOf("--model");
+        expect(i).toBeGreaterThanOrEqual(0);
+        expect(call.args[i + 1]).toBe("claude-opus-4-8");
+      } finally {
+        if (prev === undefined) delete process.env.DISPATCH_CLAUDE_MODEL;
+        else process.env.DISPATCH_CLAUDE_MODEL = prev;
+      }
+    });
+
+    test("runHeadless omits --model when DISPATCH_CLAUDE_MODEL is unset (default unchanged)", async () => {
+      const prev = process.env.DISPATCH_CLAUDE_MODEL;
+      delete process.env.DISPATCH_CLAUDE_MODEL;
+      try {
+        await manager.runHeadless(config, "thread-nomodel", "/impl 1", "corp-dispatch-1");
+        expect(effects.executor.runHeadlessCalls[0]!.args).not.toContain("--model");
+      } finally {
+        if (prev !== undefined) process.env.DISPATCH_CLAUDE_MODEL = prev;
+      }
+    });
   });
 });
