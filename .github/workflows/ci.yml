@@ -151,6 +151,7 @@ jobs:
                    tests/session/dispatch-run.test.ts \
                    tests/session/dispatch-integration.test.ts \
                    tests/session/dispatch-headless.test.ts \
+                   tests/session/dispatch-report.test.ts \
                    tests/session/adapters-executor.test.ts \
                    tests/session/manager-headless.test.ts \
                    tests/session/headless-liveness.test.ts \

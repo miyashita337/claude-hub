@@ -1,5 +1,8 @@
 import { execFile, spawn } from "child_process";
 import { promisify } from "util";
+import { mkdtempSync, rmSync, writeFileSync } from "fs";
+import { tmpdir } from "os";
+import { join } from "path";
 import {
   openTab as realOpenTab,
   markTabStopped as realMarkTabStopped,
@@ -116,6 +119,13 @@ export interface HeadlessRunResult {
   stderr: string;
   /** True when the run was killed because it exceeded {@link HeadlessRunOptions.timeoutMs}. */
   timedOut: boolean;
+  /**
+   * Wall-clock duration from spawn to exit, in ms (Epic #75 Phase 4 / #289).
+   * Measured here so it is ALWAYS available — even on a timeout or a crash where
+   * the `claude -p --output-format json` `duration_ms` field never gets emitted —
+   * because the dispatch report always carries a duration.
+   */
+  durationMs: number;
 }
 
 export interface HeadlessRunOptions {
@@ -152,6 +162,21 @@ export interface ExecutorAdapter {
   runHeadless(opts: HeadlessRunOptions): Promise<HeadlessRunResult>;
 }
 
+/**
+ * Posts a comment to a GitHub Issue (Epic #75 Phase 4 / #289). Used by the
+ * headless dispatch path to append the machine-parsable "Dispatch 実行レポート"
+ * (a contract corp reconcile parses, corp #76). Injected so unit tests assert
+ * the call without shelling out to `gh`. The real impl runs `gh` in the branch
+ * worktree cwd so the Issue's repo resolves from that dir's git remote.
+ */
+export interface IssueReporterAdapter {
+  postComment(opts: {
+    cwd: string;
+    issueNumber: number;
+    body: string;
+  }): Promise<void>;
+}
+
 export interface SessionEffects {
   tmux: TmuxAdapter;
   iterm2: ItermAdapter;
@@ -159,6 +184,7 @@ export interface SessionEffects {
   process: ProcessAdapter;
   worktree: WorktreeAdapter;
   executor: ExecutorAdapter;
+  issueReporter: IssueReporterAdapter;
 }
 
 // Issue #222: bound every synchronous tmux call so a wedged tmux server (whose
@@ -384,6 +410,7 @@ export const realExecutorAdapter: ExecutorAdapter = {
         return;
       }
       onSpawn?.(pid);
+      const startedAt = Date.now();
 
       let stdout = "";
       let stderr = "";
@@ -429,9 +456,37 @@ export const realExecutorAdapter: ExecutorAdapter = {
         // On a timeout kill the numeric code reflects the signal, not a
         // meaningful "job failed with code N" — report null so the caller
         // renders it as a timeout rather than a numeric non-zero exit.
-        resolve({ exitCode: timedOut ? null : code, stdout, stderr, timedOut });
+        resolve({
+          exitCode: timedOut ? null : code,
+          stdout,
+          stderr,
+          timedOut,
+          durationMs: Date.now() - startedAt,
+        });
       });
     });
+  },
+};
+
+/** Timeout for the `gh issue comment` call — bound a wedged gh so a failed report never hangs teardown. */
+const GH_COMMENT_TIMEOUT_MS = 15_000;
+
+export const realIssueReporterAdapter: IssueReporterAdapter = {
+  async postComment({ cwd, issueNumber, body }) {
+    // --body-file (not --body): the report contains markdown headings and
+    // newlines; a temp file avoids any shell/`gh` re-parsing of the body.
+    const dir = mkdtempSync(join(tmpdir(), "dispatch-report-"));
+    const bodyFile = join(dir, "report.md");
+    try {
+      writeFileSync(bodyFile, body);
+      await execFileAsync(
+        "gh",
+        ["issue", "comment", String(issueNumber), "--body-file", bodyFile],
+        { cwd, encoding: "utf8", timeout: GH_COMMENT_TIMEOUT_MS },
+      );
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
   },
 };
 
@@ -442,4 +497,5 @@ export const realSessionEffects: SessionEffects = {
   process: realProcessAdapter,
   worktree: realWorktreeAdapter,
   executor: realExecutorAdapter,
+  issueReporter: realIssueReporterAdapter,
 };

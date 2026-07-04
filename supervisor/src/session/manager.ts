@@ -40,6 +40,7 @@ import {
   type SelfHealer,
 } from "./self-heal";
 import { compactClaudeHubExit } from "./primary-compact";
+import { formatDispatchReport } from "./dispatch-report";
 
 const DEFAULT_CLAUDE_PATH = resolve(homedir(), ".local", "bin", "claude");
 const TMUX_SESSION_PREFIX = "claude-";
@@ -237,10 +238,13 @@ export function buildHeadlessClaudeFlags(
   const args = [
     "-p",
     initialCommand,
-    // text is the default -p format, but pin it explicitly so a future default
-    // change cannot silently turn stdout into JSON the formatter would post raw.
+    // JSON so the run's usage is machine-readable (Epic #75 Phase 4 / #289):
+    // the final envelope carries `usage.output_tokens` for the dispatch report
+    // and `result` (the final text) for the thread. Verified against a real
+    // `claude -p --output-format json` run (v2.1.201): top-level `result`,
+    // `duration_ms`, and `usage.{input,output}_tokens`.
     "--output-format",
-    "text",
+    "json",
     "--dangerously-skip-permissions",
   ];
 
@@ -283,11 +287,57 @@ function buildHeadlessEnv(): Record<string, string | undefined> {
 }
 
 /** Outcome of {@link SessionManager.runHeadless}. */
-export interface HeadlessSessionResult extends HeadlessRunResult {
+export interface HeadlessSessionResult {
+  /** `claude -p` exit code, or null when killed (e.g. timeout). */
+  exitCode: number | null;
+  /**
+   * Presentable text: the parsed `result` field of the JSON envelope, or the raw
+   * stdout when the envelope could not be parsed (crash / timeout before it was
+   * emitted). This is what the dispatch thread shows — never the raw JSON.
+   */
+  stdout: string;
+  stderr: string;
+  timedOut: boolean;
+  /** Wall-clock run duration in ms (always present). */
+  durationMs: number;
+  /**
+   * Total output tokens (`usage.output_tokens`), or null when unobtainable
+   * (JSON unparsable / field absent). The dispatch report omits the tokens line
+   * when null rather than guessing (#289).
+   */
+  tokens: number | null;
   /** Supervisor session-row id (for correlating with sessions.db). */
   sessionId: string;
   /** The pinned `--session-id` value handed to the child. */
   claudeSessionId: string;
+}
+
+/**
+ * Parse the `claude -p --output-format json` envelope (Epic #75 Phase 4 / #289).
+ * Fail-soft: on any parse failure (empty / partial / non-JSON — e.g. a crash or
+ * timeout before the envelope was written) it returns the raw output as the
+ * presentable text and null tokens, never throwing and never fabricating a token
+ * count. Field names verified against a real run (v2.1.201): top-level `result`,
+ * `usage.output_tokens`.
+ */
+export function parseHeadlessOutput(raw: string): {
+  text: string;
+  tokens: number | null;
+} {
+  const trimmed = raw.trim();
+  if (!trimmed) return { text: "", tokens: null };
+  try {
+    const obj = JSON.parse(trimmed) as {
+      result?: unknown;
+      usage?: { output_tokens?: unknown };
+    };
+    const text = typeof obj.result === "string" ? obj.result : raw;
+    const ot = obj.usage?.output_tokens;
+    const tokens = typeof ot === "number" && Number.isFinite(ot) ? ot : null;
+    return { text, tokens };
+  } catch {
+    return { text: raw, tokens: null };
+  }
 }
 
 /**
@@ -411,6 +461,8 @@ export class SessionManager {
       process: options.effects?.process ?? realSessionEffects.process,
       worktree: options.effects?.worktree ?? realSessionEffects.worktree,
       executor: options.effects?.executor ?? realSessionEffects.executor,
+      issueReporter:
+        options.effects?.issueReporter ?? realSessionEffects.issueReporter,
     };
     this.gracefulKillTimeoutMs =
       options.gracefulKillTimeoutMs ?? GRACEFUL_KILL_TIMEOUT_MS;
@@ -777,6 +829,7 @@ export class SessionManager {
     threadId: string,
     initialCommand: string,
     branch?: string,
+    issueNumber?: number,
   ): Promise<HeadlessSessionResult> {
     // Same single-flight guards as start(): runHeadless is another async entry
     // that registers a session, so it must respect the identical MAX_SESSIONS /
@@ -874,12 +927,34 @@ export class SessionManager {
         },
       });
 
+      // Parse the JSON envelope into presentable text + token usage (#289).
+      // Fail-soft: a crash / timeout that left no valid JSON yields the raw
+      // output and null tokens rather than throwing.
+      const parsed = parseHeadlessOutput(result.stdout);
+      const outcome: HeadlessSessionResult = {
+        exitCode: result.exitCode,
+        stdout: parsed.text,
+        stderr: result.stderr,
+        timedOut: result.timedOut,
+        durationMs: result.durationMs,
+        tokens: parsed.tokens,
+        sessionId,
+        claudeSessionId,
+      };
+
+      // Post the Dispatch 実行レポート to the target Issue BEFORE finishHeadless
+      // removes the worktree — gh runs in that worktree cwd (#289). Fail-soft:
+      // a report failure must never block session teardown or lose the run.
+      if (issueNumber != null) {
+        await this.postDispatchReport(issueNumber, projectDir, outcome);
+      }
+
       // Child exited → close the session (frees the slot). Even if onSpawn never
       // fired (should not happen unless the adapter misbehaves), finishHeadless
       // is a no-op safe cleanup.
       await this.finishHeadless(threadId, sessionId, result, worktree);
 
-      return { ...result, sessionId, claudeSessionId };
+      return outcome;
     } finally {
       // Error-path safety net: if the spawn threw before onSpawn, drop the
       // pending marker so the slot is not leaked (delete is idempotent).
@@ -923,6 +998,38 @@ export class SessionManager {
     console.log(
       `[SessionManager] Headless session for thread ${threadId} closed (reason: ${reason}, exit: ${result.exitCode})`,
     );
+  }
+
+  /**
+   * Append the Dispatch 実行レポート to the target Issue (Epic #75 Phase 4 /
+   * #289). Runs `gh issue comment` in the branch worktree `cwd` (via the injected
+   * {@link IssueReporterAdapter}) so the Issue's repo resolves from that dir's git
+   * remote. FAIL-SOFT: any failure is logged and swallowed — a report is
+   * observability, so it must never abort the run or block session teardown
+   * (agent-output-quality: the failure is surfaced in the log, not silently
+   * dropped).
+   */
+  private async postDispatchReport(
+    issueNumber: number,
+    cwd: string,
+    outcome: HeadlessSessionResult,
+  ): Promise<void> {
+    const body = formatDispatchReport({
+      tokens: outcome.tokens,
+      durationMs: outcome.durationMs,
+      exitCode: outcome.exitCode,
+    });
+    try {
+      await this.effects.issueReporter.postComment({ cwd, issueNumber, body });
+      console.log(
+        `[SessionManager] Posted dispatch report to issue #${issueNumber} (tokens: ${outcome.tokens ?? "n/a"}, duration_ms: ${outcome.durationMs}, exit: ${outcome.exitCode})`,
+      );
+    } catch (err) {
+      console.warn(
+        `[SessionManager] Failed to post dispatch report to issue #${issueNumber} (fail-soft, run unaffected):`,
+        err,
+      );
+    }
   }
 
   /**
