@@ -669,8 +669,10 @@ export class SessionManager {
    * `projectDir` MUST be the directory the original session ran in (recorded in
    * sessions.db): `claude --resume` keys the transcript by cwd, so resuming
    * from any other directory — including a `-w` worktree — fails to find the
-   * jsonl. Worktree re-creation is intentionally out of scope; a missing
-   * `projectDir` throws so the caller can report it instead of silently
+   * jsonl. When `projectDir` is missing but a `branch` is recorded, the
+   * worktree is re-created at the same path before launching (Issue #217);
+   * only when recovery is impossible (no branch recorded, or the branch was
+   * deleted) does this throw, so the caller reports it instead of silently
    * starting a fresh conversation.
    */
   async resumeSession(
