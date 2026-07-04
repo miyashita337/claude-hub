@@ -59,10 +59,16 @@ ignore:
   - "supervisor/node_modules/**"
   # テストヘルパ自身は self-coverage 不要
   - "supervisor/tests/**"
-  # ライブ Discord bot token を要する起動経路。トークン無しでは実行不能で、
-  # AC-1/2/3 は PR 本文で手動検証扱い（ci.yml e2e-tests ジョブのコメント参照）。
+  # index.ts はライブ Discord token を読んで startBot() を呼ぶだけの薄い起動
+  # エントリ（~38 行、ビジネスロジックなし）。トークン無しでは実行不能な境界
+  # コードのため除外（AC-1/2/3 は PR 本文で手動検証扱い。ci.yml e2e-tests
+  # ジョブのコメント参照）。
+  # NOTE: src/bot.ts（~1065 行）はコアロジック（アクセス制御 / self-heal /
+  # キュー / 中継）を含むため除外しない。現状は startBot(token) 内に密結合で
+  # 未カバーだが、blanket 除外は coverage-policy.md §5 の anti-gaming に反する
+  # （PR #301 の gemini review 指摘）。トークン起動部とロジックの分離リファクタ
+  # + テスト補充は follow-up #300 で追跡する。
   - "supervisor/index.ts"
-  - "supervisor/src/bot.ts"
   # iterm2 タブ着色。~/.claude/scripts/project-colors.json とローカル iTerm2 を
   # 要するローカル専用（ci.yml 末尾「Local-only tests」参照）。
   - "supervisor/src/session/iterm2.ts"
