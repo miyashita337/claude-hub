@@ -20,6 +20,13 @@ PLIST_DIR="${GC_PLIST_DIR:-$HOME/Library/LaunchAgents}"
 PLIST="$PLIST_DIR/$LABEL.plist"
 GUI_UID=$(id -u)
 
+# root で実行すると logs/ や plist の所有権が root になり、一般ユーザーの
+# launchd ジョブがログを書けず起動失敗する（gui/0 への登録も意図外）。
+if [ "$GUI_UID" -eq 0 ]; then
+  echo "[install] ERROR: Do not run this script as root/sudo. Run as the login user." >&2
+  exit 1
+fi
+
 if [ "${1:-}" = "--uninstall" ]; then
   echo "[install] Uninstalling $LABEL..."
   if [ "${GC_SKIP_LOAD:-0}" != "1" ]; then
@@ -39,9 +46,15 @@ fi
 mkdir -p "$REPO_DIR/logs"
 mkdir -p "$PLIST_DIR"
 
+# bun が Homebrew 等でインストールされている環境では ~/.bun/bin/bun が
+# 存在しないため、実行環境の bun 実パスを検出して置換する（無ければ
+# テンプレート既定の ~/.bun/bin/bun にフォールバック）。
+BUN_PATH="$(command -v bun || echo "$HOME/.bun/bin/bun")"
 echo "[install] Generating plist from template..."
 echo "[install]   HOME=$HOME"
-sed "s|/Users/YOUR_USER|$HOME|g" "$TEMPLATE" > "$PLIST"
+echo "[install]   bun=$BUN_PATH"
+sed -e "s|/Users/YOUR_USER/.bun/bin/bun|$BUN_PATH|g" \
+    -e "s|/Users/YOUR_USER|$HOME|g" "$TEMPLATE" > "$PLIST"
 if grep -q "YOUR_USER" "$PLIST"; then
   echo "[install] ERROR: placeholder substitution failed: $PLIST" >&2
   exit 1
@@ -60,9 +73,11 @@ echo "[install] Loading job..."
 launchctl bootstrap "gui/$GUI_UID" "$PLIST"
 
 echo "[install] Verifying..."
-launchctl print "gui/$GUI_UID/$LABEL" >/dev/null 2>&1 && echo "[install] loaded: $LABEL" || {
+if launchctl print "gui/$GUI_UID/$LABEL" >/dev/null 2>&1; then
+  echo "[install] loaded: $LABEL"
+else
   echo "[install] ERROR: job not visible in launchctl after load" >&2
   exit 1
-}
+fi
 echo "[install] Done. Runs daily at 04:00. Manual run: launchctl kickstart -k gui/$GUI_UID/$LABEL"
 echo "[install] Logs: $REPO_DIR/logs/gc-attachments.stdout.log / .stderr.log"
