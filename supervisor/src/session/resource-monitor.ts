@@ -63,7 +63,10 @@ export class ResourceMonitor {
 
   async check(): Promise<void> {
     this.sampleLoad();
-    for (const [threadId, session] of this.sessionManager.entries()) {
+    // Snapshot first: stop() (resource_limit teardown below) awaits and mutates
+    // the live map mid-loop, so iterating the raw entries() iterator while
+    // deleting is a race (gemini PR #297 HIGH). Mirrors the reapers.
+    for (const [threadId, session] of Array.from(this.sessionManager.entries())) {
       if (!session.pid) continue;
       try {
         const { stdout } = await execAsync(`ps -o rss= -p ${session.pid}`);

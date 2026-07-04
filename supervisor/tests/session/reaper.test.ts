@@ -148,4 +148,37 @@ describe("Reaper.check", () => {
     // The teardown notice carried the resume導線 with the captured session id.
     expect(sent.join("\n")).toContain("/session resume sess-idle");
   });
+
+  test("reaps EVERY idle session even though stop() deletes from the live map mid-iteration (PR #297 HIGH)", async () => {
+    const NOW = 1000 * HOUR;
+    // All three are idle past the threshold. makeManager.stop deletes each from
+    // the map, so without the Array.from snapshot the live-iterator could skip
+    // entries; the snapshot guarantees all three are processed.
+    const sessions = new Map<string, SessionInfo>(
+      ["a", "b", "c"].map((id) => [
+        id,
+        makeSession({ threadId: id, lastActivityAt: new Date(NOW - 8 * HOUR) }),
+      ]),
+    );
+    const { manager, stopCalls } = makeManager(sessions);
+    const thread = {
+      isThread: () => true,
+      name: "🟢 x",
+      send: async () => {},
+      setName: async () => {},
+      setArchived: async () => {},
+    };
+    const client = {
+      channels: { cache: { get: () => thread }, fetch: async () => thread },
+    } as unknown as Client;
+
+    const reaper = new Reaper(manager, client, {
+      idleTimeoutMs: 6 * HOUR,
+      now: () => NOW,
+    });
+    await reaper.check();
+
+    expect(stopCalls.map((c) => c.threadId).sort()).toEqual(["a", "b", "c"]);
+    expect(sessions.size).toBe(0); // all removed
+  });
 });

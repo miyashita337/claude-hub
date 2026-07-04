@@ -81,7 +81,10 @@ export class Reaper {
    */
   async check(): Promise<void> {
     const now = this.now();
-    for (const [threadId, session] of this.sessionManager.entries()) {
+    // Snapshot first: stop() awaits and mutates the live map mid-loop, so
+    // iterating the raw entries() iterator while deleting is a race (gemini PR
+    // #297 HIGH). Mirrors GoalWatcher / OrphanDispatchReaper, which already do this.
+    for (const [threadId, session] of Array.from(this.sessionManager.entries())) {
       const idleMs = now - session.lastActivityAt.getTime();
       if (idleMs > this.idleTimeoutMs) {
         const snapshot: ReapedSessionInfo = {
