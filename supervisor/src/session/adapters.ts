@@ -1,4 +1,4 @@
-import { execFile } from "child_process";
+import { execFile, spawn } from "child_process";
 import { promisify } from "util";
 import {
   openTab as realOpenTab,
@@ -354,46 +354,84 @@ export const realWorktreeAdapter: WorktreeAdapter = {
 };
 
 export const realExecutorAdapter: ExecutorAdapter = {
-  // Bun.spawn (not child_process) so the pid is available synchronously for
-  // onSpawn and the streams read without a maxBuffer ceiling — the tmux path's
-  // execFile helpers above cannot expose the pid before exit. Runtime is Bun
-  // (see supervisor/CLAUDE.md), so this is the project-native process API.
-  async runHeadless({ claudePath, args, cwd, env, timeoutMs, onSpawn }) {
-    const proc = Bun.spawn([claudePath, ...args], {
-      cwd,
-      // Bun.spawn REPLACES the environment (it does not merge with process.env),
-      // so the caller passes a complete env; keys whose value is undefined are
-      // omitted, which is how ANTHROPIC_API_KEY gets unset (use Claude Max).
-      env,
-      stdout: "pipe",
-      stderr: "pipe",
-      stdin: "ignore",
+  // child_process.spawn (async, so lint-no-sync-exec is satisfied) with
+  // `detached: true` so the child leads its own process GROUP. On timeout we
+  // kill the whole group (`process.kill(-pid)`), not just the direct child:
+  // `claude -p` spawns tool subprocesses (git / gh / bash), and if any survive
+  // they keep the stdout pipe open, so the 'close' event — and this promise —
+  // would hang until they exit (observed as a Linux-CI deadlock with an
+  // orphaned grandchild). Group SIGKILL closes the pipes promptly.
+  runHeadless({ claudePath, args, cwd, env, timeoutMs, onSpawn }) {
+    return new Promise<HeadlessRunResult>((resolve, reject) => {
+      let child;
+      try {
+        child = spawn(claudePath, args, {
+          cwd,
+          // Passed through as-is (keys with undefined value are dropped by Node),
+          // so ANTHROPIC_API_KEY is unset here → use the Claude Max subscription.
+          env,
+          detached: true,
+          stdio: ["ignore", "pipe", "pipe"],
+        });
+      } catch (err) {
+        reject(err);
+        return;
+      }
+
+      const pid = child.pid;
+      if (pid == null) {
+        reject(new Error("failed to spawn headless claude (no pid)"));
+        return;
+      }
+      onSpawn?.(pid);
+
+      let stdout = "";
+      let stderr = "";
+      child.stdout?.setEncoding("utf8");
+      child.stderr?.setEncoding("utf8");
+      child.stdout?.on("data", (d: string) => {
+        stdout += d;
+      });
+      child.stderr?.on("data", (d: string) => {
+        stderr += d;
+      });
+
+      let timedOut = false;
+      let settled = false;
+      const timer = setTimeout(() => {
+        timedOut = true;
+        try {
+          // Negative pid → the whole process group (claude + its tool children).
+          // SIGKILL because a wedged run may ignore SIGTERM.
+          process.kill(-pid, "SIGKILL");
+        } catch {
+          // Group already gone / not a leader — fall back to the direct child.
+          try {
+            child.kill("SIGKILL");
+          } catch {
+            // Nothing more we can do; 'close' will still settle the promise.
+          }
+        }
+      }, timeoutMs);
+
+      child.on("error", (err) => {
+        if (settled) return;
+        settled = true;
+        clearTimeout(timer);
+        reject(err);
+      });
+      // 'close' fires once the process exited AND its stdio streams closed. With
+      // the group kill above, grandchildren die too, so this is not delayed.
+      child.on("close", (code) => {
+        if (settled) return;
+        settled = true;
+        clearTimeout(timer);
+        // On a timeout kill the numeric code reflects the signal, not a
+        // meaningful "job failed with code N" — report null so the caller
+        // renders it as a timeout rather than a numeric non-zero exit.
+        resolve({ exitCode: timedOut ? null : code, stdout, stderr, timedOut });
+      });
     });
-    onSpawn?.(proc.pid);
-
-    let timedOut = false;
-    const timer = setTimeout(() => {
-      timedOut = true;
-      // SIGTERM the child; its exit resolves `proc.exited` and closes the
-      // streams, so the reads below unblock with whatever was buffered.
-      proc.kill();
-    }, timeoutMs);
-
-    try {
-      // Drain both streams concurrently, then await exit. Reading before
-      // awaiting exit avoids a pipe-buffer deadlock on large output.
-      const [stdout, stderr] = await Promise.all([
-        new Response(proc.stdout).text(),
-        new Response(proc.stderr).text(),
-      ]);
-      const exitCode = await proc.exited;
-      // On a timeout kill the reported exit code reflects the signal, which is
-      // not a meaningful "the job failed with code N" — report null so the
-      // caller renders it as a timeout, not a numeric non-zero exit.
-      return { exitCode: timedOut ? null : exitCode, stdout, stderr, timedOut };
-    } finally {
-      clearTimeout(timer);
-    }
   },
 };
 
