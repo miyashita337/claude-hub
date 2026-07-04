@@ -100,8 +100,10 @@ dispatch は「Issue 番号とコマンドを与えて完走させる」バッ�
 | `DISPATCH_EXECUTOR_MODE` | 未設定（既定） / `tmux` | 現行の tmux 対話 TUI 経路（変更なし） |
 | `DISPATCH_EXECUTOR_MODE` | `headless` | dispatch を `claude -p` の子プロセスで実行し stdout をスレッド返却 |
 | `DISPATCH_HEADLESS_TIMEOUT_MS` | 正の整数（既定 `7200000` = 2h） | headless 子プロセスの wall-clock 上限。超過で SIGTERM → スレッドにタイムアウト明示 |
+| `DISPATCH_CLAUDE_MODEL` | 未設定（既定） | 設定時のみ headless argv に `--model <値>` を追加（例 `claude-opus-4-8`）。未設定・空白のみ = 環境既定モデル（現行不変）。corp #81 Phase 6 / #298 |
 
 - 完全に **opt-in**: `headless` 以外の値（未設定・空・大文字 `HEADLESS` 等）はすべて `tmux` にフォールバックする（`resolveExecutorMode`、fail-safe）。
+- `DISPATCH_CLAUDE_MODEL`: 不正なモデル ID はサイレント fallback せず、`claude -p` のローンチ失敗（非ゼロ exit）として既存経路でスレッドに明示される。`--model` は `claude --help`（v2.1.201）で実在確認済み。
 - 対話セッション（`/session start`、primary channel）は headless 化しない。人間との対話は TUI のまま。
 - Supervisor の plist `EnvironmentVariables` に `DISPATCH_EXECUTOR_MODE=headless` を追加 → `launchctl bootout`+`bootstrap` で反映（他の env 同様、`kickstart -k` では env 再読込されない点に注意）。
 
