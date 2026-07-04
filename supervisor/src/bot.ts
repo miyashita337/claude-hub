@@ -53,6 +53,8 @@ import {
   runDispatch,
   resolveExecutorMode,
 } from "./session/dispatch";
+import { DispatchQueue } from "./session/dispatch-queue";
+import { AdmissionController } from "./session/admission";
 import { buildThreadTitle } from "./session/thread-title";
 
 /** Shared context for delivering a self-heal outcome to a thread (Issue #206/#244). */
@@ -288,6 +290,15 @@ export async function startBot(token: string): Promise<void> {
     },
   });
   const resourceMonitor = new ResourceMonitor(sessionManager);
+  // Phase 5c (#294): dispatch concurrency limiter + FIFO queue. Only
+  // handleDispatchMessage submits here; interactive /session start bypasses it
+  // (AC-3). The SessionManager frees a slot when a dispatch session ends.
+  const dispatchQueue = new DispatchQueue();
+  sessionManager.onSessionEnd((threadId) => dispatchQueue.notifyEnded(threadId));
+  // Phase 5d (#295): dynamic admission (WARN-first). Default observe-only — logs a
+  // WARN under high load but does not delay; enforcement is opt-in via
+  // DISPATCH_ADMISSION_ENFORCE=1.
+  const admissionController = new AdmissionController();
   const sessionHandler = createSessionHandler(sessionManager);
 
   // Per-thread progress buffer (Issue #119): coalesce PostToolUse events
@@ -528,70 +539,106 @@ export async function startBot(token: string): Promise<void> {
     // Epic #285 Phase 2: headless is opt-in via DISPATCH_EXECUTOR_MODE=headless.
     // Default (unset) keeps the current tmux path unchanged.
     const executorMode = resolveExecutorMode();
-    const result = await runDispatch({
-      config,
-      branch,
-      issueNumber,
-      command,
-      sessionManager,
-      executorMode,
-      // Headless streams its formatted output back through this poster (the tmux
-      // path never calls it — it posts its own welcome below).
-      postToThread: async (tId: string, content: string) => {
-        const thread = await client.channels.fetch(tId);
-        if (thread?.isThread()) {
-          await thread.send(content);
-        }
-      },
-      createThread: async (b: string) => {
-        // Sequence suffix only when another session is already live on the same
-        // branch (mirrors handleStart / RW-046 same-branch multi-session).
-        const sameBranchCount = sessionManager
-          .listRunningByChannel(channelName)
-          .filter((s) => s.branch === b).length;
-        const threadName = buildThreadTitle(
-          "running",
-          b,
-          config.displayName,
-          sameBranchCount + 1
-        );
-        const thread = await textChannel.threads.create({
-          name: threadName,
-          autoArchiveDuration: 10080, // 7 days
-        });
-        return { id: thread.id };
-      },
-    });
 
-    if (result.ok && result.mode === "tmux") {
-      try {
-        const thread = await client.channels.fetch(result.threadId);
-        if (thread?.isThread()) {
-          await thread.send(
+    const postToThread = async (tId: string, content: string): Promise<void> => {
+      const thread = await client.channels.fetch(tId);
+      if (thread?.isThread()) {
+        await thread.send(content);
+      }
+    };
+
+    // Phase 5c (#294): the thread is created EAGERLY (before the concurrency
+    // decision) so a queued dispatch can be told it is waiting, in its own thread.
+    // Sequence suffix mirrors handleStart / RW-046 same-branch multi-session.
+    let dispatchThread: { id: string };
+    try {
+      const sameBranchCount = sessionManager
+        .listRunningByChannel(channelName)
+        .filter((s) => s.branch === branch).length;
+      const threadName = buildThreadTitle(
+        "running",
+        branch,
+        config.displayName,
+        sameBranchCount + 1
+      );
+      const created = await textChannel.threads.create({
+        name: threadName,
+        autoArchiveDuration: 10080, // 7 days
+      });
+      dispatchThread = { id: created.id };
+    } catch (err) {
+      console.error(
+        `[Bot] Dispatch thread creation failed in channel ${channelName}:`,
+        err
+      );
+      return true;
+    }
+
+    // Runs the actual dispatch once a concurrency slot is granted. Returns whether
+    // a session actually started (the queue holds the slot until the session ends
+    // when true; frees it immediately when false).
+    const runOnce = async (): Promise<boolean> => {
+      // Phase 5d (#295): WARN-first admission. Observe mode (default) only logs a
+      // WARN under high load; enforce mode delays the start.
+      await admissionController.gate();
+      const result = await runDispatch({
+        config,
+        branch,
+        issueNumber,
+        command,
+        sessionManager,
+        executorMode,
+        postToThread,
+        createThread: async () => dispatchThread, // reuse the eagerly-created thread
+      });
+
+      if (result.ok && result.mode === "tmux") {
+        try {
+          await postToThread(
+            result.threadId,
             `🛰️ **${config.displayName}** をディスパッチで起動しました\n\n` +
               `🌿 ブランチ: \`${branch}\`\n` +
               `▶️ 初期コマンド: \`${result.injected}\`\n` +
               `📊 稼働中セッション: ${sessionManager.count()}/${MAX_SESSIONS}`
           );
+        } catch (err) {
+          console.error(
+            `[Bot] Dispatch welcome message failed for thread ${result.threadId}:`,
+            err
+          );
         }
-      } catch (err) {
+      } else if (result.ok) {
+        console.log(
+          `[Bot] Headless dispatch completed in channel ${channelName} (thread=${result.threadId}, exit=${result.exitCode}, timedOut=${result.timedOut})`
+        );
+      } else {
         console.error(
-          `[Bot] Dispatch welcome message failed for thread ${result.threadId}:`,
-          err
+          `[Bot] Dispatch failed (stage=${result.stage}) in channel ${channelName}: ${result.error}`
         );
       }
-    } else if (result.ok) {
-      // Headless: runDispatch already posted the start notice + formatted output
-      // to the thread. Log the job outcome so a non-zero exit / timeout is
-      // visible in the supervisor log too (the thread carries the detail).
-      console.log(
-        `[Bot] Headless dispatch completed in channel ${channelName} (thread=${result.threadId}, exit=${result.exitCode}, timedOut=${result.timedOut})`
-      );
-    } else {
-      console.error(
-        `[Bot] Dispatch failed (stage=${result.stage}) in channel ${channelName}: ${result.error}`
-      );
-    }
+      return result.ok;
+    };
+
+    // Phase 5c (#294): submit to the concurrency-limited FIFO queue. Under the
+    // limit it starts now; over the limit it is queued (not rejected) and the
+    // thread is told its position.
+    await dispatchQueue.submit({
+      key: dispatchThread.id,
+      run: runOnce,
+      onQueued: async (position) => {
+        await postToThread(
+          dispatchThread.id,
+          `⏳ 同時実行の上限（${dispatchQueue.limit()}）に達しているため待機中です（キュー ${position} 番目）。` +
+            `先行 dispatch の完了後、FIFO で自動起動します。`
+        );
+      },
+      onDequeued: async () => {
+        await postToThread(
+          dispatchThread.id,
+          `▶️ 空きが出たため、キューから起動します。`
+        );
+      },
+    });
     return true;
   }
 

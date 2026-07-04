@@ -169,3 +169,34 @@ export const GOAL_GRACE_MS = 3 * 60 * 1000; // 3 minutes
 // idle threshold is env-overridable (`DISPATCH_ORPHAN_IDLE_MS`) for ops tuning.
 export const DISPATCH_ORPHAN_IDLE_MS = 48 * 60 * 60 * 1000; // 48 hours
 export const DISPATCH_ORPHAN_CHECK_INTERVAL_MS = 30 * 60 * 1000; // 30 minutes
+
+// Phase 5b (#293 / Epic #292): the interactive idle reaper threshold is now
+// env-configurable (`SESSION_IDLE_TIMEOUT_MS`) with a much shorter default —
+// idle interactive sessions squat CPU/RAM and worsen the multi-session
+// saturation the Epic targets. The old 30-day value (IDLE_TIMEOUT_MS above) is
+// demoted to a HARD BACKSTOP: the effective timeout is
+// min(SESSION_IDLE_TIMEOUT_MS, SESSION_IDLE_BACKSTOP_MS), so a misconfigured huge
+// env value can never disable reaping past 30 days. Setting
+// SESSION_IDLE_TIMEOUT_MS=2592000000 restores the exact old 30-day behaviour
+// (AC-1). On teardown the reaper leaves a resume導線 in the thread.
+export const SESSION_IDLE_DEFAULT_MS = 6 * 60 * 60 * 1000; // 6 hours
+export const SESSION_IDLE_BACKSTOP_MS = IDLE_TIMEOUT_MS; // 30 days, hard cap
+
+// Phase 5c (#294 / Epic #292): dispatch concurrency limit + FIFO queue. When the
+// number of running dispatch sessions reaches this, a new /dispatch is QUEUED
+// (not rejected) and started FIFO as slots free. Interactive /session start does
+// NOT go through this queue (it is capped only by MAX_SESSIONS), so the human
+// experience is unchanged. Kept well under MAX_SESSIONS so interactive keeps
+// headroom. Env-overridable via `DISPATCH_MAX_CONCURRENT`.
+export const DISPATCH_MAX_CONCURRENT = 3;
+
+// Phase 5d (#295 / Epic #292): dynamic admission is WARN-first — it defaults to
+// OBSERVE ONLY (log a WARN when load is high, but do NOT delay). Enforcement
+// (actually delaying a start under high load) is opt-in via
+// `DISPATCH_ADMISSION_ENFORCE=1`, to be flipped on only after a few days of
+// zero-false-positive observation (thin-scaffolding dogfood). The load ceiling
+// is `core_count * ADMISSION_LOAD_FACTOR`; over it, enforcement waits
+// ADMISSION_DELAY_MS before admitting (never rejects — dispatch is queued/delayed,
+// not dropped).
+export const ADMISSION_LOAD_FACTOR = 1.0;
+export const ADMISSION_DELAY_MS = 5000; // 5s

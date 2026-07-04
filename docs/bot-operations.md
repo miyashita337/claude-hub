@@ -143,6 +143,45 @@ headless 実行の完了時、対象 Issue へ実行レポートを `gh issue co
 1. `DISPATCH_EXECUTOR_MODE=headless` を opt-in で有効化し、agent-base 向け dispatch（no-template / pdca）で数日 dogfood。
 2. 故障モードを観測ログで確認。問題なければ既定を headless に昇格し、tmux は明示指定の逃げ道として残す。
 
+## 多セッション性能（Phase 5, Epic #292）
+
+10+ セッション同時起動の重さ・timeout は **CPU 実行キュー飽和**が主犯（実測: 10 core に load 13-21、swap 0）。MAX_SESSIONS=10 は 11 本目を拒否するだけで 10 本同時 active の飽和を防げないため、以下の 3 施策を追加した。既定値はすべて安全側（現行挙動を壊さない）。
+
+### 5b: 対話セッション idle reaper の短縮（#293）
+
+| env | 既定 | 意味 |
+|---|---|---|
+| `SESSION_IDLE_TIMEOUT_MS` | `21600000`（6h） | 対話セッションの idle 自動終了しきい値。idle セッションは CPU/RAM を squat するため 30 日→6h に短縮 |
+
+- 30 日は **hard backstop に降格**: 実効しきい値 = `min(SESSION_IDLE_TIMEOUT_MS, 30日)`。巨大値を設定しても 30 日で必ず回収する。
+- `SESSION_IDLE_TIMEOUT_MS=2592000000`（30日）で**旧挙動を完全復元**できる。
+- 停止時にスレッドへ **resume 導線**（`/session resume <id>` または `/session start <branch>`）を残す。
+- dispatch 専用の `DISPATCH_ORPHAN_IDLE_MS`（48h, #275）とは別軸。二重実装せず、本 5b は汎用 Reaper のしきい値のみを可変化。
+
+### 5c: dispatch 同時実行制限 + FIFO キュー（#294）
+
+| env | 既定 | 意味 |
+|---|---|---|
+| `DISPATCH_MAX_CONCURRENT` | `3` | 同時に実行する dispatch セッションの上限。超過分は**拒否せずキュー**に積み、先行完了で FIFO 起動 |
+
+- 対話 `/session start` は**このキューを通らない**（`MAX_SESSIONS` のみで制限）。人間の体験は不変。
+- キュー投入時・キューから起動時にスレッドへ状態を明示（サイレントに待たせない）。
+- **再起動時のキュー扱い（選択理由）**: キューは **in-memory** で、supervisor 再起動で消える。永続化（DB + 再起動時 dedup）は不採用。理由: corp reconcile が未完了 Issue を再検出して re-dispatch するため、落ちたキュー項目は上流で self-heal する（既存の「再起動で in-flight relay 状態が消える」姿勢と同じ）。
+
+### 5d: ResourceMonitor 連動の動的 admission（WARN-first, #295）
+
+| env | 既定 | 意味 |
+|---|---|---|
+| `DISPATCH_ADMISSION_ENFORCE` | 未設定（= observe） | `1` で enforce（高負荷時に新規起動を遅延）。既定は**観測のみ**（WARN ログ、遅延なし） |
+
+- **WARN-first**: 既定は observe モード = 高負荷（load > core 数）で WARN を出すが遅延しない。ResourceMonitor が定期サンプリングして高負荷エピソードをログ化する。
+- enforce は **数日 observe して false positive ゼロを確認してから**有効化する（thin-scaffolding dogfood）。決して起動を拒否せず、遅延のみ（dispatch は落とさない）。
+- **撤退基準（YAGNI）**: 5c の FIFO キューだけで timeout が解消するなら、本 5d の enforce は**有効化しない**。observe のログで「遅延が必要な高負荷が実際に発生しているか」を確認し、発生していなければ enforce へ昇格させず observe のまま（または撤去）とする。
+
+### 5a: headless の有効化（運用のみ）
+
+`DISPATCH_EXECUTOR_MODE=headless`（上記「Headless executor モード」節）を Supervisor 環境に設定して dogfood 開始。完了で自己終了するため常駐 TUI の squat が構造的に消え、5c/5d の効果と相乗する。
+
 ## Access Policy (claudeHubExit)
 
 claudeHubExit Bot は `~/.claude/channels/discord/access.json` で access 制御される。Issue #47 以降、以下の方針で運用する。
