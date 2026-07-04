@@ -102,12 +102,63 @@ export interface WorktreeAdapter {
   recreateForBranch(mainRepoDir: string, branch: string): Promise<boolean>;
 }
 
+/**
+ * Result of one headless `claude -p` run (Epic #285 Phase 2). Captured after the
+ * child exits so the dispatch orchestrator can format stdout for the department
+ * thread. A non-zero `exitCode` is DATA, not an error — the caller surfaces it to
+ * the thread (AC-5, no silent success); {@link ExecutorAdapter.runHeadless} only
+ * throws when the child could not be spawned at all (binary/cwd missing).
+ */
+export interface HeadlessRunResult {
+  /** Child exit code, or `null` when it was killed (e.g. the timeout fired). */
+  exitCode: number | null;
+  stdout: string;
+  stderr: string;
+  /** True when the run was killed because it exceeded {@link HeadlessRunOptions.timeoutMs}. */
+  timedOut: boolean;
+}
+
+export interface HeadlessRunOptions {
+  /** Absolute path to the `claude` binary (resolved by the caller). */
+  claudePath: string;
+  /**
+   * argv passed AFTER the binary — includes `-p <initialCommand>`, the headless
+   * flag set, and `--session-id <uuid>`. Passed as an array (no shell) so the
+   * prompt and JSON `--mcp-config` value cannot be re-parsed by a shell.
+   */
+  args: string[];
+  /** Working directory for the child (the branch worktree, or the channel dir). */
+  cwd: string;
+  /** Full environment for the child (the caller builds it; it is NOT merged). */
+  env: Record<string, string | undefined>;
+  /** Wall-clock ceiling; on expiry the child is killed and `timedOut` is set. */
+  timeoutMs: number;
+  /**
+   * Invoked exactly once with the child pid immediately after spawn (before the
+   * child exits). Lets {@link import("./manager").SessionManager} register the
+   * session for slot accounting / liveness while the long run is still in flight.
+   */
+  onSpawn?: (pid: number) => void;
+}
+
+/**
+ * Headless executor (Epic #285 Phase 2). Runs `claude -p "<command>"` as a child
+ * process and returns its captured output — the structural seam that lets the
+ * dispatch path bypass the tmux Ink TUI (and its {@link waitForInputReady}
+ * string-match timing class, RW-025 / RW-047) for batch dispatch workloads. Unit
+ * tests inject a fake so they never spawn a real `claude`.
+ */
+export interface ExecutorAdapter {
+  runHeadless(opts: HeadlessRunOptions): Promise<HeadlessRunResult>;
+}
+
 export interface SessionEffects {
   tmux: TmuxAdapter;
   iterm2: ItermAdapter;
   relayServer: RelayServerAdapter;
   process: ProcessAdapter;
   worktree: WorktreeAdapter;
+  executor: ExecutorAdapter;
 }
 
 // Issue #222: bound every synchronous tmux call so a wedged tmux server (whose
@@ -302,10 +353,55 @@ export const realWorktreeAdapter: WorktreeAdapter = {
   },
 };
 
+export const realExecutorAdapter: ExecutorAdapter = {
+  // Bun.spawn (not child_process) so the pid is available synchronously for
+  // onSpawn and the streams read without a maxBuffer ceiling — the tmux path's
+  // execFile helpers above cannot expose the pid before exit. Runtime is Bun
+  // (see supervisor/CLAUDE.md), so this is the project-native process API.
+  async runHeadless({ claudePath, args, cwd, env, timeoutMs, onSpawn }) {
+    const proc = Bun.spawn([claudePath, ...args], {
+      cwd,
+      // Bun.spawn REPLACES the environment (it does not merge with process.env),
+      // so the caller passes a complete env; keys whose value is undefined are
+      // omitted, which is how ANTHROPIC_API_KEY gets unset (use Claude Max).
+      env,
+      stdout: "pipe",
+      stderr: "pipe",
+      stdin: "ignore",
+    });
+    onSpawn?.(proc.pid);
+
+    let timedOut = false;
+    const timer = setTimeout(() => {
+      timedOut = true;
+      // SIGTERM the child; its exit resolves `proc.exited` and closes the
+      // streams, so the reads below unblock with whatever was buffered.
+      proc.kill();
+    }, timeoutMs);
+
+    try {
+      // Drain both streams concurrently, then await exit. Reading before
+      // awaiting exit avoids a pipe-buffer deadlock on large output.
+      const [stdout, stderr] = await Promise.all([
+        new Response(proc.stdout).text(),
+        new Response(proc.stderr).text(),
+      ]);
+      const exitCode = await proc.exited;
+      // On a timeout kill the reported exit code reflects the signal, which is
+      // not a meaningful "the job failed with code N" — report null so the
+      // caller renders it as a timeout, not a numeric non-zero exit.
+      return { exitCode: timedOut ? null : exitCode, stdout, stderr, timedOut };
+    } finally {
+      clearTimeout(timer);
+    }
+  },
+};
+
 export const realSessionEffects: SessionEffects = {
   tmux: realTmuxAdapter,
   iterm2: realItermAdapter,
   relayServer: realRelayServerAdapter,
   process: realProcessAdapter,
   worktree: realWorktreeAdapter,
+  executor: realExecutorAdapter,
 };

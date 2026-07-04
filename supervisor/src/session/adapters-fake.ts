@@ -1,4 +1,7 @@
 import type {
+  ExecutorAdapter,
+  HeadlessRunOptions,
+  HeadlessRunResult,
   ItermAdapter,
   ProcessAdapter,
   RelayServerAdapter,
@@ -187,12 +190,43 @@ export class FakeWorktreeAdapter implements WorktreeAdapter {
   }
 }
 
+export class FakeExecutorAdapter implements ExecutorAdapter {
+  /** Every runHeadless() invocation, so tests can assert argv / cwd / env (AC-1). */
+  runHeadlessCalls: HeadlessRunOptions[] = [];
+  /**
+   * Result returned by runHeadless(). Tests overwrite it to drive the exit-code
+   * / timeout / empty-output branches of the dispatch orchestrator.
+   */
+  result: HeadlessRunResult = {
+    exitCode: 0,
+    stdout: "",
+    stderr: "",
+    timedOut: false,
+  };
+  /** pid handed to onSpawn (incremented per call so concurrent runs differ). */
+  spawnPid = 20_000;
+  /** When set, runHeadless throws to simulate a spawn failure (binary missing). */
+  failOnSpawn = false;
+
+  async runHeadless(opts: HeadlessRunOptions): Promise<HeadlessRunResult> {
+    this.runHeadlessCalls.push(opts);
+    if (this.failOnSpawn) {
+      // Mirror Bun.spawn's synchronous throw when the executable is not found:
+      // the child never started, so onSpawn is NOT called (no session to register).
+      throw new Error("spawn claude ENOENT");
+    }
+    opts.onSpawn?.(this.spawnPid++);
+    return this.result;
+  }
+}
+
 export interface FakeSessionEffects extends SessionEffects {
   tmux: FakeTmuxAdapter;
   iterm2: FakeItermAdapter;
   relayServer: FakeRelayServerAdapter;
   process: FakeProcessAdapter;
   worktree: FakeWorktreeAdapter;
+  executor: FakeExecutorAdapter;
 }
 
 export function createFakeEffects(): FakeSessionEffects {
@@ -202,5 +236,6 @@ export function createFakeEffects(): FakeSessionEffects {
     relayServer: new FakeRelayServerAdapter(),
     process: new FakeProcessAdapter(),
     worktree: new FakeWorktreeAdapter(),
+    executor: new FakeExecutorAdapter(),
   };
 }

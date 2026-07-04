@@ -51,6 +51,7 @@ import {
   DISPATCH_PREFIX,
   parseDispatchCommand,
   runDispatch,
+  resolveExecutorMode,
 } from "./session/dispatch";
 import { buildThreadTitle } from "./session/thread-title";
 
@@ -524,12 +525,24 @@ export async function startBot(token: string): Promise<void> {
     );
 
     const textChannel = message.channel as TextChannel;
+    // Epic #285 Phase 2: headless is opt-in via DISPATCH_EXECUTOR_MODE=headless.
+    // Default (unset) keeps the current tmux path unchanged.
+    const executorMode = resolveExecutorMode();
     const result = await runDispatch({
       config,
       branch,
       issueNumber,
       command,
       sessionManager,
+      executorMode,
+      // Headless streams its formatted output back through this poster (the tmux
+      // path never calls it — it posts its own welcome below).
+      postToThread: async (tId: string, content: string) => {
+        const thread = await client.channels.fetch(tId);
+        if (thread?.isThread()) {
+          await thread.send(content);
+        }
+      },
       createThread: async (b: string) => {
         // Sequence suffix only when another session is already live on the same
         // branch (mirrors handleStart / RW-046 same-branch multi-session).
@@ -550,7 +563,7 @@ export async function startBot(token: string): Promise<void> {
       },
     });
 
-    if (result.ok) {
+    if (result.ok && result.mode === "tmux") {
       try {
         const thread = await client.channels.fetch(result.threadId);
         if (thread?.isThread()) {
@@ -567,6 +580,13 @@ export async function startBot(token: string): Promise<void> {
           err
         );
       }
+    } else if (result.ok) {
+      // Headless: runDispatch already posted the start notice + formatted output
+      // to the thread. Log the job outcome so a non-zero exit / timeout is
+      // visible in the supervisor log too (the thread carries the detail).
+      console.log(
+        `[Bot] Headless dispatch completed in channel ${channelName} (thread=${result.threadId}, exit=${result.exitCode}, timedOut=${result.timedOut})`
+      );
     } else {
       console.error(
         `[Bot] Dispatch failed (stage=${result.stage}) in channel ${channelName}: ${result.error}`

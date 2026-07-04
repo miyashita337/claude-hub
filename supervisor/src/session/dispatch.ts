@@ -33,9 +33,30 @@
  */
 
 import { resolveWorktreePath } from "./worktree";
+import { formatForDiscord } from "./output-formatter";
 
 /** Literal trigger token. Exposed so external callers (corp) can match it. */
 export const DISPATCH_PREFIX = "/dispatch";
+
+/**
+ * Dispatch executor backend (Epic #285 Phase 2). `"tmux"` is the current
+ * interactive-TUI path (start → waitForInputReady → sendMessage); `"headless"`
+ * runs `claude -p` and returns captured stdout. Opt-in and fail-safe: anything
+ * other than the exact literal `"headless"` resolves to `"tmux"`, so the default
+ * (env unset) is unchanged (AC-4).
+ */
+export type DispatchExecutorMode = "tmux" | "headless";
+
+/**
+ * Resolve the executor mode from the environment (Epic #285 / #287). Read at the
+ * bot boundary and passed explicitly into {@link runDispatch} so the orchestrator
+ * stays pure/testable. Only the exact string `"headless"` enables headless.
+ */
+export function resolveExecutorMode(
+  env: Record<string, string | undefined> = process.env,
+): DispatchExecutorMode {
+  return env.DISPATCH_EXECUTOR_MODE === "headless" ? "headless" : "tmux";
+}
 
 /**
  * Dispatch goal selector — the optional 3rd token of
@@ -169,6 +190,19 @@ export function parseDispatchCommand(content: string): ParsedDispatch {
 }
 
 /**
+ * Captured result of a headless dispatch run (Epic #285 Phase 2). Structurally a
+ * subset of the manager's HeadlessSessionResult, so a SessionManager satisfies
+ * this seam without importing the concrete type.
+ */
+export interface DispatchHeadlessOutcome {
+  /** Child exit code, or null when killed (e.g. timeout). */
+  exitCode: number | null;
+  stdout: string;
+  stderr: string;
+  timedOut: boolean;
+}
+
+/**
  * Minimal SessionManager surface the dispatch orchestrator needs. Keeping it
  * structural lets tests inject a fake without the real tmux/claude stack.
  */
@@ -188,7 +222,31 @@ export interface DispatchSessionManager {
    */
   waitForInputReady(threadId: string): Promise<boolean>;
   sendMessage(threadId: string, message: string): Promise<unknown>;
+  /**
+   * Headless executor path (Epic #285 Phase 2 / #287). Runs `claude -p
+   * "<initialCommand>"` in the branch worktree to completion and resolves with
+   * the captured output. Optional so a tmux-only fake still satisfies the
+   * interface; {@link runDispatch} verifies it is present before taking the
+   * headless branch (no silent fallback).
+   */
+  runHeadless?(
+    config: unknown,
+    threadId: string,
+    initialCommand: string,
+    branch?: string,
+  ): Promise<DispatchHeadlessOutcome>;
 }
+
+/**
+ * Post a single (already Discord-safe) message to the dispatch thread. Injected
+ * so the headless path can stream its formatted output back without runDispatch
+ * importing discord.js. Each `content` is <= Discord's 2000-char limit (the
+ * caller chunks via {@link formatForDiscord}).
+ */
+export type DispatchThreadPoster = (
+  threadId: string,
+  content: string,
+) => Promise<void>;
 
 /** Creates the Discord thread the session runs in and returns its id. */
 export type DispatchThreadFactory = (
@@ -202,11 +260,39 @@ export interface RunDispatchArgs {
   command: DispatchCommand;
   sessionManager: DispatchSessionManager;
   createThread: DispatchThreadFactory;
+  /**
+   * Executor backend (Epic #285 Phase 2). Defaults to `"tmux"` (current
+   * behaviour). `"headless"` requires `sessionManager.runHeadless` and
+   * {@link postToThread} to be present. Injected explicitly (bot.ts derives it
+   * from `DISPATCH_EXECUTOR_MODE` via {@link resolveExecutorMode}) so the
+   * orchestrator stays pure.
+   */
+  executorMode?: DispatchExecutorMode;
+  /**
+   * Posts the headless run's formatted output back to the dispatch thread.
+   * Required for the headless path; unused by the tmux path (bot.ts posts its
+   * own welcome there).
+   */
+  postToThread?: DispatchThreadPoster;
 }
 
 export type RunDispatchResult =
-  | { ok: true; threadId: string; injected: string }
-  | { ok: false; stage: "thread" | "start" | "inject"; error: string };
+  | {
+      ok: true;
+      /** `"tmux"` (default, unchanged) or `"headless"` (Epic #285 Phase 2). */
+      mode: "tmux" | "headless";
+      threadId: string;
+      injected: string;
+      /** Headless only: child exit code (null when killed / timed out). */
+      exitCode?: number | null;
+      /** Headless only: true when the run hit the executor timeout. */
+      timedOut?: boolean;
+    }
+  | {
+      ok: false;
+      stage: "thread" | "start" | "inject" | "output";
+      error: string;
+    };
 
 /**
  * Orchestrate a validated dispatch: create the thread, start the session in the
@@ -225,6 +311,12 @@ export async function runDispatch(
 ): Promise<RunDispatchResult> {
   const { config, branch, issueNumber, command, sessionManager, createThread } =
     args;
+
+  // Epic #285 Phase 2: opt-in headless path. Default (env unset → "tmux") keeps
+  // the interactive-TUI flow below entirely unchanged (AC-4).
+  if ((args.executorMode ?? "tmux") === "headless") {
+    return runDispatchHeadless(args);
+  }
 
   let threadId: string;
   try {
@@ -268,7 +360,167 @@ export async function runDispatch(
     return { ok: false, stage: "inject", error: errMsg(err) };
   }
 
-  return { ok: true, threadId, injected: initialCommand };
+  return { ok: true, mode: "tmux", threadId, injected: initialCommand };
+}
+
+/**
+ * Headless dispatch orchestration (Epic #285 Phase 2 / #287). Creates the
+ * thread, posts a start notice, runs `claude -p "<initialCommand>"` to
+ * completion, then posts the formatted stdout back to the thread. Every terminal
+ * state posts SOMETHING — non-zero exit, timeout, and empty-but-successful
+ * output are all surfaced explicitly (AC-5 / agent-output-quality #1: no silent
+ * success, no silent fallback).
+ *
+ * `ok` reports whether the DISPATCH was orchestrated (thread made, run executed,
+ * output posted) — a failed *job* (non-zero exit) is still `ok:true` because its
+ * failure was delivered to the thread; `exitCode` / `timedOut` carry the job
+ * outcome for the caller to log. `ok:false` is reserved for orchestration
+ * failures (thread creation, spawn, posting, or missing headless wiring).
+ */
+async function runDispatchHeadless(
+  args: RunDispatchArgs,
+): Promise<RunDispatchResult> {
+  const { config, branch, issueNumber, command, sessionManager, createThread } =
+    args;
+  const postToThread = args.postToThread;
+  const initialCommand = `/${command} ${issueNumber}`;
+
+  // Fail-closed: headless requires both the manager capability and a poster. A
+  // missing wire is a config error, surfaced (not silently downgraded to tmux).
+  if (!sessionManager.runHeadless || !postToThread) {
+    return {
+      ok: false,
+      stage: "start",
+      error:
+        "headless executor is not wired (sessionManager.runHeadless / postToThread missing)",
+    };
+  }
+
+  let threadId: string;
+  try {
+    const thread = await createThread(branch);
+    threadId = thread.id;
+  } catch (err) {
+    return { ok: false, stage: "thread", error: errMsg(err) };
+  }
+
+  // Start notice (best-effort: a failed notice must not abort the actual run).
+  try {
+    await postToThread(
+      threadId,
+      `🤖 headless 実行を開始します: \`${initialCommand}\`（ブランチ \`${branch}\`）`,
+    );
+  } catch (err) {
+    console.warn(
+      `[Dispatch] headless start notice failed for thread ${threadId}: ${errMsg(err)}`,
+    );
+  }
+
+  let outcome: DispatchHeadlessOutcome;
+  try {
+    outcome = await sessionManager.runHeadless(
+      config,
+      threadId,
+      initialCommand,
+      branch,
+    );
+  } catch (err) {
+    // Spawn / worktree failure — surface to the thread AND the caller.
+    const error = errMsg(err);
+    try {
+      await postToThread(
+        threadId,
+        `❌ headless 実行を開始できませんでした: ${error}`,
+      );
+    } catch (postErr) {
+      console.warn(
+        `[Dispatch] failed to post headless start-error for thread ${threadId}: ${errMsg(postErr)}`,
+      );
+    }
+    return { ok: false, stage: "start", error };
+  }
+
+  const posted = await postHeadlessOutcome(
+    threadId,
+    initialCommand,
+    outcome,
+    postToThread,
+  );
+  if (!posted.ok) {
+    return { ok: false, stage: "output", error: posted.error };
+  }
+
+  return {
+    ok: true,
+    mode: "headless",
+    threadId,
+    injected: initialCommand,
+    exitCode: outcome.exitCode,
+    timedOut: outcome.timedOut,
+  };
+}
+
+/** How many trailing chars of stderr to echo on failure (keep the thread lean). */
+const STDERR_TAIL_LEN = 1500;
+
+function stderrTail(stderr: string): string {
+  const trimmed = stderr.trim();
+  return trimmed.length > STDERR_TAIL_LEN
+    ? `…${trimmed.slice(-STDERR_TAIL_LEN)}`
+    : trimmed;
+}
+
+/**
+ * Render a headless outcome into Discord-safe chunks and post them (Epic #285
+ * Phase 2 / #287, AC-2 / AC-5). Distinguishes four terminal states, none of
+ * which is silent:
+ *   - timeout       → ⏱️ notice + any partial stdout + stderr tail
+ *   - non-zero exit → ❌ notice (with exit code) + stdout + stderr tail
+ *   - exit 0, empty → ⚠️ explicit "succeeded but produced no output"
+ *   - exit 0, text  → the formatted stdout
+ * Returns `{ ok:false, error }` only when posting itself throws.
+ */
+async function postHeadlessOutcome(
+  threadId: string,
+  initialCommand: string,
+  outcome: DispatchHeadlessOutcome,
+  postToThread: DispatchThreadPoster,
+): Promise<{ ok: true } | { ok: false; error: string }> {
+  const chunks: string[] = [];
+  const stdout = outcome.stdout.trim();
+  const stderr = stderrTail(outcome.stderr);
+
+  if (outcome.timedOut) {
+    chunks.push(
+      `⏱️ headless 実行がタイムアウトしました（\`${initialCommand}\`）。以下は打ち切り時点の出力です:`,
+    );
+    if (stdout) chunks.push(...formatForDiscord(outcome.stdout));
+    else chunks.push("（stdout は空でした）");
+    if (stderr) chunks.push(...formatForDiscord(`stderr:\n${stderr}`));
+  } else if (outcome.exitCode !== 0) {
+    chunks.push(
+      `❌ headless 実行が非ゼロ終了しました（exit ${outcome.exitCode}, \`${initialCommand}\`）:`,
+    );
+    if (stdout) chunks.push(...formatForDiscord(outcome.stdout));
+    if (stderr) chunks.push(...formatForDiscord(`stderr:\n${stderr}`));
+    if (!stdout && !stderr) chunks.push("（stdout / stderr ともに空でした）");
+  } else if (!stdout) {
+    // exit 0 but nothing on stdout — never present this as success (#1).
+    chunks.push(
+      `⚠️ headless 実行は正常終了 (exit 0) しましたが stdout が空でした（\`${initialCommand}\`）。ジョブが本当に完了したかログを確認してください。`,
+    );
+  } else {
+    chunks.push(...formatForDiscord(outcome.stdout));
+  }
+
+  try {
+    for (const chunk of chunks) {
+      await postToThread(threadId, chunk);
+    }
+    return { ok: true };
+  } catch (err) {
+    return { ok: false, error: errMsg(err) };
+  }
 }
 
 function errMsg(err: unknown): string {
