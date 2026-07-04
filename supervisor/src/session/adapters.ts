@@ -1,6 +1,6 @@
 import { execFile, spawn } from "child_process";
 import { promisify } from "util";
-import { mkdtempSync, rmSync, writeFileSync } from "fs";
+import { mkdtemp, rm, writeFile } from "fs/promises";
 import { tmpdir } from "os";
 import { join } from "path";
 import {
@@ -475,17 +475,21 @@ export const realIssueReporterAdapter: IssueReporterAdapter = {
   async postComment({ cwd, issueNumber, body }) {
     // --body-file (not --body): the report contains markdown headings and
     // newlines; a temp file avoids any shell/`gh` re-parsing of the body.
-    const dir = mkdtempSync(join(tmpdir(), "dispatch-report-"));
+    // Async fs (fs/promises) so the temp-file I/O never blocks the Bun event
+    // loop — the same non-blocking discipline as the async execFile tmux path
+    // (Issue #222/#227): a blocking op here would stall relay delivery under
+    // concurrent sessions (gemini PR #291 HIGH).
+    const dir = await mkdtemp(join(tmpdir(), "dispatch-report-"));
     const bodyFile = join(dir, "report.md");
     try {
-      writeFileSync(bodyFile, body);
+      await writeFile(bodyFile, body);
       await execFileAsync(
         "gh",
         ["issue", "comment", String(issueNumber), "--body-file", bodyFile],
         { cwd, encoding: "utf8", timeout: GH_COMMENT_TIMEOUT_MS },
       );
     } finally {
-      rmSync(dir, { recursive: true, force: true });
+      await rm(dir, { recursive: true, force: true });
     }
   },
 };
