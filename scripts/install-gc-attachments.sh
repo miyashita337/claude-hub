@@ -19,6 +19,10 @@ TEMPLATE="$REPO_DIR/com.claude-hub.gc-attachments.plist"
 PLIST_DIR="${GC_PLIST_DIR:-$HOME/Library/LaunchAgents}"
 PLIST="$PLIST_DIR/$LABEL.plist"
 GUI_UID=$(id -u)
+if [ "$GUI_UID" -eq 0 ]; then
+  echo "[install] ERROR: Do not run this script as root or with sudo." >&2
+  exit 1
+fi
 
 # root で実行すると logs/ や plist の所有権が root になり、一般ユーザーの
 # launchd ジョブがログを書けず起動失敗する（gui/0 への登録も意図外）。
