@@ -12,10 +12,10 @@
       Paths use a /Users/YOUR_USER placeholder; substitute $HOME on install so
       the job works on any machine (gc-attachments.ts itself resolves paths via
       os.homedir()).
-      Install (logs/ must exist first, or launchd fails to spawn the job):
-        mkdir -p ~/claude-hub/logs
-        sed "s|/Users/YOUR_USER|$HOME|g" com.claude-hub.gc-attachments.plist > ~/Library/LaunchAgents/com.claude-hub.gc-attachments.plist
-        launchctl load ~/Library/LaunchAgents/com.claude-hub.gc-attachments.plist
+      Install (idempotent; creates logs/, substitutes the placeholder, loads):
+        bash scripts/install-gc-attachments.sh
+      Uninstall:
+        bash scripts/install-gc-attachments.sh --uninstall
     -->
 
     <key>ProgramArguments</key>
