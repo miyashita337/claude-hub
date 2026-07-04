@@ -34,6 +34,9 @@ bun run supervisor/index.ts
 
 # 常駐 (launchd)
 launchctl load ~/Library/LaunchAgents/com.claude-hub.supervisor.plist
+
+# 添付ファイルの日次GC (launchd, 04:00 に tmp/attachments の30日超を削除。Issue #151/#280)
+bash scripts/install-gc-attachments.sh
 ```
 
 ## ローカル E2E 検証

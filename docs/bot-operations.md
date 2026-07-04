@@ -60,6 +60,20 @@ claude-hub プロジェクトで運用している Discord Bot の役割分担�
 - `~/claude-hub/logs/supervisor.{stdout,stderr}.log` — supervisor ログ
 - `scripts/list-mcp-load-time.sh` — 各設定での cold-start 計測 (Issue #104 / Epic #101)
 
+## メンテナンスジョブ: 添付ファイルの日次 GC (Issue #151 / #280)
+
+Discord 添付の保存先 `tmp/attachments` を毎日 04:00 に GC し、30 日超のファイルを削除する launchd ジョブ。**セットアップ時に手動インストールが必要**（supervisor 本体とは独立。未インストールだと GC が動かず添付が無限に溜まる — #280 で実際に未設置のまま放置されていた）。
+
+```bash
+bash scripts/install-gc-attachments.sh              # 設置 + load（冪等）
+bash scripts/install-gc-attachments.sh --uninstall  # 撤去
+launchctl kickstart -k gui/$(id -u)/com.claude-hub.gc-attachments  # 手動即時実行
+```
+
+- Label: `com.claude-hub.gc-attachments` / テンプレート: リポ直下 `com.claude-hub.gc-attachments.plist`
+- ログ: `logs/gc-attachments.{stdout,stderr}.log`（正常時は `[gc-attachments] done: N deleted, M kept`）
+- テスト: `bash scripts/test-install-gc-attachments.sh`（launchctl に触らず生成・冪等性のみ検証）
+
 ## Cold-start プロファイル (Issue #104)
 
 Channel-Supervisor 経由で起動する Claude Code セッションは、デフォルトで以下のフラグを付与する（`supervisor/src/session/manager.ts` の `buildClaudeFlags()`）。
