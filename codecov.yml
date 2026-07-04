@@ -1,36 +1,48 @@
+# codecov 設定（Epic miyashita337/agent-base#420 Phase 2 / rules/general/coverage-policy.md 準拠）
+#
+# WARN-first 運用（coverage-policy.md §6）:
+#   patch / project とも informational: true（WARN-only、非 blocking）で導入し、
+#   数 PR dogfood して false positive がないことを確認してから blocking 昇格する。
+#   blocking 昇格の条件・期限・手順は follow-up issue #300 で追跡する
+#   （informational のまま放置しない）。
+
 coverage:
+  precision: 2
+  round: down
+  range: "60...90"
   status:
-    # The repository baseline: keep overall coverage from regressing.
+    # プロジェクト全体: regression 禁止の ratchet（coverage-policy.md §2）。
+    # ベースライン実測（2026-07-05, ci.yml の curated Unit Tests suite）:
+    #   line 78.60% / func 81.04%。
+    # target: auto = ベースコミット比で低下禁止。実測値の向上に合わせて
+    # 明示 target（"80%" 等）へ段階引き上げる。
     project:
       default:
         target: auto
-        threshold: 1%
+        threshold: 1% # 計測ノイズ許容（Bun coverage の実行順依存分）
+        informational: true # WARN-first。blocking 昇格は follow-up #300
 
-    # Patch coverage: applied per-PR to lines changed in the diff.
+    # patch coverage: PR の変更行のみに適用（coverage-policy.md §1）。
     #
-    # Why 50% (not 80%): the `tmux send-keys` retry paths in
-    # supervisor/src/session/relay.ts are only reachable when tmux itself
-    # returns a transient failure (ETIMEDOUT or "not in a mode" on stderr).
-    # Reliably inducing those conditions in CI requires interleaving with
-    # external tmux server state that the test runner does not control,
-    # so the retry branches are validated by the real-tmux integration
-    # tests (tests/session/relay.test.ts + tests/e2e/ac-verification.test.ts)
-    # exercising the success path and the Issue #73 copy-mode recovery.
-    # The recovery call path (`ensurePaneNotInMode` before `tmuxSend`) is
-    # fully covered; only the error-categorization branches inside
-    # `tmuxSend` catch remain uncovered.
+    # 50% → 70% へ引き上げ（Epic #420 Phase 2）。旧 50% は relay.ts の tmux
+    # エラー分岐（ETIMEDOUT / "not in a mode"）が外部 tmux サーバ状態に依存し
+    # CI で誘発困難なため意図的に下げていた（Issue #73）。
     #
-    # 50% keeps the gate meaningful (any PR that *removes* test coverage
-    # of this module still fails) without forcing synthetic tests for
-    # branches that only fire on external tmux misbehavior.
+    # 制約: codecov の ignore も Bun coverage も「行 / 分岐単位の除外」を
+    # サポートしない（Bun は c8 / istanbul の ignore コメントを無視する。
+    # 2026-07-05 検証済み）。よって relay.ts の error 分岐だけを外すことは
+    # できず、relay.ts はスコープ内に残す。WARN-first（informational）にする
+    # ことで、error 分岐のみ変更した PR が patch check で不当に FAIL すること
+    # を防ぐ（統合ジャーニーAC-3）。blocking 昇格時に relay.ts の error 分岐を
+    # 実 tmux 統合テストで誘発するか個別対応するかを follow-up #300 で判断する。
     patch:
       default:
-        target: 50%
+        target: 70%
         threshold: 0%
         only_pulls: true
+        informational: true # WARN-first。blocking 昇格は follow-up #300
 
-# Annotate coverage results inline on PRs but keep the merge gate advisory
-# rather than blocking. The enforced gates for this project are:
+# 変更を PR にインラインで注記する。マージゲート（強制）はテスト系ジョブ:
 #   - Type Check (bunx tsc --noEmit)
 #   - Unit Tests (bun test)
 #   - E2E Tests (AC-1..AC-7)
@@ -40,9 +52,24 @@ comment:
   behavior: default
   require_changes: false
 
+# 計測対象外（除外理由を各項目に明記。coverage-policy.md §4）
 ignore:
-  # Generated / vendored
+  # 生成物・依存
   - "supervisor/dist/**"
   - "supervisor/node_modules/**"
-  # Test helpers don't need self-coverage
+  # テストヘルパ自身は self-coverage 不要
   - "supervisor/tests/**"
+  # ライブ Discord bot token を要する起動経路。トークン無しでは実行不能で、
+  # AC-1/2/3 は PR 本文で手動検証扱い（ci.yml e2e-tests ジョブのコメント参照）。
+  - "supervisor/index.ts"
+  - "supervisor/src/bot.ts"
+  # iterm2 タブ着色。~/.claude/scripts/project-colors.json とローカル iTerm2 を
+  # 要するローカル専用（ci.yml 末尾「Local-only tests」参照）。
+  - "supervisor/src/session/iterm2.ts"
+  # launchd 定義（宣言的 XML）。実行コードでなくカバレッジ対象外。
+  - "**/*.plist"
+  - "**/*.plist.template"
+  # シェルスクリプト（scripts/ 配下 ~23 本ほか）。Bun coverage は JS/TS のみ
+  # 計測。シェルは routing-tests ジョブの bash テストで担保する。
+  # 注: supervisor/scripts/*.ts（lint ツール群）は TS で計測対象・除外しない。
+  - "**/*.sh"
