@@ -1,4 +1,4 @@
-import { execFile } from "child_process";
+import { execFile, spawn } from "child_process";
 import { promisify } from "util";
 import {
   openTab as realOpenTab,
@@ -102,12 +102,63 @@ export interface WorktreeAdapter {
   recreateForBranch(mainRepoDir: string, branch: string): Promise<boolean>;
 }
 
+/**
+ * Result of one headless `claude -p` run (Epic #285 Phase 2). Captured after the
+ * child exits so the dispatch orchestrator can format stdout for the department
+ * thread. A non-zero `exitCode` is DATA, not an error — the caller surfaces it to
+ * the thread (AC-5, no silent success); {@link ExecutorAdapter.runHeadless} only
+ * throws when the child could not be spawned at all (binary/cwd missing).
+ */
+export interface HeadlessRunResult {
+  /** Child exit code, or `null` when it was killed (e.g. the timeout fired). */
+  exitCode: number | null;
+  stdout: string;
+  stderr: string;
+  /** True when the run was killed because it exceeded {@link HeadlessRunOptions.timeoutMs}. */
+  timedOut: boolean;
+}
+
+export interface HeadlessRunOptions {
+  /** Absolute path to the `claude` binary (resolved by the caller). */
+  claudePath: string;
+  /**
+   * argv passed AFTER the binary — includes `-p <initialCommand>`, the headless
+   * flag set, and `--session-id <uuid>`. Passed as an array (no shell) so the
+   * prompt and JSON `--mcp-config` value cannot be re-parsed by a shell.
+   */
+  args: string[];
+  /** Working directory for the child (the branch worktree, or the channel dir). */
+  cwd: string;
+  /** Full environment for the child (the caller builds it; it is NOT merged). */
+  env: Record<string, string | undefined>;
+  /** Wall-clock ceiling; on expiry the child is killed and `timedOut` is set. */
+  timeoutMs: number;
+  /**
+   * Invoked exactly once with the child pid immediately after spawn (before the
+   * child exits). Lets {@link import("./manager").SessionManager} register the
+   * session for slot accounting / liveness while the long run is still in flight.
+   */
+  onSpawn?: (pid: number) => void;
+}
+
+/**
+ * Headless executor (Epic #285 Phase 2). Runs `claude -p "<command>"` as a child
+ * process and returns its captured output — the structural seam that lets the
+ * dispatch path bypass the tmux Ink TUI (and its {@link waitForInputReady}
+ * string-match timing class, RW-025 / RW-047) for batch dispatch workloads. Unit
+ * tests inject a fake so they never spawn a real `claude`.
+ */
+export interface ExecutorAdapter {
+  runHeadless(opts: HeadlessRunOptions): Promise<HeadlessRunResult>;
+}
+
 export interface SessionEffects {
   tmux: TmuxAdapter;
   iterm2: ItermAdapter;
   relayServer: RelayServerAdapter;
   process: ProcessAdapter;
   worktree: WorktreeAdapter;
+  executor: ExecutorAdapter;
 }
 
 // Issue #222: bound every synchronous tmux call so a wedged tmux server (whose
@@ -302,10 +353,93 @@ export const realWorktreeAdapter: WorktreeAdapter = {
   },
 };
 
+export const realExecutorAdapter: ExecutorAdapter = {
+  // child_process.spawn (async, so lint-no-sync-exec is satisfied) with
+  // `detached: true` so the child leads its own process GROUP. On timeout we
+  // kill the whole group (`process.kill(-pid)`), not just the direct child:
+  // `claude -p` spawns tool subprocesses (git / gh / bash), and if any survive
+  // they keep the stdout pipe open, so the 'close' event — and this promise —
+  // would hang until they exit (observed as a Linux-CI deadlock with an
+  // orphaned grandchild). Group SIGKILL closes the pipes promptly.
+  runHeadless({ claudePath, args, cwd, env, timeoutMs, onSpawn }) {
+    return new Promise<HeadlessRunResult>((resolve, reject) => {
+      let child;
+      try {
+        child = spawn(claudePath, args, {
+          cwd,
+          // Passed through as-is (keys with undefined value are dropped by Node),
+          // so ANTHROPIC_API_KEY is unset here → use the Claude Max subscription.
+          env,
+          detached: true,
+          stdio: ["ignore", "pipe", "pipe"],
+        });
+      } catch (err) {
+        reject(err);
+        return;
+      }
+
+      const pid = child.pid;
+      if (pid == null) {
+        reject(new Error("failed to spawn headless claude (no pid)"));
+        return;
+      }
+      onSpawn?.(pid);
+
+      let stdout = "";
+      let stderr = "";
+      child.stdout?.setEncoding("utf8");
+      child.stderr?.setEncoding("utf8");
+      child.stdout?.on("data", (d: string) => {
+        stdout += d;
+      });
+      child.stderr?.on("data", (d: string) => {
+        stderr += d;
+      });
+
+      let timedOut = false;
+      let settled = false;
+      const timer = setTimeout(() => {
+        timedOut = true;
+        try {
+          // Negative pid → the whole process group (claude + its tool children).
+          // SIGKILL because a wedged run may ignore SIGTERM.
+          process.kill(-pid, "SIGKILL");
+        } catch {
+          // Group already gone / not a leader — fall back to the direct child.
+          try {
+            child.kill("SIGKILL");
+          } catch {
+            // Nothing more we can do; 'close' will still settle the promise.
+          }
+        }
+      }, timeoutMs);
+
+      child.on("error", (err) => {
+        if (settled) return;
+        settled = true;
+        clearTimeout(timer);
+        reject(err);
+      });
+      // 'close' fires once the process exited AND its stdio streams closed. With
+      // the group kill above, grandchildren die too, so this is not delayed.
+      child.on("close", (code) => {
+        if (settled) return;
+        settled = true;
+        clearTimeout(timer);
+        // On a timeout kill the numeric code reflects the signal, not a
+        // meaningful "job failed with code N" — report null so the caller
+        // renders it as a timeout rather than a numeric non-zero exit.
+        resolve({ exitCode: timedOut ? null : code, stdout, stderr, timedOut });
+      });
+    });
+  },
+};
+
 export const realSessionEffects: SessionEffects = {
   tmux: realTmuxAdapter,
   iterm2: realItermAdapter,
   relayServer: realRelayServerAdapter,
   process: realProcessAdapter,
   worktree: realWorktreeAdapter,
+  executor: realExecutorAdapter,
 };

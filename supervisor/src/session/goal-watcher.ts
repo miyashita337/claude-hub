@@ -165,6 +165,11 @@ export class GoalWatcher {
       const liveDispatch = new Set<string>();
 
       for (const [threadId, session] of sessions) {
+        // Headless dispatch sessions self-terminate on their child's exit (Epic
+        // #285 Phase 2): SessionManager.finishHeadless owns their teardown, so a
+        // label-driven stop() here would race that and could SIGTERM a run that
+        // is already exiting. Leave them entirely to the headless lifecycle.
+        if (session.executor === "headless") continue;
         const match = session.branch?.match(DISPATCH_BRANCH_RE);
         if (!match) continue; // not a dispatch session (corp / work branch) → AC-6
         liveDispatch.add(threadId);

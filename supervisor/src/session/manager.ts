@@ -27,6 +27,7 @@ import {
 import {
   realSessionEffects,
   type SessionEffects,
+  type HeadlessRunResult,
 } from "./adapters";
 import {
   createContextBudgetTracker,
@@ -191,6 +192,105 @@ export function buildClaudeFlags(config: ChannelConfig): string[] {
 }
 
 /**
+ * Default wall-clock ceiling for a headless `claude -p` run (Epic #285 Phase 2).
+ * A dispatch job (`/impl`, `/pdca`) can legitimately run for many minutes, so
+ * this is generous; it exists to bound a genuinely wedged child so it cannot
+ * squat a MAX_SESSIONS slot forever (the "誤放置" half of #288). The idle
+ * reapers deliberately do NOT reap headless sessions — a self-terminating child
+ * with its own timeout is the authoritative liveness bound, not tmux idle time —
+ * so this ceiling is that bound. Env-overridable for ops tuning (mirrors
+ * DISPATCH_ORPHAN_IDLE_MS) without a redeploy.
+ */
+export const HEADLESS_TIMEOUT_MS = 2 * 60 * 60 * 1000; // 2 hours
+
+function headlessTimeoutMs(): number {
+  const raw = process.env.DISPATCH_HEADLESS_TIMEOUT_MS;
+  if (!raw) return HEADLESS_TIMEOUT_MS;
+  const n = Number(raw);
+  return Number.isFinite(n) && n > 0 ? Math.floor(n) : HEADLESS_TIMEOUT_MS;
+}
+
+/**
+ * Build the argv for a headless `claude -p` run (Epic #285 Phase 2 / #286).
+ *
+ * This intentionally does NOT reuse {@link buildClaudeFlags}: that helper
+ * pre-quotes its values for embedding in the tmux path's bash *command string*
+ * (e.g. `--name "channel"` and `--mcp-config '{...}'` carry literal quotes so a
+ * shell round-trip parses them correctly). Headless spawns with an argv *array*
+ * and no shell (Bun.spawn), so those literal quotes would become part of the
+ * value — `--mcp-config '{"mcpServers":{}}'` would be an invalid config path.
+ * Here every token is a clean, unquoted argv element.
+ *
+ * Reuses the same config-driven decisions as buildClaudeFlags (chromeEnabled,
+ * mcpProfile) but drops `--name`, whose only effect is the Ink TUI display name
+ * (TUI-only, per #286). Flags verified against `claude --help` (v2.1.201):
+ * `-p`/`--print`, `--output-format`, `--dangerously-skip-permissions`,
+ * `--no-chrome`, `--strict-mcp-config`, `--mcp-config`, `--session-id`.
+ *
+ * `initialCommand` is the first prompt (e.g. `/impl 42`) — a fixed literal built
+ * from the validated selector + issue number, never free user text.
+ */
+export function buildHeadlessClaudeFlags(
+  config: ChannelConfig,
+  initialCommand: string,
+): string[] {
+  const args = [
+    "-p",
+    initialCommand,
+    // text is the default -p format, but pin it explicitly so a future default
+    // change cannot silently turn stdout into JSON the formatter would post raw.
+    "--output-format",
+    "text",
+    "--dangerously-skip-permissions",
+  ];
+
+  if (config.chromeEnabled !== true) {
+    args.push("--no-chrome");
+  }
+
+  const profile = config.mcpProfile ?? "none";
+  if (profile === "none") {
+    // Raw JSON (no surrounding quotes): argv is passed literally, no shell.
+    args.push("--strict-mcp-config", "--mcp-config", '{"mcpServers":{}}');
+  }
+
+  return args;
+}
+
+/**
+ * Environment for a headless child (Epic #285 Phase 2). Bun.spawn REPLACES the
+ * environment, so this returns a COMPLETE env derived from the supervisor's:
+ *   - ANTHROPIC_API_KEY removed → use the Claude Max subscription (mirrors the
+ *     tmux path's `unset ANTHROPIC_API_KEY`),
+ *   - PATH prefixed with the same dirs the tmux path exports, so tools the run
+ *     shells out to (git / gh / bun) resolve regardless of the supervisor's PATH.
+ * SUPERVISOR_RELAY_URL is intentionally NOT set: headless captures stdout
+ * directly, so the PostToolUse progress-relay hook has nothing to POST to.
+ */
+function buildHeadlessEnv(): Record<string, string | undefined> {
+  const env: Record<string, string | undefined> = { ...process.env };
+  delete env.ANTHROPIC_API_KEY;
+  const extraPath = [
+    resolve(homedir(), ".local/bin"),
+    resolve(homedir(), ".bun/bin"),
+    "/opt/homebrew/bin",
+    "/usr/local/bin",
+    "/usr/bin",
+    "/bin",
+  ].join(":");
+  env.PATH = env.PATH ? `${extraPath}:${env.PATH}` : extraPath;
+  return env;
+}
+
+/** Outcome of {@link SessionManager.runHeadless}. */
+export interface HeadlessSessionResult extends HeadlessRunResult {
+  /** Supervisor session-row id (for correlating with sessions.db). */
+  sessionId: string;
+  /** The pinned `--session-id` value handed to the child. */
+  claudeSessionId: string;
+}
+
+/**
  * Compute the runtime-dir path that holds the relay URL for a given project
  * cwd. Sanitises by stripping every leading `/` and replacing any character
  * outside `[A-Za-z0-9._-]` with `_`, so each session's URL lives in its own
@@ -310,6 +410,7 @@ export class SessionManager {
         options.effects?.relayServer ?? realSessionEffects.relayServer,
       process: options.effects?.process ?? realSessionEffects.process,
       worktree: options.effects?.worktree ?? realSessionEffects.worktree,
+      executor: options.effects?.executor ?? realSessionEffects.executor,
     };
     this.gracefulKillTimeoutMs =
       options.gracefulKillTimeoutMs ?? GRACEFUL_KILL_TIMEOUT_MS;
@@ -650,6 +751,178 @@ export class SessionManager {
     }, 0);
 
     return info;
+  }
+
+  /**
+   * Start and run a dispatch job headlessly (Epic #285 Phase 2 / #287): spawn
+   * `claude -p "<initialCommand>"` in the branch worktree and resolve with the
+   * captured stdout/stderr/exit once the child exits. Unlike {@link start}, there
+   * is NO tmux session, NO Ink TUI, and NO waitForInputReady/sendMessage — the
+   * whole TUI-timing failure class (RW-025 / RW-047) is structurally absent.
+   *
+   * The session is registered in the live map the instant the child spawns (via
+   * the adapter's onSpawn callback) so slot accounting (MAX_SESSIONS) and the
+   * status endpoints see it during the run, and closed on exit ({@link
+   * finishHeadless}). The reapers deliberately skip `executor:"headless"`
+   * sessions (orphan-dispatch-reaper.ts / goal-watcher.ts) because a headless
+   * session self-terminates — its child process, bounded by the run timeout, is
+   * the authoritative liveness signal, not tmux idle time.
+   *
+   * Guards mirror {@link start} (MAX_SESSIONS, thread/pending collision,
+   * projectDir existence). A spawn failure propagates (no session is registered,
+   * onSpawn never fired) so the caller can surface it (no silent fallback).
+   */
+  async runHeadless(
+    config: ChannelConfig,
+    threadId: string,
+    initialCommand: string,
+    branch?: string,
+  ): Promise<HeadlessSessionResult> {
+    // Same single-flight guards as start(): runHeadless is another async entry
+    // that registers a session, so it must respect the identical MAX_SESSIONS /
+    // dup / pending checks or a race could bypass them (review #185 class).
+    if (this.sessions.size + this.pendingStarts.size >= MAX_SESSIONS) {
+      throw new Error(`最大セッション数 (${MAX_SESSIONS}) に達しています`);
+    }
+    if (this.sessions.has(threadId) || this.pendingStarts.has(threadId)) {
+      throw new Error(`このスレッドのセッションは既に稼働中です`);
+    }
+    if (!existsSync(config.dir)) {
+      throw new Error(
+        `プロジェクトディレクトリが見つかりません: ${config.dir}`,
+      );
+    }
+
+    this.pendingStarts.add(threadId);
+    try {
+      // Resolve the worktree exactly as launchStart does (Issue #154): the
+      // headless child runs in the per-branch worktree, isolated from other
+      // sessions on the same repo. Failures propagate before any spawn.
+      let projectDir = config.dir;
+      let worktree: SessionInfo["worktree"];
+      const trimmedBranch = branch?.trim();
+      if (trimmedBranch) {
+        const result = await this.effects.worktree.ensure(
+          config.dir,
+          trimmedBranch,
+        );
+        projectDir = result.path;
+        worktree = {
+          mainRepoDir: config.dir,
+          path: result.path,
+          branch: trimmedBranch,
+        };
+        console.log(
+          `[SessionManager] ${result.reused ? "Reusing existing worktree" : "Created worktree"} for headless branch '${trimmedBranch}': ${result.path}`,
+        );
+      }
+
+      const sessionId = randomUUID();
+      const claudeSessionId = randomUUID();
+      const args = [
+        ...buildHeadlessClaudeFlags(config, initialCommand),
+        // Pin the session id like launchStart so the DB row captures it
+        // deterministically (Issue #167). randomUUID() is shell-safe, though
+        // there is no shell here.
+        "--session-id",
+        claudeSessionId,
+      ];
+      const now = new Date();
+
+      const result = await this.effects.executor.runHeadless({
+        claudePath: claudePath(),
+        args,
+        cwd: projectDir,
+        env: buildHeadlessEnv(),
+        timeoutMs: headlessTimeoutMs(),
+        onSpawn: (pid) => {
+          // Register the session synchronously the moment the child exists, so
+          // MAX_SESSIONS / count() reflect the in-flight run and the reapers can
+          // observe it. Hand off pendingStarts → sessions (mirrors launchStart).
+          const info: SessionInfo = {
+            id: sessionId,
+            channelName: config.channelName,
+            threadId,
+            projectDir,
+            pid,
+            claudeSessionId,
+            process: null as unknown as any, // the executor owns the child
+            startedAt: now,
+            lastActivityAt: now,
+            status: "running",
+            branch: trimmedBranch || undefined,
+            worktree,
+            executor: "headless",
+          };
+          this.sessions.set(threadId, info);
+          this.pendingStarts.delete(threadId);
+          insertSession({
+            id: sessionId,
+            channel_name: config.channelName,
+            thread_id: threadId,
+            project_dir: projectDir,
+            pid,
+            claude_session_id: claudeSessionId,
+            started_at: now.toISOString(),
+            last_activity_at: now.toISOString(),
+            status: "running",
+            branch: trimmedBranch ?? null,
+          });
+          console.log(
+            `[SessionManager] Started ${config.channelName} headless (PID: ${pid}, thread: ${threadId}, cmd: ${initialCommand})`,
+          );
+        },
+      });
+
+      // Child exited → close the session (frees the slot). Even if onSpawn never
+      // fired (should not happen unless the adapter misbehaves), finishHeadless
+      // is a no-op safe cleanup.
+      await this.finishHeadless(threadId, sessionId, result, worktree);
+
+      return { ...result, sessionId, claudeSessionId };
+    } finally {
+      // Error-path safety net: if the spawn threw before onSpawn, drop the
+      // pending marker so the slot is not leaked (delete is idempotent).
+      this.pendingStarts.delete(threadId);
+    }
+  }
+
+  /**
+   * Close a finished headless session (Epic #285 Phase 2 / #288). Symmetric with
+   * the tmux exit path ({@link watchTmuxSession}'s tmux_exited branch): drop the
+   * live map entry, record the terminal reason, and best-effort remove the
+   * worktree — a headless dispatch has pushed its work to the branch (its result
+   * is a PR), so the completed run's worktree is reclaimed here, matching how a
+   * tmux dispatch's worktree is removed when GoalWatcher/OrphanReaper stop()s it.
+   * The DB reason distinguishes a timeout so operators can audit wedged runs; the
+   * success/failure detail itself is surfaced to the thread by the caller (AC-5).
+   */
+  private async finishHeadless(
+    threadId: string,
+    sessionId: string,
+    result: HeadlessRunResult,
+    worktree: SessionInfo["worktree"],
+  ): Promise<void> {
+    this.sessions.delete(threadId);
+    this.clearWatcher(threadId); // defensive: headless never sets one
+    const reason: StopReason = result.timedOut
+      ? "headless_timeout"
+      : "headless_exited";
+    updateSessionStatus(sessionId, "stopped", reason);
+    // No relay-url file to clean: buildHeadlessEnv() does not set
+    // SUPERVISOR_RELAY_URL and the headless child never writes one (stdout is
+    // captured directly), so there is nothing the progress-relay hook could
+    // have dropped for this cwd.
+    if (worktree && !this.isWorktreePathInUse(worktree.path)) {
+      await this.removeWorktreeBestEffort(worktree);
+    } else if (worktree) {
+      console.log(
+        `[SessionManager] Headless worktree ${worktree.path} still in use by another session; not removing`,
+      );
+    }
+    console.log(
+      `[SessionManager] Headless session for thread ${threadId} closed (reason: ${reason}, exit: ${result.exitCode})`,
+    );
   }
 
   /**

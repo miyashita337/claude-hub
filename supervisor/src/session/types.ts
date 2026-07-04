@@ -34,6 +34,16 @@ export interface SessionInfo {
    * high-context session is warned only when it crosses up into a new band.
    */
   contextBudgetTracker?: ContextBudgetTracker;
+  /**
+   * Which executor backs this session (Epic #285 Phase 2). `"tmux"` (the
+   * default, and the value for every pre-#285 code path) is the interactive Ink
+   * TUI launched via `tmux new-session`; `"headless"` is a `claude -p` child
+   * process whose lifecycle is bounded by {@link SessionManager.runHeadless} —
+   * it has no tmux session and no Ink TUI. Consumers that reason about tmux
+   * liveness (the reapers / goal-watcher) branch on this so they never apply a
+   * tmux-shaped check to a headless session. Undefined is treated as `"tmux"`.
+   */
+  executor?: "tmux" | "headless";
 }
 
 /**
@@ -55,4 +65,4 @@ export interface SessionHealthInfo {
   lastActivityAt: string;
 }
 
-export type StopReason = "manual" | "idle_timeout" | "resource_limit" | "error" | "tmux_exited" | "supervisor_restart" | "self_heal_restart" | "goal_complete" | "orphan_reaped";
+export type StopReason = "manual" | "idle_timeout" | "resource_limit" | "error" | "tmux_exited" | "supervisor_restart" | "self_heal_restart" | "goal_complete" | "orphan_reaped" | "headless_exited" | "headless_timeout";

@@ -58,6 +58,15 @@ export interface ReapableSession {
   branch?: string;
   status: SessionInfo["status"];
   lastActivityAt: Date;
+  /**
+   * Executor backend (Epic #285 Phase 2). A `"headless"` dispatch session is
+   * NEVER orphan-reaped: it has no external parent to be orphaned by (its
+   * `claude -p` child self-terminates and is bounded by the run timeout), and it
+   * has no relay progress to refresh `lastActivityAt`, so an idle-based reap
+   * would wrongly fire mid-run. Its liveness is the child process, not tmux idle
+   * time. Undefined is treated as `"tmux"` (the pre-#285 behaviour).
+   */
+  executor?: SessionInfo["executor"];
 }
 
 /** One orphaned dispatch session selected for reaping. */
@@ -86,6 +95,10 @@ export function selectReapableDispatch(
   const out: OrphanReapCandidate[] = [];
   for (const [threadId, session] of entries) {
     if (session.status !== "running") continue;
+    // Headless dispatch sessions self-terminate (Epic #285 Phase 2): their child
+    // process is the authoritative liveness bound, and they have no relay to keep
+    // lastActivityAt fresh, so idle-based reaping would kill a working run. Skip.
+    if (session.executor === "headless") continue;
     if (!session.branch || !DISPATCH_BRANCH_RE.test(session.branch)) continue;
     const idleMs = opts.now - session.lastActivityAt.getTime();
     if (Number.isFinite(idleMs) && idleMs >= opts.idleThresholdMs) {

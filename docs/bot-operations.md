@@ -87,6 +87,45 @@ Channel-Supervisor 経由で起動する Claude Code セッションは、デフ
 
 「lazy load」は Claude Code 公式に仕組みが存在しないため、本実装では「default disable + 必要な channel だけ opt-in」で代替する。設定変更の検証は `bash scripts/list-mcp-load-time.sh --quick` で前後比較できる。
 
+## Headless executor モード (`DISPATCH_EXECUTOR_MODE`, Epic #285 Phase 2)
+
+`/dispatch`（corp からの自動起動）で始まる部署セッションは、既定では tmux 内の対話 TUI（`tmux new-session -d` で `claude` を起動し、`waitForInputReady` で Ink TUI の描画を待って send-keys で初期コマンドを注入）で動く。この経路は RW-019（copy-mode で send-keys が silent drop）や RW-025/RW-047（TUI 表示文字列マッチのタイミング依存）といった手戻りクラスの温床になる。
+
+dispatch は「Issue 番号とコマンドを与えて完走させる」バッチ的ワークロードで対話 TUI である必要がないため、**headless モード**を opt-in で用意している。headless では tmux も Ink TUI も使わず、`claude -p "<初期コマンド>"` を子プロセスとして spawn し、stdout を捕捉して部署スレッドへ投稿する。TUI 依存の故障モードが構造的に消える。
+
+### 有効化（opt-in・逃げ道）
+
+| env | 値 | 挙動 |
+|---|---|---|
+| `DISPATCH_EXECUTOR_MODE` | 未設定（既定） / `tmux` | 現行の tmux 対話 TUI 経路（変更なし） |
+| `DISPATCH_EXECUTOR_MODE` | `headless` | dispatch を `claude -p` の子プロセスで実行し stdout をスレッド返却 |
+| `DISPATCH_HEADLESS_TIMEOUT_MS` | 正の整数（既定 `7200000` = 2h） | headless 子プロセスの wall-clock 上限。超過で SIGTERM → スレッドにタイムアウト明示 |
+
+- 完全に **opt-in**: `headless` 以外の値（未設定・空・大文字 `HEADLESS` 等）はすべて `tmux` にフォールバックする（`resolveExecutorMode`、fail-safe）。
+- 対話セッション（`/session start`、primary channel）は headless 化しない。人間との対話は TUI のまま。
+- Supervisor の plist `EnvironmentVariables` に `DISPATCH_EXECUTOR_MODE=headless` を追加 → `launchctl bootout`+`bootstrap` で反映（他の env 同様、`kickstart -k` では env 再読込されない点に注意）。
+
+### 起動フラグ（TUI 専用フラグの除外）
+
+headless の argv は `buildHeadlessClaudeFlags()`（`supervisor/src/session/manager.ts`）が生成する。tmux 経路の `buildClaudeFlags()` は bash コマンド文字列への埋め込み用に値を pre-quote しているため**再利用せず**、shell を通さない argv 配列として組み立てる（`--mcp-config '{...}'` の literal quote 混入を防ぐ）。TUI 表示名 `--name` は除外。`claude --help`（v2.1.201）で確認したフラグ: `-p`/`--print`、`--output-format text`、`--dangerously-skip-permissions`、`--no-chrome`、`--strict-mcp-config`、`--mcp-config`、`--session-id`。
+
+### ライフサイクル / 誤回収防止
+
+- 子プロセス spawn 時に session を登録（MAX_SESSIONS 枠・`/session list` に反映）、exit で close（DB を `stopped` 化、reason は `headless_exited` / タイムアウトは `headless_timeout`、worktree は best-effort 削除）。
+- headless セッションは自己終了（子プロセス exit が権威的な liveness）で relay 進捗を出さないため、tmux idle 前提の **OrphanDispatchReaper / GoalWatcher は `executor:"headless"` を skip** する（idle 誤回収・done ラベル起因の stop() レースを回避）。wedge した子は上記 `DISPATCH_HEADLESS_TIMEOUT_MS` で回収する。
+
+### 観測ログ
+
+- 起動: `[SessionManager] Started <channel> headless (PID: ..., thread: ..., cmd: /impl <N>)`
+- 終了: `[SessionManager] Headless session for thread <id> closed (reason: headless_exited|headless_timeout, exit: <code>)`
+- bot 側: `[Bot] Headless dispatch completed in channel <ch> (thread=..., exit=..., timedOut=...)`
+- 非ゼロ exit / タイムアウト / exit 0 だが stdout 空 は、いずれも**スレッドに明示投稿**する（サイレント成功にしない）。
+
+### 段階導入（WARN-first dogfood の写像）
+
+1. `DISPATCH_EXECUTOR_MODE=headless` を opt-in で有効化し、agent-base 向け dispatch（no-template / pdca）で数日 dogfood。
+2. 故障モードを観測ログで確認。問題なければ既定を headless に昇格し、tmux は明示指定の逃げ道として残す。
+
 ## Access Policy (claudeHubExit)
 
 claudeHubExit Bot は `~/.claude/channels/discord/access.json` で access 制御される。Issue #47 以降、以下の方針で運用する。
