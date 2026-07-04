@@ -155,6 +155,9 @@ jobs:
                    tests/session/adapters-executor.test.ts \
                    tests/session/manager-headless.test.ts \
                    tests/session/headless-liveness.test.ts \
+                   tests/session/reaper.test.ts \
+                   tests/session/dispatch-queue.test.ts \
+                   tests/session/admission.test.ts \
                    tests/session/latency-logger.test.ts \
                    tests/session/manager-input-ready.test.ts \
                    tests/session/progress-buffer.test.ts \

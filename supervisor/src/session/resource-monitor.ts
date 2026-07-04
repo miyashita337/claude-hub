@@ -5,13 +5,31 @@ import {
   RESOURCE_CHECK_INTERVAL_MS,
   MAX_MEMORY_PER_SESSION_MB,
 } from "../config/channels";
+import { AdmissionController } from "./admission";
 
 const execAsync = promisify(exec);
 
+export interface ResourceMonitorDeps {
+  /**
+   * Admission controller used purely for its load/memory sampling here (Phase 5d
+   * / #295): each check() samples system load and logs a WARN when it is high, so
+   * saturation episodes are observable in the supervisor log even in the default
+   * observe-only mode. The start-time admission GATE lives in bot.ts; this is the
+   * periodic observation half. Defaults to a fresh observe-mode controller.
+   */
+  admission?: AdmissionController;
+}
+
 export class ResourceMonitor {
   private timer: ReturnType<typeof setInterval> | null = null;
+  private readonly admission: AdmissionController;
 
-  constructor(private sessionManager: SessionManager) {}
+  constructor(
+    private sessionManager: SessionManager,
+    deps: ResourceMonitorDeps = {},
+  ) {
+    this.admission = deps.admission ?? new AdmissionController();
+  }
 
   start(): void {
     this.timer = setInterval(
@@ -30,8 +48,25 @@ export class ResourceMonitor {
     }
   }
 
-  private async check(): Promise<void> {
-    for (const [threadId, session] of this.sessionManager.entries()) {
+  /**
+   * Sample system load and log a WARN when it is over the ceiling (Phase 5d /
+   * #295). Public so a test can drive it deterministically with an injected
+   * sampler. Observation only — it never stops or delays anything here (the
+   * start-time gate is in bot.ts); this makes high-load episodes visible.
+   */
+  sampleLoad(): void {
+    const decision = this.admission.evaluate();
+    if (decision.warn) {
+      console.warn(`[ResourceMonitor] ${decision.warn}`);
+    }
+  }
+
+  async check(): Promise<void> {
+    this.sampleLoad();
+    // Snapshot first: stop() (resource_limit teardown below) awaits and mutates
+    // the live map mid-loop, so iterating the raw entries() iterator while
+    // deleting is a race (gemini PR #297 HIGH). Mirrors the reapers.
+    for (const [threadId, session] of Array.from(this.sessionManager.entries())) {
       if (!session.pid) continue;
       try {
         const { stdout } = await execAsync(`ps -o rss= -p ${session.pid}`);

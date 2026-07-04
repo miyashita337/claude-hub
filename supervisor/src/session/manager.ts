@@ -444,6 +444,14 @@ export class SessionManager {
    * would double-write the transcript jsonl — RW-046-type corruption).
    */
   private readonly resumingClaudeSessions = new Set<string>();
+  /**
+   * Optional listener fired whenever a session ends (stop / tmux-exit /
+   * headless-finish), with its threadId (Phase 5c / #294). The DispatchQueue
+   * registers it to free a concurrency slot and pump the FIFO queue. Kept generic
+   * (the manager does not know "dispatch"): the queue ignores threadIds that do
+   * not hold a slot, so an interactive session ending is a harmless no-op.
+   */
+  private dispatchEndListener?: (threadId: string) => void;
   private readonly effects: SessionEffects;
   private readonly gracefulKillTimeoutMs: number;
   private readonly resumePromptPollAttempts: number;
@@ -497,6 +505,27 @@ export class SessionManager {
    * stopped, which races nothing the first relay depends on).
    */
   readonly recovery: Promise<void>;
+
+  /**
+   * Register the session-end listener (Phase 5c / #294). Called once at startup
+   * by bot.ts to connect the DispatchQueue. Fired after a session leaves the live
+   * map on any terminal path.
+   */
+  onSessionEnd(listener: (threadId: string) => void): void {
+    this.dispatchEndListener = listener;
+  }
+
+  /** Notify the end listener, swallowing listener errors (must never break teardown). */
+  private emitSessionEnd(threadId: string): void {
+    try {
+      this.dispatchEndListener?.(threadId);
+    } catch (err) {
+      console.error(
+        `[SessionManager] dispatchEndListener threw for ${threadId}:`,
+        err,
+      );
+    }
+  }
 
   count(): number {
     return this.sessions.size;
@@ -979,6 +1008,7 @@ export class SessionManager {
     worktree: SessionInfo["worktree"],
   ): Promise<void> {
     this.sessions.delete(threadId);
+    this.emitSessionEnd(threadId); // Phase 5c: free a dispatch queue slot (#294)
     this.clearWatcher(threadId); // defensive: headless never sets one
     const reason: StopReason = result.timedOut
       ? "headless_timeout"
@@ -1658,6 +1688,7 @@ export class SessionManager {
 
     this.clearWatcher(threadId);
     this.sessions.delete(threadId);
+    this.emitSessionEnd(threadId); // Phase 5c: free a dispatch queue slot (#294)
     // Issue #244: drop the per-conversation self-heal planner on a TERMINAL stop
     // so its cap does not leak. A `self_heal_restart` stop is NOT terminal — the
     // conversation is about to be `claude --resume`d into a fresh thread, so the
@@ -1808,6 +1839,7 @@ export class SessionManager {
             `[SessionManager] tmux session ${tmuxName} exited`
           );
           this.sessions.delete(threadId);
+          this.emitSessionEnd(threadId); // Phase 5c: free a dispatch queue slot (#294)
           if (session) {
             this.effects.iterm2.markTabStopped(session.channelName, tmuxName);
             this.cleanupRelayUrlFile(session.projectDir);
