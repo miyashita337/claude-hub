@@ -2,7 +2,21 @@ import { Database } from "bun:sqlite";
 import { resolve } from "path";
 import { homedir } from "os";
 
-const DB_PATH = process.env.SUPERVISOR_DB_PATH ?? resolve(homedir(), "claude-hub", "supervisor", "sessions.db");
+/**
+ * sessions.db の実パスを解決する（#320 で外出し）。Supervisor 本体（下の
+ * DB_PATH、モジュールロード時に固定）と読み取り専用 CLI（tools/session-ctl.ts、
+ * 呼び出し時に解決）が同じ規則を共有するための single source of truth。
+ */
+export function resolveDbPath(
+  env: Record<string, string | undefined> = process.env,
+): string {
+  return (
+    env.SUPERVISOR_DB_PATH ??
+    resolve(homedir(), "claude-hub", "supervisor", "sessions.db")
+  );
+}
+
+const DB_PATH = resolveDbPath();
 
 let db: Database;
 

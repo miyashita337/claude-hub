@@ -31,7 +31,13 @@ import {
   buildSalvageReply,
   buildStatusReply,
 } from "./session/status-reply";
-import { onProgress, onLateResponse, onSessionsQuery } from "./session/relay-server";
+import {
+  onProgress,
+  onLateResponse,
+  onSessionsQuery,
+  onHubWork,
+} from "./session/relay-server";
+import { runHubWork, HUB_WORK_PARENT_CHANNEL } from "./session/hub-work";
 import {
   extractFilePaths,
   collectAttachableFiles,
@@ -465,6 +471,64 @@ export async function startBot(token: string): Promise<void> {
         console.error(`[Bot] Late response send error for thread ${event.threadId}:`, err);
       }
     });
+
+    // Epic #316 Phase 3 (#320, ADR-002 D5): claude-hub work セッション経路。
+    // relay サーバの `POST /hub-work`（loopback-only、session-ctl
+    // start-hub-worker が叩く）を runHubWork へ結線する。config は
+    // CHANNEL_MAP.get() を通らない ephemeral なもの（runHubWork 内で組み立て、
+    // CHANNEL_MAP へは登録しない）。ワーカースレッドは corp チャンネル配下
+    // （D5-3）。キュー / admission / executor は既存 /dispatch と同一機構。
+    onHubWork(async (body) =>
+      runHubWork({
+        body,
+        sessionManager,
+        queue: dispatchQueue,
+        admissionGate: async () => {
+          await admissionController.gate();
+        },
+        executorMode: resolveExecutorMode(),
+        createThread: async (threadName) => {
+          // corp チャンネル（work スレッドの親）をギルド横断で名前解決する。
+          // 既存 dispatch は受信 message からチャンネルを得るが、HTTP 起動には
+          // message が無いので cache から引く。
+          let parent: TextChannel | null = null;
+          for (const [, guild] of readyClient.guilds.cache) {
+            const ch = guild.channels.cache.find(
+              (c) =>
+                c.name === HUB_WORK_PARENT_CHANNEL &&
+                c.isTextBased() &&
+                !c.isThread() &&
+                "threads" in c,
+            );
+            if (ch) {
+              parent = ch as TextChannel;
+              // 複数ギルド参加時の追跡性（PR #325 gemini medium）: どのギルドの
+              // #corp を選んだかをログに残す（cache の列挙順は保証されないため）。
+              console.log(
+                `[HubWork] resolved #${HUB_WORK_PARENT_CHANNEL} in guild ${guild.name} (${guild.id})`,
+              );
+              break;
+            }
+          }
+          if (!parent) {
+            throw new Error(
+              `work スレッドの親チャンネル (#${HUB_WORK_PARENT_CHANNEL}) が見つかりません`,
+            );
+          }
+          const created = await parent.threads.create({
+            name: threadName,
+            autoArchiveDuration: 10080, // 7 days（既存 dispatch と同じ）
+          });
+          return { id: created.id };
+        },
+        postToThread: async (tId, content) => {
+          const thread = await client.channels.fetch(tId);
+          if (thread?.isThread()) {
+            await thread.send(content);
+          }
+        },
+      }),
+    );
   });
 
   // Safe reply helper: never throws. Used in error paths where the interaction may
