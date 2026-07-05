@@ -5,7 +5,7 @@ import {
   type ThreadChannel,
   EmbedBuilder,
 } from "discord.js";
-import type { SessionManager } from "../session/manager";
+import { isValidModelId, type SessionManager } from "../session/manager";
 import { CHANNEL_MAP, MAX_SESSIONS } from "../config/channels";
 import { buildThreadTitle, markTitleStopped } from "../session/thread-title";
 import { buildStatusReply } from "../session/status-reply";
@@ -28,6 +28,18 @@ export function createSessionCommand() {
           opt
             .setName("branch")
             .setDescription("作業ブランチ名（例: feature-foo）")
+            .setRequired(false)
+        )
+        // Issue #303: optional model override for this session. Free-text so
+        // both aliases (fable/opus/sonnet/haiku → latest of that family) and
+        // pinned full names (e.g. claude-fable-5) work with zero maintenance.
+        // Omitted → no --model → recommended/environment-default model.
+        .addStringOption((opt) =>
+          opt
+            .setName("model")
+            .setDescription(
+              "モデル（例: fable, opus, sonnet, haiku, claude-fable-5。省略時は推奨モデル）"
+            )
             .setRequired(false)
         )
     )
@@ -341,6 +353,23 @@ async function handleStart(
     return;
   }
 
+  // Issue #303: optional model override. Empty/whitespace → undefined (no
+  // --model, environment default; behaviour unchanged). A character-safety gate
+  // rejects shell metacharacters at this Discord boundary BEFORE the value can
+  // reach the tmux bash command string (buildClaudeFlags embeds it there). A
+  // charset-valid but nonexistent id (e.g. claude-bogus) is intentionally NOT
+  // blocked here — it flows to claude and is surfaced by a non-zero exit
+  // (#298 no-silent-fallback).
+  const model = interaction.options.getString("model")?.trim() || undefined;
+  if (model && !isValidModelId(model)) {
+    await interaction.reply({
+      content:
+        "❌ model の書式が不正です。英数字と `.` `_` `-` のみ使えます（例: `fable`, `opus`, `claude-fable-5`）。",
+      flags: 64,
+    });
+    return;
+  }
+
   if (sessionManager.count() >= MAX_SESSIONS) {
     const sessions = sessionManager.listRunning();
     const oldest = sessions.sort(
@@ -396,15 +425,18 @@ async function handleStart(
 
     // Start the session with the thread ID — runs claude in a per-branch
     // worktree (Issue #154).
-    const session = await sessionManager.start(config, thread.id, branch);
+    const session = await sessionManager.start(config, thread.id, branch, model);
 
     // Post welcome message in the thread
     const locationLine = session.worktree
       ? `📁 Worktree: \`${session.worktree.path}\`\n🌿 ブランチ: \`${session.worktree.branch}\``
       : `📁 ディレクトリ: \`${config.dir}\``;
+    // #303: surface the model override so the user can confirm what was pinned
+    // (omitted → recommended/environment default, so no line is shown).
+    const modelLine = model ? `\n🤖 モデル: \`${model}\`` : "";
     await thread.send(
       `✅ **${config.displayName}** のセッションを開始しました\n\n` +
-        `${locationLine}\n` +
+        `${locationLine}${modelLine}\n` +
         `📊 稼働中セッション: ${sessionManager.count()}/${MAX_SESSIONS}\n\n` +
         `このスレッドにメッセージを送信すると、Claude Code に中継されます。\n` +
         `終了するには \`/session stop\` をこのスレッド内で実行してください。`

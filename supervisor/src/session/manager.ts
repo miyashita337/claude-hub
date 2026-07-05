@@ -169,7 +169,36 @@ const INPUT_READY_POLL_ATTEMPTS = 60;
  * not survive that round-trip. Single-quoted JSON for `--mcp-config` is safe
  * because bash treats it as a single literal argument.
  */
-export function buildClaudeFlags(config: ChannelConfig): string[] {
+/**
+ * Character-safety gate for a `/session start` model override (#303).
+ *
+ * This is NOT a model allowlist: it deliberately accepts any id/alias whose
+ * characters are shell-inert, so `claude-bogus` passes here and is later
+ * rejected by `claude` with a non-zero exit (the #298 no-silent-fallback
+ * contract). Its sole job is to reject shell metacharacters at the Discord
+ * boundary so a value like `x; rm -rf ~` can never reach the tmux bash command
+ * string. Every real id/alias matches: `fable`, `opus`, `sonnet`, `haiku`,
+ * `claude-fable-5`, `claude-opus-4-8`, `claude-haiku-4-5-20251001`.
+ */
+export function isValidModelId(model: string): boolean {
+  return /^[A-Za-z0-9][A-Za-z0-9._-]*$/.test(model);
+}
+
+/**
+ * POSIX single-quote a value for safe embedding in the tmux bash *command
+ * string* (buildClaudeFlags tokens are space-joined into a bash line — see the
+ * buildClaudeFlags contract above). Single quotes disable every shell expansion;
+ * an embedded `'` is closed, escaped, and reopened (`'\''`). Defense-in-depth:
+ * even if a caller skips {@link isValidModelId}, the value cannot break out.
+ */
+function shellSingleQuote(value: string): string {
+  return `'${value.replace(/'/g, `'\\''`)}'`;
+}
+
+export function buildClaudeFlags(
+  config: ChannelConfig,
+  model?: string,
+): string[] {
   const args = [
     "--dangerously-skip-permissions",
     "--name",
@@ -187,6 +216,16 @@ export function buildClaudeFlags(config: ChannelConfig): string[] {
       "--mcp-config",
       `'{"mcpServers":{}}'`,
     );
+  }
+
+  // #303: pin the model only when explicitly requested via `/session start`.
+  // Absent → no `--model`, environment default (behaviour unchanged; mirrors
+  // buildHeadlessClaudeFlags / #298). Unlike the headless argv path, these
+  // tokens are embedded in the tmux bash command string, so the value is
+  // single-quoted. `--model <model>` verified against `claude --help` (v2.1.201).
+  const trimmedModel = model?.trim();
+  if (trimmedModel) {
+    args.push("--model", shellSingleQuote(trimmedModel));
   }
 
   return args;
@@ -667,7 +706,8 @@ export class SessionManager {
   async start(
     config: ChannelConfig,
     threadId: string,
-    branch?: string
+    branch?: string,
+    model?: string
   ): Promise<SessionInfo> {
     // Single-flight guard (review #185 gemini HIGH): start() is async (awaits
     // the PID poll below), so these checks must not be bypassed by a second
@@ -691,7 +731,7 @@ export class SessionManager {
 
     this.pendingStarts.add(threadId);
     try {
-      return await this.launchStart(config, threadId, branch);
+      return await this.launchStart(config, threadId, branch, model);
     } finally {
       this.pendingStarts.delete(threadId);
     }
@@ -707,7 +747,8 @@ export class SessionManager {
   private async launchStart(
     config: ChannelConfig,
     threadId: string,
-    branch?: string
+    branch?: string,
+    model?: string
   ): Promise<SessionInfo> {
     // Issue #154: resolve the effective cwd. With a branch, create/reuse a
     // worktree (Q1/Q2/Q4 in worktree.ts); failures propagate so the caller can
@@ -771,7 +812,7 @@ export class SessionManager {
       // it is shell-safe to embed here.
       // Quote claudePath() so SUPERVISOR_CLAUDE_PATH values containing spaces
       // (e.g. a test fixture under "/Users/Test User/...") don't word-split.
-      `exec "${claudePath()}" --session-id ${claudeSessionId} ${buildClaudeFlags(config).join(" ")}`,
+      `exec "${claudePath()}" --session-id ${claudeSessionId} ${buildClaudeFlags(config, model).join(" ")}`,
     ].join(" && ");
 
     // Launch via tmux (provides a real TTY). Uses Supervisor's dedicated
