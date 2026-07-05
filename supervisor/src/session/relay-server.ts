@@ -1,3 +1,5 @@
+import { mkdirSync, unlinkSync, writeFileSync } from "fs";
+import { dirname } from "path";
 import { formatForDiscord } from "./output-formatter";
 import { MAX_SESSIONS } from "../config/channels";
 import type { SessionHealthInfo } from "./types";
@@ -43,6 +45,20 @@ export interface AskUserEvent {
   question: string;
   options?: string[];
 }
+
+// Epic #316 Phase 3 (#320, ADR-002 D5): claude-hub work セッション経路の起動口。
+// ローカルのオーケストレーター CC セッション（session-ctl start-hub-worker）が
+// `POST /hub-work` に {branch, issueNumber, selector?} を投げると、bot.ts が
+// 登録したハンドラ（src/session/hub-work.ts の runHubWork）へ委譲される。
+// サーバは loopback-only bind（下記 hostname: "127.0.0.1"）なので到達できるのは
+// ローカルプロセスのみ — session-ctl と同じ操作者ローカルの信頼レベル。
+// 検証（fail-closed な branch / issueNumber / selector 検査）はハンドラ側が担う。
+export type HubWorkResponse =
+  | { ok: true; threadId: string; queued: boolean; injected: string }
+  | { ok: false; status: number; error: string };
+export type HubWorkHandler = (
+  body: Record<string, unknown>,
+) => Promise<HubWorkResponse>;
 
 type ProgressCallback = (event: ProgressEvent) => void;
 type LateResponseCallback = (event: LateResponseEvent) => void;
@@ -95,6 +111,50 @@ let progressCallback: ProgressCallback | null = null;
 let lateResponseCallback: LateResponseCallback | null = null;
 let askUserCallback: AskUserCallback | null = null;
 let sessionsProvider: SessionsProvider | null = null;
+let hubWorkHandler: HubWorkHandler | null = null;
+
+/**
+ * Well-known file that carries the relay server's ephemeral port (#320).
+ * `Bun.serve({port: 0})` picks a random port, so an external local CLI
+ * (session-ctl) needs a discovery point to reach `POST /hub-work`. Uses the
+ * same runtime-dir scheme as manager.ts's relayUrlFilePath (XDG_RUNTIME_DIR
+ * when present, else /tmp/claude-hub-supervisor-<USER>) so there is exactly one
+ * runtime dir per user.
+ */
+export function relayPortFilePath(): string {
+  const fromXdg = process.env.XDG_RUNTIME_DIR;
+  const user = process.env.USER || "default";
+  const runtimeDir = fromXdg
+    ? `${fromXdg}/claude-hub-supervisor`
+    : `/tmp/claude-hub-supervisor-${user}`;
+  return `${runtimeDir}/relay-port`;
+}
+
+/**
+ * Best-effort write of the port-discovery file (#320). Fail-soft: a filesystem
+ * error must never take the relay server down — session-ctl start-hub-worker
+ * simply reports "Supervisor 未起動" until the file appears.
+ */
+function writeRelayPortFile(port: number): void {
+  const file = relayPortFilePath();
+  try {
+    mkdirSync(dirname(file), { recursive: true });
+    writeFileSync(file, String(port));
+  } catch (err) {
+    console.warn(`[relay-server] failed to write port file ${file}:`, err);
+  }
+}
+
+/** Best-effort removal of the port-discovery file (stop path; ENOENT is fine). */
+function removeRelayPortFile(): void {
+  try {
+    unlinkSync(relayPortFilePath());
+  } catch (err) {
+    if ((err as NodeJS.ErrnoException).code !== "ENOENT") {
+      console.warn(`[relay-server] failed to remove port file:`, err);
+    }
+  }
+}
 
 export function onProgress(callback: ProgressCallback): void {
   progressCallback = callback;
@@ -116,6 +176,15 @@ export function onLateResponse(callback: LateResponseCallback): void {
 
 export function onAskUser(callback: AskUserCallback): void {
   askUserCallback = callback;
+}
+
+/**
+ * Register the handler that backs `POST /hub-work` (#320, ADR-002 D5). When no
+ * handler is registered the endpoint answers 503 (fail-closed) — a hub work
+ * request can never silently no-op.
+ */
+export function onHubWork(handler: HubWorkHandler): void {
+  hubWorkHandler = handler;
 }
 
 /**
@@ -174,6 +243,45 @@ export function startRelayServer(): void {
           max: MAX_SESSIONS,
           sessions,
         });
+      }
+
+      // Epic #316 Phase 3 (#320): claude-hub work セッション経路の起動口。
+      // loopback-only なのでローカルの session-ctl / オーケストレーター CC
+      // セッションだけが叩ける。ハンドラ未登録は 503（fail-closed）。
+      if (url.pathname === "/hub-work" && req.method === "POST") {
+        const handler = hubWorkHandler;
+        if (!handler) {
+          return Response.json(
+            { error: "hub work handler not registered (Supervisor 起動中?)" },
+            { status: 503 },
+          );
+        }
+        let body: Record<string, unknown>;
+        try {
+          const parsed = (await req.json()) as unknown;
+          if (typeof parsed !== "object" || parsed === null || Array.isArray(parsed)) {
+            return Response.json({ error: "Invalid JSON body" }, { status: 400 });
+          }
+          body = parsed as Record<string, unknown>;
+        } catch {
+          return Response.json({ error: "Invalid JSON" }, { status: 400 });
+        }
+        try {
+          const result = await handler(body);
+          if (result.ok) {
+            return Response.json(result, { status: 200 });
+          }
+          return Response.json(
+            { error: result.error },
+            { status: result.status },
+          );
+        } catch (err) {
+          console.error("[relay-server] hubWorkHandler error:", err);
+          return Response.json(
+            { error: err instanceof Error ? err.message : String(err) },
+            { status: 500 },
+          );
+        }
       }
 
       // Progress endpoint: PostToolUse hook sends tool progress here
@@ -385,6 +493,9 @@ export function startRelayServer(): void {
   });
 
   relayPort = server.port ?? 0;
+  // #320: publish the ephemeral port so a local CLI (session-ctl) can discover
+  // the /hub-work endpoint. Fail-soft — never blocks server startup.
+  writeRelayPortFile(relayPort);
   console.log(`[relay-server] started on port ${relayPort}`);
 }
 
@@ -411,6 +522,8 @@ export function stopRelayServer(): void {
   lateResponseCallback = null;
   askUserCallback = null;
   sessionsProvider = null;
+  hubWorkHandler = null;
+  removeRelayPortFile();
 }
 
 export function waitForRelay(
