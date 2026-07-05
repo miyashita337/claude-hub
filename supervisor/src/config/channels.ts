@@ -170,6 +170,20 @@ export const GOAL_GRACE_MS = 3 * 60 * 1000; // 3 minutes
 export const DISPATCH_ORPHAN_IDLE_MS = 48 * 60 * 60 * 1000; // 48 hours
 export const DISPATCH_ORPHAN_CHECK_INTERVAL_MS = 30 * 60 * 1000; // 30 minutes
 
+// DispatchHealthReaper (Issue #279): the health-aware, short-horizon front line
+// for the same executor-saturation problem the OrphanDispatchReaper backstops.
+// The chairman reported dispatch sessions going silent for 2-3h and could not
+// tell from Discord which were stuck vs. genuinely working, so ActivityWatchdog
+// (#209) only *nudged*. This escalates nudge → auto-reap for dispatch sessions
+// that have been silent past DISPATCH_HEALTH_SILENCE_MS AND have no live
+// CI/build/test/push child process (the mis-fire guard — a session waiting on a
+// long CI run looks silent but must NOT be killed mid-work, since stop() removes
+// its worktree). The 48h OrphanDispatchReaper above stays as the coarse backstop
+// for anything this front line spares (probe unknown / stuck busy child). Both
+// thresholds are env-overridable for ops tuning (mirrors the orphan reaper).
+export const DISPATCH_HEALTH_SILENCE_MS = 2 * 60 * 60 * 1000; // 2 hours
+export const DISPATCH_HEALTH_CHECK_INTERVAL_MS = 30 * 60 * 1000; // 30 minutes
+
 // Phase 5b (#293 / Epic #292): the interactive idle reaper threshold is now
 // env-configurable (`SESSION_IDLE_TIMEOUT_MS`) with a much shorter default —
 // idle interactive sessions squat CPU/RAM and worsen the multi-session

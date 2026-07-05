@@ -17,6 +17,7 @@ import {
 import { Reaper } from "./session/reaper";
 import { GoalWatcher } from "./session/goal-watcher";
 import { OrphanDispatchReaper } from "./session/orphan-dispatch-reaper";
+import { DispatchHealthReaper } from "./session/dispatch-health-reaper";
 import { ActivityWatchdog } from "./session/session-activity-watchdog";
 import { ResourceMonitor } from "./session/resource-monitor";
 import { createSessionCommand, createSessionHandler } from "./commands/session";
@@ -255,6 +256,13 @@ export async function startBot(token: string): Promise<void> {
   // messages), so this idle-based safety net reaps dispatch sessions idle past
   // DISPATCH_ORPHAN_IDLE_MS while sparing any that are still actively working.
   const orphanDispatchReaper = new OrphanDispatchReaper(sessionManager, client);
+  // Issue #279: the health-aware front line for the same executor-saturation
+  // problem. Escalates ActivityWatchdog's nudge to auto-reap for dispatch
+  // sessions silent past DISPATCH_HEALTH_SILENCE_MS (2h) that also have NO live
+  // CI/build/test/push child process (the mis-fire guard — a session waiting on
+  // a long CI run looks silent but must not be killed mid-work). The 48h
+  // orphanDispatchReaper above stays as the coarse backstop for anything spared.
+  const dispatchHealthReaper = new DispatchHealthReaper(sessionManager, client);
   // Issue #209: nudge the owner when a live session has been running for hours
   // (long_lived, AC3) or has gone silent (quiet, AC1) — the gap between the
   // per-turn stall heartbeat and the idle reaper. De-dup is internal so each
@@ -355,6 +363,7 @@ export async function startBot(token: string): Promise<void> {
     reaper.start();
     goalWatcher.start();
     orphanDispatchReaper.start();
+    dispatchHealthReaper.start();
     activityWatchdog.start();
     resourceMonitor.start();
 
@@ -1005,6 +1014,7 @@ export async function startBot(token: string): Promise<void> {
     reaper.stop();
     goalWatcher.stop();
     orphanDispatchReaper.stop();
+    dispatchHealthReaper.stop();
     activityWatchdog.stop();
     resourceMonitor.stop();
     // Drain pending progress buffers before tearing down the Discord client

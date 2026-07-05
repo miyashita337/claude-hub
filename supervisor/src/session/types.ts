@@ -65,4 +65,4 @@ export interface SessionHealthInfo {
   lastActivityAt: string;
 }
 
-export type StopReason = "manual" | "idle_timeout" | "resource_limit" | "error" | "tmux_exited" | "supervisor_restart" | "self_heal_restart" | "goal_complete" | "orphan_reaped" | "headless_exited" | "headless_timeout";
+export type StopReason = "manual" | "idle_timeout" | "resource_limit" | "error" | "tmux_exited" | "supervisor_restart" | "self_heal_restart" | "goal_complete" | "orphan_reaped" | "health_reaped" | "headless_exited" | "headless_timeout";
