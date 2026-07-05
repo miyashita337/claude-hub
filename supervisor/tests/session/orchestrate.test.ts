@@ -10,6 +10,7 @@ import {
   findRunningOrchestrator,
   orchestrateBranchName,
   runOrchestrate,
+  OrchestrateLaunchLock,
 } from "../../src/session/orchestrate";
 import type { OrchestrateSessionManager } from "../../src/session/orchestrate";
 import {
@@ -153,6 +154,62 @@ describe("findRunningOrchestrator", () => {
 
   test("empty list → undefined", () => {
     expect(findRunningOrchestrator([])).toBeUndefined();
+  });
+});
+
+// ---------------------------------------------------------------------------
+// AC-4 (PR #324 review): in-flight launch lock closes the TOCTOU window
+// between the running-session guard and session registration
+// ---------------------------------------------------------------------------
+
+describe("OrchestrateLaunchLock", () => {
+  test("second acquire on the same channel is rejected until release", () => {
+    const lock = new OrchestrateLaunchLock();
+    expect(lock.tryAcquire("corp")).toBe(true);
+    expect(lock.tryAcquire("corp")).toBe(false);
+    lock.release("corp");
+    expect(lock.tryAcquire("corp")).toBe(true);
+  });
+
+  test("channels are independent", () => {
+    const lock = new OrchestrateLaunchLock();
+    expect(lock.tryAcquire("corp")).toBe(true);
+    expect(lock.tryAcquire("agent-base")).toBe(true);
+  });
+
+  test("release is idempotent (releasing an unheld channel is a no-op)", () => {
+    const lock = new OrchestrateLaunchLock();
+    lock.release("corp");
+    expect(lock.tryAcquire("corp")).toBe(true);
+  });
+
+  test("rapid double /orchestrate: only the first launch proceeds (TOCTOU)", async () => {
+    // Simulate bot.ts: both messages pass the running-session guard (no
+    // session registered yet), but the lock is acquired synchronously before
+    // any await, so the second attempt is rejected while the first is still
+    // launching.
+    const lock = new OrchestrateLaunchLock();
+    const { manager, startCalls } = fakeManager();
+
+    const attempt = async (): Promise<"launched" | "in_flight"> => {
+      if (!lock.tryAcquire("corp")) return "in_flight";
+      try {
+        await runOrchestrate({
+          config,
+          branch: "orchestrate-20260705-1200",
+          rawArgs: "x",
+          sessionManager: manager,
+          createThread: async () => ({ id: "t" }),
+        });
+        return "launched";
+      } finally {
+        lock.release("corp");
+      }
+    };
+
+    const [a, b] = await Promise.all([attempt(), attempt()]);
+    expect([a, b].sort()).toEqual(["in_flight", "launched"]);
+    expect(startCalls).toHaveLength(1);
   });
 });
 

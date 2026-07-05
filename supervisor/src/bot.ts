@@ -62,6 +62,7 @@ import {
   runOrchestrate,
   findRunningOrchestrator,
   orchestrateBranchName,
+  OrchestrateLaunchLock,
 } from "./session/orchestrate";
 import { AdmissionController } from "./session/admission";
 import { buildThreadTitle } from "./session/thread-title";
@@ -329,6 +330,10 @@ export async function startBot(token: string): Promise<void> {
   // WARN under high load but does not delay; enforcement is opt-in via
   // DISPATCH_ADMISSION_ENFORCE=1.
   const admissionController = new AdmissionController();
+  // Epic #316 Phase 1 (#318, PR #324 review): per-channel in-flight lock so two
+  // rapid /orchestrate messages cannot both pass the duplicate-launch guard
+  // before the first session registers (TOCTOU).
+  const orchestrateLaunchLock = new OrchestrateLaunchLock();
   const sessionHandler = createSessionHandler(sessionManager);
 
   // Per-thread progress buffer (Issue #119): coalesce PostToolUse events
@@ -755,109 +760,132 @@ export async function startBot(token: string): Promise<void> {
       return true;
     }
 
-    // Duplicate-launch guard (#318): one orchestrator per channel. When one is
-    // already running (branch prefix `orchestrate-`), answer with its thread
-    // link instead of starting a second — unless the user explicitly passed
-    // `--new`.
-    const running = findRunningOrchestrator(
-      sessionManager.listRunningByChannel(channelName)
-    );
-    if (running && !parsed.forceNew) {
+    // In-flight lock (PR #324 review): acquired SYNCHRONOUSLY (no await between
+    // the running-session guard below and the lock) so two rapid /orchestrate
+    // messages cannot both pass the guard while the first launch is still
+    // creating its thread / starting its session (TOCTOU). Released in finally
+    // once the launch settles (success or failure) — from then on the
+    // running-session guard takes over because the session is registered.
+    if (!orchestrateLaunchLock.tryAcquire(channelName)) {
       try {
         await textChannel.send(
-          `ℹ️ このチャンネルでは既にオーケストレーターが稼働中です: <#${running.threadId}>\n` +
-            `稼働中のスレッドに追加指示を送るか、別のオーケストレーターが必要な場合は ` +
-            `\`/orchestrate --new <タスク...>\` で明示起動してください。`
+          `⏳ このチャンネルでオーケストレーターの起動処理が進行中です。完了後に再試行してください。`
         );
       } catch (err) {
         console.error(
-          `[Bot] Orchestrate duplicate-guard notice failed in channel ${channelName}:`,
+          `[Bot] Orchestrate in-flight notice failed in channel ${channelName}:`,
           err
         );
       }
       return true;
     }
-
-    const branch = orchestrateBranchName();
-    console.log(
-      `[Bot] Orchestrate accepted in channel ${channelName} (branch=${branch}, args len=${parsed.rawArgs.length}, forceNew=${parsed.forceNew})`
-    );
-
-    // Thread creation mirrors handleDispatchMessage (sequence suffix per
-    // RW-046 same-branch multi-session).
-    let orchestrateThread: { id: string };
     try {
-      const sameBranchCount = sessionManager
-        .listRunningByChannel(channelName)
-        .filter((s) => s.branch === branch).length;
-      const threadName = buildThreadTitle(
-        "running",
-        branch,
-        config.displayName,
-        sameBranchCount + 1
+      // Duplicate-launch guard (#318): one orchestrator per channel. When one
+      // is already running (branch prefix `orchestrate-`), answer with its
+      // thread link instead of starting a second — unless the user explicitly
+      // passed `--new`.
+      const running = findRunningOrchestrator(
+        sessionManager.listRunningByChannel(channelName)
       );
-      const created = await textChannel.threads.create({
-        name: threadName,
-        autoArchiveDuration: 10080, // 7 days
-      });
-      orchestrateThread = { id: created.id };
-    } catch (err) {
-      console.error(
-        `[Bot] Orchestrate thread creation failed in channel ${channelName}:`,
-        err
-      );
-      return true;
-    }
-
-    const result = await runOrchestrate({
-      config,
-      branch,
-      rawArgs: parsed.rawArgs,
-      sessionManager,
-      createThread: async () => orchestrateThread, // reuse the created thread
-    });
-
-    if (result.ok) {
-      try {
-        const thread = await client.channels.fetch(result.threadId);
-        if (thread?.isThread()) {
-          // Echo the injected command (arguments included) so the thread's
-          // first message confirms what the orchestrator received (統合
-          // ジャーニーAC 1). Truncated to stay well under Discord's 2000-char
-          // message limit alongside the surrounding text.
-          const echo =
-            result.injected.length > 1500
-              ? `${result.injected.slice(0, 1500)}…`
-              : result.injected;
-          await thread.send(
-            `🎼 **${config.displayName}** のオーケストレーターを起動しました\n\n` +
-              `🌿 ブランチ: \`${branch}\`\n` +
-              `▶️ 初期コマンド: \`${echo}\`\n` +
-              `📊 稼働中セッション: ${sessionManager.count()}/${MAX_SESSIONS}`
+      if (running && !parsed.forceNew) {
+        try {
+          await textChannel.send(
+            `ℹ️ このチャンネルでは既にオーケストレーターが稼働中です: <#${running.threadId}>\n` +
+              `稼働中のスレッドに追加指示を送るか、別のオーケストレーターが必要な場合は ` +
+              `\`/orchestrate --new <タスク...>\` で明示起動してください。`
+          );
+        } catch (err) {
+          console.error(
+            `[Bot] Orchestrate duplicate-guard notice failed in channel ${channelName}:`,
+            err
           );
         }
+        return true;
+      }
+
+      const branch = orchestrateBranchName();
+      console.log(
+        `[Bot] Orchestrate accepted in channel ${channelName} (branch=${branch}, args len=${parsed.rawArgs.length}, forceNew=${parsed.forceNew})`
+      );
+
+      // Thread creation mirrors handleDispatchMessage (sequence suffix per
+      // RW-046 same-branch multi-session).
+      let orchestrateThread: { id: string };
+      try {
+        const sameBranchCount = sessionManager
+          .listRunningByChannel(channelName)
+          .filter((s) => s.branch === branch).length;
+        const threadName = buildThreadTitle(
+          "running",
+          branch,
+          config.displayName,
+          sameBranchCount + 1
+        );
+        const created = await textChannel.threads.create({
+          name: threadName,
+          autoArchiveDuration: 10080, // 7 days
+        });
+        orchestrateThread = { id: created.id };
       } catch (err) {
         console.error(
-          `[Bot] Orchestrate welcome message failed for thread ${result.threadId}:`,
+          `[Bot] Orchestrate thread creation failed in channel ${channelName}:`,
           err
         );
+        return true;
       }
-    } else {
-      console.error(
-        `[Bot] Orchestrate failed (stage=${result.stage}) in channel ${channelName}: ${result.error}`
-      );
-      try {
-        await textChannel.send(
-          `❌ オーケストレーターの起動に失敗しました（stage=${result.stage}）。Supervisor ログを確認してください。`
-        );
-      } catch (postErr) {
+
+      const result = await runOrchestrate({
+        config,
+        branch,
+        rawArgs: parsed.rawArgs,
+        sessionManager,
+        createThread: async () => orchestrateThread, // reuse the created thread
+      });
+
+      if (result.ok) {
+        try {
+          const thread = await client.channels.fetch(result.threadId);
+          if (thread?.isThread()) {
+            // Echo the injected command (arguments included) so the thread's
+            // first message confirms what the orchestrator received (統合
+            // ジャーニーAC 1). Truncated to stay well under Discord's 2000-char
+            // message limit alongside the surrounding text.
+            const echo =
+              result.injected.length > 1500
+                ? `${result.injected.slice(0, 1500)}…`
+                : result.injected;
+            await thread.send(
+              `🎼 **${config.displayName}** のオーケストレーターを起動しました\n\n` +
+                `🌿 ブランチ: \`${branch}\`\n` +
+                `▶️ 初期コマンド: \`${echo}\`\n` +
+                `📊 稼働中セッション: ${sessionManager.count()}/${MAX_SESSIONS}`
+            );
+          }
+        } catch (err) {
+          console.error(
+            `[Bot] Orchestrate welcome message failed for thread ${result.threadId}:`,
+            err
+          );
+        }
+      } else {
         console.error(
-          `[Bot] Orchestrate failure notice failed in channel ${channelName}:`,
-          postErr
+          `[Bot] Orchestrate failed (stage=${result.stage}) in channel ${channelName}: ${result.error}`
         );
+        try {
+          await textChannel.send(
+            `❌ オーケストレーターの起動に失敗しました（stage=${result.stage}）。Supervisor ログを確認してください。`
+          );
+        } catch (postErr) {
+          console.error(
+            `[Bot] Orchestrate failure notice failed in channel ${channelName}:`,
+            postErr
+          );
+        }
       }
+      return true;
+    } finally {
+      orchestrateLaunchLock.release(channelName);
     }
-    return true;
   }
 
   // Message relay: thread messages → Claude Code → thread reply

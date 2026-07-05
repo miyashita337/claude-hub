@@ -124,6 +124,35 @@ export function findRunningOrchestrator(
 }
 
 /**
+ * Per-channel in-flight launch lock (PR #324 review): closes the TOCTOU window
+ * between the duplicate-launch guard ({@link findRunningOrchestrator} over
+ * `listRunningByChannel`) and the session actually registering in the
+ * SessionManager. Thread creation + session start span several awaits, so two
+ * `/orchestrate` messages in rapid succession could BOTH pass the
+ * running-session guard before either session exists. `tryAcquire` mutates the
+ * set synchronously (no await between check and add), which on Node's
+ * single-threaded event loop makes the acquisition race-free. Applies to
+ * `--new` launches too — only one orchestrator launch may be in flight per
+ * channel at a time (an explicit second one can be sent again seconds later;
+ * same-minute branch names would collide anyway).
+ */
+export class OrchestrateLaunchLock {
+  private readonly channels = new Set<string>();
+
+  /** Acquire the per-channel lock; false when a launch is already in flight. */
+  tryAcquire(channelName: string): boolean {
+    if (this.channels.has(channelName)) return false;
+    this.channels.add(channelName);
+    return true;
+  }
+
+  /** Release after the launch settles (success OR failure — call in finally). */
+  release(channelName: string): void {
+    this.channels.delete(channelName);
+  }
+}
+
+/**
  * Generate the orchestrator worktree branch name: `orchestrate-<yyyymmdd-hhmm>`
  * (Issue #318 の作業項目で指定された形式、ローカル時刻)。数字とハイフンのみで
  * 構成されるため RW-045 の worktree guard（メタ文字 / traversal 拒否）を常に
