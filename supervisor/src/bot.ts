@@ -56,6 +56,14 @@ import {
   resolveExecutorMode,
 } from "./session/dispatch";
 import { DispatchQueue } from "./session/dispatch-queue";
+import {
+  ORCHESTRATE_PREFIX,
+  parseOrchestrateCommand,
+  runOrchestrate,
+  findRunningOrchestrator,
+  orchestrateBranchName,
+  OrchestrateLaunchLock,
+} from "./session/orchestrate";
 import { AdmissionController } from "./session/admission";
 import { buildThreadTitle } from "./session/thread-title";
 
@@ -322,6 +330,10 @@ export async function startBot(token: string): Promise<void> {
   // WARN under high load but does not delay; enforcement is opt-in via
   // DISPATCH_ADMISSION_ENFORCE=1.
   const admissionController = new AdmissionController();
+  // Epic #316 Phase 1 (#318, PR #324 review): per-channel in-flight lock so two
+  // rapid /orchestrate messages cannot both pass the duplicate-launch guard
+  // before the first session registers (TOCTOU).
+  const orchestrateLaunchLock = new OrchestrateLaunchLock();
   const sessionHandler = createSessionHandler(sessionManager);
 
   // Per-thread progress buffer (Issue #119): coalesce PostToolUse events
@@ -666,6 +678,216 @@ export async function startBot(token: string): Promise<void> {
     return true;
   }
 
+  // Epic #316 Phase 1 (#318): handle an `/orchestrate <生引数...>` message in a
+  // known department channel — start ONE orchestrator session (tmux + thread)
+  // and inject `/orchestrate-runner <生引数>` as its first prompt. Placed
+  // alongside handleDispatchMessage (same intercept shape) but authorized via
+  // the normal-message gate (`evaluateAccess` / access.json `allowFrom`,
+  // fail-closed), NOT the dispatch-source policy. Returns true when the message
+  // was an orchestrate attempt and was fully handled (caller must stop), false
+  // when it is not an orchestrate and normal processing should continue.
+  //
+  // Per ADR-002 D2 the Supervisor's responsibility ends here: argument
+  // interpretation, worker dispatching, monitoring and merge decisions all
+  // live in the orchestrator skill (Phase 2 #319). The raw arguments are never
+  // parsed — they travel through the relay's argv-no-shell injection path
+  // (sendMessage → tmux send-keys -l) untouched.
+  async function handleOrchestrateMessage(message: Message): Promise<boolean> {
+    // Orchestrate only applies to a non-thread message in a known department
+    // channel whose text starts with the orchestrate token.
+    if (message.channel.isThread()) return false;
+    const content = message.content ?? "";
+    const trimmed = content.trim();
+    if (
+      trimmed !== ORCHESTRATE_PREFIX &&
+      !trimmed.startsWith(ORCHESTRATE_PREFIX + " ") &&
+      !trimmed.startsWith(ORCHESTRATE_PREFIX + "\n")
+    ) {
+      return false;
+    }
+
+    const channelName =
+      "name" in message.channel ? (message.channel.name as string) : "";
+    const config = CHANNEL_MAP.get(channelName);
+    if (!config) {
+      // Unknown channel: not a valid orchestrate target — fall through to
+      // normal processing (non-thread messages are ignored there anyway).
+      return false;
+    }
+    const textChannel = message.channel as TextChannel;
+
+    // Authorize the sender with the SAME gate as normal relay messages
+    // (access.json `allowFrom` keyed on the channel id). Fail-closed: a
+    // missing / broken policy or an unlisted sender denies. Independent of
+    // the dispatch-only `dispatchFrom` list (#318).
+    {
+      const botUserId = client.user?.id;
+      const isMention = botUserId
+        ? message.mentions.users.has(botUserId)
+        : false;
+      const decision = evaluateAccess({
+        channelKey: textChannel.id,
+        userId: message.author.id,
+        isMention,
+      });
+      if (!decision.allowed) {
+        // Identifier-free denial log; never log the sender snowflake or body.
+        console.warn(
+          `[Bot] Orchestrate denied (reason=${decision.reason}) in channel ${channelName}; not started`
+        );
+        // Consume the message: by here it is an `/orchestrate` in a known
+        // department channel, which the normal relay path never acts on.
+        return true;
+      }
+    }
+
+    const parsed = parseOrchestrateCommand(content);
+    if (parsed.kind === "not_orchestrate") {
+      return false;
+    }
+    if (parsed.kind === "error") {
+      console.warn(
+        `[Bot] Orchestrate rejected in channel ${channelName}: ${parsed.reason}`
+      );
+      try {
+        await textChannel.send(`⚠️ ${parsed.reason}`);
+      } catch (err) {
+        console.error(
+          `[Bot] Orchestrate rejection notice failed in channel ${channelName}:`,
+          err
+        );
+      }
+      return true;
+    }
+
+    // In-flight lock (PR #324 review): acquired SYNCHRONOUSLY (no await between
+    // the running-session guard below and the lock) so two rapid /orchestrate
+    // messages cannot both pass the guard while the first launch is still
+    // creating its thread / starting its session (TOCTOU). Released in finally
+    // once the launch settles (success or failure) — from then on the
+    // running-session guard takes over because the session is registered.
+    if (!orchestrateLaunchLock.tryAcquire(channelName)) {
+      try {
+        await textChannel.send(
+          `⏳ このチャンネルでオーケストレーターの起動処理が進行中です。完了後に再試行してください。`
+        );
+      } catch (err) {
+        console.error(
+          `[Bot] Orchestrate in-flight notice failed in channel ${channelName}:`,
+          err
+        );
+      }
+      return true;
+    }
+    try {
+      // Duplicate-launch guard (#318): one orchestrator per channel. When one
+      // is already running (branch prefix `orchestrate-`), answer with its
+      // thread link instead of starting a second — unless the user explicitly
+      // passed `--new`.
+      const running = findRunningOrchestrator(
+        sessionManager.listRunningByChannel(channelName)
+      );
+      if (running && !parsed.forceNew) {
+        try {
+          await textChannel.send(
+            `ℹ️ このチャンネルでは既にオーケストレーターが稼働中です: <#${running.threadId}>\n` +
+              `稼働中のスレッドに追加指示を送るか、別のオーケストレーターが必要な場合は ` +
+              `\`/orchestrate --new <タスク...>\` で明示起動してください。`
+          );
+        } catch (err) {
+          console.error(
+            `[Bot] Orchestrate duplicate-guard notice failed in channel ${channelName}:`,
+            err
+          );
+        }
+        return true;
+      }
+
+      const branch = orchestrateBranchName();
+      console.log(
+        `[Bot] Orchestrate accepted in channel ${channelName} (branch=${branch}, args len=${parsed.rawArgs.length}, forceNew=${parsed.forceNew})`
+      );
+
+      // Thread creation mirrors handleDispatchMessage (sequence suffix per
+      // RW-046 same-branch multi-session).
+      let orchestrateThread: { id: string };
+      try {
+        const sameBranchCount = sessionManager
+          .listRunningByChannel(channelName)
+          .filter((s) => s.branch === branch).length;
+        const threadName = buildThreadTitle(
+          "running",
+          branch,
+          config.displayName,
+          sameBranchCount + 1
+        );
+        const created = await textChannel.threads.create({
+          name: threadName,
+          autoArchiveDuration: 10080, // 7 days
+        });
+        orchestrateThread = { id: created.id };
+      } catch (err) {
+        console.error(
+          `[Bot] Orchestrate thread creation failed in channel ${channelName}:`,
+          err
+        );
+        return true;
+      }
+
+      const result = await runOrchestrate({
+        config,
+        branch,
+        rawArgs: parsed.rawArgs,
+        sessionManager,
+        createThread: async () => orchestrateThread, // reuse the created thread
+      });
+
+      if (result.ok) {
+        try {
+          const thread = await client.channels.fetch(result.threadId);
+          if (thread?.isThread()) {
+            // Echo the injected command (arguments included) so the thread's
+            // first message confirms what the orchestrator received (統合
+            // ジャーニーAC 1). Truncated to stay well under Discord's 2000-char
+            // message limit alongside the surrounding text.
+            const echo =
+              result.injected.length > 1500
+                ? `${result.injected.slice(0, 1500)}…`
+                : result.injected;
+            await thread.send(
+              `🎼 **${config.displayName}** のオーケストレーターを起動しました\n\n` +
+                `🌿 ブランチ: \`${branch}\`\n` +
+                `▶️ 初期コマンド: \`${echo}\`\n` +
+                `📊 稼働中セッション: ${sessionManager.count()}/${MAX_SESSIONS}`
+            );
+          }
+        } catch (err) {
+          console.error(
+            `[Bot] Orchestrate welcome message failed for thread ${result.threadId}:`,
+            err
+          );
+        }
+      } else {
+        console.error(
+          `[Bot] Orchestrate failed (stage=${result.stage}) in channel ${channelName}: ${result.error}`
+        );
+        try {
+          await textChannel.send(
+            `❌ オーケストレーターの起動に失敗しました（stage=${result.stage}）。Supervisor ログを確認してください。`
+          );
+        } catch (postErr) {
+          console.error(
+            `[Bot] Orchestrate failure notice failed in channel ${channelName}:`,
+            postErr
+          );
+        }
+      }
+      return true;
+    } finally {
+      orchestrateLaunchLock.release(channelName);
+    }
+  }
+
   // Message relay: thread messages → Claude Code → thread reply
   client.on(Events.MessageCreate, async (message: Message) => {
     // Issue #32 / S7 (dispatch transport): intercept `/dispatch` from an allowed
@@ -676,6 +898,17 @@ export async function startBot(token: string): Promise<void> {
       if (await handleDispatchMessage(message)) return;
     } catch (err) {
       console.error("[Bot] Dispatch handler error:", err);
+      return;
+    }
+
+    // Epic #316 Phase 1 (#318): intercept `/orchestrate` in a known department
+    // channel BEFORE the blanket bot/webhook drop below (same shape as the
+    // dispatch intercept). Fail-closed inside handleOrchestrateMessage via
+    // evaluateAccess (access.json `allowFrom`).
+    try {
+      if (await handleOrchestrateMessage(message)) return;
+    } catch (err) {
+      console.error("[Bot] Orchestrate handler error:", err);
       return;
     }
 
