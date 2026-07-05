@@ -545,6 +545,62 @@ t45_hang_threshold_optout() {
   [ ! -e "${HDIR}/health-incident" ] && [ "$(notify_count)" = "0" ]
 }
 
+# ----- tmux command length (crash-loop hotfix, Epic #315) --------------------
+
+# T46: the launch command references the rendered-prompt FILE via a pane-shell
+# "$(cat ...)" expansion instead of inlining the (multibyte, %q-inflated)
+# prompt content. Inlining crash-looped the Bot with tmux "command too long"
+# after the #311 prompt growth.
+t46_launch_cmd_uses_prompt_file() {
+  local out
+  out=$(HIJOGUCHI_PRINT_CMD=1 bash "${TARGET}" 2>/dev/null)
+  echo "${out}" | grep -Fq -- '--append-system-prompt "$(cat ' \
+    && echo "${out}" | grep -Fq 'rendered-system-prompt.md' \
+    && ! echo "${out}" | grep -Fq '応答条件'
+}
+
+# T47: the command string stays small regardless of prompt size — the class
+# guard for tmux's ~16KB "command too long" limit. 4096 leaves ~4x headroom
+# for env-prefix growth while catching any re-inlining regression instantly.
+t47_launch_cmd_bounded() {
+  local n
+  n=$(HIJOGUCHI_PRINT_CMD=1 bash "${TARGET}" 2>/dev/null | wc -c)
+  [ "${n}" -lt 4096 ]
+}
+
+# T48: the pane-shell "$(cat file)" expansion hands claude EXACTLY the rendered
+# prompt. Re-parse the built command like tmux's child shell would (eval with a
+# stub claude that dumps its argv) and diff the received prompt value against
+# the render-only output.
+t48_pane_shell_expansion_roundtrip() {
+  local dir out cmd prompt_file
+  dir=$(mktemp -d)
+  # shellcheck disable=SC2064
+  trap "rm -rf '${dir}'" RETURN
+  # Stub `claude`: write the argument AFTER --append-system-prompt to a file.
+  cat > "${dir}/claude" <<'STUB'
+#!/bin/bash
+out="${CLAUDE_STUB_OUT:?}"
+grab=0
+for a in "$@"; do
+  if [ "${grab}" = "1" ]; then printf '%s' "${a}" > "${out}"; exit 0; fi
+  [ "${a}" = "--append-system-prompt" ] && grab=1
+done
+exit 1
+STUB
+  chmod +x "${dir}/claude"
+  prompt_file="${dir}/rendered-system-prompt.md"
+  HIJOGUCHI_RENDER_ONLY=1 bash "${TARGET}" 2>/dev/null > "${prompt_file}" || return 1
+  cmd=$(HIJOGUCHI_PRINT_CMD=1 RENDERED_PROMPT_FILE="${prompt_file}" bash "${TARGET}" 2>/dev/null) || return 1
+  # Substitute the stub for the real binary and evaluate like the pane shell.
+  cmd="${cmd/${HOME}\/.local\/bin\/claude/${dir}/claude}"
+  CLAUDE_STUB_OUT="${dir}/received" eval "${cmd}" || return 1
+  # Render-only output has a trailing newline (printf '%s\n'); "$(cat ...)"
+  # strips trailing newlines, so compare against the stripped form.
+  printf '%s' "$(cat "${prompt_file}")" > "${dir}/expected"
+  cmp -s "${dir}/expected" "${dir}/received"
+}
+
 run "T1 channel ID expanded"          t1_channel_id_expanded
 run "T2 no residual {{}} tokens"      t2_no_residual_tokens
 run "T3 env override works"           t3_env_override
@@ -590,6 +646,9 @@ run "T42 crash loop dead once"        t42_crashloop_dead_once
 run "T43 spaced crashes ok"           t43_spaced_crashes_ok
 run "T44 dead recovery needs stability" t44_dead_recovery_requires_stability
 run "T45 hang threshold opt-out"      t45_hang_threshold_optout
+run "T46 launch cmd uses prompt file" t46_launch_cmd_uses_prompt_file
+run "T47 launch cmd length bounded"   t47_launch_cmd_bounded
+run "T48 pane shell expansion roundtrip" t48_pane_shell_expansion_roundtrip
 
 if [ "${fail}" -eq 0 ]; then
   echo "ALL TESTS PASSED"

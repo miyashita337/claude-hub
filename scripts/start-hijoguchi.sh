@@ -399,7 +399,26 @@ fi
 # misclassify. The `env` prefix sets them on the claude process directly.
 CLAUDE_CMD=$(printf 'env CLAUDE_HUB_HIJOGUCHI_SESSION=1 CLAUDE_HUB_STATE_DIR=%q LAST_MSG_TS_FILE=%q HIJOGUCHI_CHANNEL_ID=%q HIJOGUCHI_BOT_MENTION=%q ' \
   "${CLAUDE_HUB_STATE_DIR}" "${LAST_MSG_TS_FILE}" "${HIJOGUCHI_CHANNEL_ID}" "${HIJOGUCHI_BOT_MENTION}")
-CLAUDE_CMD+=$(printf '%q ' "${CLAUDE_ARGV[@]}")
+# The rendered prompt must NOT be inlined (%q-escaped) into the tmux command
+# string: multibyte content escapes to ~3x its size and tmux rejects commands
+# over its ~16KB limit with "command too long" — the #311 prompt growth pushed
+# the inline form past that and crash-looped the Bot (Epic #315 hotfix). The
+# prompt is persisted to RENDERED_PROMPT_FILE below and the PANE SHELL expands
+# `"$(cat <file>)"` at launch, so the command string stays O(100B) no matter
+# how large the prompt grows. Command-substitution output is not re-parsed by
+# the shell, so prompt content still cannot leak into command evaluation; the
+# file path itself is %q-escaped.
+RENDERED_PROMPT_FILE="${RENDERED_PROMPT_FILE:-${CLAUDE_HUB_STATE_DIR}/rendered-system-prompt.md}"
+_prompt_value_next=0
+for _arg in "${CLAUDE_ARGV[@]}"; do
+  if [ "${_prompt_value_next}" = "1" ]; then
+    CLAUDE_CMD+="\"\$(cat $(printf '%q' "${RENDERED_PROMPT_FILE}"))\" "
+    _prompt_value_next=0
+    continue
+  fi
+  [ "${_arg}" = "--append-system-prompt" ] && _prompt_value_next=1
+  CLAUDE_CMD+="$(printf '%q ' "${_arg}")"
+done
 
 # Opt-in introspection for tests: print the fully-built launch command (incl.
 # the env prefix) and exit before any tmux / filesystem side effect.
@@ -411,6 +430,20 @@ fi
 # Create log dir only for real launches. Deferred past render-only / print-argv
 # so tests don't create directories as a side effect.
 mkdir -p "${LOG_DIR}"
+
+# Persist the rendered prompt for the pane shell's `"$(cat ...)"` expansion.
+# Fail loud (like the SYSTEM_PROMPT_FILE guard): a missing prompt file would
+# otherwise launch claude with an empty --append-system-prompt and silently
+# drop every routing/scope rule. Deferred past the dry-run exits above so
+# tests stay side-effect free. 0600 + state dir keeps the embedded channel /
+# bot IDs out of world-readable locations AND out of `ps` argv (the previous
+# inline form exposed them to any local process listing).
+mkdir -p "${CLAUDE_HUB_STATE_DIR}"
+if ! printf '%s' "${SYSTEM_PROMPT_CONTENT}" > "${RENDERED_PROMPT_FILE}"; then
+  echo "[hijoguchi] ERROR: cannot write rendered prompt to ${RENDERED_PROMPT_FILE}" >&2
+  exit 1
+fi
+chmod 600 "${RENDERED_PROMPT_FILE}" 2>/dev/null || true
 
 # Clean shutdown on SIGTERM from launchd
 trap 'echo "[hijoguchi] SIGTERM received, killing tmux session" >&2; "${TMUX_BIN}" kill-session -t "${SESSION}" 2>/dev/null; exit 0' TERM INT
