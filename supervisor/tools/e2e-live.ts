@@ -42,7 +42,7 @@
  */
 
 import { Database } from "bun:sqlite";
-import { existsSync, readFileSync, writeFileSync, unlinkSync } from "fs";
+import { existsSync, mkdirSync, readFileSync, writeFileSync, unlinkSync } from "fs";
 import { homedir } from "os";
 import { join } from "path";
 import { runSessionCtl, createRealEffects } from "./session-ctl";
@@ -373,7 +373,9 @@ async function main(): Promise<number> {
 
     // テスト .tmp（Issue 化されるべき handoff）
     const tmpName = `${new Date().toISOString().slice(0, 10)}-e2e-orch-session.tmp`;
-    const tmpPath = join(homedir(), ".claude", "sessions", tmpName);
+    const sessionsDir = join(homedir(), ".claude", "sessions");
+    mkdirSync(sessionsDir, { recursive: true });
+    const tmpPath = join(sessionsDir, tmpName);
     writeFileSync(tmpPath, [
       "# Session: [e2e-test] orchestrate E2E handoff",
       "",
@@ -421,7 +423,7 @@ async function main(): Promise<number> {
     }, BRAIN_TIMEOUT_MS, 30_000);
     if (newIssue !== null) {
       // 新規作成された [e2e-test] Issue を cleanup 対象に登録
-      const list = gh(["issue", "list", "--state", "open", "--search", "[e2e-test] in:title", "--json", "number", "--jq", ".[].number"]);
+      const list = gh(["issue", "list", "--state", "open", "--limit", "500", "--search", "[e2e-test] in:title", "--json", "number", "--jq", ".[].number"]);
       for (const n of list.stdout.split("\n").map(Number).filter(Boolean)) {
         if (!createdIssues.includes(n)) createdIssues.push(n);
       }
@@ -548,7 +550,8 @@ async function main(): Promise<number> {
 }
 
 function countE2eIssues(): number {
-  const r = gh(["issue", "list", "--state", "all", "--search", "[e2e-test] in:title", "--json", "number", "--jq", "length"]);
+  // 既定の取得上限（30 件）だと件数比較が飽和して新規検知できないため --limit を明示
+  const r = gh(["issue", "list", "--state", "all", "--limit", "500", "--search", "[e2e-test] in:title", "--json", "number", "--jq", "length"]);
   return Number(r.stdout || "0");
 }
 

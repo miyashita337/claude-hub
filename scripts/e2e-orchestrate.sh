@@ -42,7 +42,13 @@ run_suite tests/session/dispatch.test.ts tests/session/dispatch-queue.test.ts
 echo
 echo "== [2/2] ライブ E2E（実 Discord 駆動） =="
 # .env は稼働中 Supervisor のもの（既定 ~/claude-hub/supervisor/.env）を使う。
-# worktree から実行しても driver token を発見できるように fallback する。
+# worktree から実行しても driver token を発見できるように fallback し、
+# .env が無い環境（CI で --skip-live 実行等）では --env-file なしで起動する
+#（ライブ実行時は e2e-live.ts のプリフライトが token 欠如を fail-closed に検出する）。
 ENV_FILE="${E2E_ENV_FILE:-$ROOT/supervisor/.env}"
 if [ ! -f "$ENV_FILE" ]; then ENV_FILE="$HOME/claude-hub/supervisor/.env"; fi
-exec bun --env-file="$ENV_FILE" "$ROOT/supervisor/tools/e2e-live.ts" "$@"
+if [ -f "$ENV_FILE" ]; then
+  exec bun --env-file="$ENV_FILE" "$ROOT/supervisor/tools/e2e-live.ts" "$@"
+else
+  exec bun "$ROOT/supervisor/tools/e2e-live.ts" "$@"
+fi
