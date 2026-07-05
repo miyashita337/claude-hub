@@ -502,6 +502,11 @@ export async function startBot(token: string): Promise<void> {
             );
             if (ch) {
               parent = ch as TextChannel;
+              // 複数ギルド参加時の追跡性（PR #325 gemini medium）: どのギルドの
+              // #corp を選んだかをログに残す（cache の列挙順は保証されないため）。
+              console.log(
+                `[HubWork] resolved #${HUB_WORK_PARENT_CHANNEL} in guild ${guild.name} (${guild.id})`,
+              );
               break;
             }
           }

@@ -208,19 +208,30 @@ async function cmdStop(
   // 触れない: tmux セッション消滅を Supervisor の watchTmuxSession が検知し、
   // status='stopped' (tmux_exited) へ更新する。tmux_exited 経路は worktree を
   // 意図的に残すので、共有 worktree の破壊（RW-046）は構造的に起こらない。
-  if (row.pid != null) {
-    const delivered = fx.killPid(row.pid, "SIGTERM");
-    fx.out(
-      delivered
-        ? `SIGTERM を pid ${row.pid} へ送信しました（graceful 停止待ち ${graceMs}ms）`
-        : `pid ${row.pid} は既に終了しています`,
-    );
-  }
-  if (graceMs > 0) await fx.sleep(graceMs);
+  //
+  // PID 再利用ガード（PR #325 gemini high）: DB の pid は Supervisor 停止中や
+  // 長時間経過後に OS が別プロセスへ再利用している可能性がある。tmux セッション
+  // の生存を確認できた場合のみシグナルを送る（tmux が消えていれば元プロセスも
+  // 終了済みの可能性が極めて高く、送ると無関係プロセスを殺すリスクだけが残る）。
+  const tmuxName = row.thread_id ? tmuxNameForThread(row.thread_id) : null;
+  const tmuxAlive = tmuxName ? await fx.hasTmuxSession(tmuxName) : false;
 
-  if (row.thread_id) {
-    const tmuxName = tmuxNameForThread(row.thread_id);
-    await fx.killTmuxSession(tmuxName);
+  if (!tmuxAlive) {
+    fx.out(
+      `tmux セッション${tmuxName ? ` ${tmuxName}` : ""} が存在しないため SIGTERM / kill をスキップします` +
+        "（PID 再利用による誤 kill 防止。Supervisor が status を整合します）。",
+    );
+  } else {
+    if (row.pid != null) {
+      const delivered = fx.killPid(row.pid, "SIGTERM");
+      fx.out(
+        delivered
+          ? `SIGTERM を pid ${row.pid} へ送信しました（graceful 停止待ち ${graceMs}ms）`
+          : `pid ${row.pid} は既に終了しています`,
+      );
+      if (graceMs > 0) await fx.sleep(graceMs);
+    }
+    await fx.killTmuxSession(tmuxName!);
     fx.out(`tmux セッション ${tmuxName} を kill しました（worktree は保持されます）`);
   }
 

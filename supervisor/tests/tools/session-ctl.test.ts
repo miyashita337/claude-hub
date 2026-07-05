@@ -238,6 +238,16 @@ describe("stop", () => {
     expect(calls.out.join("\n")).toContain("Supervisor が停止中の可能性");
   });
 
+  test("tmux セッション消滅済み → SIGTERM も kill もスキップ（PID 再利用ガード）", async () => {
+    const { fx, calls } = fakeFx({ rows: [row()], tmuxAlive: false });
+    expect(await runSessionCtl(["stop", "sess-1"], fx, STOP_OPTS)).toBe(0);
+    // DB の pid が OS に再利用されている可能性があるため、tmux の生存を確認
+    // できない限りシグナルを送らない（PR #325 gemini high）。
+    expect(calls.killedPids).toHaveLength(0);
+    expect(calls.killedTmux).toHaveLength(0);
+    expect(calls.out.join("\n")).toContain("スキップ");
+  });
+
   test("running でないセッション → exit 1（何も kill しない）", async () => {
     const { fx, calls } = fakeFx({ rows: [row({ status: "stopped" })] });
     expect(await runSessionCtl(["stop", "sess-1"], fx, STOP_OPTS)).toBe(1);
