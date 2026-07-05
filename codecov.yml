@@ -79,3 +79,9 @@ ignore:
   # 計測。シェルは routing-tests ジョブの bash テストで担保する。
   # 注: supervisor/scripts/*.ts（lint ツール群）は TS で計測対象・除外しない。
   - "**/*.sh"
+  # 実 Discord 駆動のライブ E2E ドライバ（Issue #321）。実トークン + 稼働中
+  # Supervisor + 実ネットワークを要するローカル実行専用のテストハーネスで
+  # あり、coverage-policy.md §4「E2E そのものはカバレッジ対象でなく担保手段」
+  # に該当。CI では実行不能な境界コード（index.ts と同型の正当化）。
+  # 注: supervisor/tools/session-ctl.ts は計測対象のまま（除外しない）。
+  - "supervisor/tools/e2e-live.ts"
