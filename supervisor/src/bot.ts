@@ -575,9 +575,23 @@ export async function startBot(token: string): Promise<void> {
       }
       // 長文（Mermaid 含む最終レポート）は relay 本文と同じ整形で分割送信する。
       const chunks = formatForDiscord(text).filter((c) => c.trim());
-      for (const chunk of chunks) {
-        // send 失敗は relay-server 側の catch で 500 として返る（握りつぶさない）。
-        await parent.send(chunk);
+      // 途中 chunk の send 失敗時は送信済み件数をエラーに含め、呼び出し元
+      // （session-ctl post-channel / オーケストレーター）が再試行時の重複投稿
+      // リスクを判断できるようにする（PR #340 coderabbit major）。
+      let sentCount = 0;
+      try {
+        for (const chunk of chunks) {
+          await parent.send(chunk);
+          sentCount++;
+        }
+      } catch (err) {
+        return {
+          ok: false,
+          status: 502,
+          error:
+            `送信中にエラー（${sentCount}/${chunks.length} chunks 送信済み。` +
+            `再試行すると重複投稿の可能性があります）: ${err instanceof Error ? err.message : String(err)}`,
+        };
       }
       console.log(
         `[Bot] channel-post: thread ${threadId} → #${parent.name} (${chunks.length} chunks, ${text.length} chars)`,
