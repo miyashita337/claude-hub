@@ -149,15 +149,20 @@ run "Stop: corrupt prior record → recovers with idle record" t_stop_with_corru
 
 # ----- PostToolUse (heartbeat) -----
 
+# GNU stat uses -c %Y for mtime; BSD/macOS stat uses -f %m. Try GNU first:
+# on BSD, stat -c errors out and we fall back. (The reverse order is wrong —
+# on GNU, stat -f %m SUCCEEDS but prints filesystem info, not mtime.)
+mtime_of() { stat -c %Y "$1" 2>/dev/null || stat -f %m "$1"; }
+
 t_heartbeat_touch_and_advance() {
   new_state
   invoke "$(posttool_payload)" || return 1
   [ -e "$(heartbeat_file)" ] || return 1
   local m1 m2
-  m1="$(stat -f %m "$(heartbeat_file)" 2>/dev/null || stat -c %Y "$(heartbeat_file)")"
+  m1="$(mtime_of "$(heartbeat_file)")"
   sleep 1
   invoke "$(posttool_payload)" || return 1
-  m2="$(stat -f %m "$(heartbeat_file)" 2>/dev/null || stat -c %Y "$(heartbeat_file)")"
+  m2="$(mtime_of "$(heartbeat_file)")"
   [ "${m2}" -gt "${m1}" ]
 }
 run "PostToolUse: heartbeat created and mtime advances" t_heartbeat_touch_and_advance
