@@ -25,6 +25,7 @@ import { CHANNEL_MAP, MAX_SESSIONS } from "./config/channels";
 import type { AttachmentInfo } from "./session/relay";
 import { buildDialogStuckHandler } from "./session/dialog-stuck-handler";
 import { notifyPushover, warnIfPushoverUnconfigured } from "./session/notify-pushover";
+import { startActionReceiver, stopActionReceiver } from "./action/receiver";
 import { updateSessionClaudeId } from "./infra/db";
 import {
   buildSalvageReply,
@@ -206,6 +207,20 @@ export async function startBot(token: string): Promise<void> {
   // stall heartbeat / dialog watchdog pages silently drop, so warn the operator
   // up front instead of leaving it to be noticed only when a stall fails to page.
   warnIfPushoverUnconfigured();
+
+  // Issue #305 (層3): Pushover one-tap action receiver. Fire-and-forget so a
+  // slow Tailscale IP probe never delays Discord login, and fully self-contained
+  // (never throws) so a missing key / no tailnet IP disables the endpoint with a
+  // WARN without taking the bot down.
+  startActionReceiver()
+    .then((r) => {
+      if (!r.started) {
+        console.warn(`[Bot] action receiver not started (${r.reason})`);
+      }
+    })
+    .catch((err) => {
+      console.warn("[Bot] action receiver start error (endpoint off, bot unaffected):", err);
+    });
 
   const client = new Client({
     intents: [
@@ -1011,6 +1026,7 @@ export async function startBot(token: string): Promise<void> {
   // Graceful shutdown
   const shutdown = async () => {
     console.log("[Bot] Shutdown signal received");
+    stopActionReceiver();
     reaper.stop();
     goalWatcher.stop();
     orphanDispatchReaper.stop();

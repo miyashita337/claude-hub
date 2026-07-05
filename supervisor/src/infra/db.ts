@@ -30,6 +30,17 @@ export function getDb(): Database {
     // (started before this column) stay valid; resume of such a row falls back
     // to the display-name-only thread title.
     addColumnIfMissing(db, "branch", "TEXT");
+    // Issue #305 (層3): one-time nonce ledger for Pushover one-tap action tokens.
+    // A tapped `/act?t=<token>` URL is replay-protected by recording its nonce
+    // here; a second tap of the same URL finds the row and is rejected. PRIMARY
+    // KEY on nonce makes the consume atomic (INSERT ... ON CONFLICT DO NOTHING).
+    db.exec(`
+      CREATE TABLE IF NOT EXISTS action_nonces (
+        nonce TEXT PRIMARY KEY,
+        action TEXT NOT NULL,
+        used_at TEXT NOT NULL
+      )
+    `);
   }
   return db;
 }
@@ -202,4 +213,23 @@ export function getRunningSessionsByChannel(
       `SELECT * FROM sessions WHERE channel_name = ? AND status = 'running' ORDER BY started_at`
     )
     .all(channelName) as SessionRow[];
+}
+
+/**
+ * Atomically consume a one-time action nonce (Issue #305, 層3). Returns `true`
+ * when the nonce was newly recorded (first use → the caller may proceed), and
+ * `false` when it was already present (replay → the caller must reject with a
+ * "used" error). Atomicity comes from the PRIMARY KEY on `nonce`: the
+ * `ON CONFLICT DO NOTHING` makes a duplicate insert a no-op, so `changes === 1`
+ * uniquely identifies the first caller even under concurrent taps.
+ */
+export function consumeActionNonce(nonce: string, action: string): boolean {
+  const db = getDb();
+  const result = db
+    .prepare(
+      `INSERT INTO action_nonces (nonce, action, used_at) VALUES (?, ?, ?)
+       ON CONFLICT(nonce) DO NOTHING`
+    )
+    .run(nonce, action, new Date().toISOString());
+  return result.changes === 1;
 }

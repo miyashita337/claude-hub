@@ -168,7 +168,10 @@ jobs:
                    tests/session/keep-attachment.test.ts \
                    tests/commands/session-keep.test.ts \
                    tests/session/self-heal.test.ts \
-                   tests/session/self-heal-restart.test.ts
+                   tests/session/self-heal-restart.test.ts \
+                   tests/action/token.test.ts \
+                   tests/action/execute.test.ts \
+                   tests/action/receiver.test.ts
 
       # #238 regression: realTmuxAdapter.hasSession must treat a tmux
       # control-channel ETIMEDOUT as "alive" (assume the session survives),
