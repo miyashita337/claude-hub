@@ -245,6 +245,9 @@ jobs:
       - name: Run claudeHubExit mechanical mention gate tests (#267)
         run: bash scripts/test-hijoguchi-discord-gate.sh
 
+      - name: Run claudeHubExit turn-state producer tests (#312)
+        run: bash scripts/test-hijoguchi-record-turn-state.sh
+
   # E2E verification of the Discord ↔ Supervisor ↔ Claude Code relay chain.
   # Covers AC-4/5/6/7 hermetically (tmux + mock claude + relay-server HTTP).
   # AC-1/2/3 require a live Discord bot token and are documented as manual
