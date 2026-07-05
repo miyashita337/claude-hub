@@ -12,6 +12,7 @@ import { resolve } from "path";
 import {
   SessionManager,
   buildClaudeFlags,
+  isValidModelId,
   AUTO_COMPACT_INTENT,
 } from "../../src/session/manager";
 import {
@@ -522,6 +523,83 @@ describe("buildClaudeFlags()", () => {
       `"test-channel"`,
     ]);
   });
+
+  // Issue #303: optional model override on the interactive `/session start` path.
+  test("no model arg → no --model (environment default, behaviour unchanged)", () => {
+    expect(buildClaudeFlags(baseConfig)).not.toContain("--model");
+    expect(buildClaudeFlags(baseConfig, undefined)).not.toContain("--model");
+  });
+
+  test("blank/whitespace model → no --model (treated as unset)", () => {
+    expect(buildClaudeFlags(baseConfig, "")).not.toContain("--model");
+    expect(buildClaudeFlags(baseConfig, "   ")).not.toContain("--model");
+  });
+
+  test("model alias → --model with a single-quoted value (tmux bash-string safe)", () => {
+    const flags = buildClaudeFlags(baseConfig, "fable");
+    const i = flags.indexOf("--model");
+    expect(i).toBeGreaterThanOrEqual(0);
+    expect(flags[i + 1]).toBe("'fable'");
+  });
+
+  test("full model name is single-quoted and trimmed", () => {
+    const flags = buildClaudeFlags(baseConfig, "  claude-fable-5  ");
+    const i = flags.indexOf("--model");
+    expect(flags[i + 1]).toBe("'claude-fable-5'");
+  });
+
+  test("defense-in-depth: shell metacharacters cannot break out of the quote", () => {
+    // buildClaudeFlags must be safe even if a caller skips isValidModelId.
+    const flags = buildClaudeFlags(baseConfig, "x'; rm -rf ~ #");
+    const i = flags.indexOf("--model");
+    // The embedded single quote is closed/escaped/reopened ('\'') so the whole
+    // value stays one bash literal — no command substitution / word split.
+    expect(flags[i + 1]).toBe("'x'\\''; rm -rf ~ #'");
+  });
+});
+
+describe("isValidModelId() (#303 shell-safety gate)", () => {
+  test("accepts real aliases and full names", () => {
+    for (const ok of [
+      "fable",
+      "opus",
+      "sonnet",
+      "haiku",
+      "claude-fable-5",
+      "claude-opus-4-8",
+      "claude-sonnet-5",
+      "claude-haiku-4-5-20251001",
+      "claude-fable-5-mythos-5",
+    ]) {
+      expect(isValidModelId(ok)).toBe(true);
+    }
+  });
+
+  test("accepts charset-valid but nonexistent ids (rejection is claude's job, #298)", () => {
+    // No allowlist here: a bogus-but-safe id must pass the gate and be surfaced
+    // downstream by claude's non-zero exit, not silently blocked/fixed.
+    expect(isValidModelId("claude-bogus")).toBe(true);
+  });
+
+  test("rejects shell metacharacters and whitespace", () => {
+    for (const bad of [
+      "x; rm -rf ~",
+      "$(whoami)",
+      "`id`",
+      "a b",
+      "a'b",
+      'a"b',
+      "a|b",
+      "a&b",
+      "a>b",
+      "-rf", // leading hyphen rejected → cannot masquerade as a claude flag
+      "",
+      "   ",
+      "/etc/passwd",
+    ]) {
+      expect(isValidModelId(bad)).toBe(false);
+    }
+  });
 });
 
 describe("SessionManager worktree integration (#154)", () => {
@@ -564,6 +642,20 @@ describe("SessionManager worktree integration (#154)", () => {
     expect(session.worktree).toBeUndefined();
     expect(session.projectDir).toBe(config.dir);
     expect(effects.worktree.ensureCalls).toHaveLength(0);
+  });
+
+  test("#303: start with model injects --model into the claude command (single-quoted)", async () => {
+    await manager.start(config, "t-model", "feature-foo", "claude-fable-5");
+    const cmd = effects.tmux.getCommand("claude-t-model");
+    // AC-1 (journey): the launched claude carries the pinned model.
+    expect(cmd).toContain("--model 'claude-fable-5'");
+  });
+
+  test("#303: start without model omits --model (behaviour unchanged)", async () => {
+    await manager.start(config, "t-nomodel", "feature-foo");
+    const cmd = effects.tmux.getCommand("claude-t-nomodel");
+    // AC-2 (journey): omitting model must not add --model (env default).
+    expect(cmd).not.toContain("--model");
   });
 
   test("AC-3 / Q4: a pre-existing worktree is reused", async () => {
