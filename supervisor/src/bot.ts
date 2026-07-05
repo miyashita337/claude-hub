@@ -6,6 +6,7 @@ import {
   Events,
   type Interaction,
   type Message,
+  type Channel,
   type ThreadChannel,
   type TextChannel,
 } from "discord.js";
@@ -554,8 +555,18 @@ export async function startBot(token: string): Promise<void> {
           error: `スレッドではありません: ${threadId}`,
         };
       }
-      const parent = thread.parent;
-      if (!parent || !parent.isTextBased()) {
+      // thread.parent はキャッシュ依存のゲッターで、起動直後などキャッシュ外
+      // だと実在する親でも null を返す（PR #340 gemini high）。parentId からの
+      // 明示 fetch にフォールバックする。
+      let parent: Channel | null = thread.parent;
+      if (!parent && thread.parentId) {
+        try {
+          parent = await client.channels.fetch(thread.parentId);
+        } catch {
+          // fetch 失敗は下の null チェックで 404 に落とす。
+        }
+      }
+      if (!parent || !parent.isTextBased() || parent.isDMBased()) {
         return {
           ok: false,
           status: 404,
