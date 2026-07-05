@@ -367,11 +367,18 @@ export async function startActionReceiver(
       return new Response("ok", { status: 200 });
     }
     if (url.pathname === "/act" && req.method === "GET") {
-      return handleActRequest(url, {
-        ...base,
-        key: boundKey,
-        nowSeconds: Math.floor(Date.now() / 1000),
-      });
+      try {
+        return await handleActRequest(url, {
+          ...base,
+          key: boundKey,
+          nowSeconds: Math.floor(Date.now() / 1000),
+        });
+      } catch (err) {
+        // DB ロックや一時的な I/O エラー等の未捕捉例外でサーバを落とさず、
+        // スマホ側にも 500 の結果画面を返す（CodeRabbit medium 指摘対応）
+        console.error("[action-receiver] Unhandled error in handleActRequest:", err);
+        return htmlResponse(500, renderResultHtml({ status: 500, outcome: "send_failed" }));
+      }
     }
     return new Response("Not found", { status: 404 });
   };
