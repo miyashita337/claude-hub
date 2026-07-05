@@ -385,6 +385,166 @@ t35_invalid_poll_sec_falls_back() {
     | grep -Fq "invalid HIJOGUCHI_IDLE_POLL_SEC"
 }
 
+# ----- health: hang / dead detection + edge-triggered notify (#313) ---------
+# All health tests run through the HIJOGUCHI_HEALTH_TICK_ONLY /
+# HIJOGUCHI_CRASH_NOTE_ONLY dry-run hooks with mocked notify commands that
+# append one line per call to a counter file — so "exactly one push per
+# incident" is asserted by line count, no real Pushover / terminal-notifier.
+
+# Create an isolated health-test env. Sets HDIR (state dir), NOTIFY_LOG and
+# exports a mock for both notify channels.
+health_env() {
+  HDIR="$(mktemp -d)"
+  NOTIFY_LOG="${HDIR}/notify.log"
+  MOCK_NOTIFY="${HDIR}/mock-notify.sh"
+  printf '#!/bin/bash\necho "$1" >> "%s"\n' "${NOTIFY_LOG}" > "${MOCK_NOTIFY}"
+  chmod +x "${MOCK_NOTIFY}"
+}
+
+# Run one health tick. Args are extra env VAR=VAL pairs.
+health_tick() {
+  env "$@" \
+    HIJOGUCHI_HEALTH_TICK_ONLY=1 \
+    CLAUDE_HUB_STATE_DIR="${HDIR}" \
+    HIJOGUCHI_PUSHOVER_CMD="${MOCK_NOTIFY}" \
+    HIJOGUCHI_NOTIFIER_CMD="${MOCK_NOTIFY}" \
+    bash "${TARGET}" >/dev/null 2>&1
+}
+
+# Record one crash via the dry-run hook; prints DEAD/OK on stdout.
+health_crash() {
+  env "$@" \
+    HIJOGUCHI_CRASH_NOTE_ONLY=1 \
+    CLAUDE_HUB_STATE_DIR="${HDIR}" \
+    HIJOGUCHI_PUSHOVER_CMD="${MOCK_NOTIFY}" \
+    HIJOGUCHI_NOTIFIER_CMD="${MOCK_NOTIFY}" \
+    bash "${TARGET}" 2>/dev/null
+}
+
+notify_count() { grep -c . "${NOTIFY_LOG}" 2>/dev/null || echo 0; }
+
+# Write a processing bot-status.json with the given since epoch.
+write_processing() {
+  printf '{"state":"processing","since":%s,"chat_id":"c1","mentioned":true,"last_outcome":null}\n' "$1" \
+    > "${HDIR}/bot-status.json"
+}
+
+# T36: processing + stale heartbeat + no busy child → exactly one HANG push
+# on each of the two notify channels (mock is shared → 2 lines).
+t36_hang_detected_notifies_once() {
+  health_env
+  write_processing 1577836000                 # turn started before the heartbeat
+  touch -t 202001010000 "${HDIR}/heartbeat"   # mtime = 1577836800 (2020-01-01)
+  health_tick HIJOGUCHI_NOW_EPOCH=1577840000 HIJOGUCHI_BUSY_OVERRIDE=0 || return 1
+  [ "$(cat "${HDIR}/health-incident" 2>/dev/null)" = "hang" ] \
+    && [ "$(notify_count)" = "2" ] \
+    && grep -Fq "claudeHubExit HANG" "${NOTIFY_LOG}"
+}
+
+# T37: repeated ticks in the same incident add no notifications (edge trigger).
+t37_hang_edge_triggered_no_repeat() {
+  health_env
+  write_processing 1577836000
+  touch -t 202001010000 "${HDIR}/heartbeat"
+  health_tick HIJOGUCHI_NOW_EPOCH=1577840000 HIJOGUCHI_BUSY_OVERRIDE=0 || return 1
+  health_tick HIJOGUCHI_NOW_EPOCH=1577840010 HIJOGUCHI_BUSY_OVERRIDE=0 || return 1
+  health_tick HIJOGUCHI_NOW_EPOCH=1577840020 HIJOGUCHI_BUSY_OVERRIDE=0 || return 1
+  [ "$(notify_count)" = "2" ]
+}
+
+# T38: back to idle → one RECOVERED push (2 mock lines) + sentinel cleared.
+t38_recovered_clears_sentinel() {
+  health_env
+  write_processing 1577836000
+  touch -t 202001010000 "${HDIR}/heartbeat"
+  health_tick HIJOGUCHI_NOW_EPOCH=1577840000 HIJOGUCHI_BUSY_OVERRIDE=0 || return 1
+  printf '{"state":"idle","since":1577840050,"chat_id":"c1","mentioned":true,"last_outcome":"completed"}\n' \
+    > "${HDIR}/bot-status.json"
+  health_tick HIJOGUCHI_NOW_EPOCH=1577840060 HIJOGUCHI_BUSY_OVERRIDE=0 || return 1
+  [ ! -e "${HDIR}/health-incident" ] \
+    && [ "$(notify_count)" = "4" ] \
+    && grep -Fq "claudeHubExit RECOVERED" "${NOTIFY_LOG}"
+}
+
+# T39: busy child present → no hang push even with a stale heartbeat
+# (a long-running single tool call is progress; devils-advocate F1 = always
+# AND with liveness).
+t39_busy_child_suppresses_hang() {
+  health_env
+  write_processing 1577836000
+  touch -t 202001010000 "${HDIR}/heartbeat"
+  health_tick HIJOGUCHI_NOW_EPOCH=1577840000 HIJOGUCHI_BUSY_OVERRIDE=1 || return 1
+  [ ! -e "${HDIR}/health-incident" ] && [ "$(notify_count)" = "0" ]
+}
+
+# T40: a turn that has only just started must not be flagged even though the
+# heartbeat file is stale from the PREVIOUS turn (last-progress = max(since,
+# heartbeat), false-hang-at-turn-boundary guard).
+t40_fresh_turn_stale_heartbeat_ok() {
+  health_env
+  write_processing 1577839990   # turn started 10s before "now"
+  touch -t 202001010000 "${HDIR}/heartbeat"
+  health_tick HIJOGUCHI_NOW_EPOCH=1577840000 HIJOGUCHI_BUSY_OVERRIDE=0 || return 1
+  [ ! -e "${HDIR}/health-incident" ] && [ "$(notify_count)" = "0" ]
+}
+
+# T41: idle / missing status file → never flags, never notifies.
+t41_idle_or_missing_status_ok() {
+  health_env
+  health_tick HIJOGUCHI_NOW_EPOCH=100000 HIJOGUCHI_BUSY_OVERRIDE=0 || return 1
+  printf '{"state":"idle","since":1000}\n' > "${HDIR}/bot-status.json"
+  health_tick HIJOGUCHI_NOW_EPOCH=100000 HIJOGUCHI_BUSY_OVERRIDE=0 || return 1
+  [ ! -e "${HDIR}/health-incident" ] && [ "$(notify_count)" = "0" ]
+}
+
+# T42: crash loop — 3rd death within the window prints DEAD and pushes once;
+# a 4th death does not re-push (edge trigger on the dead sentinel).
+t42_crashloop_dead_once() {
+  health_env
+  [ "$(health_crash HIJOGUCHI_NOW_EPOCH=100000)" = "OK" ] || return 1
+  [ "$(health_crash HIJOGUCHI_NOW_EPOCH=100020)" = "OK" ] || return 1
+  [ "$(health_crash HIJOGUCHI_NOW_EPOCH=100040)" = "DEAD" ] || return 1
+  [ "$(notify_count)" = "2" ] || return 1
+  grep -Fq "claudeHubExit DEAD" "${NOTIFY_LOG}" || return 1
+  [ "$(health_crash HIJOGUCHI_NOW_EPOCH=100060)" = "DEAD" ] || return 1
+  [ "$(notify_count)" = "2" ]
+}
+
+# T43: spaced-out single crashes never reach DEAD (launchd self-heals those).
+t43_spaced_crashes_ok() {
+  health_env
+  [ "$(health_crash HIJOGUCHI_NOW_EPOCH=100000)" = "OK" ] || return 1
+  [ "$(health_crash HIJOGUCHI_NOW_EPOCH=101000)" = "OK" ] || return 1
+  [ "$(health_crash HIJOGUCHI_NOW_EPOCH=102000)" = "OK" ] || return 1
+  [ "$(notify_count)" = "0" ]
+}
+
+# T44: dead sentinel is NOT cleared while crashes are still recent (would
+# re-arm and re-push every bounce), and IS cleared once the last crash ages
+# past the window.
+t44_dead_recovery_requires_stability() {
+  health_env
+  health_crash HIJOGUCHI_NOW_EPOCH=100000 >/dev/null
+  health_crash HIJOGUCHI_NOW_EPOCH=100020 >/dev/null
+  health_crash HIJOGUCHI_NOW_EPOCH=100040 >/dev/null   # → dead sentinel + push
+  printf '{"state":"idle","since":100050}\n' > "${HDIR}/bot-status.json"
+  health_tick HIJOGUCHI_NOW_EPOCH=100060 HIJOGUCHI_BUSY_OVERRIDE=0 || return 1
+  [ "$(cat "${HDIR}/health-incident" 2>/dev/null)" = "dead" ] || return 1   # still armed
+  [ "$(notify_count)" = "2" ] || return 1
+  health_tick HIJOGUCHI_NOW_EPOCH=100400 HIJOGUCHI_BUSY_OVERRIDE=0 || return 1  # window passed
+  [ ! -e "${HDIR}/health-incident" ] \
+    && [ "$(notify_count)" = "4" ] \
+    && grep -Fq "claudeHubExit RECOVERED" "${NOTIFY_LOG}"
+}
+
+# T45: hang threshold opt-out (non-numeric / empty) never flags.
+t45_hang_threshold_optout() {
+  health_env
+  write_processing 1000
+  health_tick HIJOGUCHI_NOW_EPOCH=100000 HIJOGUCHI_BUSY_OVERRIDE=0 HIJOGUCHI_HANG_SEC=abc || return 1
+  [ ! -e "${HDIR}/health-incident" ] && [ "$(notify_count)" = "0" ]
+}
+
 run "T1 channel ID expanded"          t1_channel_id_expanded
 run "T2 no residual {{}} tokens"      t2_no_residual_tokens
 run "T3 env override works"           t3_env_override
@@ -420,6 +580,16 @@ run "T32 hook writes in session"      t32_hook_writes_when_in_session
 run "T33 hook no-op without marker"   t33_hook_noop_without_marker
 run "T34 launch cmd has env prefix"   t34_launch_cmd_has_env_prefix
 run "T35 invalid poll sec falls back" t35_invalid_poll_sec_falls_back
+run "T36 hang detected notifies once" t36_hang_detected_notifies_once
+run "T37 hang edge trigger no repeat" t37_hang_edge_triggered_no_repeat
+run "T38 recovered clears sentinel"   t38_recovered_clears_sentinel
+run "T39 busy child suppresses hang"  t39_busy_child_suppresses_hang
+run "T40 fresh turn stale hb ok"      t40_fresh_turn_stale_heartbeat_ok
+run "T41 idle/missing status ok"      t41_idle_or_missing_status_ok
+run "T42 crash loop dead once"        t42_crashloop_dead_once
+run "T43 spaced crashes ok"           t43_spaced_crashes_ok
+run "T44 dead recovery needs stability" t44_dead_recovery_requires_stability
+run "T45 hang threshold opt-out"      t45_hang_threshold_optout
 
 if [ "${fail}" -eq 0 ]; then
   echo "ALL TESTS PASSED"
