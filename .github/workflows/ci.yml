@@ -175,6 +175,7 @@ jobs:
                    tests/action/receiver.test.ts \
                    tests/session/hub-work.test.ts \
                    tests/session/relay-server-hub-work.test.ts \
+                   tests/session/relay-server-channel-post.test.ts \
                    tests/tools/session-ctl.test.ts
 
       # #238 regression: realTmuxAdapter.hasSession must treat a tmux

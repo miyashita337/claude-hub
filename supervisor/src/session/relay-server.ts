@@ -60,6 +60,21 @@ export type HubWorkHandler = (
   body: Record<string, unknown>,
 ) => Promise<HubWorkResponse>;
 
+// Issue #339: オーケストレーターの進捗・最終レポートを corp チャンネル**直下**へ
+// 届ける経路。ローカルの CC セッション（session-ctl post-channel）が
+// `POST /channel-post/:threadId` に {text} を投げると、bot.ts が登録した
+// ハンドラが threadId のスレッドを解決し、その**親チャンネル**へ投稿する。
+// 投稿先は構造的に「そのスレッドの親」に限定される（任意チャンネル投稿は不可）。
+// loopback-only bind + ハンドラ未登録 503 の fail-closed は /hub-work と同じ
+// 信頼境界。
+export type ChannelPostResponse =
+  | { ok: true; channelId: string; chunks: number }
+  | { ok: false; status: number; error: string };
+export type ChannelPostHandler = (
+  threadId: string,
+  text: string,
+) => Promise<ChannelPostResponse>;
+
 type ProgressCallback = (event: ProgressEvent) => void;
 type LateResponseCallback = (event: LateResponseEvent) => void;
 type AskUserCallback = (event: AskUserEvent) => void;
@@ -112,6 +127,7 @@ let lateResponseCallback: LateResponseCallback | null = null;
 let askUserCallback: AskUserCallback | null = null;
 let sessionsProvider: SessionsProvider | null = null;
 let hubWorkHandler: HubWorkHandler | null = null;
+let channelPostHandler: ChannelPostHandler | null = null;
 
 /**
  * Well-known file that carries the relay server's ephemeral port (#320).
@@ -185,6 +201,15 @@ export function onAskUser(callback: AskUserCallback): void {
  */
 export function onHubWork(handler: HubWorkHandler): void {
   hubWorkHandler = handler;
+}
+
+/**
+ * Register the handler that backs `POST /channel-post/:threadId` (#339). When
+ * no handler is registered the endpoint answers 503 (fail-closed) — a channel
+ * post can never silently no-op.
+ */
+export function onChannelPost(handler: ChannelPostHandler): void {
+  channelPostHandler = handler;
 }
 
 /**
@@ -277,6 +302,65 @@ export function startRelayServer(): void {
           );
         } catch (err) {
           console.error("[relay-server] hubWorkHandler error:", err);
+          return Response.json(
+            { error: err instanceof Error ? err.message : String(err) },
+            { status: 500 },
+          );
+        }
+      }
+
+      // Issue #339: オーケストレーターの進捗・最終レポートをスレッドの親
+      // チャンネル直下へ投稿する経路。loopback-only なのでローカルの
+      // session-ctl / オーケストレーター CC セッションだけが叩ける。
+      // ハンドラ未登録は 503（fail-closed、/hub-work と同型）。
+      const channelPostMatch = url.pathname.match(/^\/channel-post\/(.+)$/);
+      if (channelPostMatch && req.method === "POST") {
+        const rawThreadId = channelPostMatch[1];
+        if (!rawThreadId) {
+          return Response.json({ error: "Invalid thread ID" }, { status: 400 });
+        }
+        // manager.ts / session-ctl と対称（encodeURIComponent で送られてくる）。
+        let threadId: string;
+        try {
+          threadId = decodeURIComponent(rawThreadId);
+        } catch {
+          return Response.json(
+            { error: "Invalid thread ID encoding" },
+            { status: 400 },
+          );
+        }
+        let body: Record<string, unknown>;
+        try {
+          const parsed = (await req.json()) as unknown;
+          if (typeof parsed !== "object" || parsed === null || Array.isArray(parsed)) {
+            return Response.json({ error: "Invalid JSON body" }, { status: 400 });
+          }
+          body = parsed as Record<string, unknown>;
+        } catch {
+          return Response.json({ error: "Invalid JSON" }, { status: 400 });
+        }
+        const text = typeof body.text === "string" ? body.text : "";
+        if (!text.trim()) {
+          return Response.json({ error: "text is required" }, { status: 400 });
+        }
+        const handler = channelPostHandler;
+        if (!handler) {
+          return Response.json(
+            { error: "channel post handler not registered (Supervisor 起動中?)" },
+            { status: 503 },
+          );
+        }
+        try {
+          const result = await handler(threadId, text);
+          if (result.ok) {
+            return Response.json(result, { status: 200 });
+          }
+          return Response.json(
+            { error: result.error },
+            { status: result.status },
+          );
+        } catch (err) {
+          console.error("[relay-server] channelPostHandler error:", err);
           return Response.json(
             { error: err instanceof Error ? err.message : String(err) },
             { status: 500 },
@@ -523,6 +607,7 @@ export function stopRelayServer(): void {
   askUserCallback = null;
   sessionsProvider = null;
   hubWorkHandler = null;
+  channelPostHandler = null;
   removeRelayPortFile();
 }
 

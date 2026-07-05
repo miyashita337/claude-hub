@@ -6,6 +6,7 @@ import {
   Events,
   type Interaction,
   type Message,
+  type Channel,
   type ThreadChannel,
   type TextChannel,
 } from "discord.js";
@@ -36,6 +37,7 @@ import {
   onLateResponse,
   onSessionsQuery,
   onHubWork,
+  onChannelPost,
 } from "./session/relay-server";
 import { runHubWork, HUB_WORK_PARENT_CHANNEL } from "./session/hub-work";
 import {
@@ -529,6 +531,73 @@ export async function startBot(token: string): Promise<void> {
         },
       }),
     );
+
+    // Issue #339: オーケストレーターの進捗・最終レポートをスレッドの**親
+    // チャンネル直下**へ投稿する経路（POST /channel-post/:threadId →
+    // session-ctl post-channel が叩く）。投稿先は threadId から解決した親
+    // チャンネルに構造的に限定される（任意チャンネル ID を受け取らない）。
+    onChannelPost(async (threadId, text) => {
+      let thread;
+      try {
+        thread = await client.channels.fetch(threadId);
+      } catch (err) {
+        // Unknown Channel 等の Discord API エラーは呼び出し側の指定ミス扱い。
+        return {
+          ok: false,
+          status: 404,
+          error: `スレッドを取得できません: ${threadId} (${err instanceof Error ? err.message : String(err)})`,
+        };
+      }
+      if (!thread?.isThread()) {
+        return {
+          ok: false,
+          status: 404,
+          error: `スレッドではありません: ${threadId}`,
+        };
+      }
+      // thread.parent はキャッシュ依存のゲッターで、起動直後などキャッシュ外
+      // だと実在する親でも null を返す（PR #340 gemini high）。parentId からの
+      // 明示 fetch にフォールバックする。
+      let parent: Channel | null = thread.parent;
+      if (!parent && thread.parentId) {
+        try {
+          parent = await client.channels.fetch(thread.parentId);
+        } catch {
+          // fetch 失敗は下の null チェックで 404 に落とす。
+        }
+      }
+      if (!parent || !parent.isTextBased() || parent.isDMBased()) {
+        return {
+          ok: false,
+          status: 404,
+          error: `親チャンネルを解決できません: ${threadId}`,
+        };
+      }
+      // 長文（Mermaid 含む最終レポート）は relay 本文と同じ整形で分割送信する。
+      const chunks = formatForDiscord(text).filter((c) => c.trim());
+      // 途中 chunk の send 失敗時は送信済み件数をエラーに含め、呼び出し元
+      // （session-ctl post-channel / オーケストレーター）が再試行時の重複投稿
+      // リスクを判断できるようにする（PR #340 coderabbit major）。
+      let sentCount = 0;
+      try {
+        for (const chunk of chunks) {
+          await parent.send(chunk);
+          sentCount++;
+        }
+      } catch (err) {
+        return {
+          ok: false,
+          status: 502,
+          error:
+            `送信中にエラー（${sentCount}/${chunks.length} chunks 送信済み。` +
+            `再試行すると重複投稿の可能性があります）: ${err instanceof Error ? err.message : String(err)}`,
+        };
+      }
+      console.log(
+        `[Bot] channel-post: thread ${threadId} → #${parent.name} (${chunks.length} chunks, ${text.length} chars)`,
+      );
+      return { ok: true, channelId: parent.id, chunks: chunks.length };
+    });
   });
 
   // Safe reply helper: never throws. Used in error paths where the interaction may
