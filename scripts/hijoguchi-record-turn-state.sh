@@ -41,7 +41,10 @@ INPUT="$(cat 2>/dev/null)" || exit 0
 # Scope to the hijoguchi session only.
 [ "${CLAUDE_HUB_HIJOGUCHI_SESSION:-0}" = "1" ] || exit 0
 
-STATE_DIR="${CLAUDE_HUB_STATE_DIR:-${HOME}/.claude-hub-state}"
+# ${HOME:-} (not ${HOME}): under set -u an unset HOME (restricted daemon env)
+# would abort here and violate the always-exit-0 contract; with the empty
+# fallback the later mkdir simply fails and we exit 0 without a write.
+STATE_DIR="${CLAUDE_HUB_STATE_DIR:-${HOME:-}/.claude-hub-state}"
 STATUS_FILE="${STATE_DIR}/bot-status.json"
 HEARTBEAT_FILE="${STATE_DIR}/heartbeat"
 

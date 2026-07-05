@@ -25,8 +25,14 @@ run() {
   if "$@"; then echo "PASS ${name}"; else echo "FAIL ${name}"; fail=1; fi
 }
 
+# Track every temp state dir and remove them all on exit (no /tmp leak).
+TEMP_DIRS=()
+cleanup() { [ "${#TEMP_DIRS[@]}" -gt 0 ] && rm -rf "${TEMP_DIRS[@]}"; }
+trap cleanup EXIT
+
 new_state() {
   STATE="$(mktemp -d)"
+  TEMP_DIRS+=("${STATE}")
   export CLAUDE_HUB_STATE_DIR="${STATE}"
 }
 
@@ -149,21 +155,18 @@ run "Stop: corrupt prior record → recovers with idle record" t_stop_with_corru
 
 # ----- PostToolUse (heartbeat) -----
 
-# GNU stat uses -c %Y for mtime; BSD/macOS stat uses -f %m. Try GNU first:
-# on BSD, stat -c errors out and we fall back. (The reverse order is wrong —
-# on GNU, stat -f %m SUCCEEDS but prints filesystem info, not mtime.)
-mtime_of() { stat -c %Y "$1" 2>/dev/null || stat -f %m "$1"; }
-
 t_heartbeat_touch_and_advance() {
   new_state
   invoke "$(posttool_payload)" || return 1
   [ -e "$(heartbeat_file)" ] || return 1
-  local m1 m2
-  m1="$(mtime_of "$(heartbeat_file)")"
+  # Portable mtime-advance check: mark a reference file AFTER the first touch,
+  # then assert the second touch lands newer via the shell's -nt operator —
+  # no dependency on GNU vs BSD stat flag dialects.
+  local ref="${CLAUDE_HUB_STATE_DIR}/ref"
+  touch "${ref}"
   sleep 1
   invoke "$(posttool_payload)" || return 1
-  m2="$(mtime_of "$(heartbeat_file)")"
-  [ "${m2}" -gt "${m1}" ]
+  [ "$(heartbeat_file)" -nt "${ref}" ]
 }
 run "PostToolUse: heartbeat created and mtime advances" t_heartbeat_touch_and_advance
 
