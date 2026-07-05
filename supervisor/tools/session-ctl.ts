@@ -29,6 +29,7 @@
  *   bun run supervisor/tools/session-ctl.ts send <thread_id|session_id> <text...>
  *   bun run supervisor/tools/session-ctl.ts stop <id>
  *   bun run supervisor/tools/session-ctl.ts start-hub-worker <branch> <issueNumber> [selector]
+ *   bun run supervisor/tools/session-ctl.ts post-channel <thread_id> <text...>
  *
  * `<id>` は session row id / thread_id / claude_session_id のいずれでも可。
  */
@@ -102,7 +103,10 @@ subcommands:
       Supervisor の watcher が行う (この CLI は DB に書かない)。worktree は保持 (RW-046)
   start-hub-worker <branch> <issueNumber> [selector]
       claude-hub work セッションを corp チャンネル配下に起動 (POST /hub-work, ADR-002 D5)。
-      selector: impl / no-template / pdca / article / devcycle (省略時 impl)`;
+      selector: impl / no-template / pdca / article / devcycle (省略時 impl)
+  post-channel <thread_id> <text...>
+      スレッドの親チャンネル直下へテキスト投稿 (POST /channel-post, #339)。
+      オーケストレーターの進捗・最終レポートを corp チャンネル直下へ届ける用途`;
 
 /** threadId → tmux セッション名（Supervisor と同一の公式マッピングを共有）。 */
 export function tmuxNameForThread(threadId: string): string {
@@ -299,6 +303,55 @@ async function cmdStartHubWorker(
   return 1;
 }
 
+async function cmdPostChannel(
+  fx: SessionCtlEffects,
+  threadId: string,
+  text: string,
+): Promise<number> {
+  // Discord thread ID は snowflake（数値列）。書式で早期に弾いて、Supervisor
+  // への無駄な往復と紛らわしい 404 を避ける。
+  if (!/^[0-9]+$/.test(threadId)) {
+    fx.err(`thread_id は Discord スレッド ID（数値列）で指定してください: ${threadId}`);
+    return 1;
+  }
+  if (!text.trim()) {
+    fx.err("投稿テキストが空です。");
+    return 1;
+  }
+  const port = fx.readRelayPort();
+  if (port == null) {
+    fx.err(
+      "Supervisor の relay ポートを発見できません（ポートファイルなし）。" +
+        "Supervisor が起動しているか確認してください。",
+    );
+    return 1;
+  }
+  let res: { status: number; body: unknown };
+  try {
+    res = await fx.httpPost(
+      `http://127.0.0.1:${port}/channel-post/${encodeURIComponent(threadId)}`,
+      { text },
+    );
+  } catch (err) {
+    fx.err(
+      `Supervisor への接続に失敗しました (port ${port}): ${err instanceof Error ? err.message : String(err)}`,
+    );
+    return 1;
+  }
+  const body = (res.body ?? {}) as Record<string, unknown>;
+  if (res.status === 200 && body.ok === true) {
+    fx.out(
+      `✅ スレッド ${threadId} の親チャンネル (${String(body.channelId)}) へ投稿しました ` +
+        `(${String(body.chunks)} chunks)`,
+    );
+    return 0;
+  }
+  fx.err(
+    `❌ チャンネル投稿に失敗しました (HTTP ${res.status}): ${typeof body.error === "string" ? body.error : JSON.stringify(res.body)}`,
+  );
+  return 1;
+}
+
 /**
  * CLI エントリ本体（純粋オーケストレーション）。argv はサブコマンド以降
  * （`process.argv.slice(2)` 相当）。テストは fake effects を注入して呼ぶ。
@@ -343,6 +396,14 @@ export async function runSessionCtl(
         return 1;
       }
       return cmdStartHubWorker(fx, branch, issueArg, selector);
+    }
+    case "post-channel": {
+      const [threadId, ...words] = rest;
+      if (!threadId || words.length === 0) {
+        fx.err("使い方: session-ctl post-channel <thread_id> <text...>");
+        return 1;
+      }
+      return cmdPostChannel(fx, threadId, words.join(" "));
     }
     case "help":
     case "--help":

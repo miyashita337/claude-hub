@@ -36,6 +36,7 @@ import {
   onLateResponse,
   onSessionsQuery,
   onHubWork,
+  onChannelPost,
 } from "./session/relay-server";
 import { runHubWork, HUB_WORK_PARENT_CHANNEL } from "./session/hub-work";
 import {
@@ -529,6 +530,49 @@ export async function startBot(token: string): Promise<void> {
         },
       }),
     );
+
+    // Issue #339: オーケストレーターの進捗・最終レポートをスレッドの**親
+    // チャンネル直下**へ投稿する経路（POST /channel-post/:threadId →
+    // session-ctl post-channel が叩く）。投稿先は threadId から解決した親
+    // チャンネルに構造的に限定される（任意チャンネル ID を受け取らない）。
+    onChannelPost(async (threadId, text) => {
+      let thread;
+      try {
+        thread = await client.channels.fetch(threadId);
+      } catch (err) {
+        // Unknown Channel 等の Discord API エラーは呼び出し側の指定ミス扱い。
+        return {
+          ok: false,
+          status: 404,
+          error: `スレッドを取得できません: ${threadId} (${err instanceof Error ? err.message : String(err)})`,
+        };
+      }
+      if (!thread?.isThread()) {
+        return {
+          ok: false,
+          status: 404,
+          error: `スレッドではありません: ${threadId}`,
+        };
+      }
+      const parent = thread.parent;
+      if (!parent || !parent.isTextBased()) {
+        return {
+          ok: false,
+          status: 404,
+          error: `親チャンネルを解決できません: ${threadId}`,
+        };
+      }
+      // 長文（Mermaid 含む最終レポート）は relay 本文と同じ整形で分割送信する。
+      const chunks = formatForDiscord(text).filter((c) => c.trim());
+      for (const chunk of chunks) {
+        // send 失敗は relay-server 側の catch で 500 として返る（握りつぶさない）。
+        await parent.send(chunk);
+      }
+      console.log(
+        `[Bot] channel-post: thread ${threadId} → #${parent.name} (${chunks.length} chunks, ${text.length} chars)`,
+      );
+      return { ok: true, channelId: parent.id, chunks: chunks.length };
+    });
   });
 
   // Safe reply helper: never throws. Used in error paths where the interaction may

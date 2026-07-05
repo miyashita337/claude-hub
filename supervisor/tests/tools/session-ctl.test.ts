@@ -366,3 +366,69 @@ describe("実 DB 読み取り（createRealEffects の store、読み取り専用
     }
   });
 });
+
+describe("post-channel (#339)", () => {
+  test("引数不足（thread_id のみ）は usage エラーで 1", async () => {
+    const { fx, calls } = fakeFx();
+    expect(await runSessionCtl(["post-channel", "111122223333444455"], fx)).toBe(1);
+    expect(calls.err[0]).toContain("使い方");
+    expect(calls.posts).toHaveLength(0);
+  });
+
+  test("thread_id が snowflake 形式でない場合は 1", async () => {
+    const { fx, calls } = fakeFx();
+    expect(await runSessionCtl(["post-channel", "not-a-thread", "hello"], fx)).toBe(1);
+    expect(calls.err[0]).toContain("thread_id");
+    expect(calls.posts).toHaveLength(0);
+  });
+
+  test("ポートファイルなし → Supervisor 未起動の案内で 1", async () => {
+    const { fx, calls } = fakeFx({ relayPort: null });
+    expect(
+      await runSessionCtl(["post-channel", "111122223333444455", "hello"], fx),
+    ).toBe(1);
+    expect(calls.err[0]).toContain("Supervisor");
+    expect(calls.posts).toHaveLength(0);
+  });
+
+  test("成功: /channel-post/<threadId> へ {text} を POST し ✅ を出す", async () => {
+    const { fx, calls } = fakeFx({
+      httpResponse: { status: 200, body: { ok: true, channelId: "C1", chunks: 2 } },
+    });
+    expect(
+      await runSessionCtl(
+        ["post-channel", "111122223333444455", "##", "進捗", "レポート"],
+        fx,
+      ),
+    ).toBe(0);
+    expect(calls.posts).toHaveLength(1);
+    expect(calls.posts[0]!.url).toBe(
+      "http://127.0.0.1:45678/channel-post/111122223333444455",
+    );
+    expect(calls.posts[0]!.body).toEqual({ text: "## 進捗 レポート" });
+    expect(calls.out[0]).toContain("✅");
+    expect(calls.out[0]).toContain("C1");
+  });
+
+  test("HTTP エラー（404 等）はエラー内容を表示して 1", async () => {
+    const { fx, calls } = fakeFx({
+      httpResponse: { status: 404, body: { error: "スレッドが見つかりません" } },
+    });
+    expect(
+      await runSessionCtl(["post-channel", "111122223333444455", "hello"], fx),
+    ).toBe(1);
+    expect(calls.err[0]).toContain("404");
+    expect(calls.err[0]).toContain("スレッドが見つかりません");
+  });
+
+  test("接続失敗（httpPost throw）は接続エラー案内で 1", async () => {
+    const { fx, calls } = fakeFx();
+    fx.httpPost = async () => {
+      throw new Error("connect ECONNREFUSED");
+    };
+    expect(
+      await runSessionCtl(["post-channel", "111122223333444455", "hello"], fx),
+    ).toBe(1);
+    expect(calls.err[0]).toContain("接続に失敗");
+  });
+});
