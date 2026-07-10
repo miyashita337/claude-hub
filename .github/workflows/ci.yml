@@ -136,6 +136,9 @@ jobs:
                    tests/commands/session-start-access.test.ts \
                    tests/commands/session-start-branch.test.ts \
                    tests/commands/session-thread-title.test.ts \
+                   tests/commands/session-stop.test.ts \
+                   tests/commands/session-list.test.ts \
+                   tests/commands/session-status.test.ts \
                    tests/config/access-policy.test.ts \
                    tests/config/check-access-policy.test.ts \
                    tests/discord/in-memory-client.test.ts \
