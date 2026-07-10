@@ -35,11 +35,27 @@ const isolatedRuntimeDir = mkdtempSync(
 process.env.XDG_RUNTIME_DIR = isolatedRuntimeDir;
 
 // Best-effort cleanup so repeated runs don't litter the temp root. Fail-soft:
-// an unremovable temp dir must never fail the test run.
-process.on("exit", () => {
+// an unremovable temp dir must never fail the test run. Idempotent (rmSync with
+// force), so running it from both a signal handler and the subsequent `exit`
+// event is harmless.
+const cleanup = () => {
   try {
     rmSync(isolatedRuntimeDir, { recursive: true, force: true });
   } catch {
     // ignore — OS will reclaim the temp dir eventually
   }
+};
+
+// Normal termination.
+process.on("exit", cleanup);
+// SIGINT (Ctrl+C) / SIGTERM do NOT fire the `exit` event, so an interrupted
+// `bun test` would otherwise leak the temp dir. Clean up, then re-exit with the
+// conventional 128+signal code to preserve interrupt semantics.
+process.on("SIGINT", () => {
+  cleanup();
+  process.exit(130);
+});
+process.on("SIGTERM", () => {
+  cleanup();
+  process.exit(143);
 });
