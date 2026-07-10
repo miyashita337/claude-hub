@@ -32,6 +32,14 @@ import { join } from "path";
 const isolatedRuntimeDir = mkdtempSync(
   join(tmpdir(), "claude-hub-supervisor-test-"),
 );
+// Preserve the pre-override value so the regression guard
+// (tests/session/relay-port-isolation.test.ts) can reconstruct the REAL
+// production relay-port path for THIS platform and assert it stays untouched:
+// Linux CI → $XDG_RUNTIME_DIR/claude-hub-supervisor/… (XDG is normally
+// /run/user/<uid>), macOS → the /tmp/claude-hub-supervisor-<USER>/… fallback.
+// Empty string encodes "was unset" (→ /tmp fallback), matching
+// relayPortFilePath()'s own resolution.
+process.env.ORIGINAL_XDG_RUNTIME_DIR = process.env.XDG_RUNTIME_DIR ?? "";
 process.env.XDG_RUNTIME_DIR = isolatedRuntimeDir;
 
 // Best-effort cleanup so repeated runs don't litter the temp root. Fail-soft:

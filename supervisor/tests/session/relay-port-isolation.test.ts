@@ -34,7 +34,14 @@ describe("relay-port isolation (Issue #341)", () => {
 
   test("start/stop touches only the isolated dir; the well-known production path is left intact", () => {
     const user = process.env.USER || "default";
-    const wellKnown = `/tmp/claude-hub-supervisor-${user}/relay-port`;
+    // The REAL production path for THIS platform, reconstructed from the XDG
+    // value the preload captured before overriding it — so the guard is accurate
+    // on Linux CI (XDG = /run/user/<uid>) too, not just the macOS /tmp fallback.
+    // Mirrors relayPortFilePath()'s own resolution.
+    const originalXdg = process.env.ORIGINAL_XDG_RUNTIME_DIR;
+    const wellKnown = originalXdg
+      ? `${originalXdg}/claude-hub-supervisor/relay-port`
+      : `/tmp/claude-hub-supervisor-${user}/relay-port`;
     // Read-only snapshot of the real path (present or absent) — this test must
     // never itself mutate the production file it is guarding.
     const before = existsSync(wellKnown)
