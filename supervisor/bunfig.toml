@@ -1,0 +1,9 @@
+# Issue #341: isolate the per-user runtime dir for `bun test` so hermetic tests
+# never write/unlink the LIVE Supervisor's relay-port file. The preload runs
+# once per `bun test` process, before any test file, and repoints
+# XDG_RUNTIME_DIR at a throwaway temp dir. Scoped to `[test]` only — `bun run`
+# and production start-up are unaffected. All test invocations (CI ci.yml,
+# scripts/e2e-orchestrate.sh) run `bun test` from this directory, so this
+# bunfig is always picked up.
+[test]
+preload = ["./tests/setup/runtime-dir-isolation.ts"]
