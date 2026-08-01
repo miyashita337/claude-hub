@@ -86,8 +86,12 @@ describe("relay outer-catch notice leaks nothing (#236)", () => {
   test("bot.ts outer catch sends the canned notice, not the raw error", async () => {
     const block = await readRelayCatchBlock();
 
-    // The user-facing send must be the constant.
-    expect(block).toContain("RELAY_ERROR_USER_MESSAGE");
+    // The user-facing send must be the constant AND NOTHING ELSE. Asserting
+    // mere presence of the identifier would still admit
+    // `thread.send(`${RELAY_ERROR_USER_MESSAGE}: ${err}`)` — a bare `${err}`
+    // is neither `err.message` nor `String(err)`, so the negative checks below
+    // would not catch it (CodeRabbit on PR #361).
+    expect(block).toMatch(/await\s+thread\.send\(\s*RELAY_ERROR_USER_MESSAGE\s*\);/);
     // No raw error content may be interpolated into the Discord message. The
     // diagnostic `console.error` passes the `err` OBJECT (preserving the stack),
     // so neither stringification form should appear anywhere in this block.
