@@ -122,6 +122,7 @@ jobs:
                    tests/session/dialog-detect.test.ts \
                    tests/session/dialog-watchdog.test.ts \
                    tests/session/relay-send-failure.test.ts \
+                   tests/session/relay-error-notice.test.ts \
                    tests/scripts/lint-blocking-in-timers.test.ts \
                    tests/scripts/lint-no-sync-exec.test.ts \
                    tests/session/notify-pushover.test.ts \
