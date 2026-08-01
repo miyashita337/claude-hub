@@ -8,9 +8,10 @@
       Paths use a /Users/YOUR_USER placeholder; substitute $HOME on install so
       the job works on any machine (Issue #198 — same convention as
       com.claude-hub.gc-attachments.plist).
-      Install:
+      Install (source path absolute on purpose: with a relative path a wrong cwd
+      makes sed fail while the redirect still truncates the installed plist):
         mkdir -p ~/claude-hub/logs
-        sed "s|/Users/YOUR_USER|$HOME|g" com.claude-hub.supervisor.plist \
+        sed "s|/Users/YOUR_USER|$HOME|g" ~/claude-hub/com.claude-hub.supervisor.plist \
           > ~/Library/LaunchAgents/com.claude-hub.supervisor.plist
         launchctl load ~/Library/LaunchAgents/com.claude-hub.supervisor.plist
       CAUTION on re-install: the command above OVERWRITES the installed plist,
