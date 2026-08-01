@@ -5,5 +5,14 @@
 # and production start-up are unaffected. All test invocations (CI ci.yml,
 # scripts/e2e-orchestrate.sh) run `bun test` from this directory, so this
 # bunfig is always picked up.
+#
+# Issue #308: the same hook point isolates sessions.db. db.ts resolves its path
+# at module load and caches a singleton, so a per-file `SUPERVISOR_DB_PATH`
+# assignment loses the race whenever another file imports db.ts first — which
+# let `bun test` truncate the LIVE sessions.db. The preload runs before any test
+# file, so the singleton binds to `:memory:`.
 [test]
-preload = ["./tests/setup/runtime-dir-isolation.ts"]
+preload = [
+  "./tests/setup/runtime-dir-isolation.ts",
+  "./tests/setup/db-isolation.ts",
+]

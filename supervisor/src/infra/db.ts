@@ -1,19 +1,74 @@
 import { Database } from "bun:sqlite";
 import { resolve } from "path";
-import { homedir } from "os";
+import { homedir, tmpdir } from "os";
+
+/**
+ * テスト実行中か（Issue #308）。`bun test` は NODE_ENV を "test" に設定する
+ * （Bun 1.3.11 で実測: `env -u NODE_ENV bun test` でも "test"）。
+ * SUPERVISOR_TEST_ISOLATION は tests/setup/db-isolation.ts preload が立てる
+ * マーカーで、NODE_ENV を上書きされてもガードが外れないようにする二重化。
+ */
+function isUnderTest(env: Record<string, string | undefined>): boolean {
+  return env.NODE_ENV === "test" || env.SUPERVISOR_TEST_ISOLATION === "1";
+}
+
+/**
+ * テスト実行中に開いてよい sqlite パスか。`:memory:`（および URI 形式）と
+ * 一時ディレクトリ配下のみを許可する allowlist ＝「permissive より restrictive」
+ * （rules/general/defensive-programming.md）。本番 sessions.db はもちろん、
+ * 将来うっかり指定された任意の実ファイルも弾く。
+ */
+function isTestSafeDbPath(path: string): boolean {
+  // Bun/sqlite で filesystem に触れない形式。"" は bun:sqlite の匿名 in-memory。
+  if (path === "" || path.includes(":memory:")) return true;
+  // macOS の tmpdir() は /var/folders/...、/tmp は /private/tmp への symlink。
+  // mkdtemp(join(tmpdir(), …)) 由来のパス（tests/tools/session-ctl.test.ts）を
+  // 通しつつ、いずれの表記でも一時領域だけを許可する。
+  return [tmpdir(), "/tmp", "/private/tmp"]
+    .map((root) => root.replace(/\/+$/, "") + "/")
+    .some((root) => path.startsWith(root));
+}
+
+/**
+ * Fail-fast ガード（Issue #308）: テスト実行中に本番 sessions.db を開こうと
+ * したら即座に throw する。
+ *
+ * 背景: preload（tests/setup/db-isolation.ts）が一次防御だが、preload が外され
+ * た・新しい入口が env を無視した、といった経路が残る。実測では隔離が壊れると
+ * テストは 72 pass / 0 fail のまま本番の行を消す（silent data loss）ため、
+ * 「黙って壊す」より「その場で落ちる」方を選ぶ。
+ */
+export function assertTestDbIsolation(
+  path: string,
+  env: Record<string, string | undefined> = process.env,
+): void {
+  if (!isUnderTest(env)) return;
+  if (isTestSafeDbPath(path)) return;
+  throw new Error(
+    `[db] テスト実行中に隔離されていない sessions.db を開こうとしました: ${path}\n` +
+      `これは本番のセッション行を破壊しうるため中断しました（Issue #308）。\n` +
+      `対処: SUPERVISOR_DB_PATH=":memory:" を設定するか、一時ディレクトリ配下の ` +
+      `パスを指定してください。通常は supervisor/bunfig.toml の ` +
+      `[test].preload（tests/setup/db-isolation.ts）が自動で設定します。`,
+  );
+}
 
 /**
  * sessions.db の実パスを解決する（#320 で外出し）。Supervisor 本体（下の
  * DB_PATH、モジュールロード時に固定）と読み取り専用 CLI（tools/session-ctl.ts、
  * 呼び出し時に解決）が同じ規則を共有するための single source of truth。
+ *
+ * 解決と同時に #308 のガードを通すので、パスを得る経路すべて（singleton /
+ * session-ctl / e2e-live）が自動的に保護される。
  */
 export function resolveDbPath(
   env: Record<string, string | undefined> = process.env,
 ): string {
-  return (
+  const path =
     env.SUPERVISOR_DB_PATH ??
-    resolve(homedir(), "claude-hub", "supervisor", "sessions.db")
-  );
+    resolve(homedir(), "claude-hub", "supervisor", "sessions.db");
+  assertTestDbIsolation(path, env);
+  return path;
 }
 
 const DB_PATH = resolveDbPath();
