@@ -3,23 +3,33 @@
   "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
 <plist version="1.0">
 <dict>
+    <!--
+      LEGACY template, not the job that runs today. The resident Supervisor is
+      `com.claude-hub.supervisor` (repo root plist); this one targets
+      ~/channel/supervisor/index.ts, a path that no longer exists, and is not
+      loaded in launchctl. Kept only so the two templates share one install
+      convention; removal is tracked in Issue #359.
+      Paths use a /Users/YOUR_USER placeholder; substitute $HOME on install
+      (Issue #198 — same convention as com.claude-hub.gc-attachments.plist).
+    -->
+
     <key>Label</key>
     <string>com.channel.supervisor</string>
 
     <key>ProgramArguments</key>
     <array>
-        <string>/Users/harieshokunin/.bun/bin/bun</string>
+        <string>/Users/YOUR_USER/.bun/bin/bun</string>
         <string>run</string>
-        <string>/Users/harieshokunin/channel/supervisor/index.ts</string>
+        <string>/Users/YOUR_USER/channel/supervisor/index.ts</string>
     </array>
 
     <key>WorkingDirectory</key>
-    <string>/Users/harieshokunin/channel/supervisor</string>
+    <string>/Users/YOUR_USER/channel/supervisor</string>
 
     <key>EnvironmentVariables</key>
     <dict>
         <key>PATH</key>
-        <string>/Users/harieshokunin/.local/bin:/Users/harieshokunin/.bun/bin:/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin</string>
+        <string>/Users/YOUR_USER/.local/bin:/Users/YOUR_USER/.bun/bin:/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin</string>
     </dict>
 
     <key>KeepAlive</key>
@@ -32,9 +42,9 @@
     <integer>10</integer>
 
     <key>StandardOutPath</key>
-    <string>/Users/harieshokunin/channel/logs/supervisor.stdout.log</string>
+    <string>/Users/YOUR_USER/channel/logs/supervisor.stdout.log</string>
     <key>StandardErrorPath</key>
-    <string>/Users/harieshokunin/channel/logs/supervisor.stderr.log</string>
+    <string>/Users/YOUR_USER/channel/logs/supervisor.stderr.log</string>
 
     <key>RunAtLoad</key>
     <true/>
