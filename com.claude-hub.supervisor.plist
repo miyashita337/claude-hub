@@ -3,6 +3,24 @@
   "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
 <plist version="1.0">
 <dict>
+    <!--
+      Channel-Supervisor resident job (Bun + discord.js, caffeinate-wrapped).
+      Paths use a /Users/YOUR_USER placeholder; substitute $HOME on install so
+      the job works on any machine (Issue #198 — same convention as
+      com.claude-hub.gc-attachments.plist).
+      Install (source path absolute on purpose: with a relative path a wrong cwd
+      makes sed fail while the redirect still truncates the installed plist):
+        mkdir -p ~/claude-hub/logs
+        sed "s|/Users/YOUR_USER|$HOME|g" ~/claude-hub/com.claude-hub.supervisor.plist \
+          > ~/Library/LaunchAgents/com.claude-hub.supervisor.plist
+        launchctl load ~/Library/LaunchAgents/com.claude-hub.supervisor.plist
+      CAUTION on re-install: the command above OVERWRITES the installed plist,
+      clearing the manually-filled HIJOGUCHI_CHANNEL_ID below (blank in source
+      by design). Re-fill it and reload with bootout+bootstrap, otherwise the
+      claudeHubExit `/session compact` route silently stays disabled. See
+      docs/bot-operations.md § "Required env vars (claudeHubExit)".
+    -->
+
     <key>Label</key>
     <string>com.claude-hub.supervisor</string>
 
@@ -10,18 +28,18 @@
     <array>
         <string>/usr/bin/caffeinate</string>
         <string>-dimsu</string>
-        <string>/Users/harieshokunin/.bun/bin/bun</string>
+        <string>/Users/YOUR_USER/.bun/bin/bun</string>
         <string>run</string>
-        <string>/Users/harieshokunin/claude-hub/supervisor/index.ts</string>
+        <string>/Users/YOUR_USER/claude-hub/supervisor/index.ts</string>
     </array>
 
     <key>WorkingDirectory</key>
-    <string>/Users/harieshokunin/claude-hub/supervisor</string>
+    <string>/Users/YOUR_USER/claude-hub/supervisor</string>
 
     <key>EnvironmentVariables</key>
     <dict>
         <key>PATH</key>
-        <string>/Users/harieshokunin/.local/bin:/Users/harieshokunin/.bun/bin:/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin</string>
+        <string>/Users/YOUR_USER/.local/bin:/Users/YOUR_USER/.bun/bin:/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin</string>
         <!-- Issue #199 AC1: claudeHubExit primary channel id. When set, `/session
              compact` invoked in that channel routes to the claudeHubExit tmux
              session (default socket) instead of showing the thread-only hint.
@@ -45,9 +63,9 @@
     <integer>10</integer>
 
     <key>StandardOutPath</key>
-    <string>/Users/harieshokunin/claude-hub/logs/supervisor.stdout.log</string>
+    <string>/Users/YOUR_USER/claude-hub/logs/supervisor.stdout.log</string>
     <key>StandardErrorPath</key>
-    <string>/Users/harieshokunin/claude-hub/logs/supervisor.stderr.log</string>
+    <string>/Users/YOUR_USER/claude-hub/logs/supervisor.stderr.log</string>
 
     <key>RunAtLoad</key>
     <true/>

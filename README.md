@@ -32,12 +32,23 @@ cp .env.example .env  # トークン設定
 # 開発
 bun run supervisor/index.ts
 
-# 常駐 (launchd)
+# 常駐 (launchd)。plist 内の /Users/YOUR_USER プレースホルダを $HOME に置換して配置する
+# source は絶対パスで指定する: 相対パスだと cwd 違いで sed が失敗しても > が
+# installed plist を空ファイルに切り詰めてしまう
+mkdir -p ~/claude-hub/logs
+sed "s|/Users/YOUR_USER|$HOME|g" ~/claude-hub/com.claude-hub.supervisor.plist > ~/Library/LaunchAgents/com.claude-hub.supervisor.plist
 launchctl load ~/Library/LaunchAgents/com.claude-hub.supervisor.plist
+# 再設置時の注意: 上の sed は installed plist を上書きするため、手動記入した
+# HIJOGUCHI_CHANNEL_ID (channel id は非コミット。Issue #63) が消える。再記入 +
+# bootout/bootstrap で再ロードすること。詳細は docs/bot-operations.md を参照
 
 # 添付ファイルの日次GC (launchd, 04:00 に tmp/attachments の30日超を削除。Issue #151/#280)
 bash scripts/install-gc-attachments.sh
 ```
+
+launchd plist は全て `/Users/YOUR_USER` プレースホルダで管理し、install 時に `$HOME` へ置換する
+（Issue #198）。ハードコードされたユーザーパスの再混入は CI で機械検知する:
+`bash scripts/test-plist-placeholders.sh`
 
 ## ローカル E2E 検証
 
