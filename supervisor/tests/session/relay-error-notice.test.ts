@@ -1,5 +1,8 @@
 import { test, expect, describe } from "bun:test";
-import { RELAY_ERROR_USER_MESSAGE } from "../../src/session/relay";
+import {
+  RELAY_ERROR_USER_MESSAGE,
+  SEND_FAILURE_USER_MESSAGE,
+} from "../../src/session/relay";
 
 /**
  * Issue #236 (follow-up of #74): the relay block's OUTER catch in bot.ts used
@@ -55,7 +58,29 @@ describe("relay outer-catch notice leaks nothing (#236)", () => {
     expect(RELAY_ERROR_USER_MESSAGE).not.toMatch(/ENOENT|EACCES|SQLITE|DiscordAPIError/i);
     expect(RELAY_ERROR_USER_MESSAGE).not.toMatch(/Error:|\bat \w+ \(|Command failed|tmux/i);
     // Actionable: tells the user how to recover (same contract as #74).
-    expect(RELAY_ERROR_USER_MESSAGE).toContain("/session restart");
+    expect(RELAY_ERROR_USER_MESSAGE).toContain("/session status");
+    expect(RELAY_ERROR_USER_MESSAGE).toContain("/session start");
+  });
+
+  test("recovery guidance only names subcommands that actually exist", async () => {
+    // Both notices used to point at `/session restart`, which was never
+    // registered (#236): session.ts declares start/stop/list/status/resume/
+    // compact/keep. Telling a user to run a command that does not exist turns a
+    // transient failure into a dead end, so pin the guidance to the real
+    // registry rather than to a hand-copied list.
+    const cmdSrc = await Bun.file("src/commands/session.ts").text();
+    const registered = new Set(
+      [...cmdSrc.matchAll(/sub\s*(?:\n\s*)?\.setName\("([a-z]+)"\)/g)].map((m) => m[1]!)
+    );
+    expect(registered.size).toBeGreaterThan(0);
+
+    for (const notice of [RELAY_ERROR_USER_MESSAGE, SEND_FAILURE_USER_MESSAGE]) {
+      const referenced = [...notice.matchAll(/\/session\s+([a-z]+)/g)].map((m) => m[1]!);
+      expect(referenced.length).toBeGreaterThan(0);
+      for (const sub of referenced) {
+        expect(registered).toContain(sub);
+      }
+    }
   });
 
   test("bot.ts outer catch sends the canned notice, not the raw error", async () => {

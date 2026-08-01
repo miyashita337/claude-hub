@@ -45,8 +45,10 @@ describe("relay send-keys failure does not leak tmux internals (#74)", () => {
 
   test("the canned message is clean and actionable", () => {
     expect(SEND_FAILURE_USER_MESSAGE).not.toMatch(/not in a mode|tmux|send-keys/i);
-    // Actionable: tells the user how to recover.
-    expect(SEND_FAILURE_USER_MESSAGE).toContain("/session restart");
+    // Actionable: tells the user how to recover. (#236 corrected the wording —
+    // it used to name `/session restart`, which is not a registered subcommand.
+    // tests/session/relay-error-notice.test.ts enforces that mechanically.)
+    expect(SEND_FAILURE_USER_MESSAGE).toContain("/session start");
   });
 
   test("handles non-Error throwables without leaking", () => {
