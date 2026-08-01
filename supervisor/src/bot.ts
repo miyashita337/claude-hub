@@ -23,7 +23,7 @@ import { ActivityWatchdog } from "./session/session-activity-watchdog";
 import { ResourceMonitor } from "./session/resource-monitor";
 import { createSessionCommand, createSessionHandler } from "./commands/session";
 import { CHANNEL_MAP, MAX_SESSIONS } from "./config/channels";
-import type { AttachmentInfo } from "./session/relay";
+import { RELAY_ERROR_USER_MESSAGE, type AttachmentInfo } from "./session/relay";
 import { buildDialogStuckHandler } from "./session/dialog-stuck-handler";
 import { notifyPushover, warnIfPushoverUnconfigured } from "./session/notify-pushover";
 import { startActionReceiver, stopActionReceiver } from "./action/receiver";
@@ -1352,11 +1352,12 @@ export async function startBot(token: string): Promise<void> {
         relaySucceeded = !result.error;
 
       } catch (err) {
+        // Issue #236: log the raw cause (object, so the stack survives) but post
+        // only the canned notice — `err.message` can embed absolute paths and
+        // `String(err)` anything at all. Same split as #74's send-keys path.
         console.error(`[Bot] Relay error in thread ${threadId}:`, err);
         try {
-          await thread.send(
-            `⚠️ Claude Code への中継中にエラーが発生しました: ${(err instanceof Error ? err.message : String(err)).slice(0, 1900)}`
-          );
+          await thread.send(RELAY_ERROR_USER_MESSAGE);
         } catch (sendErr) {
           console.error(`[Bot] Failed to send error notification to thread ${threadId}:`, sendErr);
         }

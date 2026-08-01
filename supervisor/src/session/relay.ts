@@ -323,6 +323,26 @@ export const SEND_FAILURE_USER_MESSAGE =
   "⚠️ メッセージを Claude Code セッションに送信できませんでした（セッションが応答不能、または画面が一時的に固まっている可能性があります）。少し待って再送するか、`/session restart` で再開してください。";
 
 /**
+ * Issue #236 (follow-up of #74): user-facing notice for a failure caught by the
+ * relay block's OUTER catch in `bot.ts` — i.e. anything awaited in that block
+ * that has no inner catch (the session-teardown race in `sendMessage`, a
+ * `bun:sqlite` write, a `thread.send` DiscordAPIError, or any throw a future
+ * change adds there).
+ *
+ * That catch used to interpolate `err.message` (sliced at 1900 chars) straight
+ * into the Discord message. Node/Bun `Error.message` embeds absolute paths —
+ * `ENOENT: no such file or directory, open '/Users/<name>/...'` — and
+ * `String(err)` on a non-Error throwable can carry anything, so the shape
+ * itself is the vulnerability: one new fs/child-process throw in that block and
+ * a home path is posted to a thread that may have non-owner readers.
+ *
+ * Same contract as {@link SEND_FAILURE_USER_MESSAGE}: clean + actionable for the
+ * user, raw cause preserved in `console.error` for diagnostics.
+ */
+export const RELAY_ERROR_USER_MESSAGE =
+  "⚠️ Claude Code への中継中にエラーが発生しました（一時的な障害の可能性があります）。`/session status` で状態を確認し、少し待ってから再送するか、`/session restart` で再開してください。詳細は Supervisor のログに記録されています。";
+
+/**
  * Build the {@link RelayResult} for a send-keys failure. Pure + exported so a
  * unit test can lock that raw tmux internals never reach the user-facing chunk
  * while the diagnostic cause is still carried in `error` (Issue #74). By the
