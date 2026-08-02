@@ -57,6 +57,10 @@ function fakeFx(opts: {
   httpResponse?: { status: number; body: unknown };
   /** stop 中、tmux kill 後に store が返す status（Supervisor watcher 反映の模擬）。 */
   statusAfterKill?: string;
+  /** `ps -p <pid> -o command=` の模擬値（#358）。null = プロセス不在。 */
+  pidCommand?: string | null;
+  /** true なら SIGTERM 後も pidAlive が true のまま（SIGKILL 昇格の模擬、#358）。 */
+  survivesSigterm?: boolean;
 } = {}): { fx: SessionCtlEffects; calls: FakeCalls } {
   const calls: FakeCalls = {
     sends: [],
@@ -68,6 +72,7 @@ function fakeFx(opts: {
   };
   const rows = opts.rows ?? [];
   let killed = false;
+  let sigtermed = false;
 
   const currentRows = (): SessionRow[] =>
     killed && opts.statusAfterKill
@@ -103,9 +108,13 @@ function fakeFx(opts: {
     },
     killPid: (pid, signal) => {
       calls.killedPids.push({ pid, signal });
+      if (signal === "SIGTERM" && !opts.survivesSigterm) sigtermed = true;
       return true;
     },
-    pidAlive: () => opts.pidAlive ?? true,
+    // #358: SIGTERM が効いたら以降 dead を返す（SIGKILL 昇格の分岐を出し分ける）。
+    pidAlive: () => (sigtermed ? false : opts.pidAlive ?? true),
+    readPidCommand: async () =>
+      opts.pidCommand === undefined ? null : opts.pidCommand,
     sleep: async () => {},
     readRelayPort: () => (opts.relayPort === undefined ? 45678 : opts.relayPort),
     httpPost: async (url, body) => {
@@ -245,6 +254,71 @@ describe("stop", () => {
     // できない限りシグナルを送らない（PR #325 gemini high）。
     expect(calls.killedPids).toHaveLength(0);
     expect(calls.killedTmux).toHaveLength(0);
+    expect(calls.out.join("\n")).toContain("スキップ");
+  });
+
+  // Issue #358: headless（`claude -p`）ワーカーは tmux を持たないため、tmux の
+  // 生存だけを条件にすると「止めたつもりで走り続ける」状態になっていた。
+  // 代替の本人確認としてコマンドライン中の claude_session_id（UUID）を照合する。
+  const HEADLESS_CMD =
+    "/Users/x/.local/bin/claude -p /pdca 268 --output-format json " +
+    "--dangerously-skip-permissions --session-id aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee";
+
+  test("headless（tmux 不在）+ コマンドライン一致 → SIGTERM が届く（AC-1）", async () => {
+    const { fx, calls } = fakeFx({
+      rows: [row()],
+      tmuxAlive: false,
+      pidCommand: HEADLESS_CMD,
+    });
+    expect(await runSessionCtl(["stop", "sess-1"], fx, STOP_OPTS)).toBe(0);
+
+    expect(calls.killedPids).toEqual([{ pid: 4242, signal: "SIGTERM" }]);
+    // tmux は無いので kill-session は呼ばない。
+    expect(calls.killedTmux).toHaveLength(0);
+    expect(calls.out.join("\n")).toContain("SIGTERM で終了しました");
+  });
+
+  test("headless + SIGTERM で死なない → SIGKILL へ昇格（AC-1）", async () => {
+    const { fx, calls } = fakeFx({
+      rows: [row()],
+      tmuxAlive: false,
+      pidCommand: HEADLESS_CMD,
+      survivesSigterm: true,
+    });
+    expect(await runSessionCtl(["stop", "sess-1"], fx, STOP_OPTS)).toBe(0);
+
+    expect(calls.killedPids).toEqual([
+      { pid: 4242, signal: "SIGTERM" },
+      { pid: 4242, signal: "SIGKILL" },
+    ]);
+    expect(calls.out.join("\n")).toContain("SIGKILL");
+  });
+
+  test("pid は生存だがコマンドラインが別物 → kill しない（PID 再利用ガード、AC-2）", async () => {
+    // 元の headless プロセスは終了し、OS が同じ pid を無関係プロセスへ再利用した状況。
+    const { fx, calls } = fakeFx({
+      rows: [row()],
+      tmuxAlive: false,
+      pidCommand: "/usr/bin/some-unrelated-daemon --serve",
+    });
+    expect(await runSessionCtl(["stop", "sess-1"], fx, STOP_OPTS)).toBe(0);
+
+    expect(calls.killedPids).toHaveLength(0);
+    expect(calls.killedTmux).toHaveLength(0);
+    const out = calls.out.join("\n");
+    expect(out).toContain("スキップ");
+    // 「なぜ殺さなかったか」を必ず言う（silent に落とさない）。
+    expect(out).toContain("PID 再利用");
+  });
+
+  test("claude_session_id 未記録の行 → 照合できないので kill しない", async () => {
+    const { fx, calls } = fakeFx({
+      rows: [row({ claude_session_id: null })],
+      tmuxAlive: false,
+      pidCommand: HEADLESS_CMD,
+    });
+    expect(await runSessionCtl(["stop", "sess-1"], fx, STOP_OPTS)).toBe(0);
+    expect(calls.killedPids).toHaveLength(0);
     expect(calls.out.join("\n")).toContain("スキップ");
   });
 

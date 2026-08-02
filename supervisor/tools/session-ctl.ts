@@ -66,6 +66,11 @@ export interface SessionCtlEffects {
   /** process.kill 相当。配達できたら true。 */
   killPid(pid: number, signal: NodeJS.Signals): boolean;
   pidAlive(pid: number): boolean;
+  /**
+   * pid の実行中コマンドライン（`ps -p <pid> -o command=` 相当）。プロセスが
+   * 居なければ null。headless セッションの本人確認に使う（Issue #358）。
+   */
+  readPidCommand(pid: number): Promise<string | null>;
   sleep(ms: number): Promise<void>;
   /** relay ポートファイルから Supervisor の relay ポートを読む（無ければ null）。 */
   readRelayPort(): number | null;
@@ -193,6 +198,59 @@ async function cmdSend(
   return 0;
 }
 
+/**
+ * tmux を持たない headless ワーカーを pid 経由で停止する（Issue #358、案 A）。
+ *
+ * 本人確認は `ps` のコマンドラインに当該セッションの `claude_session_id`（UUID）が
+ * 含まれるかで行う。これが PID 再利用ガードの代替:
+ *
+ *   - UUID 不一致 → OS が pid を別プロセスへ再利用している（or そもそも別物）
+ *     → **何もしない**。無関係プロセスを殺さないことを最優先する
+ *   - 一致 → 紛れもなく当該ワーカー → SIGTERM → 猶予 → まだ生きていれば SIGKILL
+ *
+ * 戻り値で「殺さなかった理由」を呼び出し側に伝え、メッセージを出し分ける
+ * （どちらのスキップも silent にしない = agent-output-quality #1）。
+ * sessions.db には書かない（書き込みは Supervisor の専権）。
+ */
+type HeadlessStopOutcome =
+  /** 本人確認が取れてシグナルを送った（メッセージは本関数が出力済み）。 */
+  | "signalled"
+  /** pid は生存しているがコマンドラインが一致しない = PID 再利用の疑い。 */
+  | "identity-mismatch"
+  /** pid 不明 / session id 未記録 / 既に終了 — headless 停止の対象外。 */
+  | "not-applicable";
+
+async function stopHeadlessByPid(
+  fx: SessionCtlEffects,
+  row: SessionRow,
+  graceMs: number,
+): Promise<HeadlessStopOutcome> {
+  const pid = row.pid;
+  const claudeSessionId = row.claude_session_id;
+  if (pid == null || !claudeSessionId) return "not-applicable";
+  if (!fx.pidAlive(pid)) return "not-applicable";
+
+  const command = await fx.readPidCommand(pid);
+  // ps が読めない場合も一致とは見なさない（安全側 = 殺さない）。
+  if (!command || !command.includes(claudeSessionId)) return "identity-mismatch";
+
+  fx.out(
+    `tmux 不在（headless）。pid ${pid} のコマンドラインで session id を確認したため SIGTERM を送信します。`,
+  );
+  fx.killPid(pid, "SIGTERM");
+  if (graceMs > 0) await fx.sleep(graceMs);
+
+  if (fx.pidAlive(pid)) {
+    fx.killPid(pid, "SIGKILL");
+    fx.out(
+      `猶予 ${graceMs}ms 経過後も生存していたため SIGKILL を送信しました（pid ${pid}）。`,
+    );
+  } else {
+    fx.out(`pid ${pid} は SIGTERM で終了しました。`);
+  }
+  return "signalled";
+}
+
 async function cmdStop(
   fx: SessionCtlEffects,
   key: string,
@@ -221,10 +279,28 @@ async function cmdStop(
   const tmuxAlive = tmuxName ? await fx.hasTmuxSession(tmuxName) : false;
 
   if (!tmuxAlive) {
-    fx.out(
-      `tmux セッション${tmuxName ? ` ${tmuxName}` : ""} が存在しないため SIGTERM / kill をスキップします` +
-        "（PID 再利用による誤 kill 防止。Supervisor が status を整合します）。",
-    );
+    // Issue #358: headless（`claude -p`）ワーカーは tmux を持たない。上の
+    // ガードは「tmux が無い = もう死んでいる」と見なすため、headless では
+    // SIGTERM がスキップされ、プロセスが生きたまま「停止した」ように見えていた。
+    // 暴走ワーカーを止める最後の手段が効かず、記事投稿・SNS 連携のような不可逆な
+    // 外部副作用を伴うタスクで特に危険（2026-08-01 の誤 dispatch で実際に踏んだ）。
+    //
+    // PID 再利用ガードの意図は保つ: tmux の代わりに **コマンドラインが当該
+    // セッションのものか** を照合する。headless argv には必ず
+    // `--session-id <uuid>` が入る（manager.ts buildHeadlessClaudeFlags 直後で
+    // 付与）ので、UUID 一致は事実上衝突しない本人確認になる。
+    const outcome = await stopHeadlessByPid(fx, row, graceMs);
+    if (outcome === "identity-mismatch") {
+      fx.out(
+        `pid ${row.pid} は生存していますが、コマンドラインに session id ${row.claude_session_id} を含みません。` +
+          "SIGTERM / kill をスキップします（PID 再利用による誤 kill 防止）。",
+      );
+    } else if (outcome === "not-applicable") {
+      fx.out(
+        `tmux セッション${tmuxName ? ` ${tmuxName}` : ""} が存在しないため SIGTERM / kill をスキップします` +
+          "（PID 再利用による誤 kill 防止。Supervisor が status を整合します）。",
+      );
+    }
   } else {
     if (row.pid != null) {
       const delivered = fx.killPid(row.pid, "SIGTERM");
@@ -492,6 +568,22 @@ export function createRealEffects(): SessionCtlEffects {
         return true;
       } catch {
         return false;
+      }
+    },
+    readPidCommand: async (pid) => {
+      // `ps -p <pid> -o command=` は macOS / Linux 共通で full argv を返す
+      // （`=` でヘッダ抑止）。argv 配列で渡すので shell は介さない。
+      // プロセス不在なら ps は非 0 で終わる → null（呼び出し側は kill しない）。
+      try {
+        const { stdout } = await execFileAsync(
+          "/bin/ps",
+          ["-p", String(pid), "-o", "command="],
+          { timeout: 5000 },
+        );
+        const line = stdout.trim();
+        return line || null;
+      } catch {
+        return null;
       }
     },
     pidAlive: (pid) => {
