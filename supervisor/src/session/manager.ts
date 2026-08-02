@@ -470,11 +470,32 @@ export interface SessionManagerOptions {
   watchIntervalMs?: number;
 }
 
+/**
+ * A compact was requested for a thread that already has one in flight (#364).
+ * Distinct from a generic failure so the command layer can say "already running"
+ * instead of "❌ 送信に失敗" — nothing went wrong, the first one is still going.
+ */
+export class CompactInFlightError extends Error {
+  constructor(public readonly threadId: string) {
+    super(`compact は既にこのスレッドで実行中です (thread ${threadId})`);
+    this.name = "CompactInFlightError";
+  }
+}
+
 export class SessionManager {
   /** Map<threadId, SessionInfo> — one session per thread */
   private sessions = new Map<string, SessionInfo>();
   /** Map<threadId, intervalHandle> — watchdogs to clear on stop/shutdown */
   private watchers = new Map<string, ReturnType<typeof setInterval>>();
+  /**
+   * Thread ids with an in-flight {@link compactSession} (Issue #364). `/compact`
+   * is relayed as a multi-step `sendToPane` sequence (Escape → literal → Enter);
+   * two overlapping sends interleave into the SAME pane and can leave a partial
+   * command in the TUI. A slash command is hard to fire twice in the same
+   * instant, but a button stays clickable after the click — so this became a
+   * reachable race the moment the compact button was added.
+   */
+  private compactInFlight = new Set<string>();
   /**
    * Map<claudeSessionId, SelfHealer> — the per-CONVERSATION self-heal planner
    * (Issue #206/#244). Keyed by claude session id, NOT threadId, so the
@@ -1692,18 +1713,30 @@ export class SessionManager {
       throw new Error(`スレッド ${threadId} にセッションが見つかりません`);
     }
 
-    const tmuxName = this.tmuxSessionName(threadId);
-    if (!(await this.effects.tmux.hasSession(tmuxName))) {
-      throw new Error("tmux session dead");
+    // Issue #364: reject an overlapping compact on the same thread rather than
+    // interleaving two send-keys sequences into one pane. Claimed before the
+    // first await after this point so two callers can't both pass the check.
+    if (this.compactInFlight.has(threadId)) {
+      throw new CompactInFlightError(threadId);
     }
+    this.compactInFlight.add(threadId);
 
-    session.lastActivityAt = new Date();
-    updateSessionActivity(session.id);
+    try {
+      const tmuxName = this.tmuxSessionName(threadId);
+      if (!(await this.effects.tmux.hasSession(tmuxName))) {
+        throw new Error("tmux session dead");
+      }
 
-    // Fire-and-forget. On a mid-sequence sendToPane failure the pane may be left
-    // in an indeterminate state (e.g. the Escape landed but the literal/Enter
-    // did not); the caller surfaces the throw so the user can retry.
-    await sendToPane(tmuxName, `/compact ${intent}`);
+      session.lastActivityAt = new Date();
+      updateSessionActivity(session.id);
+
+      // Fire-and-forget. On a mid-sequence sendToPane failure the pane may be left
+      // in an indeterminate state (e.g. the Escape landed but the literal/Enter
+      // did not); the caller surfaces the throw so the user can retry.
+      await sendToPane(tmuxName, `/compact ${intent}`);
+    } finally {
+      this.compactInFlight.delete(threadId);
+    }
   }
 
   /**

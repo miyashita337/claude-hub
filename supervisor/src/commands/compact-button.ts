@@ -4,7 +4,7 @@ import {
   ButtonStyle,
   type ButtonInteraction,
 } from "discord.js";
-import type { SessionManager } from "../session/manager";
+import { CompactInFlightError, type SessionManager } from "../session/manager";
 import { safeRespond } from "./safe-respond";
 
 /**
@@ -110,6 +110,16 @@ export function createCompactButtonHandler(sessionManager: SessionManager) {
         content: `🗜️ compact を送信しました: \`/compact ${DEFAULT_COMPACT_INTENT}\``,
       });
     } catch (err) {
+      // A button stays clickable after the click, so a double-click is the
+      // expected way to hit this — report it as "already running", not a
+      // failure, and don't invite a third click.
+      if (err instanceof CompactInFlightError) {
+        await safeRespond(interaction, {
+          content: "⏳ compact は既に実行中です。完了までお待ちください。",
+          ephemeral: true,
+        });
+        return;
+      }
       const msg = `❌ compact の送信に失敗: ${err instanceof Error ? err.message : String(err)}`;
       await safeRespond(interaction, { content: msg, ephemeral: true });
     }

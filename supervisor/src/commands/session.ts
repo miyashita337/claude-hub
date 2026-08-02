@@ -5,10 +5,14 @@ import {
   type ThreadChannel,
   EmbedBuilder,
 } from "discord.js";
-import { isValidModelId, type SessionManager } from "../session/manager";
+import {
+  CompactInFlightError,
+  isValidModelId,
+  type SessionManager,
+} from "../session/manager";
 import { CHANNEL_MAP, MAX_SESSIONS } from "../config/channels";
 import { buildThreadTitle, markTitleStopped } from "../session/thread-title";
-import { buildStatusReply } from "../session/status-reply";
+import { buildStatusReplyDetailed } from "../session/status-reply";
 import { evaluateAccess } from "../config/access-policy";
 import { safeRespond } from "./safe-respond";
 import { keepAttachment, KeepError } from "../session/keep-attachment";
@@ -257,6 +261,15 @@ async function handleCompact(
       content: `🗜️ compact を送信しました: \`/compact ${intent}\``,
     });
   } catch (err) {
+    // #364: an overlapping compact is a "wait", not a failure — same wording as
+    // the button so the two entry points read identically.
+    if (err instanceof CompactInFlightError) {
+      await safeRespond(interaction, {
+        content: "⏳ compact は既に実行中です。完了までお待ちください。",
+        ephemeral: true,
+      });
+      return;
+    }
     const msg = `❌ compact の送信に失敗: ${err instanceof Error ? err.message : String(err)}`;
     await safeRespond(interaction, { content: msg, ephemeral: true });
   }
@@ -281,13 +294,13 @@ async function handleStatus(
   // #364: status is the step the owner takes right before deciding to compact,
   // so carry the one-click button here too. Only when a session is actually
   // running — on a dead thread the reply is resume guidance and a compact button
-  // would be a dead end.
-  const running =
-    (await sessionManager.livenessOf(channel.id)) === "alive" &&
-    sessionManager.has(channel.id);
+  // would be a dead end. The detailed builder reports `running` from the SAME
+  // liveness evaluation it used for the text, so the two can't disagree and the
+  // reply stays inside Discord's 3s deadline.
+  const status = await buildStatusReplyDetailed(sessionManager, channel.id);
   await interaction.reply({
-    content: await buildStatusReply(sessionManager, channel.id),
-    ...(running ? { components: [buildCompactButtonRow()] } : {}),
+    content: status.content,
+    ...(status.running ? { components: [buildCompactButtonRow()] } : {}),
   });
 }
 

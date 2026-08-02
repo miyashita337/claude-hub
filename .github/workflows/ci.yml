@@ -136,6 +136,7 @@ jobs:
                    tests/scripts/lint-gating-coverage.test.ts \
                    tests/commands/session-compact.test.ts \
                    tests/commands/compact-button.test.ts \
+                   tests/session/manager-compact-concurrency.test.ts \
                    tests/commands/session-start-access.test.ts \
                    tests/commands/session-start-branch.test.ts \
                    tests/commands/session-thread-title.test.ts \

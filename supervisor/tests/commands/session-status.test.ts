@@ -158,4 +158,77 @@ describe("/session status dispatch (#349)", () => {
       COMPACT_BUTTON_ID
     );
   });
+
+  test("liveness is evaluated exactly once per status (3s deadline guard, #364)", async () => {
+    // livenessOf runs `tmux has-session` with a 2s timeout and, on timeout,
+    // waits the full 2s before assuming alive (#238). Two evaluations can
+    // therefore exceed Discord's 3s initial-response deadline and make
+    // /session status itself fail — the very "アプリケーションが応答しません
+    // でした" symptom #364 exists to remove. They can also disagree, leaving
+    // the text and the button inconsistent.
+    const threadId = "thread-status-once";
+    const effects = createFakeEffects();
+    manager = new SessionManager({ effects });
+    insertSession({
+      id: "status-once",
+      channel_name: "agent-base",
+      thread_id: threadId,
+      project_dir: "/tmp/x",
+      pid: 7474,
+      claude_session_id: "88888888-8888-8888-8888-888888888888",
+      started_at: new Date().toISOString(),
+      last_activity_at: new Date().toISOString(),
+      status: "running",
+    });
+    effects.process.alivePids.add(7474);
+    await effects.tmux.newSession(`claude-${threadId.slice(0, 12)}`, "x");
+    (manager as unknown as { sessions: Map<string, unknown> }).sessions.set(
+      threadId,
+      { threadId }
+    );
+
+    let livenessCalls = 0;
+    const realLivenessOf = manager.livenessOf.bind(manager);
+    manager.livenessOf = async (id: string) => {
+      livenessCalls++;
+      return realLivenessOf(id);
+    };
+
+    const { interaction } = makeInteraction({ isThread: true, threadId });
+    await createSessionHandler(manager)(interaction as never);
+
+    expect(livenessCalls).toBe(1);
+  });
+
+  test("dead session: liveness is still evaluated only once (#364)", async () => {
+    // The salvage path used to re-derive the verdict inside buildSalvageReply.
+    const threadId = "thread-status-dead-once";
+    const effects = createFakeEffects();
+    manager = new SessionManager({ effects });
+    insertSession({
+      id: "status-dead-once",
+      channel_name: "agent-base",
+      thread_id: threadId,
+      project_dir: "/tmp/x",
+      pid: 7575,
+      claude_session_id: "99999999-9999-9999-9999-999999999999",
+      started_at: new Date().toISOString(),
+      last_activity_at: new Date().toISOString(),
+      status: "running",
+    });
+    updateSessionStatus("status-dead-once", "stopped", "process_dead");
+
+    let livenessCalls = 0;
+    const realLivenessOf = manager.livenessOf.bind(manager);
+    manager.livenessOf = async (id: string) => {
+      livenessCalls++;
+      return realLivenessOf(id);
+    };
+
+    const { interaction, replies } = makeInteraction({ isThread: true, threadId });
+    await createSessionHandler(manager)(interaction as never);
+
+    expect(livenessCalls).toBe(1);
+    expect(replies[0]!.content).toContain("停止しています");
+  });
 });

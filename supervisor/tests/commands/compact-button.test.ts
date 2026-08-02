@@ -1,5 +1,6 @@
 import { test, expect, describe } from "bun:test";
 import { ButtonStyle } from "discord.js";
+import { CompactInFlightError } from "../../src/session/manager";
 import {
   COMPACT_BUTTON_ID,
   DEFAULT_COMPACT_INTENT,
@@ -128,6 +129,22 @@ describe("compact button handler (#364)", () => {
 
     expect(fx.compactCalls).toHaveLength(0);
     expect(fx.replies.find((r) => r.kind === "reply")?.flags).toBe(64);
+  });
+
+  test("double-click: the second click reports 'already running', not a failure", async () => {
+    const fx = makeInteraction({
+      compactImpl: () => {
+        // What SessionManager throws when a compact is already in flight for
+        // this thread — the reachable case now that a button stays clickable.
+        throw new CompactInFlightError("thread-btn-1");
+      },
+    });
+    await fx.run();
+
+    const last = fx.replies[fx.replies.length - 1];
+    expect(last?.content).toContain("既に実行中");
+    // Must not read as an error: nothing failed, the first compact is running.
+    expect(last?.content).not.toContain("失敗");
   });
 
   test("compact failure is reported, never swallowed", async () => {
