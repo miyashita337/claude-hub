@@ -11,6 +11,7 @@ const { insertSession, updateSessionStatus, getDb } = await import(
 const { createSessionHandler } = await import("../../src/commands/session");
 const { SessionManager } = await import("../../src/session/manager");
 const { createFakeEffects } = await import("../../src/session/adapters-fake");
+const { COMPACT_BUTTON_ID } = await import("../../src/commands/compact-button");
 
 /**
  * Handler-level tests for `/session status` (Issue #349).
@@ -28,6 +29,7 @@ const { createFakeEffects } = await import("../../src/session/adapters-fake");
 interface ReplyRecord {
   content?: string;
   flags?: number;
+  components?: unknown[];
 }
 
 function makeInteraction(opts: { isThread: boolean; threadId?: string }) {
@@ -114,5 +116,46 @@ describe("/session status dispatch (#349)", () => {
     expect(replies).toHaveLength(1);
     expect(replies[0]!.content).toContain("停止しています");
     expect(replies[0]!.content).toContain(`/session resume ${claudeId}`);
+    // #364: a compact button on a dead session would be a dead end — the reply
+    // is resume guidance, so no button.
+    expect(replies[0]!.components).toBeUndefined();
+  });
+
+  test("in a thread, live session → reply carries the one-click compact button (#364)", async () => {
+    const threadId = "thread-status-live";
+    const effects = createFakeEffects();
+    manager = new SessionManager({ effects });
+    insertSession({
+      id: "status-live",
+      channel_name: "agent-base",
+      thread_id: threadId,
+      project_dir: "/tmp/x",
+      pid: 7373,
+      claude_session_id: "77777777-7777-7777-7777-777777777777",
+      started_at: new Date().toISOString(),
+      last_activity_at: new Date().toISOString(),
+      status: "running",
+    });
+    // "稼働中" needs BOTH pid/tmux liveness and in-memory tracking (PR #179),
+    // which is the same condition that gates the button.
+    effects.process.alivePids.add(7373);
+    await effects.tmux.newSession(`claude-${threadId.slice(0, 12)}`, "x");
+    (manager as unknown as { sessions: Map<string, unknown> }).sessions.set(
+      threadId,
+      { threadId }
+    );
+
+    const { interaction, replies } = makeInteraction({
+      isThread: true,
+      threadId,
+    });
+    await createSessionHandler(manager)(interaction as never);
+
+    expect(replies).toHaveLength(1);
+    expect(replies[0]!.content).toContain("稼働中");
+    expect(replies[0]!.components).toHaveLength(1);
+    expect(JSON.stringify(replies[0]!.components)).toContain(
+      COMPACT_BUTTON_ID
+    );
   });
 });

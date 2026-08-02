@@ -12,6 +12,10 @@ import { buildStatusReply } from "../session/status-reply";
 import { evaluateAccess } from "../config/access-policy";
 import { safeRespond } from "./safe-respond";
 import { keepAttachment, KeepError } from "../session/keep-attachment";
+import {
+  buildCompactButtonRow,
+  DEFAULT_COMPACT_INTENT,
+} from "./compact-button";
 
 export function createSessionCommand() {
   return new SlashCommandBuilder()
@@ -99,10 +103,9 @@ export function createSessionCommand() {
     );
 }
 
-// RW-032: a bare `/compact` produces a bad compact (the model can't predict the
-// next work direction). When the user omits an intent we attach this default so
-// the summary keeps the current state and next action.
-export const DEFAULT_COMPACT_INTENT = "直近の作業状態と次アクションを保持して圧縮";
+// Re-exported from ./compact-button, which owns it now that the button (#364)
+// shares the same never-bare-/compact contract (RW-032).
+export { DEFAULT_COMPACT_INTENT };
 
 /**
  * Issue #199 AC1: the claudeHubExit primary channel id, read from the
@@ -274,8 +277,17 @@ async function handleStatus(
   // Deterministic status query (Issue #170): authoritative liveness verdict
   // (#168) + claude_session_id. Runs outside the message-relay path, so it can
   // never hijack a real work message.
+  //
+  // #364: status is the step the owner takes right before deciding to compact,
+  // so carry the one-click button here too. Only when a session is actually
+  // running — on a dead thread the reply is resume guidance and a compact button
+  // would be a dead end.
+  const running =
+    (await sessionManager.livenessOf(channel.id)) === "alive" &&
+    sessionManager.has(channel.id);
   await interaction.reply({
     content: await buildStatusReply(sessionManager, channel.id),
+    ...(running ? { components: [buildCompactButtonRow()] } : {}),
   });
 }
 

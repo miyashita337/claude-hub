@@ -1,7 +1,7 @@
 import {
   MessageFlags,
-  type ChatInputCommandInteraction,
   type EmbedBuilder,
+  type RepliableInteraction,
 } from "discord.js";
 
 /**
@@ -30,9 +30,13 @@ export interface SafeRespondOptions {
  *
  * - Not yet acknowledged → `reply` (applies `ephemeral` via `flags: 64`).
  * - Already deferred or replied → `editReply` (ephemerality inherited from defer).
+ *
+ * Typed on `RepliableInteraction` (not just the slash-command interaction) so
+ * component handlers get the same guarantee — the compact button (#364) shares
+ * this path with `/session compact`.
  */
 export async function safeRespond(
-  interaction: ChatInputCommandInteraction,
+  interaction: RepliableInteraction,
   options: SafeRespondOptions
 ): Promise<void> {
   const { content, embeds, ephemeral } = options;

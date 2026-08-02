@@ -22,6 +22,11 @@ import { DispatchHealthReaper } from "./session/dispatch-health-reaper";
 import { ActivityWatchdog } from "./session/session-activity-watchdog";
 import { ResourceMonitor } from "./session/resource-monitor";
 import { createSessionCommand, createSessionHandler } from "./commands/session";
+import {
+  COMPACT_BUTTON_ID,
+  createCompactButtonHandler,
+  withCompactButton,
+} from "./commands/compact-button";
 import { CHANNEL_MAP, MAX_SESSIONS } from "./config/channels";
 import { RELAY_ERROR_USER_MESSAGE, type AttachmentInfo } from "./session/relay";
 import { buildDialogStuckHandler } from "./session/dialog-stuck-handler";
@@ -99,7 +104,10 @@ async function deliverSelfHealOutcome(
   console.warn(
     `[Bot] context-budget ${outcome.level} on thread ${threadId}: ${outcome.tokens} tokens (action=${outcome.action})`
   );
-  await thread.send(outcome.message);
+  // #364: on the notify-only outcome the owner has to act; offer the button.
+  // "compact"/"restart" outcomes already self-heal, so a button there would
+  // invite a redundant second compact.
+  await thread.send(withCompactButton(outcome.message, outcome.action === "notify"));
   if (outcome.action === "restart" && outcome.restart) {
     await runSelfHealRestart(outcome, ctx);
   }
@@ -309,7 +317,13 @@ export async function startBot(token: string): Promise<void> {
         console.warn(
           `[Bot] activity-watchdog ${warning.level} on thread ${threadId}`
         );
-        await channel.send(warning.message);
+        // #364: long_lived is the nudge that tells the owner to consider
+        // compacting, so give it a button they can press instead of a command
+        // name they have to retype (and mistype into another app's /compact).
+        // The quiet nudge is about silence, not context — no button there.
+        await channel.send(
+          withCompactButton(warning.message, warning.level === "long_lived")
+        );
         // long_lived is the more serious "is it stuck?" signal — also page
         // Pushover so the owner sees it off-Discord (best-effort).
         if (warning.level === "long_lived") {
@@ -343,6 +357,7 @@ export async function startBot(token: string): Promise<void> {
   // before the first session registers (TOCTOU).
   const orchestrateLaunchLock = new OrchestrateLaunchLock();
   const sessionHandler = createSessionHandler(sessionManager);
+  const compactButtonHandler = createCompactButtonHandler(sessionManager);
 
   // Per-thread progress buffer (Issue #119): coalesce PostToolUse events
   // within a 2-second window so tool-heavy turns don't trip Discord's
@@ -606,7 +621,9 @@ export async function startBot(token: string): Promise<void> {
     interaction: Interaction,
     err: unknown
   ): Promise<void> {
-    if (!interaction.isChatInputCommand()) return;
+    // Repliable (not just chat-input): button interactions share this path since
+    // #364, and narrowing to slash commands would silently swallow their errors.
+    if (!interaction.isRepliable()) return;
     const content = `❌ エラーが発生しました: ${err instanceof Error ? err.message : String(err)}`;
     try {
       if (interaction.deferred || interaction.replied) {
@@ -621,8 +638,19 @@ export async function startBot(token: string): Promise<void> {
     }
   }
 
-  // Handle slash commands
+  // Handle slash commands + message components
   client.on(Events.InteractionCreate, (interaction: Interaction) => {
+    // #364: the one-click compact button. Component interactions are routed by
+    // customId to the app that sent the message, so unlike a top-level
+    // `/compact` slash command this can never be captured by another bot.
+    if (interaction.isButton()) {
+      if (interaction.customId !== COMPACT_BUTTON_ID) return;
+      compactButtonHandler(interaction).catch(async (err) => {
+        console.error("[Bot] Compact button error:", err);
+        await safeReplyError(interaction, err);
+      });
+      return;
+    }
     if (!interaction.isChatInputCommand()) return;
     if (interaction.commandName !== "session") return;
 
