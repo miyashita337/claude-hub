@@ -1,4 +1,4 @@
-import type { SessionManager } from "./manager";
+import type { Liveness, SessionManager } from "./manager";
 import { getSessionByThreadId } from "../infra/db";
 
 /**
@@ -24,9 +24,14 @@ import { getSessionByThreadId } from "../infra/db";
  */
 export async function buildSalvageReply(
   sessionManager: SessionManager,
-  threadId: string
+  threadId: string,
+  // #364: callers that already resolved the verdict pass it in. `livenessOf`
+  // runs `tmux has-session` with a 2s timeout (and on timeout waits the full 2s
+  // before assuming alive — #238), so re-deriving it here can push a caller past
+  // Discord's 3s initial-response deadline. Omitted → resolved here as before.
+  knownVerdict?: Liveness
 ): Promise<string> {
-  const verdict = await sessionManager.livenessOf(threadId);
+  const verdict = knownVerdict ?? (await sessionManager.livenessOf(threadId));
   if (verdict === "unknown") {
     return "ℹ️ このスレッドにはセッション履歴がありません。`/session start` で開始してください。";
   }
@@ -80,24 +85,54 @@ export async function buildStatusReply(
   sessionManager: SessionManager,
   threadId: string
 ): Promise<string> {
+  return (await buildStatusReplyDetailed(sessionManager, threadId)).content;
+}
+
+/** {@link buildStatusReplyDetailed} result. */
+export interface StatusReply {
+  content: string;
+  /**
+   * True only for the "稼働中" case — live AND tracked, i.e. the Supervisor can
+   * actually relay to this session. Callers use it to decide whether an action
+   * affordance (the #364 compact button) makes sense.
+   */
+  running: boolean;
+}
+
+/**
+ * As {@link buildStatusReply}, but also reports whether the session is running.
+ *
+ * #364: the caller needs that verdict to decide whether to attach the compact
+ * button, and deriving it separately would run `livenessOf` twice — up to 4s of
+ * tmux timeouts against Discord's 3s initial-response deadline, plus a window
+ * where the text and the button could disagree. Resolving once here keeps the
+ * whole status path to a single liveness evaluation.
+ */
+export async function buildStatusReplyDetailed(
+  sessionManager: SessionManager,
+  threadId: string
+): Promise<StatusReply> {
   // "稼働中" only when the session is BOTH live AND tracked in memory — i.e. the
   // Supervisor can actually relay to it. If livenessOf is alive but the session
   // is no longer tracked (has() === false), the user cannot interact with it;
   // fall through to the salvage wording which says the Supervisor lost tracking
   // (gemini HIGH review, PR #179).
-  if (
-    (await sessionManager.livenessOf(threadId)) === "alive" &&
-    sessionManager.has(threadId)
-  ) {
+  const verdict = await sessionManager.livenessOf(threadId);
+  if (verdict === "alive" && sessionManager.has(threadId)) {
     const row = getSessionByThreadId(threadId);
     const id = row?.claude_session_id;
-    return (
-      "✅ このスレッドのセッションは稼働中です。\n" +
-      (id
-        ? `🔑 claude_session_id: \`${id}\``
-        : "🔑 claude_session_id: 未記録（#167 導入前に開始されたセッション）")
-    );
+    return {
+      running: true,
+      content:
+        "✅ このスレッドのセッションは稼働中です。\n" +
+        (id
+          ? `🔑 claude_session_id: \`${id}\``
+          : "🔑 claude_session_id: 未記録（#167 導入前に開始されたセッション）"),
+    };
   }
   // not tracked (lost tracking), dead, or unknown → salvage wording covers all.
-  return await buildSalvageReply(sessionManager, threadId);
+  return {
+    running: false,
+    content: await buildSalvageReply(sessionManager, threadId, verdict),
+  };
 }

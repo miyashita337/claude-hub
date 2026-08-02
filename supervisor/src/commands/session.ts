@@ -5,13 +5,21 @@ import {
   type ThreadChannel,
   EmbedBuilder,
 } from "discord.js";
-import { isValidModelId, type SessionManager } from "../session/manager";
+import {
+  CompactInFlightError,
+  isValidModelId,
+  type SessionManager,
+} from "../session/manager";
 import { CHANNEL_MAP, MAX_SESSIONS } from "../config/channels";
 import { buildThreadTitle, markTitleStopped } from "../session/thread-title";
-import { buildStatusReply } from "../session/status-reply";
+import { buildStatusReplyDetailed } from "../session/status-reply";
 import { evaluateAccess } from "../config/access-policy";
 import { safeRespond } from "./safe-respond";
 import { keepAttachment, KeepError } from "../session/keep-attachment";
+import {
+  buildCompactButtonRow,
+  DEFAULT_COMPACT_INTENT,
+} from "./compact-button";
 
 export function createSessionCommand() {
   return new SlashCommandBuilder()
@@ -99,10 +107,9 @@ export function createSessionCommand() {
     );
 }
 
-// RW-032: a bare `/compact` produces a bad compact (the model can't predict the
-// next work direction). When the user omits an intent we attach this default so
-// the summary keeps the current state and next action.
-export const DEFAULT_COMPACT_INTENT = "直近の作業状態と次アクションを保持して圧縮";
+// Re-exported from ./compact-button, which owns it now that the button (#364)
+// shares the same never-bare-/compact contract (RW-032).
+export { DEFAULT_COMPACT_INTENT };
 
 /**
  * Issue #199 AC1: the claudeHubExit primary channel id, read from the
@@ -254,6 +261,15 @@ async function handleCompact(
       content: `🗜️ compact を送信しました: \`/compact ${intent}\``,
     });
   } catch (err) {
+    // #364: an overlapping compact is a "wait", not a failure — same wording as
+    // the button so the two entry points read identically.
+    if (err instanceof CompactInFlightError) {
+      await safeRespond(interaction, {
+        content: "⏳ compact は既に実行中です。完了までお待ちください。",
+        ephemeral: true,
+      });
+      return;
+    }
     const msg = `❌ compact の送信に失敗: ${err instanceof Error ? err.message : String(err)}`;
     await safeRespond(interaction, { content: msg, ephemeral: true });
   }
@@ -274,8 +290,17 @@ async function handleStatus(
   // Deterministic status query (Issue #170): authoritative liveness verdict
   // (#168) + claude_session_id. Runs outside the message-relay path, so it can
   // never hijack a real work message.
+  //
+  // #364: status is the step the owner takes right before deciding to compact,
+  // so carry the one-click button here too. Only when a session is actually
+  // running — on a dead thread the reply is resume guidance and a compact button
+  // would be a dead end. The detailed builder reports `running` from the SAME
+  // liveness evaluation it used for the text, so the two can't disagree and the
+  // reply stays inside Discord's 3s deadline.
+  const status = await buildStatusReplyDetailed(sessionManager, channel.id);
   await interaction.reply({
-    content: await buildStatusReply(sessionManager, channel.id),
+    content: status.content,
+    ...(status.running ? { components: [buildCompactButtonRow()] } : {}),
   });
 }
 
