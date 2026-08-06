@@ -384,3 +384,64 @@ describe("headless completion warning (#342)", () => {
     }
   });
 });
+
+// Issue #342 Layer 2 extension: zero artifacts is warned in the thread even on
+// exit 0 + clean completion ("finished cleanly but delivered nothing").
+describe("headless artifact warning (#342 Layer 2 extension)", () => {
+  async function run(artifacts: DispatchHeadlessOutcome["artifacts"]) {
+    const { manager } = harness({
+      exitCode: 0,
+      stdout: "done",
+      stderr: "",
+      timedOut: false,
+      completion: { status: "clean", detail: "" },
+      artifacts,
+    });
+    const posts: string[] = [];
+    await runDispatch({
+      config,
+      branch: "b",
+      issueNumber: 1,
+      command: "impl",
+      sessionManager: manager,
+      executorMode: "headless",
+      createThread: async () => ({ id: "t" }),
+      postToThread: async (_id, c) => {
+        posts.push(c);
+      },
+    });
+    return posts.join("\n");
+  }
+
+  test("artifacts none posts the ⚠️ zero-artifact warning even on clean completion", async () => {
+    const all = await run({ status: "none", detail: "", dirty: false });
+    expect(all).toContain("成果物（commit / PR / Issue / コメント）を確認できませんでした");
+    expect(all).toContain("artifacts: none");
+    expect(all).not.toContain("未 commit の変更");
+  });
+
+  test("artifacts none + dirty mentions the retained worktree", async () => {
+    const all = await run({ status: "none", detail: "", dirty: true });
+    expect(all).toContain("未 commit の変更が worktree に残っている");
+  });
+
+  test("artifacts unknown also warns (fail-loud)", async () => {
+    const all = await run({
+      status: "unknown",
+      detail: "gh pr list: connection refused",
+      dirty: false,
+    });
+    expect(all).toContain("artifacts: unknown");
+    expect(all).toContain("connection refused");
+  });
+
+  test("artifacts found / absent posts no artifact warning", async () => {
+    for (const artifacts of [
+      { status: "found" as const, detail: "pr #12", dirty: false },
+      undefined,
+    ]) {
+      const all = await run(artifacts);
+      expect(all).not.toContain("成果物（commit / PR / Issue / コメント）を確認できませんでした");
+    }
+  });
+});

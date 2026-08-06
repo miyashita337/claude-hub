@@ -48,6 +48,11 @@ import {
   probePendingWork,
   type PendingWorkProbe,
 } from "./pending-work";
+import {
+  probeArtifacts,
+  type ArtifactProbe,
+  type ArtifactProbeInput,
+} from "./artifact-probe";
 
 const DEFAULT_CLAUDE_PATH = resolve(homedir(), ".local", "bin", "claude");
 const TMUX_SESSION_PREFIX = "claude-";
@@ -446,6 +451,14 @@ export interface HeadlessSessionResult {
   claudeSessionId: string;
   /** Completion verdict (Issue #342): pending/unknown runs are not successes. */
   completion: HeadlessCompletion;
+  /**
+   * Artifact verdict (Issue #342, Layer 2 extension): did the run deliver
+   * ANYTHING (commit / PR / Issue / comment)? Present only for branch runs —
+   * without a branch there is no dispatch worktree to probe. `none`/`unknown`
+   * is a warning even on exit 0 + `clean` completion: a run that finished
+   * "cleanly" but produced nothing is the remaining silent-failure shape.
+   */
+  artifacts?: ArtifactProbe;
 }
 
 /**
@@ -547,6 +560,13 @@ export interface SessionManagerOptions {
    * Production leaves this undefined.
    */
   probePendingWorkFn?: (transcriptPath: string) => PendingWorkProbe;
+  /**
+   * Test seam for the post-exit artifact probe (Issue #342, Layer 2
+   * extension): overrides the git/gh-backed {@link probeArtifacts} so unit
+   * tests control the artifact verdict without shelling out. Production
+   * leaves this undefined.
+   */
+  probeArtifactsFn?: (input: ArtifactProbeInput) => Promise<ArtifactProbe>;
 }
 
 /**
@@ -626,6 +646,9 @@ export class SessionManager {
   private readonly probePendingWorkFn: (
     transcriptPath: string,
   ) => PendingWorkProbe;
+  private readonly probeArtifactsFn: (
+    input: ArtifactProbeInput,
+  ) => Promise<ArtifactProbe>;
 
   constructor(options: SessionManagerOptions = {}) {
     this.effects = {
@@ -651,6 +674,7 @@ export class SessionManager {
       options.inputReadyPollIntervalMs ?? 1000;
     this.watchIntervalMs = options.watchIntervalMs ?? 10_000;
     this.probePendingWorkFn = options.probePendingWorkFn ?? probePendingWork;
+    this.probeArtifactsFn = options.probeArtifactsFn ?? probeArtifacts;
 
     // Issue #227 (PR-4): ensureSocketConfigured is async now. The constructor
     // cannot await, so fire-and-forget it — it is idempotent and re-applied in
@@ -1160,6 +1184,36 @@ export class SessionManager {
         );
       }
 
+      // Issue #342 Layer 2 extension: verify the run DELIVERED something
+      // (commit / PR / Issue / comment). Runs before postDispatchReport so the
+      // report comment never counts as its own artifact. Branch runs only —
+      // without a branch there is no dispatch worktree to probe. Same
+      // observability-not-control-flow rule as the completion probe: a seam
+      // failure degrades to `unknown`, never rejects runHeadless.
+      let artifacts: ArtifactProbe | undefined;
+      if (trimmedBranch) {
+        try {
+          artifacts = await this.probeArtifactsFn({
+            cwd: projectDir,
+            branch: trimmedBranch,
+            issueNumber: issueNumber ?? null,
+            startedAt: now,
+          });
+        } catch (err) {
+          artifacts = {
+            status: "unknown",
+            detail: `artifact probe failed: ${err instanceof Error ? err.message : String(err)}`,
+            dirty: false,
+          };
+        }
+        if (artifacts.status !== "found") {
+          console.warn(
+            `[SessionManager] Headless run for thread ${threadId} produced ` +
+              `no verifiable artifact (${artifacts.status}${artifacts.detail ? `: ${artifacts.detail}` : ""})`,
+          );
+        }
+      }
+
       const outcome: HeadlessSessionResult = {
         exitCode: result.exitCode,
         stdout: parsed.text,
@@ -1170,6 +1224,7 @@ export class SessionManager {
         sessionId,
         claudeSessionId,
         completion,
+        artifacts,
       };
 
       // Post the Dispatch 実行レポート to the target Issue BEFORE finishHeadless
@@ -1182,7 +1237,14 @@ export class SessionManager {
       // Child exited → close the session (frees the slot). Even if onSpawn never
       // fired (should not happen unless the adapter misbehaves), finishHeadless
       // is a no-op safe cleanup.
-      await this.finishHeadless(threadId, sessionId, result, worktree, completion);
+      await this.finishHeadless(
+        threadId,
+        sessionId,
+        result,
+        worktree,
+        completion,
+        artifacts,
+      );
 
       return outcome;
     } finally {
@@ -1262,6 +1324,7 @@ export class SessionManager {
     result: HeadlessRunResult,
     worktree: SessionInfo["worktree"],
     completion: HeadlessCompletion,
+    artifacts?: ArtifactProbe,
   ): Promise<void> {
     this.sessions.delete(threadId);
     this.emitSessionEnd(threadId); // Phase 5c: free a dispatch queue slot (#294)
@@ -1274,6 +1337,10 @@ export class SessionManager {
     // SUPERVISOR_RELAY_URL and the headless child never writes one (stdout is
     // captured directly), so there is nothing the progress-relay hook could
     // have dropped for this cwd.
+    const abandonedEdits =
+      artifacts !== undefined &&
+      artifacts.status !== "found" &&
+      artifacts.dirty;
     if (worktree && completion.status !== "clean") {
       // Issue #342: a pending/unknown run is not a success — keep the worktree
       // (and its uncommitted work) recoverable instead of `--force`-removing it
@@ -1282,6 +1349,15 @@ export class SessionManager {
       // the state right back up.
       console.warn(
         `[SessionManager] Headless run ended ${completion.status} — retaining worktree ${worktree.path} for recovery (${completion.detail})`,
+      );
+    } else if (worktree && abandonedEdits) {
+      // Issue #342 Layer 2 extension: no artifact was delivered AND the
+      // worktree holds uncommitted edits — removing it would destroy the only
+      // copy of that work (the exact loss mode of agent-base#456). A
+      // none+clean-tree run has nothing to recover, so it is still reclaimed
+      // below (no worktree accumulation on genuinely-empty runs).
+      console.warn(
+        `[SessionManager] Headless run delivered no artifact but left uncommitted edits — retaining worktree ${worktree.path} for recovery`,
       );
     } else if (worktree && !this.isWorktreePathInUse(worktree.path)) {
       await this.removeWorktreeBestEffort(worktree);
@@ -1315,6 +1391,8 @@ export class SessionManager {
       exitCode: outcome.exitCode,
       completion: outcome.completion.status,
       completionDetail: outcome.completion.detail || undefined,
+      artifacts: outcome.artifacts?.status,
+      artifactsDetail: outcome.artifacts?.detail || undefined,
     });
     try {
       await this.effects.issueReporter.postComment({ cwd, issueNumber, body });

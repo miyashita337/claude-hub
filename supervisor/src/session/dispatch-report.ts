@@ -40,6 +40,17 @@ export interface DispatchReportFields {
   completion?: "clean" | "pending" | "unknown";
   /** Human-readable pending/unknown evidence; omitted when empty. */
   completionDetail?: string;
+  /**
+   * Artifact verdict (Issue #342, Layer 2 extension). ADDITIVE like
+   * `completion`: `found` runs still emit the line so a reader can distinguish
+   * "verified delivery" from "predates the artifact probe". `none` means the
+   * run delivered no commit / PR / Issue / comment — a warning even when
+   * `completion` is clean. Optional so callers without a probe (non-branch
+   * runs) simply omit the lines.
+   */
+  artifacts?: "found" | "none" | "unknown";
+  /** First artifact found / probe errors; omitted when empty. */
+  artifactsDetail?: string;
 }
 
 /**
@@ -61,13 +72,26 @@ export function formatDispatchReport(fields: DispatchReportFields): string {
     if (fields.completionDetail) {
       lines.push(`- completion_detail: ${fields.completionDetail}`);
     }
-    if (fields.completion !== "clean") {
-      lines.push(
-        "",
-        "⚠️ この run は正常完了と確認できていません（Issue claude-hub#342）。" +
-          "worktree は復旧用に保全されています。同じブランチへの再 dispatch で作業状態を引き継げます。",
-      );
+  }
+  if (fields.artifacts) {
+    lines.push(`- artifacts: ${fields.artifacts}`);
+    if (fields.artifactsDetail) {
+      lines.push(`- artifacts_detail: ${fields.artifactsDetail}`);
     }
+  }
+  if (fields.completion && fields.completion !== "clean") {
+    lines.push(
+      "",
+      "⚠️ この run は正常完了と確認できていません（Issue claude-hub#342）。" +
+        "worktree は復旧用に保全されています。同じブランチへの再 dispatch で作業状態を引き継げます。",
+    );
+  }
+  if (fields.artifacts && fields.artifacts !== "found") {
+    lines.push(
+      "",
+      "⚠️ この run の成果物（commit / PR / Issue / コメント）を確認できませんでした" +
+        `（artifacts: ${fields.artifacts}、Issue claude-hub#342）。作業が実際に行われたか確認してください。`,
+    );
   }
   return lines.join("\n") + "\n";
 }
