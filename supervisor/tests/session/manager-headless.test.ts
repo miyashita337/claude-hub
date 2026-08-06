@@ -31,6 +31,18 @@ import type { ChannelConfig } from "../../src/config/channels";
  *   - the start guards (dup) and spawn-failure surfacing hold.
  */
 
+/**
+ * Neutral artifact probe (Issue #342 Layer 2 extension) for tests that do NOT
+ * exercise the artifact path: `found` adds no warning and changes no
+ * retention, and injecting it keeps unit tests from shelling out to the real
+ * git/gh-backed default.
+ */
+const foundArtifactsFn = async () => ({
+  status: "found" as const,
+  detail: "commit deadbeef",
+  dirty: false,
+});
+
 function makeChannelConfig(overrides: Partial<ChannelConfig> = {}): ChannelConfig {
   const dir = resolve(tmpdir(), `headless-mgr-${process.pid}`);
   mkdirSync(dir, { recursive: true });
@@ -49,7 +61,11 @@ describe("SessionManager.runHeadless", () => {
 
   beforeEach(() => {
     effects = createFakeEffects();
-    manager = new SessionManager({ effects, gracefulKillTimeoutMs: 0 });
+    manager = new SessionManager({
+      effects,
+      gracefulKillTimeoutMs: 0,
+      probeArtifactsFn: foundArtifactsFn,
+    });
     config = makeChannelConfig({ channelName: "chan-hl" });
   });
 
@@ -112,6 +128,7 @@ describe("SessionManager.runHeadless", () => {
     const mgr = new SessionManager({
       effects: { ...createFakeEffects(), executor: exec },
       gracefulKillTimeoutMs: 0,
+      probeArtifactsFn: foundArtifactsFn,
     });
 
     const p = mgr.runHeadless(config, "thread-run", "/impl 1", "corp-dispatch-1");
@@ -255,6 +272,7 @@ describe("SessionManager.runHeadless", () => {
     const mgr = new SessionManager({
       effects: { ...createFakeEffects(), executor: failing },
       gracefulKillTimeoutMs: 0,
+      probeArtifactsFn: foundArtifactsFn,
     });
     await expect(
       mgr.runHeadless(config, "thread-fail", "/impl 1", "corp-dispatch-1"),
@@ -348,6 +366,7 @@ describe("SessionManager.runHeadless", () => {
         effects: fx,
         gracefulKillTimeoutMs: 0,
         probePendingWorkFn: probe,
+        probeArtifactsFn: foundArtifactsFn,
       });
       return { mgr, fx };
     }
@@ -445,6 +464,111 @@ describe("SessionManager.runHeadless", () => {
       const flags = buildPendingGuardFlags({});
       expect(flags[0]).toBe("--settings");
       expect(flags[1]).toContain("headless-pending-guard.ts");
+    });
+  });
+
+  // Issue #342 Layer 2 extension: zero-artifact detection. A run can leave no
+  // pending signal (completion: clean) and still have delivered nothing — no
+  // commit, no PR, no Issue, no comment. That is the remaining silent-failure
+  // shape after #368 and must be loud.
+  describe("artifact probe (Issue #342 Layer 2 extension)", () => {
+    const cleanProbe = () => ({
+      ok: true as const,
+      value: { pendingTasks: [], pendingWakeup: false, skippedLines: 0 },
+    });
+
+    function makeManager(
+      artifacts: () => Promise<{
+        status: "found" | "none" | "unknown";
+        detail: string;
+        dirty: boolean;
+      }>,
+    ): { mgr: SessionManager; fx: FakeSessionEffects } {
+      const fx = createFakeEffects();
+      const mgr = new SessionManager({
+        effects: fx,
+        gracefulKillTimeoutMs: 0,
+        probePendingWorkFn: cleanProbe,
+        probeArtifactsFn: artifacts,
+      });
+      return { mgr, fx };
+    }
+
+    test("found: reports artifacts: found, worktree removed as usual", async () => {
+      const { mgr, fx } = makeManager(async () => ({
+        status: "found" as const,
+        detail: "pr #12",
+        dirty: false,
+      }));
+      const res = await mgr.runHeadless(config, "t-art-found", "/impl 7", "corp-dispatch-7", 7);
+
+      expect(res.artifacts?.status).toBe("found");
+      expect(fx.worktree.removeCalls).toHaveLength(1);
+      const report = fx.issueReporter.postCommentCalls[0]!.body;
+      expect(report).toContain("- artifacts: found");
+      expect(report).toContain("- artifacts_detail: pr #12");
+      expect(report).not.toContain("成果物（commit / PR / Issue / コメント）を確認できませんでした");
+      await mgr.shutdownAll();
+    });
+
+    test("none + clean tree: loud in the report, worktree still reclaimed (nothing to recover)", async () => {
+      const { mgr, fx } = makeManager(async () => ({
+        status: "none" as const,
+        detail: "",
+        dirty: false,
+      }));
+      const res = await mgr.runHeadless(config, "t-art-none", "/impl 8", "corp-dispatch-8", 8);
+
+      expect(res.exitCode).toBe(0);
+      expect(res.completion.status).toBe("clean");
+      expect(res.artifacts?.status).toBe("none");
+      // Nothing uncommitted → reclaim (no worktree accumulation on empty runs).
+      expect(fx.worktree.removeCalls).toHaveLength(1);
+      const report = fx.issueReporter.postCommentCalls[0]!.body;
+      expect(report).toContain("- artifacts: none");
+      expect(report).toContain("成果物（commit / PR / Issue / コメント）を確認できませんでした");
+      await mgr.shutdownAll();
+    });
+
+    test("none + dirty tree RETAINS the worktree (abandoned edits, #456 loss mode)", async () => {
+      const { mgr, fx } = makeManager(async () => ({
+        status: "none" as const,
+        detail: "",
+        dirty: true,
+      }));
+      const res = await mgr.runHeadless(config, "t-art-dirty", "/impl 9", "corp-dispatch-9", 9);
+
+      expect(res.artifacts?.status).toBe("none");
+      expect(fx.worktree.removeCalls).toHaveLength(0);
+      expect(mgr.has("t-art-dirty")).toBe(false);
+      await mgr.shutdownAll();
+    });
+
+    test("a throwing artifact probe degrades to unknown and never leaks the slot", async () => {
+      const { mgr, fx } = makeManager(async () => {
+        throw new Error("gh exploded");
+      });
+      const res = await mgr.runHeadless(config, "t-art-throw", "/impl 10", "corp-dispatch-10", 10);
+
+      expect(res.artifacts?.status).toBe("unknown");
+      expect(res.artifacts?.detail).toContain("gh exploded");
+      expect(mgr.has("t-art-throw")).toBe(false);
+      expect(mgr.count()).toBe(0);
+      expect(fx.issueReporter.postCommentCalls[0]!.body).toContain("- artifacts: unknown");
+      await mgr.shutdownAll();
+    });
+
+    test("no branch → no artifact probe (nothing to measure without a dispatch worktree)", async () => {
+      let called = 0;
+      const { mgr } = makeManager(async () => {
+        called++;
+        return { status: "found" as const, detail: "", dirty: false };
+      });
+      const res = await mgr.runHeadless(config, "t-art-nobranch", "/impl 11");
+
+      expect(called).toBe(0);
+      expect(res.artifacts).toBeUndefined();
+      await mgr.shutdownAll();
     });
   });
 });

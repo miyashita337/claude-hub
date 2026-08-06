@@ -119,4 +119,66 @@ describe("formatDispatchReport", () => {
       );
     });
   });
+
+  // Issue #342 Layer 2 extension: artifact lines are ADDITIVE like completion.
+  describe("artifact lines (#342 Layer 2 extension)", () => {
+    test("found run emits the artifacts lines, no warning", () => {
+      const body = formatDispatchReport({
+        tokens: 1,
+        durationMs: 2,
+        exitCode: 0,
+        completion: "clean",
+        artifacts: "found",
+        artifactsDetail: "pr #12",
+      });
+      expect(body.split("\n")).toContain("- artifacts: found");
+      expect(body.split("\n")).toContain("- artifacts_detail: pr #12");
+      expect(body).not.toContain("⚠️");
+    });
+
+    test("none run warns even when completion is clean", () => {
+      const body = formatDispatchReport({
+        tokens: 1,
+        durationMs: 2,
+        exitCode: 0,
+        completion: "clean",
+        artifacts: "none",
+      });
+      expect(body.split("\n")).toContain("- artifacts: none");
+      expect(body).toContain("成果物（commit / PR / Issue / コメント）を確認できませんでした");
+      // clean completion adds no completion warning of its own.
+      expect(body).not.toContain("正常完了と確認できていません");
+    });
+
+    test("unknown run warns (fail-loud) with detail line", () => {
+      const body = formatDispatchReport({
+        tokens: null,
+        durationMs: 5,
+        exitCode: 0,
+        completion: "clean",
+        artifacts: "unknown",
+        artifactsDetail: "gh pr list: connection refused",
+      });
+      expect(body.split("\n")).toContain("- artifacts: unknown");
+      expect(body).toContain("- artifacts_detail: gh pr list: connection refused");
+      expect(body).toContain("成果物（commit / PR / Issue / コメント）を確認できませんでした");
+    });
+
+    test("omitting artifacts keeps the #368 shape byte-identical", () => {
+      const body = formatDispatchReport({
+        tokens: 1,
+        durationMs: 2,
+        exitCode: 0,
+        completion: "pending",
+        completionDetail: "未完了の背景タスク 1 件 (x)",
+      });
+      expect(body).not.toContain("artifacts");
+      expect(body).toBe(
+        "## Dispatch 実行レポート\n\n- tokens: 1\n- duration_ms: 2\n- exit_code: 0\n" +
+          "- completion: pending\n- completion_detail: 未完了の背景タスク 1 件 (x)\n\n" +
+          "⚠️ この run は正常完了と確認できていません（Issue claude-hub#342）。" +
+          "worktree は復旧用に保全されています。同じブランチへの再 dispatch で作業状態を引き継げます。\n",
+      );
+    });
+  });
 });

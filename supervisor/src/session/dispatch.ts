@@ -208,6 +208,14 @@ export interface DispatchHeadlessOutcome {
    * "no probe ran" and no completion warning is posted.
    */
   completion?: { status: "clean" | "pending" | "unknown"; detail: string };
+  /**
+   * Artifact verdict from the manager's post-exit probe (Issue #342, Layer 2
+   * extension). `none`/`unknown` runs are surfaced as warnings even on exit 0
+   * + clean completion — a run that finished cleanly but delivered no commit /
+   * PR / Issue / comment is the remaining silent-failure shape. Optional for
+   * the same seam-compatibility reason as `completion`.
+   */
+  artifacts?: { status: "found" | "none" | "unknown"; detail: string; dirty: boolean };
 }
 
 /**
@@ -535,6 +543,19 @@ async function postHeadlessOutcome(
       `⚠️ この run は正常完了と確認できていません（completion: ${completion.status}）。` +
         `${completion.detail ? `\n検出内容: ${completion.detail}` : ""}\n` +
         `worktree は復旧用に保全されています。同じブランチへの再 dispatch で作業状態を引き継げます（Issue claude-hub#342）。`,
+    );
+  }
+
+  // Issue #342 Layer 2 extension: zero artifacts is a warning REGARDLESS of
+  // exit code or completion — "finished cleanly but delivered nothing" is the
+  // remaining silent-failure shape the pending probe cannot see.
+  const artifacts = outcome.artifacts;
+  if (artifacts && artifacts.status !== "found") {
+    chunks.push(
+      `⚠️ この run の成果物（commit / PR / Issue / コメント）を確認できませんでした（artifacts: ${artifacts.status}）。` +
+        `${artifacts.detail ? `\n検出内容: ${artifacts.detail}` : ""}` +
+        `${artifacts.dirty ? "\n未 commit の変更が worktree に残っているため、worktree を復旧用に保全しています。" : ""}` +
+        `\n作業が実際に行われたか確認してください（Issue claude-hub#342）。`,
     );
   }
 
