@@ -71,4 +71,52 @@ describe("formatDispatchReport", () => {
       expect(body.split("\n")).toContain(line);
     }
   });
+
+  // Issue #342: completion lines are ADDITIVE to the corp reconcile contract.
+  describe("completion lines (#342)", () => {
+    test("clean run emits the completion line, no warning", () => {
+      const body = formatDispatchReport({
+        tokens: 1,
+        durationMs: 2,
+        exitCode: 0,
+        completion: "clean",
+      });
+      expect(body.split("\n")).toContain("- completion: clean");
+      expect(body).not.toContain("⚠️");
+    });
+
+    test("pending run emits detail + a human warning", () => {
+      const body = formatDispatchReport({
+        tokens: 34602,
+        durationMs: 2757370,
+        exitCode: 0,
+        completion: "pending",
+        completionDetail: "未完了の背景タスク 1 件 (bas5ws1zh)",
+      });
+      expect(body.split("\n")).toContain("- completion: pending");
+      expect(body).toContain("- completion_detail: 未完了の背景タスク 1 件 (bas5ws1zh)");
+      expect(body).toContain("正常完了と確認できていません");
+      expect(body).toContain("worktree は復旧用に保全");
+    });
+
+    test("unknown run also warns (fail-loud, not folded into clean)", () => {
+      const body = formatDispatchReport({
+        tokens: null,
+        durationMs: 5,
+        exitCode: 0,
+        completion: "unknown",
+        completionDetail: "transcript 検証不能 (ENOENT)",
+      });
+      expect(body.split("\n")).toContain("- completion: unknown");
+      expect(body).toContain("正常完了と確認できていません");
+    });
+
+    test("omitting completion keeps the pre-#342 shape byte-identical", () => {
+      const body = formatDispatchReport({ tokens: 7, durationMs: 3, exitCode: 9 });
+      expect(body).not.toContain("completion");
+      expect(body).toBe(
+        "## Dispatch 実行レポート\n\n- tokens: 7\n- duration_ms: 3\n- exit_code: 9\n",
+      );
+    });
+  });
 });

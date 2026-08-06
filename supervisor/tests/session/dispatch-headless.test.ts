@@ -296,3 +296,91 @@ describe("runDispatch headless", () => {
     expect(sent).toEqual(["/impl 1"]);
   });
 });
+
+// Issue #342: pending/unknown completion is warned in the thread even on exit 0.
+describe("headless completion warning (#342)", () => {
+  test("exit 0 + completion pending posts the ⚠️ pending warning", async () => {
+    const { manager } = harness({
+      exitCode: 0,
+      stdout: "作業中の報告テキスト",
+      stderr: "",
+      timedOut: false,
+      completion: {
+        status: "pending",
+        detail: "未完了の背景タスク 1 件 (bas5ws1zh)",
+      },
+    });
+    const posts: string[] = [];
+    const r = await runDispatch({
+      config,
+      branch: "b",
+      issueNumber: 456,
+      command: "pdca",
+      sessionManager: manager,
+      executorMode: "headless",
+      createThread: async () => ({ id: "t" }),
+      postToThread: async (_id, c) => {
+        posts.push(c);
+      },
+    });
+    expect(r.ok).toBe(true);
+    const all = posts.join("\n");
+    expect(all).toContain("正常完了と確認できていません");
+    expect(all).toContain("completion: pending");
+    expect(all).toContain("bas5ws1zh");
+    expect(all).toContain("worktree は復旧用に保全");
+  });
+
+  test("completion unknown also warns (fail-loud)", async () => {
+    const { manager } = harness({
+      exitCode: 0,
+      stdout: "done",
+      stderr: "",
+      timedOut: false,
+      completion: { status: "unknown", detail: "transcript 検証不能 (ENOENT)" },
+    });
+    const posts: string[] = [];
+    await runDispatch({
+      config,
+      branch: "b",
+      issueNumber: 1,
+      command: "impl",
+      sessionManager: manager,
+      executorMode: "headless",
+      createThread: async () => ({ id: "t" }),
+      postToThread: async (_id, c) => {
+        posts.push(c);
+      },
+    });
+    expect(posts.join("\n")).toContain("completion: unknown");
+  });
+
+  test("completion clean posts no warning; absent completion stays pre-#342 silent", async () => {
+    for (const completion of [
+      { status: "clean" as const, detail: "" },
+      undefined,
+    ]) {
+      const { manager } = harness({
+        exitCode: 0,
+        stdout: "done",
+        stderr: "",
+        timedOut: false,
+        completion,
+      });
+      const posts: string[] = [];
+      await runDispatch({
+        config,
+        branch: "b",
+        issueNumber: 1,
+        command: "impl",
+        sessionManager: manager,
+        executorMode: "headless",
+        createThread: async () => ({ id: "t" }),
+        postToThread: async (_id, c) => {
+          posts.push(c);
+        },
+      });
+      expect(posts.join("\n")).not.toContain("正常完了と確認できていません");
+    }
+  });
+});

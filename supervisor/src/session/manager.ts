@@ -2,6 +2,7 @@ import { randomUUID } from "crypto";
 import { existsSync, unlinkSync } from "fs";
 import { dirname, resolve } from "path";
 import { homedir } from "os";
+import { fileURLToPath } from "url";
 import type { SessionInfo, SessionHealthInfo, StopReason } from "./types";
 import type { ChannelConfig } from "../config/channels";
 import {
@@ -41,6 +42,12 @@ import {
 } from "./self-heal";
 import { compactClaudeHubExit } from "./primary-compact";
 import { formatDispatchReport } from "./dispatch-report";
+import {
+  deriveTranscriptPath,
+  describePendingWork,
+  probePendingWork,
+  type PendingWorkProbe,
+} from "./pending-work";
 
 const DEFAULT_CLAUDE_PATH = resolve(homedir(), ".local", "bin", "claude");
 const TMUX_SESSION_PREFIX = "claude-";
@@ -326,6 +333,69 @@ export function buildHeadlessClaudeFlags(
 }
 
 /**
+ * Absolute path to the Stop hook that keeps a headless worker alive while it
+ * still has pending background work (Issue #342, Layer 1). Resolved from this
+ * module's location so it always points at the checkout the Supervisor is
+ * actually running from (main or a worktree).
+ */
+const PENDING_GUARD_HOOK_PATH = fileURLToPath(
+  new URL("../../hooks/headless-pending-guard.ts", import.meta.url),
+);
+
+/**
+ * Build the `--settings` flag that injects the pending-work Stop hook into a
+ * headless child (Issue #342). Scoped injection: only headless dispatch
+ * children receive the hook — interactive/tmux sessions and the user's own
+ * settings are untouched. `--settings <json>` and Stop-hook `decision:block`
+ * under `claude -p` were both verified against real runs (v2.x, 2026-08-06).
+ *
+ * Kill switch: `HEADLESS_PENDING_GUARD=off` disables the injection entirely
+ * (the hook script honours the same variable as a second layer). The hook is
+ * run with the same bun binary that runs the Supervisor (`process.execPath`)
+ * so no PATH assumption leaks into the child.
+ */
+export function buildPendingGuardFlags(
+  env: Record<string, string | undefined> = process.env,
+): string[] {
+  if (env.HEADLESS_PENDING_GUARD === "off") return [];
+  const settings = {
+    hooks: {
+      Stop: [
+        {
+          hooks: [
+            {
+              type: "command",
+              command: `"${process.execPath}" "${PENDING_GUARD_HOOK_PATH}"`,
+            },
+          ],
+        },
+      ],
+    },
+  };
+  return ["--settings", JSON.stringify(settings)];
+}
+
+/**
+ * Completion verdict for a finished headless run (Issue #342, Layer 2).
+ *
+ *   - `clean`:   no pending signal — safe to reclaim the worktree.
+ *   - `pending`: the child left work in flight (surviving process-group
+ *                members, unfinished background tasks, or an unfired
+ *                ScheduleWakeup). The run is NOT a success even on exit 0.
+ *   - `unknown`: the transcript could not be read/parsed, so completion could
+ *                not be verified. Deliberately NOT folded into `clean`
+ *                (fail-loud): treating "could not check" as "checked OK" would
+ *                re-create the silent failure this exists to remove.
+ */
+export type HeadlessCompletionStatus = "clean" | "pending" | "unknown";
+
+export interface HeadlessCompletion {
+  status: HeadlessCompletionStatus;
+  /** Human-readable evidence (pending task ids / probe error), "" when clean. */
+  detail: string;
+}
+
+/**
  * Environment for a headless child (Epic #285 Phase 2). Bun.spawn REPLACES the
  * environment, so this returns a COMPLETE env derived from the supervisor's:
  *   - ANTHROPIC_API_KEY removed → use the Claude Max subscription (mirrors the
@@ -374,6 +444,8 @@ export interface HeadlessSessionResult {
   sessionId: string;
   /** The pinned `--session-id` value handed to the child. */
   claudeSessionId: string;
+  /** Completion verdict (Issue #342): pending/unknown runs are not successes. */
+  completion: HeadlessCompletion;
 }
 
 /**
@@ -468,6 +540,13 @@ export interface SessionManagerOptions {
    * Defaults to 10_000.
    */
   watchIntervalMs?: number;
+  /**
+   * Test seam for the headless completion probe (Issue #342): overrides the
+   * transcript read+parse (`probePendingWork`) so unit tests control the
+   * pending verdict without writing real files under `~/.claude/projects`.
+   * Production leaves this undefined.
+   */
+  probePendingWorkFn?: (transcriptPath: string) => PendingWorkProbe;
 }
 
 /**
@@ -544,6 +623,9 @@ export class SessionManager {
   private readonly inputReadyPollAttempts: number;
   private readonly inputReadyPollIntervalMs: number;
   private readonly watchIntervalMs: number;
+  private readonly probePendingWorkFn: (
+    transcriptPath: string,
+  ) => PendingWorkProbe;
 
   constructor(options: SessionManagerOptions = {}) {
     this.effects = {
@@ -568,6 +650,7 @@ export class SessionManager {
     this.inputReadyPollIntervalMs =
       options.inputReadyPollIntervalMs ?? 1000;
     this.watchIntervalMs = options.watchIntervalMs ?? 10_000;
+    this.probePendingWorkFn = options.probePendingWorkFn ?? probePendingWork;
 
     // Issue #227 (PR-4): ensureSocketConfigured is async now. The constructor
     // cannot await, so fire-and-forget it — it is idempotent and re-applied in
@@ -994,6 +1077,10 @@ export class SessionManager {
           initialCommand,
           resolveDispatchModel(),
         ),
+        // Issue #342 Layer 1: inject the pending-work Stop hook so the worker
+        // cannot end its turn (= kill the process) while background tasks or a
+        // ScheduleWakeup reservation are still in flight.
+        ...buildPendingGuardFlags(),
         // Pin the session id like launchStart so the DB row captures it
         // deterministically (Issue #167). randomUUID() is shell-safe, though
         // there is no shell here.
@@ -1002,6 +1089,11 @@ export class SessionManager {
       ];
       const now = new Date();
 
+      // Issue #342 Layer 2: the child's pid doubles as its process-GROUP id
+      // (the executor spawns with `detached: true`), so it is kept for the
+      // post-exit orphan probe.
+      let spawnedPid: number | null = null;
+
       const result = await this.effects.executor.runHeadless({
         claudePath: claudePath(),
         args,
@@ -1009,6 +1101,7 @@ export class SessionManager {
         env: buildHeadlessEnv(),
         timeoutMs: headlessTimeoutMs(),
         onSpawn: (pid) => {
+          spawnedPid = pid;
           // Register the session synchronously the moment the child exists, so
           // MAX_SESSIONS / count() reflect the in-flight run and the reapers can
           // observe it. Hand off pendingStarts → sessions (mirrors launchStart).
@@ -1051,6 +1144,22 @@ export class SessionManager {
       // Fail-soft: a crash / timeout that left no valid JSON yields the raw
       // output and null tokens rather than throwing.
       const parsed = parseHeadlessOutput(result.stdout);
+
+      // Issue #342 Layer 2: verify the run actually FINISHED its work before
+      // treating exit 0 as success. Both observed silent failures (#338,
+      // agent-base#456) exited 0 with pending background work.
+      const completion = this.probeHeadlessCompletion(
+        spawnedPid,
+        projectDir,
+        claudeSessionId,
+      );
+      if (completion.status !== "clean") {
+        console.warn(
+          `[SessionManager] Headless run for thread ${threadId} ended ` +
+            `${completion.status}: ${completion.detail}`,
+        );
+      }
+
       const outcome: HeadlessSessionResult = {
         exitCode: result.exitCode,
         stdout: parsed.text,
@@ -1060,6 +1169,7 @@ export class SessionManager {
         tokens: parsed.tokens,
         sessionId,
         claudeSessionId,
+        completion,
       };
 
       // Post the Dispatch 実行レポート to the target Issue BEFORE finishHeadless
@@ -1072,7 +1182,7 @@ export class SessionManager {
       // Child exited → close the session (frees the slot). Even if onSpawn never
       // fired (should not happen unless the adapter misbehaves), finishHeadless
       // is a no-op safe cleanup.
-      await this.finishHeadless(threadId, sessionId, result, worktree);
+      await this.finishHeadless(threadId, sessionId, result, worktree, completion);
 
       return outcome;
     } finally {
@@ -1092,11 +1202,66 @@ export class SessionManager {
    * The DB reason distinguishes a timeout so operators can audit wedged runs; the
    * success/failure detail itself is surfaced to the thread by the caller (AC-5).
    */
+  /**
+   * Post-exit completion probe (Issue #342 Layer 2). Two deterministic signals,
+   * neither of which depends on the model's prose:
+   *
+   *   1. Process-group survival: the executor spawns the child `detached`, so
+   *      its pid is the group id. `isAlive(-pid)` (POSIX group-target kill 0)
+   *      after exit means orphaned tool subprocesses are still running — work
+   *      was abandoned mid-flight. Version-independent.
+   *   2. Transcript parse (`pending-work.ts`): unfinished background tasks /
+   *      an unfired ScheduleWakeup reservation.
+   *
+   * Fail-LOUD: an unreadable transcript yields `unknown`, never `clean` — the
+   * whole point is that "could not verify" must not masquerade as success.
+   */
+  private probeHeadlessCompletion(
+    pid: number | null,
+    cwd: string,
+    claudeSessionId: string,
+  ): HeadlessCompletion {
+    // The probe is observability, not control flow: a throw here would reject
+    // runHeadless AFTER the child exited, skipping finishHeadless and leaking
+    // the session slot (PR #368 review). Any internal failure degrades to
+    // `unknown` — loud downstream, but the teardown always runs.
+    try {
+      const groupAlive = pid !== null && this.effects.process.isAlive(-pid);
+
+      const transcriptPath = deriveTranscriptPath(cwd, claudeSessionId);
+      const probe = this.probePendingWorkFn(transcriptPath);
+
+      const details: string[] = [];
+      if (groupAlive) {
+        details.push(`プロセスグループ ${pid} に生存プロセスあり`);
+      }
+      if (!probe.ok) {
+        details.push(`transcript 検証不能 (${probe.error})`);
+        return {
+          status: groupAlive ? "pending" : "unknown",
+          detail: details.join(" / "),
+        };
+      }
+      const summary = describePendingWork(probe.value);
+      if (summary) details.push(summary);
+      if (groupAlive || summary) {
+        return { status: "pending", detail: details.join(" / ") };
+      }
+      return { status: "clean", detail: "" };
+    } catch (err) {
+      return {
+        status: "unknown",
+        detail: `completion probe failed: ${err instanceof Error ? err.message : String(err)}`,
+      };
+    }
+  }
+
   private async finishHeadless(
     threadId: string,
     sessionId: string,
     result: HeadlessRunResult,
     worktree: SessionInfo["worktree"],
+    completion: HeadlessCompletion,
   ): Promise<void> {
     this.sessions.delete(threadId);
     this.emitSessionEnd(threadId); // Phase 5c: free a dispatch queue slot (#294)
@@ -1109,7 +1274,16 @@ export class SessionManager {
     // SUPERVISOR_RELAY_URL and the headless child never writes one (stdout is
     // captured directly), so there is nothing the progress-relay hook could
     // have dropped for this cwd.
-    if (worktree && !this.isWorktreePathInUse(worktree.path)) {
+    if (worktree && completion.status !== "clean") {
+      // Issue #342: a pending/unknown run is not a success — keep the worktree
+      // (and its uncommitted work) recoverable instead of `--force`-removing it
+      // under possibly-live orphan processes (RW-046 class). `worktree.ensure`
+      // reuses an existing worktree, so a re-dispatch of the same branch picks
+      // the state right back up.
+      console.warn(
+        `[SessionManager] Headless run ended ${completion.status} — retaining worktree ${worktree.path} for recovery (${completion.detail})`,
+      );
+    } else if (worktree && !this.isWorktreePathInUse(worktree.path)) {
       await this.removeWorktreeBestEffort(worktree);
     } else if (worktree) {
       console.log(
@@ -1117,7 +1291,7 @@ export class SessionManager {
       );
     }
     console.log(
-      `[SessionManager] Headless session for thread ${threadId} closed (reason: ${reason}, exit: ${result.exitCode})`,
+      `[SessionManager] Headless session for thread ${threadId} closed (reason: ${reason}, exit: ${result.exitCode}, completion: ${completion.status})`,
     );
   }
 
@@ -1139,6 +1313,8 @@ export class SessionManager {
       tokens: outcome.tokens,
       durationMs: outcome.durationMs,
       exitCode: outcome.exitCode,
+      completion: outcome.completion.status,
+      completionDetail: outcome.completion.detail || undefined,
     });
     try {
       await this.effects.issueReporter.postComment({ cwd, issueNumber, body });

@@ -200,6 +200,14 @@ export interface DispatchHeadlessOutcome {
   stdout: string;
   stderr: string;
   timedOut: boolean;
+  /**
+   * Completion verdict from the manager's post-exit probe (Issue #342).
+   * `pending`/`unknown` runs are surfaced as warnings in the thread even on
+   * exit 0 — the two observed silent failures both exited 0. Optional so a
+   * minimal fake (or an older manager) still satisfies the seam; absent means
+   * "no probe ran" and no completion warning is posted.
+   */
+  completion?: { status: "clean" | "pending" | "unknown"; detail: string };
 }
 
 /**
@@ -517,6 +525,17 @@ async function postHeadlessOutcome(
     );
   } else {
     chunks.push(...formatForDiscord(outcome.stdout));
+  }
+
+  // Issue #342: a pending/unknown completion is a warning REGARDLESS of the
+  // exit code — both observed silent failures exited 0 with work in flight.
+  const completion = outcome.completion;
+  if (completion && completion.status !== "clean") {
+    chunks.push(
+      `⚠️ この run は正常完了と確認できていません（completion: ${completion.status}）。` +
+        `${completion.detail ? `\n検出内容: ${completion.detail}` : ""}\n` +
+        `worktree は復旧用に保全されています。同じブランチへの再 dispatch で作業状態を引き継げます（Issue claude-hub#342）。`,
+    );
   }
 
   try {

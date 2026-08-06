@@ -5,6 +5,7 @@ import { resolve } from "path";
 import {
   SessionManager,
   buildHeadlessClaudeFlags,
+  buildPendingGuardFlags,
   resolveDispatchModel,
 } from "../../src/session/manager";
 import {
@@ -313,6 +314,137 @@ describe("SessionManager.runHeadless", () => {
       } finally {
         if (prev !== undefined) process.env.DISPATCH_CLAUDE_MODEL = prev;
       }
+    });
+  });
+
+  // Issue #342: completion probe (Layer 2) + Stop-hook injection (Layer 1).
+  describe("headless completion probe (#342)", () => {
+    const cleanProbe = () =>
+      ({
+        ok: true as const,
+        value: { pendingTasks: [], pendingWakeup: false, skippedLines: 0 },
+      });
+    const pendingProbe = () =>
+      ({
+        ok: true as const,
+        value: {
+          pendingTasks: [
+            {
+              toolUseId: "toolu_bg1",
+              taskId: "bas5ws1zh",
+              source: "timeout_backgrounded" as const,
+            },
+          ],
+          pendingWakeup: false,
+          skippedLines: 0,
+        },
+      });
+
+    function makeManager(
+      probe: () => import("../../src/session/pending-work").PendingWorkProbe,
+    ): { mgr: SessionManager; fx: FakeSessionEffects } {
+      const fx = createFakeEffects();
+      const mgr = new SessionManager({
+        effects: fx,
+        gracefulKillTimeoutMs: 0,
+        probePendingWorkFn: probe,
+      });
+      return { mgr, fx };
+    }
+
+    test("clean run removes the worktree and reports completion: clean", async () => {
+      const { mgr, fx } = makeManager(cleanProbe);
+      const res = await mgr.runHeadless(config, "t-clean", "/impl 1", "corp-dispatch-1", 1);
+
+      expect(res.completion.status).toBe("clean");
+      expect(fx.worktree.removeCalls).toHaveLength(1);
+      const report = fx.issueReporter.postCommentCalls[0]!.body;
+      expect(report).toContain("- completion: clean");
+      expect(report).not.toContain("正常完了と確認できていません");
+      await mgr.shutdownAll();
+    });
+
+    test("pending run RETAINS the worktree and reports completion: pending (#456 regression)", async () => {
+      const { mgr, fx } = makeManager(pendingProbe);
+      const res = await mgr.runHeadless(config, "t-pend", "/impl 2", "corp-dispatch-2", 2);
+
+      // exit 0 だが pending — これが 2 例の実測 silent failure の形。
+      expect(res.exitCode).toBe(0);
+      expect(res.completion.status).toBe("pending");
+      expect(res.completion.detail).toContain("bas5ws1zh");
+      // Worktree is kept for recovery, session slot is still freed.
+      expect(fx.worktree.removeCalls).toHaveLength(0);
+      expect(mgr.has("t-pend")).toBe(false);
+      const report = fx.issueReporter.postCommentCalls[0]!.body;
+      expect(report).toContain("- completion: pending");
+      expect(report).toContain("- completion_detail:");
+      expect(report).toContain("正常完了と確認できていません");
+      await mgr.shutdownAll();
+    });
+
+    test("unreadable transcript is fail-loud: completion unknown, worktree retained", async () => {
+      const { mgr, fx } = makeManager(() => ({
+        ok: false as const,
+        error: "transcript unreadable: ENOENT",
+      }));
+      const res = await mgr.runHeadless(config, "t-unk", "/impl 3", "corp-dispatch-3", 3);
+
+      expect(res.completion.status).toBe("unknown");
+      expect(fx.worktree.removeCalls).toHaveLength(0);
+      expect(fx.issueReporter.postCommentCalls[0]!.body).toContain("- completion: unknown");
+      await mgr.shutdownAll();
+    });
+
+    test("a throwing probe degrades to unknown and never leaks the slot (PR #368 review)", async () => {
+      const { mgr, fx } = makeManager(() => {
+        throw new Error("boom in probe");
+      });
+      const res = await mgr.runHeadless(config, "t-throw", "/impl 6", "corp-dispatch-6", 6);
+
+      expect(res.completion.status).toBe("unknown");
+      expect(res.completion.detail).toContain("boom in probe");
+      // Teardown still ran: slot freed, report posted, worktree retained.
+      expect(mgr.has("t-throw")).toBe(false);
+      expect(mgr.count()).toBe(0);
+      expect(fx.issueReporter.postCommentCalls[0]!.body).toContain("- completion: unknown");
+      expect(fx.worktree.removeCalls).toHaveLength(0);
+      await mgr.shutdownAll();
+    });
+
+    test("surviving process group forces pending even when the transcript looks clean", async () => {
+      const { mgr, fx } = makeManager(cleanProbe);
+      // The fake executor reports pid 20000 via onSpawn; mark its process
+      // GROUP (-pid) alive so the orphan probe fires.
+      fx.process.alivePids.add(-20000);
+      const res = await mgr.runHeadless(config, "t-orphan", "/impl 4", "corp-dispatch-4", 4);
+
+      expect(res.completion.status).toBe("pending");
+      expect(res.completion.detail).toContain("プロセスグループ");
+      expect(fx.worktree.removeCalls).toHaveLength(0);
+      await mgr.shutdownAll();
+    });
+
+    test("injects the pending-guard Stop hook via --settings (Layer 1)", async () => {
+      const { mgr, fx } = makeManager(cleanProbe);
+      await mgr.runHeadless(config, "t-guard", "/impl 5", "corp-dispatch-5");
+
+      const args = fx.executor.runHeadlessCalls[0]!.args;
+      const i = args.indexOf("--settings");
+      expect(i).toBeGreaterThanOrEqual(0);
+      const settings = JSON.parse(args[i + 1]!) as {
+        hooks?: { Stop?: { hooks: { type: string; command: string }[] }[] };
+      };
+      const hook = settings.hooks?.Stop?.[0]?.hooks?.[0];
+      expect(hook?.type).toBe("command");
+      expect(hook?.command).toContain("headless-pending-guard.ts");
+      await mgr.shutdownAll();
+    });
+
+    test("HEADLESS_PENDING_GUARD=off disables the Stop-hook injection", () => {
+      expect(buildPendingGuardFlags({ HEADLESS_PENDING_GUARD: "off" })).toEqual([]);
+      const flags = buildPendingGuardFlags({});
+      expect(flags[0]).toBe("--settings");
+      expect(flags[1]).toContain("headless-pending-guard.ts");
     });
   });
 });
