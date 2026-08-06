@@ -555,6 +555,22 @@ describe("SessionManager.runHeadless", () => {
       expect(mgr.has("t-art-throw")).toBe(false);
       expect(mgr.count()).toBe(0);
       expect(fx.issueReporter.postCommentCalls[0]!.body).toContain("- artifacts: unknown");
+      // The throw path pins dirty:false, which is exactly why unknown must
+      // retain (PR #371 review): "could not check" ≠ "safe to reclaim".
+      expect(fx.worktree.removeCalls).toHaveLength(0);
+      await mgr.shutdownAll();
+    });
+
+    test("unknown RETAINS the worktree even with dirty=false (dirty is untrustworthy, PR #371 review)", async () => {
+      const { mgr, fx } = makeManager(async () => ({
+        status: "unknown" as const,
+        detail: "gh pr list: connection refused",
+        dirty: false,
+      }));
+      const res = await mgr.runHeadless(config, "t-art-unk", "/impl 12", "corp-dispatch-12", 12);
+
+      expect(res.artifacts?.status).toBe("unknown");
+      expect(fx.worktree.removeCalls).toHaveLength(0);
       await mgr.shutdownAll();
     });
 
