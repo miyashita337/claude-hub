@@ -101,7 +101,9 @@ describe("findMissingHookWiring", () => {
       hooks: Record<string, unknown[]>;
     };
     // Move ask-user-relay from PreToolUse to PostToolUse.
-    settings.hooks.PostToolUse.push({
+    const postToolUse = settings.hooks.PostToolUse ?? [];
+    settings.hooks.PostToolUse = postToolUse;
+    postToolUse.push({
       matcher: "AskUserQuestion",
       hooks: [
         {
