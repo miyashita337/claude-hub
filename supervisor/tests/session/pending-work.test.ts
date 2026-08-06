@@ -188,6 +188,31 @@ describe("parsePendingWork", () => {
     expect(work.skippedLines).toBe(1);
     expect(work.pendingTasks).toHaveLength(1);
   });
+
+  test("notification XML echoed inside a tool_result does NOT fake-complete (PR #368 review)", () => {
+    // e.g. the worker Read a file quoting the notification of a STILL-RUNNING
+    // task — only real notification containers may complete it.
+    const jsonl = [
+      assistantToolUse("toolu_bg1", "Bash", { run_in_background: true }),
+      userToolResult(
+        "toolu_read1",
+        "<task-notification>\n<tool-use-id>toolu_bg1</tool-use-id>\n</task-notification>",
+      ),
+    ].join("\n");
+
+    expect(parsePendingWork(jsonl).pendingTasks).toHaveLength(1);
+  });
+
+  test("an injected user-message notification (plain text) DOES complete", () => {
+    const jsonl = [
+      assistantToolUse("toolu_bg1", "Bash", { run_in_background: true }),
+      plainUserPrompt(
+        "<task-notification>\n<tool-use-id>toolu_bg1</tool-use-id>\n<status>completed</status>\n</task-notification>",
+      ),
+    ].join("\n");
+
+    expect(parsePendingWork(jsonl).pendingTasks).toHaveLength(0);
+  });
 });
 
 describe("probePendingWork (fail-loud file wrapper)", () => {
@@ -201,6 +226,16 @@ describe("probePendingWork (fail-loud file wrapper)", () => {
     const p = join(dir, "empty.jsonl");
     writeFileSync(p, "   \n", "utf8");
     expect(probePendingWork(p).ok).toBe(false);
+  });
+
+  test("corrupt lines make the probe fail-loud (ok:false), never clean (PR #368 review)", () => {
+    const dir = mkdtempSync(join(tmpdir(), "pending-work-"));
+    const p = join(dir, "corrupt.jsonl");
+    // The corrupt line could have held the only background start.
+    writeFileSync(p, '{"type":"assistant","message"…truncated\n', "utf8");
+    const probe = probePendingWork(p);
+    expect(probe.ok).toBe(false);
+    if (!probe.ok) expect(probe.error).toContain("unparsable");
   });
 
   test("readable transcript parses through to a value", () => {

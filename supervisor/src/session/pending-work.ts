@@ -156,19 +156,23 @@ export function parsePendingWork(jsonlText: string): PendingWork {
   let lastWakeupIdx = -1;
   let lastPlainUserIdx = -1;
 
+  // Collect completion ids only from the containers that actually carry
+  // notifications: `queue-operation` entries and user-message TEXT (the
+  // injected `<task-notification>` prompt). Deliberately NOT from tool_result
+  // bodies or a raw-line scan — a worker that happens to echo the XML (e.g. by
+  // Reading a file that quotes it) must not fake-complete a running task
+  // (PR #368 review).
+  const collectNotificationIds = (text: string): void => {
+    if (!text.includes("<task-notification>")) return;
+    for (const m of text.matchAll(NOTIFICATION_TOOL_USE_ID_RE)) {
+      completedToolUseIds.add(m[1]!);
+    }
+  };
+
   const lines = jsonlText.split("\n");
   for (let i = 0; i < lines.length; i++) {
     const line = lines[i]!;
     if (line.trim() === "") continue;
-
-    // Completion notifications carry the XML literally inside the JSON string,
-    // in both `queue-operation` entries and injected user messages — a raw-line
-    // scan covers every container shape without depending on any of them.
-    if (line.includes("<task-notification>")) {
-      for (const m of line.matchAll(NOTIFICATION_TOOL_USE_ID_RE)) {
-        completedToolUseIds.add(m[1]!);
-      }
-    }
 
     let entry: Record<string, unknown>;
     try {
@@ -178,6 +182,10 @@ export function parsePendingWork(jsonlText: string): PendingWork {
       continue;
     }
 
+    if (entry.type === "queue-operation" && typeof entry.content === "string") {
+      collectNotificationIds(entry.content);
+    }
+
     if (isPlainUserPrompt(entry)) {
       lastPlainUserIdx = i;
     }
@@ -185,6 +193,9 @@ export function parsePendingWork(jsonlText: string): PendingWork {
     const message = entry.message;
     if (!message || typeof message !== "object") continue;
     const content = (message as { content?: unknown }).content;
+    if (entry.type === "user" && typeof content === "string") {
+      collectNotificationIds(content);
+    }
     if (!Array.isArray(content)) continue;
 
     for (const item of content) {
@@ -196,7 +207,12 @@ export function parsePendingWork(jsonlText: string): PendingWork {
         input?: unknown;
         tool_use_id?: string;
         content?: unknown;
+        text?: unknown;
       };
+
+      if (entry.type === "user" && c.type === "text" && typeof c.text === "string") {
+        collectNotificationIds(c.text);
+      }
 
       if (c.type === "tool_use" && typeof c.id === "string") {
         const input =
@@ -257,7 +273,17 @@ export function probePendingWork(transcriptPath: string): PendingWorkProbe {
   if (text.trim() === "") {
     return { ok: false, error: "transcript is empty" };
   }
-  return { ok: true, value: parsePendingWork(text) };
+  const value = parsePendingWork(text);
+  // Fail-loud on corruption too (PR #368 review): a skipped line could have
+  // held the only background start or ScheduleWakeup, so a partially parsable
+  // transcript cannot vouch for a clean completion.
+  if (value.skippedLines > 0) {
+    return {
+      ok: false,
+      error: `transcript has ${value.skippedLines} unparsable line(s)`,
+    };
+  }
+  return { ok: true, value };
 }
 
 /** Human-readable one-line summary for reports / hook block reasons. */

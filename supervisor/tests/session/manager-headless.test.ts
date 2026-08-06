@@ -395,6 +395,22 @@ describe("SessionManager.runHeadless", () => {
       await mgr.shutdownAll();
     });
 
+    test("a throwing probe degrades to unknown and never leaks the slot (PR #368 review)", async () => {
+      const { mgr, fx } = makeManager(() => {
+        throw new Error("boom in probe");
+      });
+      const res = await mgr.runHeadless(config, "t-throw", "/impl 6", "corp-dispatch-6", 6);
+
+      expect(res.completion.status).toBe("unknown");
+      expect(res.completion.detail).toContain("boom in probe");
+      // Teardown still ran: slot freed, report posted, worktree retained.
+      expect(mgr.has("t-throw")).toBe(false);
+      expect(mgr.count()).toBe(0);
+      expect(fx.issueReporter.postCommentCalls[0]!.body).toContain("- completion: unknown");
+      expect(fx.worktree.removeCalls).toHaveLength(0);
+      await mgr.shutdownAll();
+    });
+
     test("surviving process group forces pending even when the transcript looks clean", async () => {
       const { mgr, fx } = makeManager(cleanProbe);
       // The fake executor reports pid 20000 via onSpawn; mark its process

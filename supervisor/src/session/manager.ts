@@ -1221,25 +1221,39 @@ export class SessionManager {
     cwd: string,
     claudeSessionId: string,
   ): HeadlessCompletion {
-    const groupAlive = pid !== null && this.effects.process.isAlive(-pid);
+    // The probe is observability, not control flow: a throw here would reject
+    // runHeadless AFTER the child exited, skipping finishHeadless and leaking
+    // the session slot (PR #368 review). Any internal failure degrades to
+    // `unknown` — loud downstream, but the teardown always runs.
+    try {
+      const groupAlive = pid !== null && this.effects.process.isAlive(-pid);
 
-    const transcriptPath = deriveTranscriptPath(cwd, claudeSessionId);
-    const probe = this.probePendingWorkFn(transcriptPath);
+      const transcriptPath = deriveTranscriptPath(cwd, claudeSessionId);
+      const probe = this.probePendingWorkFn(transcriptPath);
 
-    const details: string[] = [];
-    if (groupAlive) {
-      details.push(`プロセスグループ ${pid} に生存プロセスあり`);
+      const details: string[] = [];
+      if (groupAlive) {
+        details.push(`プロセスグループ ${pid} に生存プロセスあり`);
+      }
+      if (!probe.ok) {
+        details.push(`transcript 検証不能 (${probe.error})`);
+        return {
+          status: groupAlive ? "pending" : "unknown",
+          detail: details.join(" / "),
+        };
+      }
+      const summary = describePendingWork(probe.value);
+      if (summary) details.push(summary);
+      if (groupAlive || summary) {
+        return { status: "pending", detail: details.join(" / ") };
+      }
+      return { status: "clean", detail: "" };
+    } catch (err) {
+      return {
+        status: "unknown",
+        detail: `completion probe failed: ${err instanceof Error ? err.message : String(err)}`,
+      };
     }
-    if (!probe.ok) {
-      details.push(`transcript 検証不能 (${probe.error})`);
-      return { status: groupAlive ? "pending" : "unknown", detail: details.join(" / ") };
-    }
-    const summary = describePendingWork(probe.value);
-    if (summary) details.push(summary);
-    if (groupAlive || summary) {
-      return { status: "pending", detail: details.join(" / ") };
-    }
-    return { status: "clean", detail: "" };
   }
 
   private async finishHeadless(
