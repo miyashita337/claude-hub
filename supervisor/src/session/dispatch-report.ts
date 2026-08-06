@@ -30,6 +30,16 @@ export interface DispatchReportFields {
   durationMs: number;
   /** `claude -p` exit code, or `null` when the run was killed (e.g. timeout). */
   exitCode: number | null;
+  /**
+   * Completion verdict (Issue #342). ADDITIVE to the machine contract: corp
+   * reconcile keys off the heading and the existing `- key: value` lines, so
+   * appending new keys is backwards-compatible. `clean` runs still emit the
+   * line (a reader can distinguish "verified clean" from "predates #342").
+   * Optional so callers without a probe (none today) simply omit the lines.
+   */
+  completion?: "clean" | "pending" | "unknown";
+  /** Human-readable pending/unknown evidence; omitted when empty. */
+  completionDetail?: string;
 }
 
 /**
@@ -46,5 +56,18 @@ export function formatDispatchReport(fields: DispatchReportFields): string {
   }
   lines.push(`- duration_ms: ${fields.durationMs}`);
   lines.push(`- exit_code: ${fields.exitCode === null ? "null" : fields.exitCode}`);
+  if (fields.completion) {
+    lines.push(`- completion: ${fields.completion}`);
+    if (fields.completionDetail) {
+      lines.push(`- completion_detail: ${fields.completionDetail}`);
+    }
+    if (fields.completion !== "clean") {
+      lines.push(
+        "",
+        "⚠️ この run は正常完了と確認できていません（Issue claude-hub#342）。" +
+          "worktree は復旧用に保全されています。同じブランチへの再 dispatch で作業状態を引き継げます。",
+      );
+    }
+  }
   return lines.join("\n") + "\n";
 }

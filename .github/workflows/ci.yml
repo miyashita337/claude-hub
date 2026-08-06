@@ -150,6 +150,7 @@ jobs:
                    tests/guards/access-enforcement-wired.test.ts \
                    tests/hooks/ask-user-relay.test.ts \
                    tests/hooks/auto-approve-permission.test.ts \
+                   tests/hooks/headless-pending-guard.test.ts \
                    tests/hooks/progress-relay.test.ts \
                    tests/scripts/cleanup-idle-claude.test.ts \
                    tests/scripts/setup-agent-base.test.ts \
@@ -163,6 +164,7 @@ jobs:
                    tests/session/adapters-executor.test.ts \
                    tests/session/manager-headless.test.ts \
                    tests/session/headless-liveness.test.ts \
+                   tests/session/pending-work.test.ts \
                    tests/session/reaper.test.ts \
                    tests/session/dispatch-queue.test.ts \
                    tests/session/admission.test.ts \
