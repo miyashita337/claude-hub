@@ -43,8 +43,12 @@ import {
   onSessionsQuery,
   onHubWork,
   onChannelPost,
+  onAskUser,
+  hasPendingAsk,
+  resolveAskUser,
 } from "./session/relay-server";
 import { runHubWork, HUB_WORK_PARENT_CHANNEL } from "./session/hub-work";
+import { checkHookWiring } from "./infra/hook-wiring-check";
 import {
   extractFilePaths,
   collectAttachableFiles,
@@ -417,6 +421,13 @@ export async function startBot(token: string): Promise<void> {
     activityWatchdog.start();
     resourceMonitor.start();
 
+    // Issue #370 A-2: warn (never fail) about supervisor relay hooks that
+    // exist on disk but are not wired into ~/.claude/settings.json.
+    // ask-user-relay.sh sat unwired for months because nothing checked this.
+    for (const warning of checkHookWiring()) {
+      console.error(warning);
+    }
+
     // Register progress callback to send tool progress to Discord threads.
     // Events are buffered (Issue #119) and flushed every 2s as a single
     // message per thread to stay under Discord's 5-msg/5-sec rate limit.
@@ -440,6 +451,39 @@ export async function startBot(token: string): Promise<void> {
     // live snapshot of the manager's in-memory sessions so an E2E harness can
     // verify the thread → tmux session mapping without host access.
     onSessionsQuery(() => sessionManager.sessionsHealth());
+
+    // Issue #370: forward AskUserQuestion prompts (POSTed by
+    // hooks/ask-user-relay.sh to /ask/:threadId) to the Discord thread. Without
+    // this subscriber the endpoint fast-fails 503 and the question never leaves
+    // the TUI — the user saw a silent 19-minute block. The next user message in
+    // the thread resolves the ask (see the messageCreate handler).
+    onAskUser((event) => {
+      void (async () => {
+        try {
+          const channel = await client.channels.fetch(event.threadId);
+          if (!channel?.isThread()) return;
+          const lines = [`❓ **Claude からの質問**`, event.question];
+          if (event.options?.length) {
+            lines.push("", ...event.options.map((o, i) => `${i + 1}. ${o}`));
+          }
+          lines.push(
+            "",
+            "このスレッドへの次の返信がそのまま回答として送られます（約 5 分でタイムアウトし、TUI ダイアログに戻ります）。"
+          );
+          // Discord caps a message at 2000 chars; a long option list must not
+          // kill the whole question post.
+          const body = lines.join("\n");
+          await channel.send(
+            body.length > 1900 ? `${body.slice(0, 1900)}…` : body
+          );
+        } catch (err) {
+          console.error(
+            `[Bot] Failed to post AskUserQuestion to thread ${event.threadId}:`,
+            err
+          );
+        }
+      })();
+    });
 
     // Register late-response callback: when a Stop hook POST arrives after
     // the initial relay already resolved (e.g. Monitor/background-task split
@@ -1190,6 +1234,20 @@ export async function startBot(token: string): Promise<void> {
       messageText = "添付ファイルを確認してください。";
     }
     if (!messageText) return;
+
+    // Issue #370: a pending AskUserQuestion consumes the next user message in
+    // this thread as its answer. The session is blocked inside the PreToolUse
+    // hook waiting on POST /ask — relaying the reply into tmux would type it
+    // into a TUI that is not accepting input, so resolve the ask and stop.
+    if (hasPendingAsk(threadId)) {
+      resolveAskUser(threadId, messageText);
+      try {
+        await message.react("✅");
+      } catch {
+        // Best-effort ack; delivering the answer is what matters.
+      }
+      return;
+    }
 
     // Slash-prefix stripping: `/hanle-review XXX` → `hanle-review XXX`. Without
     // this, Claude Code's Ink TUI enters its slash-command picker on `/`, and
