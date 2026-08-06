@@ -1337,10 +1337,15 @@ export class SessionManager {
     // SUPERVISOR_RELAY_URL and the headless child never writes one (stdout is
     // captured directly), so there is nothing the progress-relay hook could
     // have dropped for this cwd.
+    // `unknown` retains too (PR #371 review, CodeRabbit Major): it means the
+    // probe could not verify — including the throw / git-status-failure paths
+    // that pin `dirty: false` — so `dirty` cannot be trusted to prove the tree
+    // is safe to reclaim. "Could not check" must not destroy possibly-live
+    // uncommitted work (same fail-loud rule as the completion probe).
     const abandonedEdits =
       artifacts !== undefined &&
       artifacts.status !== "found" &&
-      artifacts.dirty;
+      (artifacts.dirty || artifacts.status === "unknown");
     if (worktree && completion.status !== "clean") {
       // Issue #342: a pending/unknown run is not a success — keep the worktree
       // (and its uncommitted work) recoverable instead of `--force`-removing it
@@ -1357,7 +1362,9 @@ export class SessionManager {
       // none+clean-tree run has nothing to recover, so it is still reclaimed
       // below (no worktree accumulation on genuinely-empty runs).
       console.warn(
-        `[SessionManager] Headless run delivered no artifact but left uncommitted edits — retaining worktree ${worktree.path} for recovery`,
+        `[SessionManager] Headless run delivered no verifiable artifact ` +
+          `(status: ${artifacts!.status}, dirty: ${artifacts!.dirty}) — ` +
+          `retaining worktree ${worktree.path} for recovery`,
       );
     } else if (worktree && !this.isWorktreePathInUse(worktree.path)) {
       await this.removeWorktreeBestEffort(worktree);
