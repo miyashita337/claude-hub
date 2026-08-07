@@ -20,6 +20,7 @@ import {
   type FakeSessionEffects,
 } from "../../src/session/adapters-fake";
 import type { ChannelConfig } from "../../src/config/channels";
+import { getSessionByClaudeSessionId } from "../../src/infra/db";
 
 /**
  * These tests inject fake adapters via {@link SessionManager}'s DI hooks so
@@ -682,6 +683,26 @@ describe("SessionManager worktree integration (#154)", () => {
   test("stop of a branchless session does not call worktree.remove", async () => {
     await manager.start(config, "thread-plain-stop");
     await manager.stop("thread-plain-stop", "manual");
+    expect(effects.worktree.removeCalls).toHaveLength(0);
+  });
+
+  test("#369 A-1: shutdownAll preserves worktrees and records supervisor_restart", async () => {
+    // A SIGTERM-driven shutdown (launchctl kickstart) is NOT an explicit
+    // /session stop — force-removing the worktree here destroyed uncommitted
+    // work three times in the handoff-96-2 incident (Issue #369, cause A).
+    const session = await manager.start(config, "thread-restart-wt", "feature-foo");
+
+    await manager.shutdownAll();
+
+    expect(effects.worktree.removeCalls).toHaveLength(0);
+    const row = getSessionByClaudeSessionId(session.claudeSessionId!);
+    expect(row?.status).toBe("stopped");
+    expect(row?.stopped_reason).toBe("supervisor_restart");
+  });
+
+  test("#369 A-1: explicit stop('supervisor_restart') also preserves the worktree", async () => {
+    await manager.start(config, "thread-sr-stop", "feature-foo");
+    await manager.stop("thread-sr-stop", "supervisor_restart");
     expect(effects.worktree.removeCalls).toHaveLength(0);
   });
 

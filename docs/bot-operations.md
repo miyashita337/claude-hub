@@ -52,6 +52,15 @@ claude-hub プロジェクトで運用している Discord Bot の役割分担�
 2. 必要なら `claudeHubExit` 経由で修正
 3. ローカルで `launchctl kickstart -k gui/$(id -u)/com.claude-hub.supervisor`
 
+> **警告（Issue #369）**: supervisor の再起動（`launchctl kickstart -k ... com.claude-hub.supervisor`）を
+> **supervisor 管理下のセッション内から実行してはならない**。SIGTERM → `shutdownAll()` が実行中の
+> 全セッション（自分自身を含む）を stop するため、実行したセッションはコマンドの途中で kill され、
+> handoff に「supervisor 再起動」が残っていると resume のたびに同じ地点で自死するループになる。
+> 再起動は必ずセッション外（ローカルターミナル / claudeHubExit 経由）から実行すること。
+> なお shutdown で停止したセッションは `stopped_reason=supervisor_restart` で記録され、
+> worktree は保持される（`/session resume` で再開可能）。ユーザーの明示的な `/session stop`
+> （`stopped_reason=manual`）のみが worktree を削除する。
+
 ## 関連ファイル
 
 - `supervisor/src/config/channels.ts` — CHANNEL_MAP 定義 + claude-hub ガード
