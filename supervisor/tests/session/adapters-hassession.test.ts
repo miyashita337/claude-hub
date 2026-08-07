@@ -130,6 +130,7 @@ describe("realTmuxAdapter.hasSession timeout handling (#238 / #227)", () => {
     // so a false teardown can be diagnosed post-hoc (previously silent).
     expect(warnSpy).toHaveBeenCalledTimes(1);
     expect(String(warnSpy.mock.calls[0]?.[0])).toContain("claude-dead");
+    expect(String(warnSpy.mock.calls[0]?.[0])).toContain("exit=1");
   });
 
   test("#369 B-1: returns true (assume alive) when the tmux spawn itself fails (EAGAIN)", async () => {
