@@ -1,9 +1,16 @@
-// supervisor/tests/hooks/ask-user-relay.test.ts (Issue #12 Phase 1)
+// supervisor/tests/hooks/ask-user-relay.test.ts (Issue #12 Phase 1 / #370)
 //
 // Black-box test for hooks/ask-user-relay.sh. Uses a mock curl to capture the
 // outbound POST and feed back a synthetic supervisor reply, then asserts the
-// hook's stdout produces the PreToolUse `updatedInput` envelope so Claude
-// resumes with the user's answer instead of blocking on the TUI dialog.
+// hook's stdout produces the PreToolUse deny envelope that carries the user's
+// answer back to Claude so it resumes without blocking on the TUI dialog.
+//
+// Issue #370 (D2): AskUserQuestion's real input shape is `questions[]` — an
+// array of { question, header, multiSelect, options[{label, description}] }.
+// The old tests fixed a flat `{ question: "..." }` shape that the tool never
+// sends, which let the schema mismatch pass CI. All fixtures here use the
+// real shape captured from a live transcript
+// (~/.claude/projects/.../6639c00f-....jsonl, 2026-08-06T07:13:18Z).
 import { test, expect, describe, beforeEach, afterEach } from "bun:test";
 import { $ } from "bun";
 import { resolve } from "path";
@@ -81,6 +88,29 @@ function makeInput(toolInput: Record<string, unknown>, cwd: string): string {
   });
 }
 
+/** Real single-question input shape (captured from a live transcript). */
+function singleQuestionInput(): Record<string, unknown> {
+  return {
+    questions: [
+      {
+        question: "claude-hub#342 の対策方式はどれで確定しますか？",
+        header: "342方式",
+        multiSelect: false,
+        options: [
+          {
+            label: "案B-lite（推奨）",
+            description: "完了判定を git 成果物ベースに変更",
+          },
+          {
+            label: "案A: tmux 既定化",
+            description: "dispatch セッションを tmux 常駐にして予防",
+          },
+        ],
+      },
+    ],
+  };
+}
+
 async function runHook(
   env: TestEnv,
   input: string,
@@ -101,17 +131,14 @@ describe("ask-user-relay.sh — supervisor session active", () => {
   beforeEach(() => {
     env = setupTestEnv({
       relayUrl: "http://localhost:12345/relay/thread-abc",
-      curlOutput: '{"answer":"use PR #42"}',
+      curlOutput: '{"answer":"案B-lite（推奨）"}',
     });
   });
 
   afterEach(() => cleanup(env));
 
-  test("forwards question to /ask/ and emits updatedInput with the user's reply", async () => {
-    const input = makeInput(
-      { question: "Which PR did you mean?" },
-      env.dir,
-    );
+  test("forwards question + options to /ask/ and emits deny envelope carrying the user's reply", async () => {
+    const input = makeInput(singleQuestionInput(), env.dir);
 
     const { stdout, exitCode } = await runHook(env, input);
     expect(exitCode).toBe(0);
@@ -121,21 +148,51 @@ describe("ask-user-relay.sh — supervisor session active", () => {
     expect(curlArgs).toContain("http://localhost:12345/ask/thread-abc");
     expect(curlArgs).not.toContain("\\/");
 
-    // Outbound JSON sent to relay-server.
+    // Outbound JSON sent to relay-server: question text + flattened options.
     const sent = JSON.parse(readFileSync(env.curlStdinFile, "utf8"));
-    expect(sent.question).toBe("Which PR did you mean?");
+    expect(sent.question).toBe(
+      "claude-hub#342 の対策方式はどれで確定しますか？",
+    );
+    expect(sent.options).toEqual([
+      "案B-lite（推奨） — 完了判定を git 成果物ベースに変更",
+      "案A: tmux 既定化 — dispatch セッションを tmux 常駐にして予防",
+    ]);
 
-    // Hook stdout: PreToolUse hookSpecificOutput with updatedInput.
+    // Hook stdout: PreToolUse deny whose reason carries the answer. The
+    // wording mirrors the native answered-dialog tool_result ("Your questions
+    // have been answered: ...") so Claude treats it as an answer, not a
+    // refusal, and continues the turn.
     const out = JSON.parse(stdout);
     expect(out.hookSpecificOutput.hookEventName).toBe("PreToolUse");
-    expect(out.hookSpecificOutput.updatedInput.question).toBe("use PR #42");
+    expect(out.hookSpecificOutput.permissionDecision).toBe("deny");
+    expect(out.hookSpecificOutput.permissionDecisionReason).toContain(
+      'Your questions have been answered:',
+    );
+    expect(out.hookSpecificOutput.permissionDecisionReason).toContain(
+      '"claude-hub#342 の対策方式はどれで確定しますか？"="案B-lite（推奨）"',
+    );
   });
 
-  test("accepts `prompt` field as fallback for the question text", async () => {
-    const input = makeInput({ prompt: "Pick a path" }, env.dir);
-    await runHook(env, input);
+  test("multiple questions: all question texts are forwarded, options omitted", async () => {
+    const input = makeInput(
+      {
+        questions: [
+          { question: "Q1 はどうしますか？", header: "Q1", multiSelect: false, options: [{ label: "a", description: "d1" }] },
+          { question: "Q2 はどうしますか？", header: "Q2", multiSelect: false, options: [{ label: "b", description: "d2" }] },
+        ],
+      },
+      env.dir,
+    );
+
+    const { exitCode } = await runHook(env, input);
+    expect(exitCode).toBe(0);
+
     const sent = JSON.parse(readFileSync(env.curlStdinFile, "utf8"));
-    expect(sent.question).toBe("Pick a path");
+    // Both questions must reach Discord in one message; per-question option
+    // mapping is ambiguous over a free-text reply, so options are omitted.
+    expect(sent.question).toContain("Q1 はどうしますか？");
+    expect(sent.question).toContain("Q2 はどうしますか？");
+    expect(sent.options).toBeUndefined();
   });
 });
 
@@ -150,7 +207,7 @@ describe("ask-user-relay.sh — URL derivation safety", () => {
       curlOutput: '{"answer":"ok"}',
     });
     try {
-      const input = makeInput({ question: "ping" }, env.dir);
+      const input = makeInput(singleQuestionInput(), env.dir);
       await runHook(env, input);
       const curlArgs = readFileSync(env.curlArgsFile, "utf8");
       expect(curlArgs).toContain(
@@ -168,7 +225,7 @@ describe("ask-user-relay.sh — URL derivation safety", () => {
       curlOutput: '{"answer":"ok"}',
     });
     try {
-      const input = makeInput({ question: "ping" }, env.dir);
+      const input = makeInput(singleQuestionInput(), env.dir);
       await runHook(env, input);
       const curlArgs = readFileSync(env.curlArgsFile, "utf8");
       expect(curlArgs).toContain(
@@ -184,7 +241,7 @@ describe("ask-user-relay.sh — fallback / safety", () => {
   test("no relay-url file: hook is a no-op (empty stdout, exit 0)", async () => {
     const env = setupTestEnv({}); // no relayUrl written
     try {
-      const input = makeInput({ question: "hi" }, env.dir);
+      const input = makeInput(singleQuestionInput(), env.dir);
       const { stdout, exitCode } = await runHook(env, input);
       // AC-3 / Journey-AC #3: hook must produce no stdout when not in a
       // supervisor session — Claude proceeds with original tool_input.
@@ -195,7 +252,7 @@ describe("ask-user-relay.sh — fallback / safety", () => {
     }
   });
 
-  test("missing question/prompt: hook exits 0 with no stdout", async () => {
+  test("empty tool_input: hook exits 0 with no stdout", async () => {
     const env = setupTestEnv({
       relayUrl: "http://localhost:12345/relay/t",
       curlOutput: '{"answer":"x"}',
@@ -210,13 +267,30 @@ describe("ask-user-relay.sh — fallback / safety", () => {
     }
   });
 
+  test("legacy flat shape (question at top level, no questions[]): TUI fallback", async () => {
+    // Issue #370 (D2): the tool never sends this shape. An unknown shape must
+    // fall through to the TUI dialog, never emit a half-built deny envelope.
+    const env = setupTestEnv({
+      relayUrl: "http://localhost:12345/relay/t",
+      curlOutput: '{"answer":"x"}',
+    });
+    try {
+      const input = makeInput({ question: "hi" }, env.dir);
+      const { stdout, exitCode } = await runHook(env, input);
+      expect(stdout.trim()).toBe("");
+      expect(exitCode).toBe(0);
+    } finally {
+      cleanup(env);
+    }
+  });
+
   test("supervisor returns 504-style empty answer: hook is a no-op (TUI fallback)", async () => {
     const env = setupTestEnv({
       relayUrl: "http://localhost:12345/relay/t",
       curlOutput: '{"error":"ask timeout"}',
     });
     try {
-      const input = makeInput({ question: "hi" }, env.dir);
+      const input = makeInput(singleQuestionInput(), env.dir);
       const { stdout, exitCode } = await runHook(env, input);
       expect(stdout.trim()).toBe("");
       expect(exitCode).toBe(0);
@@ -232,7 +306,7 @@ describe("ask-user-relay.sh — fallback / safety", () => {
       curlExit: 7, // CURLE_COULDNT_CONNECT
     });
     try {
-      const input = makeInput({ question: "hi" }, env.dir);
+      const input = makeInput(singleQuestionInput(), env.dir);
       const { stdout, exitCode } = await runHook(env, input);
       expect(stdout.trim()).toBe("");
       expect(exitCode).toBe(0);
@@ -249,7 +323,7 @@ describe("ask-user-relay.sh — fallback / safety", () => {
     try {
       const input = JSON.stringify({
         tool_name: "AskUserQuestion",
-        tool_input: { question: "hi" },
+        tool_input: singleQuestionInput(),
         // no `cwd`
       });
       const { stdout, exitCode } = await runHook(env, input);

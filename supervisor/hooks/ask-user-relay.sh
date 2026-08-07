@@ -1,16 +1,24 @@
 #!/bin/bash
-# Claude Code PreToolUse hook (matcher: AskUserQuestion). Issue #12 Phase 1.
+# Claude Code PreToolUse hook (matcher: AskUserQuestion). Issue #12 Phase 1 / #370.
 #
-# Forwards an AskUserQuestion prompt from a headless supervisor session to the
-# Discord thread, waits for the user's reply, and injects the reply back into
-# the tool call via PreToolUse `updatedInput` so Claude continues without
-# blocking on a TUI dialog.
+# Forwards an AskUserQuestion prompt from a supervisor session to the Discord
+# thread, waits for the user's reply, and returns the reply to Claude via a
+# PreToolUse deny envelope so Claude continues without blocking on a TUI
+# dialog that a Discord-only user can never see (Issue #370).
+#
+# Why deny instead of `updatedInput`: AskUserQuestion has no documented way to
+# pre-supply an answer through its input — rewriting the input still opens the
+# TUI dialog. A deny reason IS delivered to Claude as the tool result, so the
+# reason text mirrors the native answered-dialog wording ("Your questions have
+# been answered: ...") and Claude treats it as the user's answer, not a
+# refusal.
 #
 # Skipping behaviour
 # ------------------
 # Out of a supervisor session (no relay-url file for the cwd), the hook exits
 # 0 silently with no stdout — Claude sees the original tool input unchanged
 # and the regular TUI dialog flow runs (Issue #12 AC-3 / Journey-AC #3).
+# Unknown input shapes (no `questions[]`) fall through the same way.
 #
 # Relay URL discovery mirrors `progress-relay.sh`: the runtime-dir layout is
 # written by SessionManager.start (`relayUrlFilePath()` in manager.ts).
@@ -53,14 +61,36 @@ fi
 # gemini-code-assist on PR #142, comment 3179491537).
 ASK_URL=$(printf '%s' "$SUPERVISOR_RELAY_URL" | sed 's|/relay/|/ask/|')
 
-# Extract the question Claude wants to ask. AskUserQuestion's input shape is
-# `{ "question": "..." }`. Some flavours nest it under `prompt`, so accept
-# either; on the way out we always send `question` to the relay-server.
-QUESTION=$(echo "$INPUT" | jq -r '.tool_input.question // .tool_input.prompt // ""')
-if [ -z "$QUESTION" ]; then
-  # Nothing useful to forward — let Claude proceed with its original input.
+# AskUserQuestion's real input shape (Issue #370 D2, captured from a live
+# transcript) is:
+#   { "questions": [ { "question", "header", "multiSelect",
+#                      "options": [ { "label", "description" } ] } ] }
+# Single question: forward its text + options flattened to "label — description"
+# strings so Discord can list the choices. Multiple questions: forward all
+# question texts joined by newlines; per-question option mapping over one
+# free-text reply is ambiguous, so options are omitted.
+QUESTION_COUNT=$(echo "$INPUT" | jq -r '(.tool_input.questions // []) | length' 2>/dev/null)
+if [ -z "$QUESTION_COUNT" ] || [ "$QUESTION_COUNT" -eq 0 ] 2>/dev/null; then
+  # Unknown / legacy shape — let the regular TUI dialog handle it.
   exit 0
 fi
+
+QUESTION_TEXT=$(echo "$INPUT" | jq -r '(.tool_input.questions // []) | map(.question // "") | join("\n")')
+if [ -z "$QUESTION_TEXT" ]; then
+  exit 0
+fi
+
+PAYLOAD=$(echo "$INPUT" | jq -c '
+  (.tool_input.questions // []) as $qs
+  | if ($qs | length) == 1 then
+      { question: ($qs[0].question // ""),
+        options: [ $qs[0].options[]?
+          | (.label // "")
+            + (if (.description // "") != "" then " — " + .description else "" end) ] }
+      | if (.options | length) == 0 then del(.options) else . end
+    else
+      { question: ($qs | map(.question // "") | join("\n")) }
+    end')
 
 # Forward to the supervisor and wait for the user's reply. --max-time matches
 # the relay-server's DEFAULT_ASK_TIMEOUT_MS (300s since Issue #255) plus a small
@@ -68,7 +98,7 @@ fi
 # INVARIANT: this MUST stay >= DEFAULT_ASK_TIMEOUT_MS/1000, or curl gives up
 # before the server and the user's late reply is wasted. relay-server.test.ts
 # locks `--max-time*1000 >= DEFAULT_ASK_TIMEOUT_MS`.
-RESPONSE=$(jq -n --arg q "$QUESTION" '{question: $q}' | \
+RESPONSE=$(printf '%s' "$PAYLOAD" | \
   curl -s -X POST "$ASK_URL" \
     -H "Content-Type: application/json" \
     -d @- \
@@ -87,14 +117,13 @@ if [ -z "$ANSWER" ]; then
   exit 0
 fi
 
-# Inject the reply via PreToolUse `updatedInput`. Claude consumes this as the
-# new tool_input, so AskUserQuestion completes synchronously with the user's
-# reply and Claude continues on the next turn.
-jq -n --arg answer "$ANSWER" '{
+# Deliver the reply via PreToolUse deny. The reason mirrors the wording the
+# harness itself uses for an answered dialog, so Claude reads it as "the user
+# answered" and continues the turn with the answer in mind.
+jq -n --arg q "$QUESTION_TEXT" --arg a "$ANSWER" '{
   hookSpecificOutput: {
     hookEventName: "PreToolUse",
-    updatedInput: {
-      question: $answer
-    }
+    permissionDecision: "deny",
+    permissionDecisionReason: ("Your questions have been answered: \"" + $q + "\"=\"" + $a + "\". You can now continue with these answers in mind. (answered by the user via Discord relay)")
   }
 }'

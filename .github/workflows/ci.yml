@@ -120,6 +120,7 @@ jobs:
                    tests/hooks/stop-relay.test.ts \
                    tests/infra/db.test.ts \
                    tests/infra/db-isolation.test.ts \
+                   tests/infra/hook-wiring-check.test.ts \
                    tests/session/dialog-detect.test.ts \
                    tests/session/dialog-watchdog.test.ts \
                    tests/session/relay-send-failure.test.ts \

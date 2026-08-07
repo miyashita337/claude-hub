@@ -226,6 +226,17 @@ export function resolveAskUser(threadId: string, answer: string): void {
 }
 
 /**
+ * Issue #370: whether a /ask/:threadId request is currently awaiting a user
+ * reply for this thread. bot.ts consults this in messageCreate so the next
+ * thread message resolves the pending ask instead of being relayed into tmux
+ * (the session is blocked inside the PreToolUse hook and the TUI is not
+ * accepting input).
+ */
+export function hasPendingAsk(threadId: string): boolean {
+  return pendingAsks.has(threadId);
+}
+
+/**
  * Cancel a pending /ask/:threadId request. The waiting POST handler responds
  * with 499 (Client Closed Request, Nginx convention) so the hook script can
  * fall back to the original tool input rather than blocking the session.
