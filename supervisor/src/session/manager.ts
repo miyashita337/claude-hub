@@ -2065,6 +2065,21 @@ export class SessionManager {
     updateSessionStatus(session.id, "stopped", reason);
     this.cleanupRelayUrlFile(session.projectDir);
 
+    // Issue #369 (cause A): a supervisor shutdown (SIGTERM / launchctl
+    // kickstart) is NOT an explicit teardown — the user never chose to drop
+    // this work. `git worktree remove --force` here destroyed uncommitted work
+    // three times in the handoff-96-2 incident. Preserve the worktree so
+    // `/session resume` can pick the branch back up (matches the
+    // tmux_exited/recoverFromDb paths, and docs/e2e-orchestrate.md).
+    if (reason === "supervisor_restart") {
+      if (session.worktree) {
+        console.log(
+          `[SessionManager] Preserving worktree ${session.worktree.path} (supervisor restart; resume with /session resume)`
+        );
+      }
+      return;
+    }
+
     // Issue #154 (Q3): remove the per-branch worktree on stop; the branch is
     // preserved. But Q4 allows multiple sessions to share one worktree (同
     // branch 多重 session). `this.sessions` no longer contains the current
@@ -2156,8 +2171,12 @@ export class SessionManager {
 
   async shutdownAll(): Promise<void> {
     console.log("[SessionManager] Shutting down all sessions...");
+    // Issue #369 (cause A): record `supervisor_restart`, not `manual`. This is
+    // a SIGTERM-driven shutdown, not a user's /session stop — stop() preserves
+    // the worktree for this reason so uncommitted work survives the restart,
+    // and the DB reason matches what docs/e2e-orchestrate.md documents.
     const promises = Array.from(this.sessions.keys()).map((threadId) =>
-      this.stop(threadId, "manual").catch((err) =>
+      this.stop(threadId, "supervisor_restart").catch((err) =>
         console.error(`[SessionManager] Error stopping ${threadId}:`, err)
       )
     );
@@ -2167,7 +2186,7 @@ export class SessionManager {
       clearInterval(handle);
     }
     this.watchers.clear();
-    // Defensive — stop("manual") already drops each, but clear any orphan left
+    // Defensive — stop() above already drops each, but clear any orphan left
     // by a failed-then-unresumed self_heal_restart (Issue #244).
     this.selfHealers.clear();
     this.effects.relayServer.stop();

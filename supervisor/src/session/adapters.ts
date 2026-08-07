@@ -268,6 +268,26 @@ export const realTmuxAdapter: TmuxAdapter = {
       if (warnIfTmuxTimeout("has-session", name, err)) {
         return true;
       }
+      const e = err as NodeJS.ErrnoException | undefined;
+      // Issue #369 (cause B): under memory/load pressure the fork+exec of tmux
+      // itself can fail (EAGAIN/ENOMEM/EMFILE, ...) before tmux ever runs.
+      // Those errors carry a *string* errno code, unlike a real tmux
+      // "no such session" exit (numeric exit code on err.code). A spawn
+      // failure says nothing about the session, so — like a timeout — treat
+      // liveness as unknown and assume alive rather than tearing down live
+      // work.
+      if (typeof e?.code === "string") {
+        console.warn(
+          `[tmux] has-session spawn failed for ${name} (code=${e.code}); liveness unknown → assuming alive (#369)`
+        );
+        return true;
+      }
+      // tmux ran and exited non-zero → the session really is gone. Log the
+      // exit detail so a suspected false teardown can be diagnosed post-hoc
+      // (#369 B-1: this path used to be silent, making incidents unanalyzable).
+      console.warn(
+        `[tmux] has-session: no session ${name} (exit=${e?.code ?? "?"})`
+      );
       return false;
     }
   },

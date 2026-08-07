@@ -117,11 +117,45 @@ describe("realTmuxAdapter.hasSession timeout handling (#238 / #227)", () => {
   });
 
   test("returns false when the session genuinely does not exist (non-timeout error)", async () => {
-    mockExecFileError = new Error("can't find session: claude-dead");
+    // Real shape: tmux ran and exited 1 → promisify(execFile) sets the numeric
+    // exit code on err.code.
+    const err = new Error(
+      "Command failed: tmux has-session -t claude-dead\ncan't find session: claude-dead"
+    ) as Error & { code: number };
+    err.code = 1;
+    mockExecFileError = err;
 
     expect(await realTmuxAdapter.hasSession("claude-dead")).toBe(false);
-    // A real "no session" is not a timeout, so no timeout warning.
-    expect(warnSpy).not.toHaveBeenCalled();
+    // Issue #369 B-1: the "no session" outcome is logged with its exit detail
+    // so a false teardown can be diagnosed post-hoc (previously silent).
+    expect(warnSpy).toHaveBeenCalledTimes(1);
+    expect(String(warnSpy.mock.calls[0]?.[0])).toContain("claude-dead");
+    expect(String(warnSpy.mock.calls[0]?.[0])).toContain("exit=1");
+  });
+
+  test("#369 B-1: returns true (assume alive) when the tmux spawn itself fails (EAGAIN)", async () => {
+    // Under freeMem≈0% / load1≈50 the fork+exec of tmux can fail with
+    // EAGAIN/ENOMEM before tmux ever runs. That is NOT evidence the session
+    // exited — treating it as "exited" tears down a live session (the
+    // handoff-96 false-teardown, Issue #369 cause B). errno-style spawn
+    // failures carry a *string* code, unlike a tmux exit (numeric code).
+    const err = new Error("spawn EAGAIN") as NodeJS.ErrnoException;
+    err.code = "EAGAIN";
+    err.errno = -35;
+    mockExecFileError = err;
+
+    expect(await realTmuxAdapter.hasSession("claude-loaded")).toBe(true);
+    expect(warnSpy).toHaveBeenCalledTimes(1);
+    expect(String(warnSpy.mock.calls[0]?.[0])).toContain("EAGAIN");
+  });
+
+  test("#369 B-1: returns true (assume alive) on ENOMEM spawn failure", async () => {
+    const err = new Error("spawn ENOMEM") as NodeJS.ErrnoException;
+    err.code = "ENOMEM";
+    mockExecFileError = err;
+
+    expect(await realTmuxAdapter.hasSession("claude-oom")).toBe(true);
+    expect(warnSpy).toHaveBeenCalledTimes(1);
   });
 
   test("returns true when has-session succeeds (session present)", async () => {
