@@ -1,0 +1,44 @@
+# Issue #384 (Epic #381): weekly traceability metrics.
+#
+# Recomputes the #381 baseline numbers (main fix ratio / revert count /
+# main-push CI failures / bug-issue repro-section rate) and publishes them to
+# the run's Step Summary. This is the consumer that keeps the metric alive
+# (rules/general/observability.md: no writer without a consumer).
+#
+# Read-only: git log + read-scoped `gh api` / `gh issue list` only. No
+# Pushover, no issue writes, no real-service side effects.
+name: Traceability Metrics
+
+on:
+  schedule:
+    # Mondays 21:00 UTC = Tuesday 06:00 JST, before the workday starts.
+    - cron: "0 21 * * 1"
+  workflow_dispatch: {}
+
+permissions:
+  contents: read
+  issues: read
+  actions: read
+
+jobs:
+  metrics:
+    name: Weekly metrics report
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          # Full history: the script reads `git log --since` on main.
+          fetch-depth: 0
+          # Read-only job: git is only read locally, gh uses GH_TOKEN.
+          persist-credentials: false
+
+      - uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: latest
+
+      - name: Compute metrics
+        working-directory: supervisor
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+        run: bun scripts/traceability-metrics.ts --days 90 | tee "$GITHUB_STEP_SUMMARY"
