@@ -130,7 +130,7 @@ export function renderReport(r: ReportInput): string {
     // through merge commits; this script uses --first-parent (one entry per
     // landing on main), so its numbers are lower. Trends must only be compared
     // against this script's own history, anchored to the first scripted run:
-    "ベースライン（2026-08-08 初回スクリプト実測, 90日窓）: fix 22/94=23.4% / main 赤 4/92 / 再現手順 28/61=45.9%（#381 手動解析の 42/145 とは分母定義が異なる）",
+    "ベースライン（2026-08-08 初回スクリプト実測, 90日窓）: fix 22/94=23.4% / main 赤 4/92 / 再現手順 21/40=52.5%（#381 手動解析の 42/145 とは分母定義が異なる）",
   ].join("\n");
 }
 
@@ -155,19 +155,25 @@ if (import.meta.main) {
   const logText = await $`git log --first-parent --since=${days + " days ago"} --pretty=%s ${ref}`.text();
   const subjects = logText.split("\n").filter((l) => l.trim() !== "");
 
-  // Actions runs are paginated newest-first; 3 pages ≅ 300 runs covers >90 days
-  // at the current merge cadence. Older windows just clip (trend still valid).
+  const sinceDate = new Date(Date.now() - days * 86400_000).toISOString().slice(0, 10);
+
+  // Server-side `created` filter keeps the window exact; pages are followed
+  // until exhausted (cap 20 = 2000 runs, far above the weekly cadence — if the
+  // cap ever clips, say so instead of silently under-reporting failures).
   const runs: CiRunLite[] = [];
-  for (let page = 1; page <= 3; page++) {
+  for (let page = 1; page <= 20; page++) {
     const chunk = JSON.parse(
-      await $`gh api ${"repos/" + repo + "/actions/runs?per_page=100&page=" + page}`.text(),
-    ).workflow_runs as (CiRunLite & { created_at: string })[];
-    runs.push(...chunk.filter((r) => Date.now() - Date.parse(r.created_at) < days * 86400_000));
+      await $`gh api ${"repos/" + repo + "/actions/runs?per_page=100&page=" + page + "&created=>=" + sinceDate}`.text(),
+    ).workflow_runs as CiRunLite[];
+    runs.push(...chunk);
     if (chunk.length < 100) break;
+    if (page === 20) console.error(`⚠ CI run pagination capped at 2000 within ${days}d — mainRuns may undercount.`);
   }
 
+  // Same window as the commit metric. Closed bugs stay in the denominator on
+  // purpose: a fixed-and-closed bug still either had repro steps or didn't.
   const issues: IssueLite[] = JSON.parse(
-    await $`gh issue list -R ${repo} --state all --limit 200 --json number,title,labels,body`.text(),
+    await $`gh issue list -R ${repo} --state all --limit 500 --search ${"created:>=" + sinceDate} --json number,title,labels,body`.text(),
   );
 
   const report = renderReport({

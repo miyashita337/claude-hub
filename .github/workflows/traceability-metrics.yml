@@ -29,6 +29,8 @@ jobs:
         with:
           # Full history: the script reads `git log --since` on main.
           fetch-depth: 0
+          # Read-only job: git is only read locally, gh uses GH_TOKEN.
+          persist-credentials: false
 
       - uses: oven-sh/setup-bun@v2
         with:
