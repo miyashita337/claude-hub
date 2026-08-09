@@ -3,6 +3,7 @@ import { mkdirSync } from "fs";
 import { tmpdir } from "os";
 import { resolve } from "path";
 import {
+  HEADLESS_TIMEOUT_MS,
   SessionManager,
   buildHeadlessClaudeFlags,
   buildPendingGuardFlags,
@@ -280,6 +281,58 @@ describe("SessionManager.runHeadless", () => {
     expect(mgr.count()).toBe(0);
     expect(mgr.has("thread-fail")).toBe(false);
     await mgr.shutdownAll();
+  });
+
+  // Issue #388: the headless wall-clock ceiling. Pins the default so it cannot
+  // drift away from docs/bot-operations.md, and asserts the env override still
+  // reaches the executor.
+  describe("headless wall-clock ceiling (#388)", () => {
+    /** Run runHeadless with DISPATCH_HEADLESS_TIMEOUT_MS forced to `value`. */
+    async function timeoutForEnv(
+      value: string | undefined,
+      threadId: string,
+    ): Promise<number | undefined> {
+      const prev = process.env.DISPATCH_HEADLESS_TIMEOUT_MS;
+      if (value === undefined) delete process.env.DISPATCH_HEADLESS_TIMEOUT_MS;
+      else process.env.DISPATCH_HEADLESS_TIMEOUT_MS = value;
+      try {
+        const fx = createFakeEffects();
+        const mgr = new SessionManager({
+          effects: fx,
+          gracefulKillTimeoutMs: 0,
+          probeArtifactsFn: foundArtifactsFn,
+        });
+        await mgr.runHeadless(config, threadId, "/pdca 388", `corp-dispatch-${threadId}`);
+        await mgr.shutdownAll();
+        return fx.executor.runHeadlessCalls[0]!.timeoutMs;
+      } finally {
+        if (prev === undefined) delete process.env.DISPATCH_HEADLESS_TIMEOUT_MS;
+        else process.env.DISPATCH_HEADLESS_TIMEOUT_MS = prev;
+      }
+    }
+
+    test("HEADLESS_TIMEOUT_MS default is 5h (18000000 ms) and matches docs (AC-1)", () => {
+      // Literal, not `5 * 60 * 60 * 1000`: this pins the exact number quoted in
+      // docs/bot-operations.md so the two cannot drift apart silently.
+      expect(HEADLESS_TIMEOUT_MS).toBe(18_000_000);
+    });
+
+    test("runHeadless hands the 5h default to the executor when the env is unset", async () => {
+      expect(await timeoutForEnv(undefined, "thread-to-default")).toBe(18_000_000);
+    });
+
+    test("DISPATCH_HEADLESS_TIMEOUT_MS overrides the default (AC-2)", async () => {
+      expect(await timeoutForEnv("60000", "thread-to-env")).toBe(60_000);
+    });
+
+    test("invalid DISPATCH_HEADLESS_TIMEOUT_MS values fall back to the default", async () => {
+      // 0 / negative / non-numeric / blank are not usable ceilings: fail safe to
+      // the compiled-in default rather than spawning with an absurd timeout.
+      expect(await timeoutForEnv("0", "thread-to-zero")).toBe(HEADLESS_TIMEOUT_MS);
+      expect(await timeoutForEnv("-1", "thread-to-neg")).toBe(HEADLESS_TIMEOUT_MS);
+      expect(await timeoutForEnv("abc", "thread-to-nan")).toBe(HEADLESS_TIMEOUT_MS);
+      expect(await timeoutForEnv("", "thread-to-blank")).toBe(HEADLESS_TIMEOUT_MS);
+    });
   });
 
   // corp #81 Phase 6 / #298: DISPATCH_CLAUDE_MODEL → headless --model.
