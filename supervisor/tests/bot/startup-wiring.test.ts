@@ -315,27 +315,53 @@ describe("bot.ts does not bypass the wiring surface (#383)", () => {
   // A `client.on(...)` added straight into startBot() would be invisible to it,
   // which puts us back at the #370 failure mode. Source-level guard, same shape
   // as tests/guards/access-enforcement-wired.test.ts.
+  // `\s*` around the dot, applied to comment-stripped and whitespace-collapsed
+  // source, so a call split across lines (`client\n  .on(`) cannot slip past.
   const BYPASS_PATTERNS: Array<{ pattern: RegExp; why: string }> = [
-    { pattern: /\bclient\.(on|once)\s*\(/, why: "use wireBoot() with a client:* id" },
-    { pattern: /\bprocess\.on\s*\(/, why: "use wireBoot() with a process:* id" },
     {
-      pattern: /\bsessionManager\.onSessionEnd\s*\(/,
+      pattern: /\bclient\s*\.\s*(on|once)\s*\(/g,
+      why: "use wireBoot() with a client:* id",
+    },
+    {
+      pattern: /\bprocess\s*\.\s*on\s*\(/g,
+      why: "use wireBoot() with a process:* id",
+    },
+    {
+      pattern: /\bsessionManager\s*\.\s*onSessionEnd\s*\(/g,
       why: "use wireBoot() with sessionManager:sessionEnd",
     },
     {
-      pattern: /\bon(Progress|SessionsQuery|AskUser|LateResponse|HubWork|ChannelPost)\s*\(/,
+      pattern:
+        /\bon(Progress|SessionsQuery|AskUser|LateResponse|HubWork|ChannelPost)\s*\(/g,
       why: "use wireReady() with the matching relay:* id",
     },
   ];
 
+  /**
+   * Drop block and line comments before matching. Without this a trailing
+   * comment (`foo(); // client.on(...) は使わない`) or a commented-out example
+   * reads as a bypass. Truncating a `//` inside a string literal is harmless
+   * here — the result is only searched for registration calls.
+   */
+  function stripComments(src: string): string {
+    return src.replace(/\/\*[\s\S]*?\*\//g, "").replace(/\/\/.*$/gm, "");
+  }
+
+  /** Comment-free, whitespace-collapsed source ready for pattern matching. */
+  function scannable(src: string): string {
+    return stripComments(src).replace(/\s+/g, " ");
+  }
+
   test("startBot registers only via wireBoot / wireReady", async () => {
     const src = await Bun.file("src/bot.ts").text();
+    const haystack = scannable(src);
 
     for (const { pattern, why } of BYPASS_PATTERNS) {
-      const offenders = src
-        .split("\n")
-        .map((line, i) => ({ line: line.trim(), no: i + 1 }))
-        .filter(({ line }) => pattern.test(line) && !line.startsWith("//"));
+      // Report the surrounding snippet: line numbers are gone after collapsing,
+      // and the snippet is what actually tells you where to look.
+      const offenders = [...haystack.matchAll(pattern)].map((m) =>
+        haystack.slice(Math.max(0, m.index - 60), m.index + 60),
+      );
       expect({ pattern: String(pattern), offenders, why }).toEqual({
         pattern: String(pattern),
         offenders: [],
@@ -346,6 +372,18 @@ describe("bot.ts does not bypass the wiring surface (#383)", () => {
     // ...and it does apply both halves of the contract.
     expect(src).toContain("wireBoot(wiringSurface");
     expect(src).toContain("wireReady(wiringSurface");
+  });
+
+  test("the guard ignores comments and catches a split-line bypass", () => {
+    // Guard-the-guard: without stripComments the first two samples false-positive,
+    // and without whitespace collapsing the third one escapes detection.
+    const clientPattern = BYPASS_PATTERNS[0]!.pattern;
+    const hits = (src: string): number =>
+      [...scannable(src).matchAll(clientPattern)].length;
+
+    expect(hits("wireBoot(s, {}); // client.on(...) は使わない\n")).toBe(0);
+    expect(hits("/* client.once(Events.ClientReady, h) */\nwireBoot(s, {});")).toBe(0);
+    expect(hits("client\n  .on(Events.MessageCreate, h);")).toBe(1);
   });
 });
 

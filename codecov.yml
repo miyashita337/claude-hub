@@ -63,6 +63,8 @@ ignore:
   # エントリ（~38 行、ビジネスロジックなし）。トークン無しでは実行不能な境界
   # コードのため除外（AC-1/2/3 は PR 本文で手動検証扱い。ci.yml e2e-tests
   # ジョブのコメント参照）。
+  - "supervisor/index.ts"
+  #
   # NOTE: src/bot.ts はコアロジック（アクセス制御 / self-heal / キュー / 中継）を
   # 含むため除外しない。#383（Epic #381）で startBot() の**起動時配線**を
   # src/bot-wiring.ts へ分離し、tests/bot/startup-wiring.test.ts で計測・検証
@@ -81,7 +83,8 @@ ignore:
   #     除外すると、今後 bot.ts へ**戻る**方向の変更が検知されなくなる。
   # patch は WARN-first（informational）なので、未カバーの残部に触れた PR が
   # 不当に FAIL することはない。blocking 昇格時の再評価は #300 で追跡する。
-  - "supervisor/index.ts"
+  # （src/bot.ts の除外エントリは意図的に存在しない）
+  #
   # iterm2 タブ着色。~/.claude/scripts/project-colors.json とローカル iTerm2 を
   # 要するローカル専用（ci.yml 末尾「Local-only tests」参照）。
   - "supervisor/src/session/iterm2.ts"
