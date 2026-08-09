@@ -151,6 +151,7 @@ jobs:
                    tests/hijoguchi-routing/p0.test.ts \
                    tests/e2e/ac-verification.test.ts \
                    tests/scripts/lint-gating-coverage.test.ts \
+                   tests/scripts/lcov-hits-only.test.ts \
                    tests/scripts/traceability-metrics.test.ts \
                    tests/commands/session-compact.test.ts \
                    tests/commands/compact-button.test.ts \
@@ -223,13 +224,25 @@ jobs:
       # (PR #239). It uses mock.module("child_process"), which is
       # process-global in Bun and would leak into the curated list above, so it
       # runs as its OWN `bun test` process. No `|| true` — it must gate the
-      # build (RW-029: a silently-green CI is worse than a red one). Not run
-      # with --coverage so it does not overwrite the lcov.info produced above.
+      # build (RW-029: a silently-green CI is worse than a red one).
+      #
+      # It DOES run with --coverage, into its own --coverage-dir (#300). It used
+      # to run without --coverage "so it does not overwrite the lcov.info
+      # produced above" — but that silently DISCARDED the coverage of every
+      # mock-isolated suite, so lines these tests do exercise were reported to
+      # Codecov as unhit. That is not cosmetic: PR #378 changed adapters.ts and
+      # added this very test file in the same PR, and still scored 27.58% of
+      # diff hit — a false FAIL that only stayed invisible because patch was
+      # informational. Separate --coverage-dir keeps lcov.info intact and each
+      # report is uploaded on its own below; Codecov merges same-commit reports.
       - name: Run mock-isolated session tests (#238 hasSession ETIMEDOUT)
         env:
           SUPERVISOR_DB_PATH: ":memory:"
           TMUX_PATH: /usr/bin/tmux
-        run: bun test tests/session/adapters-hassession.test.ts
+        run: |
+          bun test --coverage --coverage-reporter=lcov \
+                   --coverage-dir=coverage-hassession \
+                   tests/session/adapters-hassession.test.ts
 
       # adapters.test.ts and tmux.test.ts each call mock.module("child_process"),
       # which is process-global in Bun and pollutes any file sharing the process
@@ -240,13 +253,19 @@ jobs:
         env:
           SUPERVISOR_DB_PATH: ":memory:"
           TMUX_PATH: /usr/bin/tmux
-        run: bun test tests/session/adapters.test.ts
+        run: |
+          bun test --coverage --coverage-reporter=lcov \
+                   --coverage-dir=coverage-adapters \
+                   tests/session/adapters.test.ts
 
       - name: Run mock-isolated tmux tests (#248)
         env:
           SUPERVISOR_DB_PATH: ":memory:"
           TMUX_PATH: /usr/bin/tmux
-        run: bun test tests/session/tmux.test.ts
+        run: |
+          bun test --coverage --coverage-reporter=lcov \
+                   --coverage-dir=coverage-tmux \
+                   tests/session/tmux.test.ts
 
       # #227 (PR-1 / #249) AC-3: relay.ts's tmux send hot path must stay
       # non-blocking after the execFileSync→execFile migration. This file mocks
@@ -257,8 +276,42 @@ jobs:
         env:
           SUPERVISOR_DB_PATH: ":memory:"
           TMUX_PATH: /usr/bin/tmux
-        run: bun test tests/session/relay-nonblocking.test.ts
+        run: |
+          bun test --coverage --coverage-reporter=lcov \
+                   --coverage-dir=coverage-relay-nonblocking \
+                   tests/session/relay-nonblocking.test.ts
 
+      # The isolated reports are NOT uploaded raw. A suite that merely imports a
+      # module still emits DA records for it, and Bun instruments a larger line
+      # set in those runs, so a raw merge inflates the denominator: measured on
+      # this repo it moved relay.ts 57.53% -> 42.57% and the whole report
+      # 77.21% -> 73.61%. Stripping zero-hit records keeps the curated run as
+      # the sole source of the denominator and lets the isolated runs only ADD
+      # evidence that a line executed (adapters.ts 38.18% -> 61.82%,
+      # tmux.ts 70.59% -> 91.18%, total 77.21% -> 78.15%, denominator identical).
+      # Rationale in full: supervisor/scripts/lcov-hits-only.ts (#300).
+      #
+      # The raw file is deleted right after filtering, and every upload step
+      # below sets `disable_search: true`. Both are needed: codecov-action
+      # defaults to `disable_search: false`, which makes the CLI ALSO auto-scan
+      # the tree and upload every lcov.info it finds — on the first run of this
+      # change it reported "Found 5 coverage files" and shipped the very raw
+      # reports this step exists to filter out, silently reintroducing the
+      # inflated denominator. Deleting the raw file makes the invariant hold
+      # even if that default flips back.
+      - name: Keep only executed lines from the mock-isolated reports (#300)
+        run: |
+          for name in hassession adapters tmux relay-nonblocking; do
+            bun scripts/lcov-hits-only.ts \
+              "coverage-$name/lcov.info" "coverage-$name/hits-only.info"
+            rm "coverage-$name/lcov.info"
+          done
+
+      # One upload step per report, each with a single `files` value — the same
+      # shape agent-base/.github/workflows/ci.yml already uses for its python +
+      # shell reports. All five carry the same `unit-tests` flag because they
+      # are all this job's unit tests; Codecov merges reports uploaded for the
+      # same commit, so the merged view is curated ∪ mock-isolated (#300).
       - name: Upload coverage to Codecov
         if: always()
         uses: codecov/codecov-action@v5
@@ -266,6 +319,43 @@ jobs:
           files: supervisor/coverage/lcov.info
           flags: unit-tests
           fail_ci_if_error: false
+          disable_search: true
+
+      - name: Upload mock-isolated hasSession coverage to Codecov
+        if: always()
+        uses: codecov/codecov-action@v5
+        with:
+          files: supervisor/coverage-hassession/hits-only.info
+          flags: unit-tests
+          fail_ci_if_error: false
+          disable_search: true
+
+      - name: Upload mock-isolated adapters coverage to Codecov
+        if: always()
+        uses: codecov/codecov-action@v5
+        with:
+          files: supervisor/coverage-adapters/hits-only.info
+          flags: unit-tests
+          fail_ci_if_error: false
+          disable_search: true
+
+      - name: Upload mock-isolated tmux coverage to Codecov
+        if: always()
+        uses: codecov/codecov-action@v5
+        with:
+          files: supervisor/coverage-tmux/hits-only.info
+          flags: unit-tests
+          fail_ci_if_error: false
+          disable_search: true
+
+      - name: Upload mock-isolated relay coverage to Codecov
+        if: always()
+        uses: codecov/codecov-action@v5
+        with:
+          files: supervisor/coverage-relay-nonblocking/hits-only.info
+          flags: unit-tests
+          fail_ci_if_error: false
+          disable_search: true
 
   routing-tests:
     name: Routing Tests (S5 #51)

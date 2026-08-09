@@ -1,10 +1,19 @@
 # codecov 設定（Epic miyashita337/agent-base#420 Phase 2 / rules/general/coverage-policy.md 準拠）
 #
-# WARN-first 運用（coverage-policy.md §6）:
-#   patch / project とも informational: true（WARN-only、非 blocking）で導入し、
-#   数 PR dogfood して false positive がないことを確認してから blocking 昇格する。
-#   blocking 昇格の条件・期限・手順は follow-up issue #300 で追跡する
-#   （informational のまま放置しない）。
+# WARN-first 運用（coverage-policy.md §6）の現在地:
+#   patch   = blocking（informational: false）。#300 で昇格した。
+#   project = informational: true 据え置き。理由は下の project ブロックを参照。
+#
+# 昇格の根拠（#300, 2026-08-09 実測）:
+#   informational: true の status は conclusion が常に success になるため、
+#   「マージ済み PR が全部緑だった」は dogfood の証拠にならない。実判定は
+#   check-run の output.title 側にある。#296 マージ以降の 20 PR を実測すると
+#   3 件が target 70% 未満で、うち #378 は false positive だった（adapters.ts の
+#   変更と担保テストを同一 PR で入れているのに 27.58%）。原因は ci.yml の
+#   mock-isolated ステップが --coverage なしで走りカバレッジを捨てていたこと。
+#   これを --coverage-dir 分離 + 個別アップロードで解消した上で昇格している。
+#   残る 2 件（#387 54.32% / #403 57.14%）は CLI の main ブロックと実 iTerm2
+#   経路の真の未テストで、false positive ではない = ゲートの意図した動作。
 
 coverage:
   precision: 2
@@ -12,15 +21,24 @@ coverage:
   range: "60...90"
   status:
     # プロジェクト全体: regression 禁止の ratchet（coverage-policy.md §2）。
-    # ベースライン実測（2026-07-05, ci.yml の curated Unit Tests suite）:
-    #   line 78.60% / func 81.04%。
+    # 実測（curated Unit Tests suite）:
+    #   2026-07-05 ベースライン line 78.60% / func 81.04%
+    #   2026-08-09 現在        line 81.09% / func 83.34%
     # target: auto = ベースコミット比で低下禁止。実測値の向上に合わせて
     # 明示 target（"80%" 等）へ段階引き上げる。
+    #
+    # patch と違い informational: true のまま据え置く（#300）。codecov/project
+    # という check は **一度も投稿されたことがない** ためである。#296 マージ
+    # 以降の PR 20 件と main 直近 6 commit の check-runs を実測したが、出るのは
+    # codecov/patch だけだった（原因は未特定 / 確度:低）。投稿されない status は
+    # dogfood できず、required status check に足せば PR が永久に pending で
+    # 詰まる。原因調査と昇格可否は #404 で追跡する。required status check の
+    # 追加自体（branch protection がまだ 1 つも無い）は #406 で扱う。
     project:
       default:
         target: auto
         threshold: 1% # 計測ノイズ許容（Bun coverage の実行順依存分）
-        informational: true # WARN-first。blocking 昇格は follow-up #300
+        informational: true # 投稿実績ゼロのため昇格不可。follow-up で調査
 
     # patch coverage: PR の変更行のみに適用（coverage-policy.md §1）。
     #
@@ -31,16 +49,22 @@ coverage:
     # 制約: codecov の ignore も Bun coverage も「行 / 分岐単位の除外」を
     # サポートしない（Bun は c8 / istanbul の ignore コメントを無視する。
     # 2026-07-05 検証済み）。よって relay.ts の error 分岐だけを外すことは
-    # できず、relay.ts はスコープ内に残す。WARN-first（informational）にする
-    # ことで、error 分岐のみ変更した PR が patch check で不当に FAIL すること
-    # を防ぐ（統合ジャーニーAC-3）。blocking 昇格時に relay.ts の error 分岐を
-    # 実 tmux 統合テストで誘発するか個別対応するかを follow-up #300 で判断する。
+    # できず、relay.ts はスコープ内に残す。
+    #
+    # #300 で決着（選択肢 a を採用）: ETIMEDOUT 分岐は
+    # tests/session/adapters-hassession.test.ts が既に担保している。足りな
+    # かったのはテストではなく **計測** で、当該 suite は mock.module 汚染を
+    # 避けるため独立プロセスで走らせつつ --coverage を外していた。ci.yml で
+    # --coverage-dir を分けて個別アップロードするようにしたので、この分岐は
+    # 計測されるようになった。よって relay.ts 専用の低め target（選択肢 c）も
+    # file-level 除外（選択肢 b、coverage-policy.md §5 の anti-gaming 違反）も
+    # 不要。
     patch:
       default:
         target: 70%
         threshold: 0%
         only_pulls: true
-        informational: true # WARN-first。blocking 昇格は follow-up #300
+        informational: false # blocking（#300）。根拠はファイル冒頭を参照
 
 # 変更を PR にインラインで注記する。マージゲート（強制）はテスト系ジョブ:
 #   - Type Check (bunx tsc --noEmit)
@@ -81,8 +105,9 @@ ignore:
   #   - 実際、これらの分岐の多くは既に純関数側（access-policy / slash-prefix /
   #     dispatch / orchestrate / salvage-reply）へ切り出され計測されている。
   #     除外すると、今後 bot.ts へ**戻る**方向の変更が検知されなくなる。
-  # patch は WARN-first（informational）なので、未カバーの残部に触れた PR が
-  # 不当に FAIL することはない。blocking 昇格時の再評価は #300 で追跡する。
+  # patch は #300 で blocking になったため、未カバーの残部に触れる PR は
+  # 変更行の 70% を要求される。これは除外し直す理由にはならない（上の 3 点は
+  # blocking かどうかと独立）。残債の解消は #405 で追跡する。
   # （src/bot.ts の除外エントリは意図的に存在しない）
   #
   # NOTE: src/session/iterm2.ts は除外しない（Issue #385 で除外を撤回）。
@@ -96,7 +121,9 @@ ignore:
   # 実行経路のみで、これは relay.ts の tmux error 分岐と同型の「ファイル単位
   # 除外では切り出せない部分的未カバー」。実ロジックを含むファイルの blanket
   # 除外は coverage-policy.md §5 の anti-gaming に反する（上の bot.ts の判断と
-  # 同じ）ため、informational（WARN-first）のままスコープ内に残す。
+  # 同じ）ため、スコープ内に残す。patch が blocking になった今でも同じ判断で
+  # ある: 実 iTerm2 経路に触る PR にテストを要求するのは正しい挙動で、それを
+  # 避けるための file-level 除外こそが anti-gaming 違反にあたる。
   # launchd 定義（宣言的 XML）。実行コードでなくカバレッジ対象外。
   - "**/*.plist"
   - "**/*.plist.template"

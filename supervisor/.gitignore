@@ -8,6 +8,9 @@ dist
 
 # code coverage
 coverage
+# per-suite --coverage-dir outputs for the mock-isolated `bun test` runs (#300).
+# `coverage` above matches that exact name only, so these need their own entry.
+coverage-*
 *.lcov
 
 # logs
