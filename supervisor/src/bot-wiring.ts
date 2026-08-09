@@ -251,7 +251,7 @@ export function createDiscordWiringSurface(
 // Recording surface + diff (test / introspection)
 // ---------------------------------------------------------------------------
 
-export interface RecordedWiring {
+interface RecordedWiring {
   id: WiringId;
   handler: unknown;
 }
@@ -276,10 +276,6 @@ export class RecordingWiringSurface implements BotWiringSurface {
   /** Handlers registered for an id. Length > 1 means a duplicate registration. */
   handlersFor(id: WiringId): unknown[] {
     return this.recorded.filter((r) => r.id === id).map((r) => r.handler);
-  }
-
-  entries(): readonly RecordedWiring[] {
-    return this.recorded;
   }
 }
 
