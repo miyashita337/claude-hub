@@ -1,5 +1,8 @@
-import { describe, expect, test } from "bun:test";
-import { hitsOnly } from "../../scripts/lcov-hits-only";
+import { afterAll, describe, expect, test } from "bun:test";
+import { existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
+import { hitsOnly, runCli } from "../../scripts/lcov-hits-only";
 
 /**
  * Issue #300. The filter's whole job is to make the mock-isolated `bun test`
@@ -115,5 +118,48 @@ describe("hitsOnly", () => {
 
   test("tolerates a report with no trailing end_of_record", () => {
     expect(hitsOnly(["SF:src/a.ts", "DA:1,1"].join("\n"))).toContain("SF:src/a.ts");
+  });
+});
+
+/**
+ * The CLI must fail LOUDLY. CI runs it between the test steps and the Codecov
+ * uploads, and the uploads use `fail_ci_if_error: false` — so if this script
+ * ever emitted an empty file or shrugged at a missing input, the isolated
+ * coverage would vanish and every PR would silently lose it. That is the exact
+ * RW-029 "silently-green CI" shape the surrounding job comments warn about.
+ */
+describe("runCli", () => {
+  const dir = mkdtempSync(join(tmpdir(), "lcov-hits-only-"));
+  afterAll(() => rmSync(dir, { recursive: true, force: true }));
+
+  test("writes the filtered report and returns 0", () => {
+    const input = join(dir, "in.info");
+    const output = join(dir, "out.info");
+    writeFileSync(input, ["SF:src/a.ts", "DA:1,4", "DA:2,0", "end_of_record"].join("\n"));
+
+    expect(runCli([input, output])).toBe(0);
+
+    const written = readFileSync(output, "utf8");
+    expect(written).toContain("DA:1,4");
+    expect(written).not.toContain("DA:2,0");
+  });
+
+  test("returns 1 when the input file is missing", () => {
+    expect(runCli([join(dir, "absent.info"), join(dir, "unused.info")])).toBe(1);
+    expect(existsSync(join(dir, "unused.info"))).toBe(false);
+  });
+
+  test("returns 1 rather than writing an empty report", () => {
+    const input = join(dir, "all-unhit.info");
+    const output = join(dir, "never-written.info");
+    writeFileSync(input, ["SF:src/a.ts", "DA:1,0", "end_of_record"].join("\n"));
+
+    expect(runCli([input, output])).toBe(1);
+    expect(existsSync(output)).toBe(false);
+  });
+
+  test("returns 2 when either argument is missing", () => {
+    expect(runCli([join(dir, "in.info")])).toBe(2);
+    expect(runCli([])).toBe(2);
   });
 });

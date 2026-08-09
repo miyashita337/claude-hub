@@ -93,23 +93,34 @@ export function hitsOnly(source: string): string {
   return out.length > 0 ? `${out.join("\n")}\n` : "";
 }
 
-if (import.meta.main) {
-  const [input, output] = process.argv.slice(2);
+/**
+ * Returns the process exit code instead of calling `process.exit`, so the
+ * guards below are exercised in-process by the tests. CI runs this between the
+ * test steps and the Codecov uploads, and those uploads set
+ * `fail_ci_if_error: false` — so a script that shrugged at a missing input or
+ * wrote an empty report would silently drop the isolated coverage from every
+ * PR. That is the RW-029 "silently-green CI" shape, hence the loud exits.
+ */
+export function runCli(args: string[]): number {
+  const [input, output] = args;
   if (!input || !output) {
     console.error("usage: bun scripts/lcov-hits-only.ts <input.info> <output.info>");
-    process.exit(2);
+    return 2;
   }
-  // Fail loudly rather than emitting an empty report: a silently-missing
-  // upload would drop coverage on every PR once patch is blocking (RW-029).
   if (!existsSync(input)) {
     console.error(`lcov-hits-only: input not found: ${input}`);
-    process.exit(1);
+    return 1;
   }
   const filtered = hitsOnly(readFileSync(input, "utf8"));
   if (filtered === "") {
     console.error(`lcov-hits-only: ${input} contains no executed line`);
-    process.exit(1);
+    return 1;
   }
   writeFileSync(output, filtered);
   console.log(`lcov-hits-only: ${input} -> ${output}`);
+  return 0;
+}
+
+if (import.meta.main) {
+  process.exit(runCli(process.argv.slice(2)));
 }
