@@ -108,7 +108,7 @@ dispatch は「Issue 番号とコマンドを与えて完走させる」バッ�
 |---|---|---|
 | `DISPATCH_EXECUTOR_MODE` | 未設定（既定） / `tmux` | 現行の tmux 対話 TUI 経路（変更なし） |
 | `DISPATCH_EXECUTOR_MODE` | `headless` | dispatch を `claude -p` の子プロセスで実行し stdout をスレッド返却 |
-| `DISPATCH_HEADLESS_TIMEOUT_MS` | 正の整数（既定 `7200000` = 2h） | headless 子プロセスの wall-clock 上限。超過で SIGTERM → スレッドにタイムアウト明示 |
+| `DISPATCH_HEADLESS_TIMEOUT_MS` | 正の整数（既定 `18000000` = 5h、#388 で 2h から延長） | headless 子プロセスの wall-clock 上限。超過で SIGTERM → スレッドにタイムアウト明示。不正値（0 / 負 / 非数値）は既定へフォールバック |
 | `DISPATCH_CLAUDE_MODEL` | 未設定（既定） | 設定時のみ headless argv に `--model <値>` を追加（例 `claude-opus-4-8`）。未設定・空白のみ = 環境既定モデル（現行不変）。corp #81 Phase 6 / #298 |
 
 - 完全に **opt-in**: `headless` 以外の値（未設定・空・大文字 `HEADLESS` 等）はすべて `tmux` にフォールバックする（`resolveExecutorMode`、fail-safe）。
@@ -123,7 +123,7 @@ headless の argv は `buildHeadlessClaudeFlags()`（`supervisor/src/session/man
 ### ライフサイクル / 誤回収防止
 
 - 子プロセス spawn 時に session を登録（MAX_SESSIONS 枠・`/session list` に反映）、exit で close（DB を `stopped` 化、reason は `headless_exited` / タイムアウトは `headless_timeout`、worktree は best-effort 削除）。
-- headless セッションは自己終了（子プロセス exit が権威的な liveness）で relay 進捗を出さないため、tmux idle 前提の **OrphanDispatchReaper / GoalWatcher は `executor:"headless"` を skip** する（idle 誤回収・done ラベル起因の stop() レースを回避）。wedge した子は上記 `DISPATCH_HEADLESS_TIMEOUT_MS` で回収する。
+- headless セッションは自己終了（子プロセス exit が権威的な liveness）で relay 進捗を出さないため、tmux idle 前提の **OrphanDispatchReaper / GoalWatcher は `executor:"headless"` を skip** する（idle 誤回収・done ラベル起因の stop() レースを回避）。wedge した子は上記 `DISPATCH_HEADLESS_TIMEOUT_MS` で回収する。既定を 5h に延ばした結果（#388）、wedge した子が MAX_SESSIONS 枠を占有し得る最大時間も 5h になる。枠飽和が起きる運用では `DISPATCH_HEADLESS_TIMEOUT_MS` を短く戻すか `DISPATCH_MAX_CONCURRENT` を下げて同時実行数側で調整する。
 
 ### 観測ログ
 
