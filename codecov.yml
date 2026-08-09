@@ -85,3 +85,10 @@ ignore:
   # に該当。CI では実行不能な境界コード（index.ts と同型の正当化）。
   # 注: supervisor/tools/session-ctl.ts は計測対象のまま（除外しない）。
   - "supervisor/tools/e2e-live.ts"
+  # 同上（Issue #386）。隔離スタックで実 tmux セッションを起動・kill する
+  # シナリオ本体で、CI では実行できない（実 tmux + 実 git worktree + 使い捨て
+  # Supervisor スタックを要する）。**判定規則の側**（署名の正規化 / error loop の
+  # 閾値 / 誤検知防止 / 隔離ガード）は純関数として切り出し、
+  # tests/tools/e2e-isolated.test.ts が CI で常時検証する = 除外しても
+  # ロジックが無検証にはならない（coverage-policy.md §4 / §5）。
+  - "supervisor/tools/e2e-isolated.ts"
