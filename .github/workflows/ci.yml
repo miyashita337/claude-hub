@@ -290,11 +290,21 @@ jobs:
       # evidence that a line executed (adapters.ts 38.18% -> 61.82%,
       # tmux.ts 70.59% -> 91.18%, total 77.21% -> 78.15%, denominator identical).
       # Rationale in full: supervisor/scripts/lcov-hits-only.ts (#300).
+      #
+      # The raw file is deleted right after filtering, and every upload step
+      # below sets `disable_search: true`. Both are needed: codecov-action
+      # defaults to `disable_search: false`, which makes the CLI ALSO auto-scan
+      # the tree and upload every lcov.info it finds — on the first run of this
+      # change it reported "Found 5 coverage files" and shipped the very raw
+      # reports this step exists to filter out, silently reintroducing the
+      # inflated denominator. Deleting the raw file makes the invariant hold
+      # even if that default flips back.
       - name: Keep only executed lines from the mock-isolated reports (#300)
         run: |
           for name in hassession adapters tmux relay-nonblocking; do
             bun scripts/lcov-hits-only.ts \
               "coverage-$name/lcov.info" "coverage-$name/hits-only.info"
+            rm "coverage-$name/lcov.info"
           done
 
       # One upload step per report, each with a single `files` value — the same
@@ -309,6 +319,7 @@ jobs:
           files: supervisor/coverage/lcov.info
           flags: unit-tests
           fail_ci_if_error: false
+          disable_search: true
 
       - name: Upload mock-isolated hasSession coverage to Codecov
         if: always()
@@ -317,6 +328,7 @@ jobs:
           files: supervisor/coverage-hassession/hits-only.info
           flags: unit-tests
           fail_ci_if_error: false
+          disable_search: true
 
       - name: Upload mock-isolated adapters coverage to Codecov
         if: always()
@@ -325,6 +337,7 @@ jobs:
           files: supervisor/coverage-adapters/hits-only.info
           flags: unit-tests
           fail_ci_if_error: false
+          disable_search: true
 
       - name: Upload mock-isolated tmux coverage to Codecov
         if: always()
@@ -333,6 +346,7 @@ jobs:
           files: supervisor/coverage-tmux/hits-only.info
           flags: unit-tests
           fail_ci_if_error: false
+          disable_search: true
 
       - name: Upload mock-isolated relay coverage to Codecov
         if: always()
@@ -341,6 +355,7 @@ jobs:
           files: supervisor/coverage-relay-nonblocking/hits-only.info
           flags: unit-tests
           fail_ci_if_error: false
+          disable_search: true
 
   routing-tests:
     name: Routing Tests (S5 #51)
