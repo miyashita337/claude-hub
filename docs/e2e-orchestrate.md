@@ -13,7 +13,25 @@ bash scripts/e2e-orchestrate.sh --keep           # 残骸を残す（デバッ�
 bash scripts/e2e-orchestrate.sh --full           # S1 の最終レポート到達まで待つ（Phase 5 向け）
 ```
 
+シナリオを 1 つだけ回す（デバッグ・部分検証。ライブドライバ直叩き）:
+
+```bash
+bun --env-file=supervisor/.env supervisor/tools/e2e-live.ts --scenario s2-4
+bun --env-file=supervisor/.env supervisor/tools/e2e-live.ts --scenario s2-5
+```
+
+`--scenario` に指定できるのは `s1 / s1b / s2-1 / s2-2 / s2-3 / s2-4 / s2-5 / s3`。
+未知の値は fail-closed（typo で「全部スキップして 0 終了」にならない）。
+
 終了時に PASS/FAIL/SKIP のサマリ表を出力し、FAIL が 1 件でもあれば exit 1。
+
+### dispatch 同時実行枠に注意（S1b / S2-5 live）
+
+`start-hub-worker` を使うシナリオ（S1b / S2-5 の live レグ）は、dispatch 同時実行枠
+（`DISPATCH_MAX_CONCURRENT`、既定 3）が埋まっていると **SKIP** する。枠が埋まった状態で
+投入すると `POST /hub-work` は拒否ではなく **FIFO キューに載り**（exit 0 のまま戻る）、
+キューにはキャンセル API が無いため、cleanup 後に勝手に走り出す取り消せないジョブが残るため。
+枠の空きは `bun run supervisor/tools/session-ctl.ts list` で確認できる。
 
 ## 前提（手動準備・初回のみ）
 
@@ -41,15 +59,35 @@ bash scripts/e2e-orchestrate.sh --full           # S1 の最終レポート到�
 | S1-c | Mermaid 進捗ダッシュボード（P2 AC-5） | スキル | スレッドに ```` ```mermaid ```` ブロック |
 | S1-d | ワーカー起動（hub work 経路） | スキル + Supervisor | sessions.db に `channel_name='claude-hub-work'` 行 |
 | S1-e | 完了 → 最終レポート | スキル | `--full` 時のみ（Phase 5 受け入れ実走で使用） |
-| S1b | hub work 経路の直接 smoke（start-hub-worker → send → stop） | session-ctl（決定的） | DB 行 / thread / stop 反映 / hijoguchi 投稿ゼロ |
+| S1b | hub work 経路の直接 smoke（start-hub-worker → send → stop） | session-ctl（決定的） | DB 行 / thread / stop 反映 / hijoguchi 投稿ゼロ。dispatch 枠が埋まっていれば SKIP |
+| S2-4 | ワーカー故意失敗 3 回 → error loop 検知 → stop → 報告（P2 AC-3） | 隔離スタック（決定的）+ live 配達 | mock claude が同一エラーを 3 回返す → 同一署名 3 回で検知 → 実 `session-ctl stop` で tmux 消滅 + sessions.db 反映 → 報告を `post-channel` で corp へ配達し着弾確認（Issue #386） |
+| S2-5 | kill → 再入で worktree 再利用（P2 AC-4 smoke） | 隔離スタック（決定的）+ live | iso: 一時 git リポで kill → 同 branch 再入 → **worktree path 同一 + 未コミット作業の生存 + 応答復帰**。live: 実 `start-hub-worker` で同じ流れ（dispatch 枠が空いているときのみ、Issue #386） |
 | S3 | 既存機能回帰 | hermetic + live | CI と同一の e2e スイート + dispatch/orchestrate/hub-work ユニット + hijoguchi pid 不変 + session-ctl list |
+
+### S2-4 / S2-5 の隔離スタック（Issue #386）
+
+S2-4 / S2-5 の決定的部分は `supervisor/tools/e2e-isolated.ts` が**子プロセス**として実行する。
+稼働中 Supervisor の claude を差し替えられない（`SUPERVISOR_CLAUDE_PATH` はプロセス起動時に固定）
+ため、mock claude・専用 tmux socket・専用 sessions.db・専用 runtime dir を与えた使い捨てスタックを
+別プロセスで立てる。`assertIsolatedEnv` が本番 socket / 本番 DB / 本番 relay-port を指したままの
+実行を fail-closed で止める。単体デバッグは:
+
+```bash
+SUPERVISOR_TMUX_SOCKET=claude-hub-e2e-dbg \
+SUPERVISOR_DB_PATH=/tmp/e2e-dbg/sessions.db \
+XDG_RUNTIME_DIR=/tmp/e2e-dbg/runtime \
+SUPERVISOR_CLAUDE_PATH=supervisor/tests/e2e/fixtures/claude-error-loop-mock.sh \
+bun supervisor/tools/e2e-isolated.ts --scenario s2-4
+```
+
+判定規則そのもの（同一署名の正規化・閾値・誤検知防止・隔離ガード）は
+`supervisor/tests/tools/e2e-isolated.test.ts` が CI で常時検証する。
 
 ### Phase 5 送り（本 E2E では SKIP として明示レポート）
 
 | 項目 | 理由 |
 |---|---|
-| S2-4 error loop（故意失敗 3 回 → 停止、P2 AC-3） | error loop 検知はオーケストレーター（モデル）の意味判断で、決定的な PASS/FAIL アサートが書けず 30 分超かかる。実走（#322）で観測する |
-| S2-5 kill → resume 再入（P2 AC-4 smoke） | resume は Epic 番号前提（SKILL Phase E）。テスト用 Epic の常設はテスト残骸になるため実走で検証。corp 台帳の冪等性（重複投入なしの土台）は agent-base `tests/test_orchestrate_runner.sh` で担保済み |
+| error loop の**意味判断**（このエラーは同じ失敗か） | オーケストレーター（モデル）の判断であり決定的アサートが書けない。機構（検知規則 → stop → 報告）は S2-4 が自動検証するので、残るのはモデル判断のみ。実走（#322）で観測する |
 | /session start\|list\|stop\|resume の実 Discord slash 駆動 | **Bot は他 Bot の slash command を実行できない**（Discord 制約）。hermetic 回帰（session lifecycle / commands テスト）+ `.claude/commands/local-e2e-discord.md`（Chrome 手動）でカバー |
 | hijoguchi メンション応答 | `allowFrom=[owner]` のため owner アカウントからのみ発火できる（driver Bot では原理的に不可）。実走時に目視 |
 

@@ -36,18 +36,47 @@
  *   --keep             cleanup をスキップ（残骸をデバッグ用に残す）
  *   --full             S1 で最終レポート到達まで待つ（Phase 5 受け入れ実走向け）
  *   --brain-timeout-min <n>  S1 のオーケストレーター頭脳検証の上限（既定 20）
+ *   --scenario <id>    1 シナリオだけ実行する（id は {@link SCENARIO_IDS}）。
+ *                      省略時は全シナリオ。S2-4 / S2-5 の単体デバッグ用
  *
- * S2-4（error loop）/ S2-5（kill→resume 再入）はモデル挙動依存 + 長時間のため
- * 本ドライバでは SKIP として明示レポートし、Phase 5（#322）の受け入れ実走で検証する。
+ * S2-4（error loop）/ S2-5（kill→resume 再入）は Issue #386 で SKIP を解除した。
+ * モデルの意味判断に依存しない**機構**部分だけを決定的に検証する:
+ *
+ *   - S2-4: ワーカーの claude を mock（同一エラーを毎回返す）に差し替えた隔離
+ *     スタックで「同一署名 3 回 → session-ctl stop」を実行し、報告は実
+ *     `post-channel` で corp へ配達して着弾を確認する。「このエラーは同じ失敗か」
+ *     というオーケストレーター（モデル）の判断自体は引き続き実走（#322）の範囲
+ *   - S2-5: kill 後の再入で **同一 branch の worktree が再利用される**
+ *     （= 作業が失われない、RW-046）ことをアサートする。隔離スタック側は常時実行、
+ *     実 `start-hub-worker` 側は dispatch 枠が空いているときだけ実行する
+ *
+ * 隔離スタックの中身は {@link ./e2e-isolated.ts}（子プロセスとして起動する理由も
+ * そちらの docblock に書いてある）。
  */
 
 import { Database } from "bun:sqlite";
-import { existsSync, mkdirSync, readFileSync, writeFileSync, unlinkSync } from "fs";
-import { homedir } from "os";
+import {
+  existsSync,
+  mkdirSync,
+  mkdtempSync,
+  readFileSync,
+  rmSync,
+  writeFileSync,
+  unlinkSync,
+} from "fs";
+import { homedir, tmpdir } from "os";
 import { join } from "path";
-import { runSessionCtl, createRealEffects } from "./session-ctl";
+import { runSessionCtl, createRealEffects, tmuxNameForThread } from "./session-ctl";
 import { relayPortFilePath } from "../src/session/relay-server";
 import { resolveDbPath } from "../src/infra/db";
+// 純関数と定数のみ（e2e-isolated.ts は重い import を動的にしているので、
+// ここで import しても本番 socket / DB の解決は起きない）。
+import {
+  RESULT_MARKER as ISOLATED_RESULT_MARKER,
+  type ErrorLoopScenarioResult,
+  type WorktreeReuseScenarioResult,
+} from "./e2e-isolated";
+import { DISPATCH_MAX_CONCURRENT } from "../src/config/channels";
 
 const API = "https://discord.com/api/v10";
 
@@ -68,6 +97,22 @@ const SKIP_LIVE = has("--skip-live");
 const KEEP = has("--keep");
 const FULL = has("--full");
 const BRAIN_TIMEOUT_MS = Number(argVal("--brain-timeout-min", "20")) * 60_000;
+
+/** `--scenario` で個別実行できるシナリオ id（省略時は全部走る）。 */
+export const SCENARIO_IDS = [
+  "s1",
+  "s1b",
+  "s2-1",
+  "s2-2",
+  "s2-3",
+  "s2-4",
+  "s2-5",
+  "s3",
+] as const;
+type ScenarioId = (typeof SCENARIO_IDS)[number];
+const SCENARIO = argVal("--scenario", "").toLowerCase();
+/** 選択されたシナリオか（未指定なら全 true）。 */
+const wants = (id: ScenarioId): boolean => SCENARIO === "" || SCENARIO === id;
 
 // ---------- 結果集計 ----------
 type Verdict = "PASS" | "FAIL" | "SKIP";
@@ -158,6 +203,27 @@ const runningByBranchPrefix = (prefix: string) =>
 const rowsSince = (isoT0: string) =>
   dbRows(`SELECT * FROM sessions WHERE started_at > ? ORDER BY started_at`, isoT0);
 
+/**
+ * dispatch 同時実行枠の空きを調べる（`start-hub-worker` を投げてよいか）。
+ *
+ * 枠が埋まっていると `POST /hub-work` は**拒否ではなくキュー投入**になり、
+ * exit 0 のまま返る（bot.ts / hub-work.ts の DispatchQueue）。キューには
+ * キャンセル API が無いので、埋まっているのに投げると「後で勝手に走り出す
+ * 取り消せないジョブ」が残る（テスト Issue は cleanup で閉じられているのに）。
+ * よって投げる前にここで空きを確認する。
+ *
+ * Supervisor 内部のキュー状態は外から読めないため、sessions.db 上の running な
+ * dispatch 由来セッション（hub work / corp dispatch）で近似する。
+ */
+function dispatchSlots(): { busy: number; limit: number; free: boolean } {
+  const limit = Number(process.env.DISPATCH_MAX_CONCURRENT) || DISPATCH_MAX_CONCURRENT;
+  const busy = dbRows(
+    `SELECT id FROM sessions WHERE status='running' AND (channel_name = ? OR branch LIKE 'corp-dispatch-%')`,
+    "claude-hub-work",
+  ).length;
+  return { busy, limit, free: busy < limit };
+}
+
 // ---------- cleanup 対象の記録 ----------
 const createdIssues: number[] = [];
 const createdSessionKeys: string[] = []; // session row id
@@ -175,7 +241,15 @@ async function stopSessionQuiet(key: string): Promise<void> {
 
 // ============================================================
 async function main(): Promise<number> {
-  console.log(`== e2e-live (Issue #321) ${new Date().toISOString()} ==`);
+  console.log(`== e2e-live (Issue #321 / #386) ${new Date().toISOString()} ==`);
+
+  // 未知のシナリオ名は fail-closed（typo で「全部 SKIP されて 0 終了」を防ぐ）。
+  if (SCENARIO && !(SCENARIO_IDS as readonly string[]).includes(SCENARIO)) {
+    record("ARGS", "--scenario の値", "FAIL",
+      `未知のシナリオ: ${SCENARIO}（指定可能: ${SCENARIO_IDS.join(" / ")}）`);
+    return finish();
+  }
+  if (SCENARIO) console.log(`-- シナリオ絞り込み: ${SCENARIO} --`);
 
   if (SKIP_LIVE) {
     record("LIVE", "ライブ手順（プリフライト含む）", "SKIP", "--skip-live 指定（hermetic 回帰のみ）");
@@ -256,7 +330,10 @@ async function main(): Promise<number> {
     "corp allowFrom に driver Bot 未登録のため /orchestrate 駆動不可（手動準備 3 = docs/e2e-orchestrate.md。owner が access.json を編集後に再実行）";
 
   // ---------- S2-1: 空引数 → Supervisor 層 fail-closed（セッション未起動） ----------
-  if (!orchestrateDriveAuthorized) {
+  if (!wants("s2-1")) {
+    // --scenario で選ばれなかったシナリオは record しない（絞り込み実行の出力を
+    // 「本当に検証したもの」だけに保つ）。
+  } else if (!orchestrateDriveAuthorized) {
     record("S2-1", "空引数 fail-closed（セッション未起動）", "SKIP", AUTH_SKIP);
   } else {
     const before = runningByBranchPrefix("orchestrate-").length;
@@ -278,7 +355,9 @@ async function main(): Promise<number> {
   // ADR-002 D2 により Supervisor は引数を解釈しない = セッション自体は起動する（設計どおり）。
   // アサート: 起動後、スキルがエラーを報告し、ワーカー/Issue を作らないこと。
   let orchA: any = null;
-  if (!orchestrateDriveAuthorized) {
+  if (!wants("s2-3")) {
+    // 絞り込みで対象外。
+  } else if (!orchestrateDriveAuthorized) {
     record("S2-3", "存在しない .tmp（スキル層 fail-closed）", "SKIP", AUTH_SKIP);
   } else {
     const bogus = `~/.claude/sessions/e2e-nonexistent-${Date.now()}.tmp`;
@@ -315,7 +394,9 @@ async function main(): Promise<number> {
   }
 
   // ---------- S2-2: 多重 /orchestrate → 2 本目は起動せず案内 ----------
-  if (orchA) {
+  if (!wants("s2-2")) {
+    // 絞り込みで対象外。
+  } else if (orchA) {
     const before = runningByBranchPrefix("orchestrate-").length;
     const msgId = await postMessage(corpId, "/orchestrate 多重起動テスト（起動しないこと）");
     const notice = await pollUntil(async () => {
@@ -338,11 +419,17 @@ async function main(): Promise<number> {
       stopped ? `status=${stopped.status}` : "stop 後も running のまま");
   } else {
     record("S2-2", "多重 /orchestrate → 案内のみ", "SKIP",
-      orchestrateDriveAuthorized ? "S2-3 でオーケストレーター未起動のため" : AUTH_SKIP);
+      !wants("s2-3")
+        ? "S2-3（オーケストレーター起動）が --scenario の対象外のため"
+        : orchestrateDriveAuthorized
+          ? "S2-3 でオーケストレーター未起動のため"
+          : AUTH_SKIP);
   }
 
   // ---------- S1: 正常系（.tmp 1 + テスト Issue 1） ----------
-  if (!orchestrateDriveAuthorized) {
+  if (!wants("s1")) {
+    // 絞り込みで対象外。
+  } else if (!orchestrateDriveAuthorized) {
     for (const [id, name] of [
       ["S1-a", "起動（セッション + スレッド + welcome 引数エコー）"],
       ["S1-b", ".tmp → Issue 化（P2 AC-1）"],
@@ -469,7 +556,13 @@ async function main(): Promise<number> {
   }
 
   // ---------- S1b: hub work 経路の決定的検証（P3 実機残検証） ----------
-  {
+  const s1bSlots = wants("s1b") ? dispatchSlots() : null;
+  if (s1bSlots && !s1bSlots.free) {
+    // 枠が埋まっているときに投げるとキャンセル不能なキュー残留になる（#386）。
+    record("S1b", "hub work 直接起動（start-hub-worker）", "SKIP",
+      `dispatch 同時実行枠が空いていません（running ${s1bSlots.busy} / 上限 ${s1bSlots.limit}）。` +
+        "キューはキャンセルできないため投入しません。枠が空いてから再実行してください");
+  } else if (wants("s1b")) {
     const issueBody = "E2E テスト専用（Phase 4 #321 / S1b）。何もしないでください。\n\n## 統合ジャーニーAC（不要・理由: E2E テスト用の使い捨て Issue）";
     writeFileSync("/tmp/e2e-issue-body2.md", issueBody);
     const created = gh(["issue", "create", "--title", "[e2e-test] Phase4 S1b hub-work 直接起動 smoke", "--body-file", "/tmp/e2e-issue-body2.md"]);
@@ -494,9 +587,22 @@ async function main(): Promise<number> {
         if (row.thread_id) createdThreads.push(row.thread_id);
         record("S1b-start", "hub work 直接起動（start-hub-worker）", "PASS",
           `branch=${branch} thread=${row.thread_id} channel_name=${row.channel_name}`);
-        // send → stop
-        const sendCode = await runSessionCtl(["send", row.id, "e2e ping: 応答不要です。何もしないでください。"], createRealEffects());
-        record("S1b-send", "hub work セッションへ send", sendCode === 0 ? "PASS" : "FAIL", `exit=${sendCode}`);
+        // send → stop。send は tmux ペインへの入力なので、Supervisor が
+        // `DISPATCH_EXECUTOR_MODE=headless` で動いている（`claude -p` の一発実行で
+        // ペインを持たない、Issue #358）ときは非適用。PASS と偽らず SKIP にする。
+        const s1bFx = createRealEffects();
+        const s1bHasPane = row.thread_id
+          ? await s1bFx.hasTmuxSession(tmuxNameForThread(row.thread_id))
+          : false;
+        if (!s1bHasPane) {
+          record("S1b-send", "hub work セッションへ send", "SKIP",
+            "headless ワーカー（tmux ペインなし）のため send は非適用。" +
+              "起動の成立は S1b-start、停止は S1b-stop で確認する");
+        } else {
+          const sendCode = await runSessionCtl(
+            ["send", row.id, "e2e ping: 応答不要です。何もしないでください。"], s1bFx);
+          record("S1b-send", "hub work セッションへ send", sendCode === 0 ? "PASS" : "FAIL", `exit=${sendCode}`);
+        }
         await stopSessionQuiet(row.id);
         const stopped = await pollUntil(async () => {
           const r = dbRows(`SELECT status,stopped_reason FROM sessions WHERE id = ?`, row.id)[0];
@@ -513,14 +619,14 @@ async function main(): Promise<number> {
     }
   }
 
-  // ---------- S2-4 / S2-5（長時間・モデル依存 → Phase 5 送り） ----------
-  record("S2-4", "ワーカー故意失敗 3 回 → error loop 停止（P2 AC-3）", "SKIP",
-    "error loop 検知はオーケストレーター（モデル）挙動で、決定的アサート不能 + 30 分超。Phase 5 受け入れ実走で検証");
-  record("S2-5", "オーケストレーター kill → resume 再入で重複なし（P2 AC-4 smoke）", "SKIP",
-    "resume は Epic 番号前提（SKILL Phase E）でテスト Epic が必要。Phase 5 で検証（corp 台帳の冪等性は agent-base 側テストで担保済み）");
+  // ---------- S2-4: error loop 検知 → session-ctl stop → 報告（Issue #386） ----------
+  if (wants("s2-4")) await runErrorLoopScenarioLeg(corpId);
+
+  // ---------- S2-5: kill → 再入で worktree 再利用（Issue #386） ----------
+  if (wants("s2-5")) await runResumeReentryLeg();
 
   // ---------- S3: 既存機能の回帰（live 分） ----------
-  {
+  if (wants("s3")) {
     // hijoguchi プロセス非干渉（pid 不変）
     const hijoguchiPidAfter = Bun.spawnSync(["pgrep", "-f", "CLAUDE_HUB_HIJOGUCHI_SESSION=1"]).stdout.toString().trim();
     record("S3-hijo", "hijoguchi プロセス非干渉（pid 不変）",
@@ -547,6 +653,377 @@ async function main(): Promise<number> {
     await cleanup();
   }
   return finish();
+}
+
+// ============================================================
+// S2-4: error loop 検知 → session-ctl stop → 報告（Issue #386）
+// ============================================================
+
+/**
+ * 子プロセスを起動し、`timeoutMs` を超えたら kill して結果を返す。
+ *
+ * S2-4 の子は relay 応答待ちを含むため、ハングしたときにドライバごと固まらない
+ * よう上限を持たせる（タイムアウトは FAIL の evidence として残す = silent に
+ * しない）。
+ */
+async function spawnWithTimeout(
+  cmd: string[],
+  env: Record<string, string>,
+  timeoutMs: number,
+): Promise<{ code: number | null; stdout: string; stderr: string; timedOut: boolean }> {
+  const proc = Bun.spawn(cmd, { env, stdout: "pipe", stderr: "pipe" });
+  let timedOut = false;
+  const timer = setTimeout(() => {
+    timedOut = true;
+    proc.kill();
+  }, timeoutMs);
+  try {
+    const [stdout, stderr] = await Promise.all([
+      new Response(proc.stdout).text(),
+      new Response(proc.stderr).text(),
+    ]);
+    const code = await proc.exited;
+    return { code, stdout, stderr, timedOut };
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
+/** 隔離シナリオ子プロセスの上限。mock 応答は数秒なので 10 分あればハング判定に足りる。 */
+const ISOLATED_TIMEOUT_MS = 10 * 60_000;
+
+/**
+ * 隔離スタックのシナリオ（supervisor/tools/e2e-isolated.ts）を子プロセスで実行し、
+ * 結果 JSON を返す。
+ *
+ * 隔離 env（tmux socket / sessions.db / runtime dir / claude パス）はここで組み立てる。
+ * 子側の `assertIsolatedEnv` が同じ観点で再検査するので二重ガードになる。
+ */
+async function runIsolatedScenario<T extends { ok: boolean; failures: string[] }>(
+  scenario: "s2-4" | "s2-5",
+  mockFixture: string,
+): Promise<{ result: T | null; detail: string }> {
+  const toolPath = join(import.meta.dir, "e2e-isolated.ts");
+  const fixture = join(import.meta.dir, "..", "tests", "e2e", "fixtures", mockFixture);
+  if (!existsSync(fixture)) {
+    return { result: null, detail: `mock claude が見つかりません: ${fixture}` };
+  }
+  const scratch = mkdtempSync(join(tmpdir(), `e2e-${scenario}-`));
+  try {
+    const child = await spawnWithTimeout(
+      [process.execPath, toolPath, "--scenario", scenario],
+      {
+        ...(process.env as Record<string, string>),
+        SUPERVISOR_TMUX_SOCKET: `claude-hub-e2e-${scenario}`,
+        SUPERVISOR_DB_PATH: join(scratch, "sessions.db"),
+        XDG_RUNTIME_DIR: join(scratch, "runtime"),
+        SUPERVISOR_CLAUDE_PATH: fixture,
+      },
+      ISOLATED_TIMEOUT_MS,
+    );
+    const line = child.stdout
+      .split("\n")
+      .find((l) => l.startsWith(ISOLATED_RESULT_MARKER));
+    if (!line) {
+      return {
+        result: null,
+        detail:
+          `子プロセスが結果行を出力しませんでした（timedOut=${child.timedOut} exit=${child.code}）: ` +
+          (child.stderr.trim().slice(-300) || child.stdout.trim().slice(-300) || "(出力なし)"),
+      };
+    }
+    return {
+      result: JSON.parse(line.slice(ISOLATED_RESULT_MARKER.length).trim()) as T,
+      detail: "",
+    };
+  } catch (err) {
+    return { result: null, detail: `子プロセスの実行に失敗: ${err}` };
+  } finally {
+    try {
+      rmSync(scratch, { recursive: true, force: true });
+    } catch (err) {
+      console.warn(`cleanup: scratch ${scratch} の削除に失敗: ${err}`);
+    }
+  }
+}
+
+/**
+ * S2-4 — ワーカーが同じエラーを 3 回返したときの
+ * 「検知 → `session-ctl stop` → スレッド報告」を決定的に検証する。
+ *
+ * 検知と停止は隔離スタック（mock claude + 専用 tmux socket / sessions.db /
+ * runtime dir）の子プロセスが担当する（理由は e2e-isolated.ts の docblock）。
+ * 報告の配達だけは**稼働中 Supervisor の実経路**（session-ctl post-channel →
+ * `POST /channel-post` → Discord）を通し、driver Bot で着弾を確認する。
+ */
+async function runErrorLoopScenarioLeg(corpId: string): Promise<void> {
+  const NAME = "ワーカー故意失敗 3 回 → error loop 停止（P2 AC-3）";
+  const legFailures: string[] = [];
+
+  const { result, detail } = await runIsolatedScenario<ErrorLoopScenarioResult>(
+    "s2-4", "claude-error-loop-mock.sh",
+  );
+  if (!result) {
+    record("S2-4", NAME, "FAIL", detail);
+    return;
+  }
+  const r = result;
+
+  // (a) 検知: 同一署名が閾値回反復したことを実出力から判定できたか
+  const detected = r.verdict.detected;
+  if (!detected) legFailures.push("検知");
+  record("S2-4a", "同一エラー 3 回 → error loop 判定", detected ? "PASS" : "FAIL",
+    `同一署名 ${r.verdict.count}/${r.verdict.threshold} 回（判定対象 ${r.verdict.considered} 件）` +
+      ` 署名=${(r.verdict.signature ?? "(なし)").slice(0, 80)}`);
+
+  // (b) 停止: session-ctl stop が実際にループ中のワーカーを落としたか
+  const stopped = r.stopExit === 0 && r.dbStatus !== "running" && r.tmuxGone;
+  if (!stopped) legFailures.push("停止");
+  record("S2-4b", "session-ctl stop → tmux 消滅 + sessions.db 反映",
+    stopped ? "PASS" : "FAIL",
+    `stop exit=${r.stopExit ?? "-"} status=${r.dbStatus ?? "-"} tmuxGone=${r.tmuxGone}` +
+      (r.failures.length > 0 ? ` / ${r.failures.join(" ; ").slice(0, 200)}` : ""));
+
+  // (c) 報告: 実 Supervisor 経路（post-channel）で corp へ届くか
+  const runTag = `e2e-s2-4-${Date.now()}`;
+  const thread = await rest("POST", `/channels/${corpId}/threads`, {
+    name: `[e2e-test] S2-4 error loop 報告 ${runTag}`,
+    type: 11, // PUBLIC_THREAD（メッセージ非依存スレッド）
+    auto_archive_duration: 60,
+  });
+  if (thread.status !== 200 && thread.status !== 201) {
+    // 権限不足は「未検証」であって PASS ではない。SKIP + 理由で残す。
+    record("S2-4c", "error loop 報告の Discord 配達（post-channel）", "SKIP",
+      `driver Bot がスレッドを作成できません (HTTP ${thread.status})。corp での ` +
+        "Create Public Threads 権限を付与すると検証されます");
+  } else {
+    const threadId = thread.json.id as string;
+    createdThreads.push(threadId);
+    const text = `${r.report}\n- e2e-run: ${runTag}`;
+    const exit = await runSessionCtl(["post-channel", threadId, text], createRealEffects());
+    const landed = exit !== 0 ? null : await pollUntil(async () => {
+      const msgs = await fetchAllMessages(corpId);
+      return msgs.find((m) => (m.content ?? "").includes(runTag)) ?? null;
+    }, 60_000, 5_000);
+    if (!landed) legFailures.push("報告");
+    record("S2-4c", "error loop 報告の Discord 配達（post-channel）",
+      landed ? "PASS" : "FAIL",
+      landed
+        ? `corp に報告が着弾（run=${runTag}）`
+        : `post-channel exit=${exit} / 60 秒以内に corp へ着弾せず`);
+  }
+
+  record("S2-4", NAME, legFailures.length === 0 ? "PASS" : "FAIL",
+    legFailures.length === 0
+      ? `検知 ${r.verdict.count} 回 → stop exit=${r.stopExit} → 報告配達まで確認（モデルの意味判断は実走 #322 の範囲）`
+      : `未達: ${legFailures.join(" / ")}`);
+}
+
+// ============================================================
+// S2-5: kill → start-hub-worker 再入で worktree 再利用（Issue #386）
+// ============================================================
+
+/**
+ * S2-5 — ワーカーが死んだあと同じ branch で再投入したとき、**worktree が再利用**
+ * され（＝ 途中まで書いた作業が失われず）、セッションが再び応答可能になることを
+ * 検証する。
+ *
+ * これは orchestration-escalation-policy B-3「dead-session 再入（hub）は
+ * `start-hub-worker` 再実行で自動再起動（同 branch は worktree 再利用で冪等）」の
+ * 機械検証であり、同時に RW-046（停止で worktree を壊さない）の回帰でもある。
+ * Epic 番号を要する corp resume ではなく hub work 経路で検証するため、テスト用
+ * Epic の常設が不要になる（旧 SKIP 理由の解消）。
+ *
+ * 2 レグ構成:
+ *
+ *   - **iso**（常時実行）: 隔離スタック（mock claude + 一時 git リポジトリ）で
+ *     kill → 再入 → worktree 再利用 + 未コミット作業の生存 + 応答復帰を検証する。
+ *     dispatch 同時実行枠にも実課金にも依存しないので、いつ回しても検証される。
+ *   - **live**（枠が空いているときのみ）: 実 Supervisor の `start-hub-worker` で
+ *     同じ流れを通す。dispatch 枠（DISPATCH_MAX_CONCURRENT）が埋まっていると
+ *     投入が**キューに載って戻らない**ため、事前に空きを確認し、無ければ理由付きで
+ *     SKIP する（キューはキャンセル API を持たないので、埋まっているときに投げて
+ *     しまうと取り消せない残留ジョブになる。投げない方が安全）。
+ */
+async function runResumeReentryLeg(): Promise<void> {
+  const NAME = "kill → start-hub-worker 再入で worktree 再利用（P2 AC-4 smoke）";
+
+  // ---- iso レグ（決定的・常時実行） ----
+  const { result: iso, detail } = await runIsolatedScenario<WorktreeReuseScenarioResult>(
+    "s2-5", "claude-mock.sh",
+  );
+  if (!iso) {
+    record("S2-5-iso", "隔離スタックで kill → 再入 → worktree 再利用", "FAIL", detail);
+  } else {
+    record("S2-5-iso", "隔離スタックで kill → 再入 → worktree 再利用",
+      iso.ok ? "PASS" : "FAIL",
+      `before=${iso.worktreeBefore ?? "-"} after=${iso.worktreeAfter ?? "-"} same=${iso.sameWorktree}` +
+        ` dead検知=${iso.deadDetected} 未コミット作業の生存=${iso.workSurvived} 応答復帰=${iso.responsive}` +
+        (iso.failures.length > 0 ? ` / ${iso.failures.join(" ; ").slice(0, 200)}` : ""));
+  }
+  const isoOk = iso?.ok === true;
+
+  // ---- live レグ（dispatch 枠が空いているときのみ） ----
+  // 枠を占有しているのは running の dispatch 由来セッション（hub work / corp
+  // dispatch）。Supervisor 内部のキュー状態は外から読めないので同じ規則で近似する。
+  const slots = dispatchSlots();
+  if (!slots.free) {
+    record("S2-5-live", "実 start-hub-worker で kill → 再入", "SKIP",
+      `dispatch 同時実行枠が空いていません（running ${slots.busy} / 上限 ${slots.limit}）。` +
+        "投入するとキャンセル不能なキュー残留になるため投げません。枠が空いてから再実行してください");
+    record("S2-5", NAME, isoOk ? "PASS" : "FAIL",
+      isoOk
+        ? `隔離スタックで worktree 再利用を確認（live レグは dispatch 枠 ${slots.busy}/${slots.limit} のため SKIP）`
+        : "iso レグが FAIL");
+    return;
+  }
+
+  const liveFailures = await runResumeReentryLiveLeg();
+  record("S2-5", NAME, isoOk && liveFailures.length === 0 ? "PASS" : "FAIL",
+    isoOk && liveFailures.length === 0
+      ? "隔離・実 start-hub-worker の双方で kill → 再入の worktree 再利用を確認"
+      : `未達: ${[...(isoOk ? [] : ["iso"]), ...liveFailures].join(" / ")}`);
+}
+
+/** S2-5 live レグ本体。未達項目のラベル一覧を返す（空なら全 PASS）。 */
+async function runResumeReentryLiveLeg(): Promise<string[]> {
+  const bodyPath = "/tmp/e2e-issue-body-s2-5.md";
+  writeFileSync(bodyPath, [
+    "E2E テスト専用（Issue #386 / S2-5）。何もしないでください。",
+    "",
+    "## 統合ジャーニーAC（不要・理由: E2E テスト用の使い捨て Issue）",
+  ].join("\n"));
+  const created = gh(["issue", "create", "--title",
+    "[e2e-test] S2-5 kill 後の再入で worktree 再利用", "--body-file", bodyPath]);
+  const issueNumber = Number(created.stdout.match(/\/issues\/(\d+)/)?.[1] ?? 0);
+  if (!created.ok || !issueNumber) {
+    record("S2-5-live", "実 start-hub-worker で kill → 再入", "FAIL",
+      `テスト Issue 作成失敗: ${created.stderr.slice(0, 200)}`);
+    return ["live: Issue 作成"];
+  }
+  createdIssues.push(issueNumber);
+
+  const branch = `hub-work-${issueNumber}`;
+  const fx = createRealEffects();
+  const legFailures: string[] = [];
+
+  // (1) 初回起動。start-hub-worker はキューに載っても exit 0 で戻るため、
+  //     出力の queued フラグを見て「起動した」のか「待たされた」のかを区別する
+  //     （区別しないと 3 分待って「行が現れない」という誤解を招く FAIL になる）。
+  const ctlOut: string[] = [];
+  const capturing = { ...fx, out: (line: string) => { ctlOut.push(line); console.log(line); } };
+  const t0 = new Date().toISOString();
+  const startExit = await runSessionCtl(
+    ["start-hub-worker", branch, String(issueNumber), "no-template"], capturing);
+  if (ctlOut.some((l) => l.includes("queued=true"))) {
+    record("S2-5-live", "実 start-hub-worker で kill → 再入", "SKIP",
+      "投入が dispatch キューに載りました（枠が埋まった）。キューはキャンセルできないため、" +
+        "枠が空いてから再実行してください");
+    return [];
+  }
+  const first = startExit !== 0 ? null : await pollUntil(async () => {
+    const rows = rowsSince(t0).filter((r) => r.branch === branch && r.status === "running");
+    return rows[0] ?? null;
+  }, 180_000, 5_000);
+  if (!first) {
+    record("S2-5-live", "実 start-hub-worker で kill → 再入", "FAIL",
+      `初回 start-hub-worker exit=${startExit}, running 行が現れない`);
+    return ["live: 初回起動"];
+  }
+  createdSessionKeys.push(first.id);
+  createdBranches.push({ repoDir: join(homedir(), "claude-hub"), branch });
+  if (first.thread_id) createdThreads.push(first.thread_id);
+  const worktreePath: string = first.project_dir;
+
+  if (!first.thread_id) {
+    record("S2-5-live", "実 start-hub-worker で kill → 再入", "FAIL",
+      "初回セッションに thread_id がなく kill 経路を駆動できない");
+    return ["live: thread_id 欠落"];
+  }
+
+  // (2) kill（「ワーカーが突然死した」状態を作る。session-ctl stop の graceful
+  //     経路ではない）。ワーカーは tmux とは限らない: Supervisor が
+  //     `DISPATCH_EXECUTOR_MODE=headless` で動いていると `claude -p` の
+  //     子プロセスで tmux を持たない（Issue #358）。tmux があれば kill-session、
+  //     無ければ pid へ SIGKILL する。pid 側は session-ctl と同じ本人確認
+  //     （コマンドラインに claude_session_id が含まれるか）を通してから撃つ
+  //     ——PID 再利用で無関係プロセスを殺さないため。
+  const tmuxName = tmuxNameForThread(first.thread_id);
+  let killDetail: string;
+  if (await fx.hasTmuxSession(tmuxName)) {
+    await fx.killTmuxSession(tmuxName);
+    killDetail = `tmux kill-session ${tmuxName}`;
+  } else if (first.pid != null && fx.pidAlive(first.pid)) {
+    const cmd = await fx.readPidCommand(first.pid);
+    if (first.claude_session_id && cmd?.includes(first.claude_session_id)) {
+      fx.killPid(first.pid, "SIGKILL");
+      killDetail = `headless: SIGKILL pid ${first.pid}`;
+    } else {
+      killDetail = `pid ${first.pid} のコマンドラインが session id と一致せず kill を見送り（PID 再利用の疑い）`;
+    }
+  } else {
+    killDetail = "tmux セッションも生存 pid も見つからない（既に終了？）";
+  }
+  const dead = await pollUntil(async () => {
+    const row = dbRows(`SELECT status,stopped_reason FROM sessions WHERE id = ?`, first.id)[0];
+    return row && row.status !== "running" ? row : null;
+  }, 120_000, 5_000);
+  if (!dead) legFailures.push("live: kill 検知");
+  record("S2-5-live-a", "kill → Supervisor が dead を検知し status 反映", dead ? "PASS" : "FAIL",
+    `${killDetail} → ` +
+      (dead ? `status=${dead.status} reason=${dead.stopped_reason ?? "-"}` : "120 秒以内に running が解除されない"));
+
+  // (3) worktree 保全（RW-046: 停止は worktree を壊さない）
+  const retained = existsSync(worktreePath);
+  if (!retained) legFailures.push("live: worktree 保全");
+  record("S2-5-live-b", "kill 後も worktree を保全（RW-046）", retained ? "PASS" : "FAIL",
+    `${worktreePath} exists=${retained}`);
+
+  // (4) 再入 — 同じ branch / issue で start-hub-worker をもう一度
+  const t1 = new Date().toISOString();
+  const reExit = await runSessionCtl(
+    ["start-hub-worker", branch, String(issueNumber), "no-template"], fx);
+  const second = reExit !== 0 ? null : await pollUntil(async () => {
+    const rows = rowsSince(t1).filter(
+      (r) => r.branch === branch && r.status === "running" && r.id !== first.id);
+    return rows[0] ?? null;
+  }, 180_000, 5_000);
+  if (second) {
+    createdSessionKeys.push(second.id);
+    if (second.thread_id) createdThreads.push(second.thread_id);
+  }
+
+  // (5) worktree 同一性（本シナリオの中核アサート）
+  const sameWorktree = !!second && second.project_dir === worktreePath;
+  if (!sameWorktree) legFailures.push("live: worktree 再利用");
+  record("S2-5-live-c", "再入で同一 branch の worktree を再利用", sameWorktree ? "PASS" : "FAIL",
+    second
+      ? `before=${worktreePath} after=${second.project_dir} same=${sameWorktree}`
+      : `再入 start-hub-worker exit=${reExit}, running 行が現れない`);
+
+  // (6) 応答可能に戻ったか（tmux ペインが send を受理する）。
+  //     headless ワーカーはペインを持たない（`claude -p` の一発実行）ので送信の
+  //     概念が無い。その場合は「running 行が再び現れた」ことをもって再入の成立と
+  //     し、送信検証は理由付き SKIP にする（PASS と偽らない）。
+  const secondTmux = second?.thread_id ? tmuxNameForThread(second.thread_id) : null;
+  const secondHasPane = secondTmux ? await fx.hasTmuxSession(secondTmux) : false;
+  if (!second) {
+    legFailures.push("live: 応答可能");
+    record("S2-5-live-d", "再入セッションが応答可能（send 受理）", "FAIL", "再入セッションなし");
+  } else if (!secondHasPane) {
+    record("S2-5-live-d", "再入セッションが応答可能（send 受理）", "SKIP",
+      "headless ワーカー（tmux ペインなし）のため send 検証は非適用。" +
+        "再入の成立は running 行の再出現で確認済み");
+  } else {
+    const sendExit = await runSessionCtl(
+      ["send", second.id, "e2e ping: 応答不要です。何もしないでください。"], fx);
+    if (sendExit !== 0) legFailures.push("live: 応答可能");
+    record("S2-5-live-d", "再入セッションが応答可能（send 受理）", sendExit === 0 ? "PASS" : "FAIL",
+      `exit=${sendExit}`);
+  }
+
+  if (second) await stopSessionQuiet(second.id);
+  return legFailures;
 }
 
 function countE2eIssues(): number {
