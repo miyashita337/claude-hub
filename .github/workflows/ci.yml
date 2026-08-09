@@ -100,6 +100,11 @@ jobs:
       # timing-flaky but is now driven by an injected virtual clock (#190), so
       # it is deterministic and gated here too — this also gates the
       # feedback-survey "send 0, never 1" regression test it contains (#153).
+      # tests/integration/worktree-real-git.test.ts (#382) is gated here too: it
+      # drives REAL `git worktree add/remove/list/prune` against a throwaway repo
+      # in a temp dir. git is always present on the runner (actions/checkout
+      # needs it) and the suite touches neither tmux nor gh, so it needs no extra
+      # setup and stays deterministic in this job.
       - name: Run tests
         env:
           SUPERVISOR_DB_PATH: ":memory:"
@@ -178,6 +183,7 @@ jobs:
                    tests/session/slash-prefix.test.ts \
                    tests/session/thread-title.test.ts \
                    tests/session/worktree.test.ts \
+                   tests/integration/worktree-real-git.test.ts \
                    tests/session/keep-attachment.test.ts \
                    tests/commands/session-keep.test.ts \
                    tests/session/self-heal.test.ts \
