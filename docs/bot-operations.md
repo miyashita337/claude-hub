@@ -173,7 +173,7 @@ headless 実行の完了時、対象 Issue へ実行レポートを `gh issue co
 
 | env | 既定 | 意味 |
 |---|---|---|
-| `DISPATCH_MAX_CONCURRENT` | `3` | 同時に実行する dispatch セッションの上限。超過分は**拒否せずキュー**に積み、先行完了で FIFO 起動 |
+| `DISPATCH_MAX_CONCURRENT` | `5` | 同時に実行する dispatch セッションの上限。超過分は**拒否せずキュー**に積み、先行完了で FIFO 起動。既定は #389 で `3` → `5` に引き上げ（`MAX_SESSIONS = 10` の残り 5 枠は interactive 用）。負荷逼迫時はこの env で運用側から絞れる |
 
 - 対話 `/session start` は**このキューを通らない**（`MAX_SESSIONS` のみで制限）。人間の体験は不変。
 - キュー投入時・キューから起動時にスレッドへ状態を明示（サイレントに待たせない）。
