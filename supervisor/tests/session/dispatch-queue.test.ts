@@ -1,8 +1,12 @@
-import { describe, test, expect } from "bun:test";
+import { describe, test, expect, afterEach } from "bun:test";
 import {
   DispatchQueue,
   type QueuedDispatch,
 } from "../../src/session/dispatch-queue";
+import {
+  DISPATCH_MAX_CONCURRENT,
+  MAX_SESSIONS,
+} from "../../src/config/channels";
 
 /**
  * Phase 5c / #294 (Epic #292 AC-2 / AC-3): dispatch concurrency limit + FIFO
@@ -119,6 +123,58 @@ describe("DispatchQueue (AC-2: concurrency limit + FIFO)", () => {
     await flush();
     // The throw must not leak the slot.
     expect(q.activeCount()).toBe(0);
+  });
+});
+
+describe("DispatchQueue (#389: default concurrency + env override)", () => {
+  const ENV_KEY = "DISPATCH_MAX_CONCURRENT";
+  const savedEnv = process.env[ENV_KEY];
+
+  afterEach(() => {
+    if (savedEnv === undefined) delete process.env[ENV_KEY];
+    else process.env[ENV_KEY] = savedEnv;
+  });
+
+  // AC-1: the shipped default is 5 (raised from 3 in #389).
+  test("the default concurrency constant is 5", () => {
+    expect(DISPATCH_MAX_CONCURRENT).toBe(5);
+  });
+
+  // The default must stay under MAX_SESSIONS so interactive starts (which bypass
+  // this queue) keep headroom — the invariant the constant's comment claims.
+  test("the default leaves interactive headroom under MAX_SESSIONS", () => {
+    expect(DISPATCH_MAX_CONCURRENT).toBeLessThan(MAX_SESSIONS);
+    expect(MAX_SESSIONS - DISPATCH_MAX_CONCURRENT).toBeGreaterThanOrEqual(5);
+  });
+
+  test("a queue built without an explicit limit adopts the default", () => {
+    delete process.env[ENV_KEY];
+    expect(new DispatchQueue({ log: quietLog }).limit()).toBe(
+      DISPATCH_MAX_CONCURRENT,
+    );
+  });
+
+  // AC-2: env still overrides the default, so ops can dial concurrency down when
+  // the host is under pressure.
+  test("DISPATCH_MAX_CONCURRENT=2 overrides the default", () => {
+    process.env[ENV_KEY] = "2";
+    expect(new DispatchQueue({ log: quietLog }).limit()).toBe(2);
+  });
+
+  test("an invalid env value falls back to the default", () => {
+    for (const bad of ["0", "-1", "abc", ""]) {
+      process.env[ENV_KEY] = bad;
+      expect(new DispatchQueue({ log: quietLog }).limit()).toBe(
+        DISPATCH_MAX_CONCURRENT,
+      );
+    }
+  });
+
+  test("an explicit maxConcurrent dep wins over the env value", () => {
+    process.env[ENV_KEY] = "2";
+    expect(new DispatchQueue({ maxConcurrent: 7, log: quietLog }).limit()).toBe(
+      7,
+    );
   });
 });
 

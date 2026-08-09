@@ -200,9 +200,12 @@ export const SESSION_IDLE_BACKSTOP_MS = IDLE_TIMEOUT_MS; // 30 days, hard cap
 // number of running dispatch sessions reaches this, a new /dispatch is QUEUED
 // (not rejected) and started FIFO as slots free. Interactive /session start does
 // NOT go through this queue (it is capped only by MAX_SESSIONS), so the human
-// experience is unchanged. Kept well under MAX_SESSIONS so interactive keeps
-// headroom. Env-overridable via `DISPATCH_MAX_CONCURRENT`.
-export const DISPATCH_MAX_CONCURRENT = 3;
+// experience is unchanged. Kept under MAX_SESSIONS so interactive keeps headroom:
+// at 5, half of the 10 MAX_SESSIONS slots stay reserved for interactive starts.
+// Raised 3 → 5 in #389 because independent tasks were serialising behind the
+// FIFO queue and stretching overall lead time. Under host pressure, ops can dial
+// it back down at runtime. Env-overridable via `DISPATCH_MAX_CONCURRENT`.
+export const DISPATCH_MAX_CONCURRENT = 5;
 
 // Phase 5d (#295 / Epic #292): dynamic admission is WARN-first — it defaults to
 // OBSERVE ONLY (log a WARN when load is high, but do NOT delay). Enforcement

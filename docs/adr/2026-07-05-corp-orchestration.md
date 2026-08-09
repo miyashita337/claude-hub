@@ -85,7 +85,7 @@ compact / Mac 再起動後の再入手順:
 
 ### D4. 並列上限は既存 `DISPATCH_MAX_CONCURRENT` に従う
 
-オーケストレーターは独自の並列制御を持たず、既存の dispatch FIFO キューに従う。上限は `DISPATCH_MAX_CONCURRENT = 3`（`supervisor/src/config/channels.ts:205`、env `DISPATCH_MAX_CONCURRENT` で上書き可: `supervisor/src/session/dispatch-queue.ts:54-56`）。上限超過の dispatch は reject されず QUEUED になり、空き次第 FIFO で自動起動する（Phase 5c #294 の既存挙動）。オーケストレーターが 4 件以上を一括投入しても安全側に倒れる。
+オーケストレーターは独自の並列制御を持たず、既存の dispatch FIFO キューに従う。上限は `DISPATCH_MAX_CONCURRENT`（`supervisor/src/config/channels.ts`、env `DISPATCH_MAX_CONCURRENT` で上書き可: `supervisor/src/session/dispatch-queue.ts`）。本 ADR 起草時点の既定は `3`（**その後 #389 で `5` に引き上げ**。決定 D4 自体＝「独自制御を持たず既存キューに従う」は不変）。上限超過の dispatch は reject されず QUEUED になり、空き次第 FIFO で自動起動する（Phase 5c #294 の既存挙動）。オーケストレーターが 4 件以上を一括投入しても安全側に倒れる。
 
 ### D5. claude-hub work セッション経路（#208 案B）— corp チャンネル案を採用
 
