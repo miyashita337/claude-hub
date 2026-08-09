@@ -587,9 +587,22 @@ async function main(): Promise<number> {
         if (row.thread_id) createdThreads.push(row.thread_id);
         record("S1b-start", "hub work 直接起動（start-hub-worker）", "PASS",
           `branch=${branch} thread=${row.thread_id} channel_name=${row.channel_name}`);
-        // send → stop
-        const sendCode = await runSessionCtl(["send", row.id, "e2e ping: 応答不要です。何もしないでください。"], createRealEffects());
-        record("S1b-send", "hub work セッションへ send", sendCode === 0 ? "PASS" : "FAIL", `exit=${sendCode}`);
+        // send → stop。send は tmux ペインへの入力なので、Supervisor が
+        // `DISPATCH_EXECUTOR_MODE=headless` で動いている（`claude -p` の一発実行で
+        // ペインを持たない、Issue #358）ときは非適用。PASS と偽らず SKIP にする。
+        const s1bFx = createRealEffects();
+        const s1bHasPane = row.thread_id
+          ? await s1bFx.hasTmuxSession(tmuxNameForThread(row.thread_id))
+          : false;
+        if (!s1bHasPane) {
+          record("S1b-send", "hub work セッションへ send", "SKIP",
+            "headless ワーカー（tmux ペインなし）のため send は非適用。" +
+              "起動の成立は S1b-start、停止は S1b-stop で確認する");
+        } else {
+          const sendCode = await runSessionCtl(
+            ["send", row.id, "e2e ping: 応答不要です。何もしないでください。"], s1bFx);
+          record("S1b-send", "hub work セッションへ send", sendCode === 0 ? "PASS" : "FAIL", `exit=${sendCode}`);
+        }
         await stopSessionQuiet(row.id);
         const stopped = await pollUntil(async () => {
           const r = dbRows(`SELECT status,stopped_reason FROM sessions WHERE id = ?`, row.id)[0];
@@ -928,16 +941,37 @@ async function runResumeReentryLiveLeg(): Promise<string[]> {
     return ["live: thread_id 欠落"];
   }
 
-  // (2) kill（tmux セッションを落として「ワーカーが死んだ」状態を作る）。
-  //     session-ctl stop の graceful 経路ではなく突然死を模す。
-  await fx.killTmuxSession(tmuxNameForThread(first.thread_id));
+  // (2) kill（「ワーカーが突然死した」状態を作る。session-ctl stop の graceful
+  //     経路ではない）。ワーカーは tmux とは限らない: Supervisor が
+  //     `DISPATCH_EXECUTOR_MODE=headless` で動いていると `claude -p` の
+  //     子プロセスで tmux を持たない（Issue #358）。tmux があれば kill-session、
+  //     無ければ pid へ SIGKILL する。pid 側は session-ctl と同じ本人確認
+  //     （コマンドラインに claude_session_id が含まれるか）を通してから撃つ
+  //     ——PID 再利用で無関係プロセスを殺さないため。
+  const tmuxName = tmuxNameForThread(first.thread_id);
+  let killDetail: string;
+  if (await fx.hasTmuxSession(tmuxName)) {
+    await fx.killTmuxSession(tmuxName);
+    killDetail = `tmux kill-session ${tmuxName}`;
+  } else if (first.pid != null && fx.pidAlive(first.pid)) {
+    const cmd = await fx.readPidCommand(first.pid);
+    if (first.claude_session_id && cmd?.includes(first.claude_session_id)) {
+      fx.killPid(first.pid, "SIGKILL");
+      killDetail = `headless: SIGKILL pid ${first.pid}`;
+    } else {
+      killDetail = `pid ${first.pid} のコマンドラインが session id と一致せず kill を見送り（PID 再利用の疑い）`;
+    }
+  } else {
+    killDetail = "tmux セッションも生存 pid も見つからない（既に終了？）";
+  }
   const dead = await pollUntil(async () => {
     const row = dbRows(`SELECT status,stopped_reason FROM sessions WHERE id = ?`, first.id)[0];
     return row && row.status !== "running" ? row : null;
   }, 120_000, 5_000);
   if (!dead) legFailures.push("live: kill 検知");
   record("S2-5-live-a", "kill → Supervisor が dead を検知し status 反映", dead ? "PASS" : "FAIL",
-    dead ? `status=${dead.status} reason=${dead.stopped_reason ?? "-"}` : "120 秒以内に running が解除されない");
+    `${killDetail} → ` +
+      (dead ? `status=${dead.status} reason=${dead.stopped_reason ?? "-"}` : "120 秒以内に running が解除されない"));
 
   // (3) worktree 保全（RW-046: 停止は worktree を壊さない）
   const retained = existsSync(worktreePath);
@@ -967,14 +1001,26 @@ async function runResumeReentryLiveLeg(): Promise<string[]> {
       ? `before=${worktreePath} after=${second.project_dir} same=${sameWorktree}`
       : `再入 start-hub-worker exit=${reExit}, running 行が現れない`);
 
-  // (6) 応答可能に戻ったか（tmux ペインが send を受理する）
-  const sendExit = second
-    ? await runSessionCtl(
-        ["send", second.id, "e2e ping: 応答不要です。何もしないでください。"], fx)
-    : 1;
-  if (sendExit !== 0) legFailures.push("live: 応答可能");
-  record("S2-5-live-d", "再入セッションが応答可能（send 受理）", sendExit === 0 ? "PASS" : "FAIL",
-    `exit=${sendExit}`);
+  // (6) 応答可能に戻ったか（tmux ペインが send を受理する）。
+  //     headless ワーカーはペインを持たない（`claude -p` の一発実行）ので送信の
+  //     概念が無い。その場合は「running 行が再び現れた」ことをもって再入の成立と
+  //     し、送信検証は理由付き SKIP にする（PASS と偽らない）。
+  const secondTmux = second?.thread_id ? tmuxNameForThread(second.thread_id) : null;
+  const secondHasPane = secondTmux ? await fx.hasTmuxSession(secondTmux) : false;
+  if (!second) {
+    legFailures.push("live: 応答可能");
+    record("S2-5-live-d", "再入セッションが応答可能（send 受理）", "FAIL", "再入セッションなし");
+  } else if (!secondHasPane) {
+    record("S2-5-live-d", "再入セッションが応答可能（send 受理）", "SKIP",
+      "headless ワーカー（tmux ペインなし）のため send 検証は非適用。" +
+        "再入の成立は running 行の再出現で確認済み");
+  } else {
+    const sendExit = await runSessionCtl(
+      ["send", second.id, "e2e ping: 応答不要です。何もしないでください。"], fx);
+    if (sendExit !== 0) legFailures.push("live: 応答可能");
+    record("S2-5-live-d", "再入セッションが応答可能（send 受理）", sendExit === 0 ? "PASS" : "FAIL",
+      `exit=${sendExit}`);
+  }
 
   if (second) await stopSessionQuiet(second.id);
   return legFailures;
