@@ -105,6 +105,17 @@ jobs:
       # in a temp dir. git is always present on the runner (actions/checkout
       # needs it) and the suite touches neither tmux nor gh, so it needs no extra
       # setup and stays deterministic in this job.
+      #
+      # The trailing `src/session/*.test.ts` entries are COLOCATED suites (#385).
+      # They were never run in CI — the whitelist only ever listed `tests/...`
+      # paths and scripts/lint-gating-coverage.ts only scanned `tests/`, so
+      # nothing could flag the gap. That silently ungated 67 cases across six
+      # files, including src/session/iterm2.test.ts, the AppleScript-injection
+      # guard from #183. None of them use mock.module, so they share this
+      # process safely; all are hermetic (verified against a throwaway $HOME).
+      # tests/session/iterm2.test.ts joins them: it is no longer local-only now
+      # that it writes its own project-colors fixture and points
+      # SUPERVISOR_PROJECT_COLORS_PATH at it instead of reading ~/.claude (#385).
       - name: Run tests
         env:
           SUPERVISOR_DB_PATH: ":memory:"
@@ -197,7 +208,14 @@ jobs:
                    tests/session/relay-server-channel-post.test.ts \
                    tests/session/relay-port-isolation.test.ts \
                    tests/tools/session-ctl.test.ts \
-                   tests/tools/e2e-isolated.test.ts
+                   tests/tools/e2e-isolated.test.ts \
+                   tests/session/iterm2.test.ts \
+                   src/session/dispatch-child-probe.test.ts \
+                   src/session/dispatch-health-reaper.test.ts \
+                   src/session/file-attacher.test.ts \
+                   src/session/goal-watcher.test.ts \
+                   src/session/iterm2.test.ts \
+                   src/session/orphan-dispatch-reaper.test.ts
 
       # #238 regression: realTmuxAdapter.hasSession must treat a tmux
       # control-channel ETIMEDOUT as "alive" (assume the session survives),
@@ -330,6 +348,14 @@ jobs:
         run: bun test tests/e2e/session-lifecycle.test.ts
         working-directory: supervisor
 
-  # Local-only tests (require tmux/Claude CLI or local config):
-  #   manager.test.ts  — tmux + Claude Code CLI
-  #   iterm2.test.ts   — ~/.claude/scripts/project-colors.json
+  # Not-gated tests: see the EXCLUSIONS list in
+  # supervisor/scripts/lint-gating-coverage.ts — the single source of truth.
+  # Every *.test.ts under tests/ and src/ must be either gated in a `bun test`
+  # step above or carry a justified entry there; the lint fails the build
+  # otherwise, so that list cannot drift the way this comment did.
+  #
+  # This footer used to name manager.test.ts and iterm2.test.ts as local-only.
+  # Both were wrong — manager.test.ts had been gated in the Unit Tests job since
+  # #185 — yet codecov.yml and Issue #385 both cited it as fact. Deliberately no
+  # list or count here now: a hand-kept copy of a machine-checked fact only rots
+  # again (#385).

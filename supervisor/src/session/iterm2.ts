@@ -8,12 +8,25 @@ import { TMUX_PATH, TMUX_ARGS, TMUX_CMD } from "./tmux";
 
 const execFileAsync = promisify(execFile);
 
-const PROJECT_COLORS_PATH = resolve(
-  homedir(),
-  ".claude",
-  "scripts",
-  "project-colors.json"
-);
+/**
+ * Location of the iTerm2 tab-colour config.
+ *
+ * Resolved per call (not frozen at module load) so a test can point it at a
+ * fixture via `SUPERVISOR_PROJECT_COLORS_PATH` regardless of import order. This
+ * is the same env-override seam the rest of the Supervisor already uses
+ * (`SUPERVISOR_DB_PATH`, `TMUX_PATH`, `SUPERVISOR_TMUX_SOCKET`,
+ * `SUPERVISOR_CLAUDE_PATH`). Without it `resolveColor`'s lookup table could only
+ * be exercised on a Mac that happens to have the real file, which is why its
+ * tests sat local-only and ungated (Issue #385).
+ *
+ * An empty value counts as unset so `SUPERVISOR_PROJECT_COLORS_PATH=` cannot
+ * silently redirect the read to the process CWD.
+ */
+export function projectColorsPath(): string {
+  const override = process.env.SUPERVISOR_PROJECT_COLORS_PATH;
+  if (override && override.length > 0) return override;
+  return resolve(homedir(), ".claude", "scripts", "project-colors.json");
+}
 
 interface ProjectColorsConfig {
   projects: Record<string, string>;
@@ -23,7 +36,7 @@ interface ProjectColorsConfig {
 
 function loadProjectColors(): ProjectColorsConfig {
   try {
-    const text = readFileSync(PROJECT_COLORS_PATH, "utf8");
+    const text = readFileSync(projectColorsPath(), "utf8");
     return JSON.parse(text);
   } catch {
     return { projects: {}, default_saturation: 0.3, default_brightness: 0.12 };

@@ -85,9 +85,18 @@ ignore:
   # 不当に FAIL することはない。blocking 昇格時の再評価は #300 で追跡する。
   # （src/bot.ts の除外エントリは意図的に存在しない）
   #
-  # iterm2 タブ着色。~/.claude/scripts/project-colors.json とローカル iTerm2 を
-  # 要するローカル専用（ci.yml 末尾「Local-only tests」参照）。
-  - "supervisor/src/session/iterm2.ts"
+  # NOTE: src/session/iterm2.ts は除外しない（Issue #385 で除外を撤回）。
+  # 旧除外理由は「~/.claude/scripts/project-colors.json とローカル iTerm2 を
+  # 要するローカル専用」で、根拠として ci.yml 末尾の「Local-only tests」注記を
+  # 引いていた。その注記自体が stale（manager.test.ts は #185 以降 gate 済み）
+  # だったうえ、現在は純ロジック（resolveColor / hlsToRgb / dimColor /
+  # escapeAppleScriptString / build*AppleScript）を tests/session/iterm2.test.ts
+  # と src/session/iterm2.test.ts が CI で常時検証する（実測 funcs 84.62% /
+  # lines 48.32%）。未カバーは openTab / markTabStopped の実 iTerm2 + osascript
+  # 実行経路のみで、これは relay.ts の tmux error 分岐と同型の「ファイル単位
+  # 除外では切り出せない部分的未カバー」。実ロジックを含むファイルの blanket
+  # 除外は coverage-policy.md §5 の anti-gaming に反する（上の bot.ts の判断と
+  # 同じ）ため、informational（WARN-first）のままスコープ内に残す。
   # launchd 定義（宣言的 XML）。実行コードでなくカバレッジ対象外。
   - "**/*.plist"
   - "**/*.plist.template"
