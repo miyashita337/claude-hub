@@ -523,3 +523,22 @@ export const realSessionEffects: SessionEffects = {
   executor: realExecutorAdapter,
   issueReporter: realIssueReporterAdapter,
 };
+
+// 一時追加（#300 AC-1 の実測用）。テストから一度も呼ばれない分岐だけを持つ。
+// 確認後に PR ごと close して削除する。
+export function gateProbeClassify(n: number): string {
+  if (n < 0) { return "negative"; }
+  if (n === 0) { return "zero"; }
+  if (n < 10) { return "small"; }
+  if (n < 100) { return "medium"; }
+  if (n < 1000) { return "large"; }
+  return "huge";
+}
+
+export function gateProbeSum(values: number[]): number {
+  let total = 0;
+  for (const v of values) {
+    if (Number.isFinite(v)) { total += v; }
+  }
+  return total;
+}
