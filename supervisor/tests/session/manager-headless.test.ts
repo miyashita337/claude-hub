@@ -332,6 +332,12 @@ describe("SessionManager.runHeadless", () => {
       expect(await timeoutForEnv("-1", "thread-to-neg")).toBe(HEADLESS_TIMEOUT_MS);
       expect(await timeoutForEnv("abc", "thread-to-nan")).toBe(HEADLESS_TIMEOUT_MS);
       expect(await timeoutForEnv("", "thread-to-blank")).toBe(HEADLESS_TIMEOUT_MS);
+      // Sub-1ms fractions are the subtle case: 0.5 is > 0 but floors to 0, and a
+      // 0 ms ceiling would SIGTERM the child on the next tick (PR #391 review).
+      expect(await timeoutForEnv("0.5", "thread-to-frac")).toBe(HEADLESS_TIMEOUT_MS);
+      expect(await timeoutForEnv("0.999", "thread-to-frac2")).toBe(HEADLESS_TIMEOUT_MS);
+      // A fraction that still floors to a positive ms is honored as given.
+      expect(await timeoutForEnv("1500.7", "thread-to-frac3")).toBe(1500);
     });
   });
 

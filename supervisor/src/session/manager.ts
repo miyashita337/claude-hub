@@ -264,8 +264,11 @@ export const HEADLESS_TIMEOUT_MS = 5 * 60 * 60 * 1000; // 5 hours (18000000 ms)
 function headlessTimeoutMs(): number {
   const raw = process.env.DISPATCH_HEADLESS_TIMEOUT_MS;
   if (!raw) return HEADLESS_TIMEOUT_MS;
-  const n = Number(raw);
-  return Number.isFinite(n) && n > 0 ? Math.floor(n) : HEADLESS_TIMEOUT_MS;
+  // Floor BEFORE the positivity check: a fractional value like "0.5" is > 0 but
+  // floors to 0, and a 0 ms ceiling SIGTERMs the child on the next tick — the
+  // opposite of a ceiling. Fail safe to the default instead (PR #391 review).
+  const n = Math.floor(Number(raw));
+  return Number.isFinite(n) && n > 0 ? n : HEADLESS_TIMEOUT_MS;
 }
 
 /**
