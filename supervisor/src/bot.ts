@@ -3,7 +3,6 @@ import {
   GatewayIntentBits,
   REST,
   Routes,
-  Events,
   type Interaction,
   type Message,
   type Channel,
@@ -83,6 +82,12 @@ import {
 } from "./session/orchestrate";
 import { AdmissionController } from "./session/admission";
 import { buildThreadTitle } from "./session/thread-title";
+import {
+  createDiscordWiringSurface,
+  wireBoot,
+  wireReady,
+  type ReadyWiringHandlers,
+} from "./bot-wiring";
 
 /** Shared context for delivering a self-heal outcome to a thread (Issue #206/#244). */
 interface SelfHealCtx {
@@ -260,6 +265,25 @@ export async function startBot(token: string): Promise<void> {
 
   const sessionManager = new SessionManager();
 
+  // Issue #383: every startup registration goes through this surface instead of
+  // calling client.on / relay-server on* / process.on directly. src/bot-wiring.ts
+  // owns the id → target map, so tests can replay the same wiring against
+  // in-memory targets and assert nothing was dropped or mis-targeted (#370 was
+  // a subscriber that existed but was never wired, undetectable in CI).
+  const wiringSurface = createDiscordWiringSurface({
+    client,
+    relay: {
+      onProgress,
+      onSessionsQuery,
+      onAskUser,
+      onLateResponse,
+      onHubWork,
+      onChannelPost,
+    },
+    sessionManager,
+    signals: process,
+  });
+
   // Per-thread message queue: ensures only one message is relayed at a time per thread.
   // Without this, concurrent messages overwrite the pending relay request and responses are lost.
   const threadQueues = new Map<string, Promise<void>>();
@@ -351,7 +375,8 @@ export async function startBot(token: string): Promise<void> {
   // handleDispatchMessage submits here; interactive /session start bypasses it
   // (AC-3). The SessionManager frees a slot when a dispatch session ends.
   const dispatchQueue = new DispatchQueue();
-  sessionManager.onSessionEnd((threadId) => dispatchQueue.notifyEnded(threadId));
+  const handleSessionEnd = (threadId: string): void =>
+    dispatchQueue.notifyEnded(threadId);
   // Phase 5d (#295): dynamic admission (WARN-first). Default observe-only — logs a
   // WARN under high load but does not delay; enforcement is opt-in via
   // DISPATCH_ADMISSION_ENFORCE=1.
@@ -392,7 +417,7 @@ export async function startBot(token: string): Promise<void> {
   });
 
   // Register slash commands
-  client.once(Events.ClientReady, async (readyClient) => {
+  const handleClientReady = async (readyClient: Client<true>) => {
     console.log(`[Bot] Logged in as ${readyClient.user.tag}`);
     console.log(
       `[Bot] Registered channels: ${Array.from(CHANNEL_MAP.keys()).join(", ")}`
@@ -431,7 +456,7 @@ export async function startBot(token: string): Promise<void> {
     // Register progress callback to send tool progress to Discord threads.
     // Events are buffered (Issue #119) and flushed every 2s as a single
     // message per thread to stay under Discord's 5-msg/5-sec rate limit.
-    onProgress((event) => {
+    const handleProgress: ReadyWiringHandlers["relay:progress"] = (event) => {
       // Issue #209: a session streaming PostToolUse progress is *not* silent.
       // Refresh lastActivityAt here so the activity watchdog's "quiet" signal
       // (AC1) doesn't false-positive on a session that is actively reporting
@@ -445,19 +470,20 @@ export async function startBot(token: string): Promise<void> {
         tool: event.tool,
         message: event.message,
       });
-    });
+    };
 
     // Issue #78 (AC-4): back the read-only GET /health/sessions endpoint with a
     // live snapshot of the manager's in-memory sessions so an E2E harness can
     // verify the thread → tmux session mapping without host access.
-    onSessionsQuery(() => sessionManager.sessionsHealth());
+    const handleSessionsQuery: ReadyWiringHandlers["relay:sessionsQuery"] = () =>
+      sessionManager.sessionsHealth();
 
     // Issue #370: forward AskUserQuestion prompts (POSTed by
     // hooks/ask-user-relay.sh to /ask/:threadId) to the Discord thread. Without
     // this subscriber the endpoint fast-fails 503 and the question never leaves
     // the TUI — the user saw a silent 19-minute block. The next user message in
     // the thread resolves the ask (see the messageCreate handler).
-    onAskUser((event) => {
+    const handleAskUser: ReadyWiringHandlers["relay:askUser"] = (event) => {
       void (async () => {
         try {
           const channel = await client.channels.fetch(event.threadId);
@@ -483,13 +509,15 @@ export async function startBot(token: string): Promise<void> {
           );
         }
       })();
-    });
+    };
 
     // Register late-response callback: when a Stop hook POST arrives after
     // the initial relay already resolved (e.g. Monitor/background-task split
     // a single user turn into multiple assistant turns), forward the follow-up
     // text directly to the Discord thread so it isn't dropped.
-    onLateResponse(async (event) => {
+    const handleLateResponse: ReadyWiringHandlers["relay:lateResponse"] = async (
+      event,
+    ) => {
       try {
         const channel = await client.channels.fetch(event.threadId);
         if (!channel?.isThread()) return;
@@ -531,7 +559,7 @@ export async function startBot(token: string): Promise<void> {
       } catch (err) {
         console.error(`[Bot] Late response send error for thread ${event.threadId}:`, err);
       }
-    });
+    };
 
     // Epic #316 Phase 3 (#320, ADR-002 D5): claude-hub work セッション経路。
     // relay サーバの `POST /hub-work`（loopback-only、session-ctl
@@ -539,7 +567,7 @@ export async function startBot(token: string): Promise<void> {
     // CHANNEL_MAP.get() を通らない ephemeral なもの（runHubWork 内で組み立て、
     // CHANNEL_MAP へは登録しない）。ワーカースレッドは corp チャンネル配下
     // （D5-3）。キュー / admission / executor は既存 /dispatch と同一機構。
-    onHubWork(async (body) =>
+    const handleHubWork: ReadyWiringHandlers["relay:hubWork"] = async (body) =>
       runHubWork({
         body,
         sessionManager,
@@ -588,14 +616,16 @@ export async function startBot(token: string): Promise<void> {
             await thread.send(content);
           }
         },
-      }),
-    );
+      });
 
     // Issue #339: オーケストレーターの進捗・最終レポートをスレッドの**親
     // チャンネル直下**へ投稿する経路（POST /channel-post/:threadId →
     // session-ctl post-channel が叩く）。投稿先は threadId から解決した親
     // チャンネルに構造的に限定される（任意チャンネル ID を受け取らない）。
-    onChannelPost(async (threadId, text) => {
+    const handleChannelPost: ReadyWiringHandlers["relay:channelPost"] = async (
+      threadId,
+      text,
+    ) => {
       let thread;
       try {
         thread = await client.channels.fetch(threadId);
@@ -656,8 +686,19 @@ export async function startBot(token: string): Promise<void> {
         `[Bot] channel-post: thread ${threadId} → #${parent.name} (${chunks.length} chunks, ${text.length} chars)`,
       );
       return { ok: true, channelId: parent.id, chunks: chunks.length };
+    };
+
+    // Issue #383: apply the ready-time relay wiring in one place. Registering
+    // here (not at boot) is deliberate — see READY_WIRING_IDS in bot-wiring.ts.
+    wireReady(wiringSurface, {
+      "relay:progress": handleProgress,
+      "relay:sessionsQuery": handleSessionsQuery,
+      "relay:askUser": handleAskUser,
+      "relay:lateResponse": handleLateResponse,
+      "relay:hubWork": handleHubWork,
+      "relay:channelPost": handleChannelPost,
     });
-  });
+  };
 
   // Safe reply helper: never throws. Used in error paths where the interaction may
   // already be stale (Mac sleep/wake can expire the 3-second initial-response token).
@@ -683,7 +724,7 @@ export async function startBot(token: string): Promise<void> {
   }
 
   // Handle slash commands + message components
-  client.on(Events.InteractionCreate, (interaction: Interaction) => {
+  const handleInteractionCreate = (interaction: Interaction): void => {
     // #364: the one-click compact button. Component interactions are routed by
     // customId to the app that sent the message, so unlike a top-level
     // `/compact` slash command this can never be captured by another bot.
@@ -703,7 +744,7 @@ export async function startBot(token: string): Promise<void> {
       console.error("[Bot] Command error:", err);
       await safeReplyError(interaction, err);
     });
-  });
+  };
 
   // Issue #32 / S7 (dispatch transport): handle a `/dispatch <branch> <issue>`
   // message from an allowed external source (webhook / bot). Returns true when
@@ -1094,7 +1135,7 @@ export async function startBot(token: string): Promise<void> {
   }
 
   // Message relay: thread messages → Claude Code → thread reply
-  client.on(Events.MessageCreate, async (message: Message) => {
+  const handleMessageCreate = async (message: Message): Promise<void> => {
     // Issue #32 / S7 (dispatch transport): intercept `/dispatch` from an allowed
     // external source BEFORE the blanket bot/webhook drop below. Only an
     // authorized source on a known, policy-configured channel can start a
@@ -1474,7 +1515,7 @@ export async function startBot(token: string): Promise<void> {
         }
       }
     });
-  });
+  };
 
   // Graceful shutdown
   const shutdown = async () => {
@@ -1499,8 +1540,18 @@ export async function startBot(token: string): Promise<void> {
     process.exit(0);
   };
 
-  process.on("SIGTERM", shutdown);
-  process.on("SIGINT", shutdown);
+  // Issue #383: the single boot-time wiring application. Every handler above is
+  // defined by now, and nothing can fire before client.login() below, so
+  // applying the whole map here is equivalent to the previous scattered
+  // client.on / process.on calls — with the map itself now assertable in tests.
+  wireBoot(wiringSurface, {
+    "sessionManager:sessionEnd": handleSessionEnd,
+    "client:ClientReady": handleClientReady,
+    "client:InteractionCreate": handleInteractionCreate,
+    "client:MessageCreate": handleMessageCreate,
+    "process:SIGTERM": shutdown,
+    "process:SIGINT": shutdown,
+  });
 
   await client.login(token);
 }

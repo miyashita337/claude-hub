@@ -63,12 +63,28 @@ ignore:
   # エントリ（~38 行、ビジネスロジックなし）。トークン無しでは実行不能な境界
   # コードのため除外（AC-1/2/3 は PR 本文で手動検証扱い。ci.yml e2e-tests
   # ジョブのコメント参照）。
-  # NOTE: src/bot.ts（~1065 行）はコアロジック（アクセス制御 / self-heal /
-  # キュー / 中継）を含むため除外しない。現状は startBot(token) 内に密結合で
-  # 未カバーだが、blanket 除外は coverage-policy.md §5 の anti-gaming に反する
-  # （PR #301 の gemini review 指摘）。トークン起動部とロジックの分離リファクタ
-  # + テスト補充は follow-up #300 で追跡する。
   - "supervisor/index.ts"
+  #
+  # NOTE: src/bot.ts はコアロジック（アクセス制御 / self-heal / キュー / 中継）を
+  # 含むため除外しない。#383（Epic #381）で startBot() の**起動時配線**を
+  # src/bot-wiring.ts へ分離し、tests/bot/startup-wiring.test.ts で計測・検証
+  # 対象にした。
+  #
+  # 残部（bot.ts のイベントハンドラ本体）の扱いは「カバー対象化」で確定する
+  # （除外しない）。理由:
+  #   - blanket 除外は coverage-policy.md §5 の anti-gaming に反する
+  #     （PR #301 の gemini review 指摘）。
+  #   - 残部は index.ts のような「トークンが無いと実行不能な境界コード」では
+  #     なく、分岐を持つロジック（アクセスゲート / dispatch・orchestrate 傍受 /
+  #     slash strip / 中継キュー）である。coverage-policy.md §4 の除外事由
+  #     （外部 API 直叩き・E2E 担保・単純委譲）のいずれにも該当しない。
+  #   - 実際、これらの分岐の多くは既に純関数側（access-policy / slash-prefix /
+  #     dispatch / orchestrate / salvage-reply）へ切り出され計測されている。
+  #     除外すると、今後 bot.ts へ**戻る**方向の変更が検知されなくなる。
+  # patch は WARN-first（informational）なので、未カバーの残部に触れた PR が
+  # 不当に FAIL することはない。blocking 昇格時の再評価は #300 で追跡する。
+  # （src/bot.ts の除外エントリは意図的に存在しない）
+  #
   # iterm2 タブ着色。~/.claude/scripts/project-colors.json とローカル iTerm2 を
   # 要するローカル専用（ci.yml 末尾「Local-only tests」参照）。
   - "supervisor/src/session/iterm2.ts"
