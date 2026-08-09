@@ -11,16 +11,24 @@
  * security guard (#159 / RW-045) sits red-but-ungated today. Same failure class
  * as RW-029: a silently-green CI is worse than a red one.
  *
- * This lint scans every test file under `tests/` and requires each to be either:
+ * This lint scans every test file under `tests/` AND `src/` and requires each to
+ * be either:
  *   1. gated   — passed as an argument to some `bun test` step in ci.yml, or
  *   2. excluded — listed in EXCLUSIONS below WITH a non-empty reason.
  * Any other test file fails the build (a new gate omission). To stop the
  * exclusion list from rotting into a silent dumping ground, an entry with an
  * empty reason, or one that points at a file that no longer exists, also fails.
  *
+ * Issue #385 widened the scope to colocated `src/**\/*.test.ts`, which the
+ * original version explicitly deferred. That blind spot had already cost us:
+ * all SIX colocated suites (67 cases) — including
+ * `src/session/iterm2.test.ts`, the AppleScript-injection guard from #183 —
+ * were never run in CI and no lint could see it, because the whitelist only
+ * ever listed `tests/...` paths. Same RW-029 failure class the tests/-side
+ * scan was written to prevent, just one directory over.
+ *
  * Run: `bun scripts/lint-gating-coverage.ts` (from supervisor/). Exits 1 on any
- * violation. Scope is intentionally the `tests/` tree only — colocated tests
- * living under `src/` are out of scope for this issue (tracked separately).
+ * violation.
  */
 import { existsSync, readFileSync } from "fs";
 import { resolve } from "path";
@@ -38,14 +46,9 @@ export interface Exclusion {
  */
 export const EXCLUSIONS: Exclusion[] = [
   {
-    file: "tests/session/iterm2.test.ts",
-    reason:
-      "local-only: needs ~/.claude/scripts/project-colors.json (macOS iTerm2 tab colours), absent on CI ubuntu — see ci.yml 'Local-only tests' note.",
-  },
-  {
     file: "tests/session/iterm2-async.test.ts",
     reason:
-      "macOS-only timing: markTabStopped shells out to real `osascript`, which blocks >100ms on a Mac and fails the non-blocking assertion. Not deterministic across runners.",
+      "wall-clock flake, and the invariant is already gated deterministically elsewhere. Its '<100ms' assertion times a window containing two process spawns (tmux + pgrep); spawn latency is load-dependent on ANY OS, so it failed 2 of 3 consecutive local runs (#385). The property it targets — markTabStopped must not block the event loop — is enforced in CI without a clock by scripts/lint-no-sync-exec.ts (#227 PR-4). Gating it would add flake, not coverage. Full measurements and the correction to the pre-#385 reason (which blamed osascript, outside the measured window) are in the test file's header.",
   },
   {
     file: "tests/guards/shell-exec-safety.test.ts",
@@ -55,17 +58,22 @@ export const EXCLUSIONS: Exclusion[] = [
 ];
 
 /**
- * Pull every `tests/...*.test.ts` token out of the *command* lines of ci.yml.
+ * Pull every `tests/...*.test.ts` or `src/...*.test.ts` token out of the
+ * *command* lines of ci.yml.
  *
  * Comment lines (YAML `#`) are dropped first so that a file merely *mentioned*
- * in a comment (e.g. the "Local-only tests" note) is never mistaken for gated —
- * only paths inside an actual `run:` shell body count.
+ * in a comment (e.g. a "local-only" note) is never mistaken for gated — only
+ * paths inside an actual `run:` shell body count. That rule is what kept the
+ * stale "Local-only tests: manager.test.ts" footer from ever masking a real
+ * gap, and it is why widening the prefix to `src/` is safe.
  */
 export function extractGatedFiles(ciYaml: string): Set<string> {
   const gated = new Set<string>();
   for (const rawLine of ciYaml.split("\n")) {
     if (rawLine.trimStart().startsWith("#")) continue; // skip comments
-    for (const m of rawLine.matchAll(/tests\/[A-Za-z0-9_./-]+\.test\.ts/g)) {
+    for (const m of rawLine.matchAll(
+      /(?:tests|src)\/[A-Za-z0-9_./-]+\.test\.ts/g,
+    )) {
       gated.add(m[0]);
     }
   }
@@ -123,10 +131,16 @@ if (import.meta.main) {
   const gated = extractGatedFiles(ciYaml);
 
   const { Glob } = await import("bun");
-  const testFiles = [...new Glob("tests/**/*.test.ts").scanSync(root)].sort();
+  // Both trees are scanned (#385). `tests/` is the primary suite; `src/` picks
+  // up colocated *.test.ts files, which were invisible to this lint until #385
+  // and consequently never gated in ci.yml.
+  const testFiles = [
+    ...new Glob("tests/**/*.test.ts").scanSync(root),
+    ...new Glob("src/**/*.test.ts").scanSync(root),
+  ].sort();
   if (testFiles.length === 0) {
     console.error(
-      `✖ lint-gating-coverage: no test files found under ${root}/tests — refusing to report clean.`,
+      `✖ lint-gating-coverage: no test files found under ${root}/tests or ${root}/src — refusing to report clean.`,
     );
     process.exit(1);
   }
