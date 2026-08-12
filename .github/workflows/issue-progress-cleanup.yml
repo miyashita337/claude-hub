@@ -1,0 +1,36 @@
+name: Issue Progress Cleanup
+
+# Issue #417: remove the `in-progress` label once an issue is closed.
+#
+# `in-progress` is the PDCA duplicate-work guard: `commands/pdca.md` Step 0-3
+# refuses to start an issue that already carries it, reading the label as
+# "another session owns this". Step 4-6 deliberately leaves the label on at the
+# end of a run and delegates removal to *this* workflow — which did not exist,
+# so nothing ever took it off. Six already-closed issues (#300 #382 #383 #386
+# #388 #389) had accumulated a stale label, and stale labels make the guard
+# lie: an issue nobody is working on looks taken and gets skipped.
+#
+# Trigger on `closed` rather than on PR merge so every close path is covered —
+# squash merge via `Closes #N`, `gh issue close`, and closing by hand alike.
+on:
+  issues:
+    types: [closed]
+
+# Only the label write is needed. Everything else stays read-only.
+permissions:
+  issues: write
+
+jobs:
+  remove-in-progress:
+    name: Remove in-progress label
+    runs-on: ubuntu-latest
+    # Skip the API call entirely for the common case (an issue closed without
+    # the label), so the job stays a no-op instead of erroring on a 404.
+    if: contains(github.event.issue.labels.*.name, 'in-progress')
+    steps:
+      - name: Remove label
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GH_REPO: ${{ github.repository }}
+          ISSUE_NUMBER: ${{ github.event.issue.number }}
+        run: gh issue edit "$ISSUE_NUMBER" --remove-label in-progress

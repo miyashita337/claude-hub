@@ -138,6 +138,7 @@ jobs:
                    tests/infra/db.test.ts \
                    tests/infra/db-isolation.test.ts \
                    tests/infra/hook-wiring-check.test.ts \
+                   tests/infra/issue-progress-cleanup-workflow.test.ts \
                    tests/session/dialog-detect.test.ts \
                    tests/session/dialog-watchdog.test.ts \
                    tests/session/relay-send-failure.test.ts \
