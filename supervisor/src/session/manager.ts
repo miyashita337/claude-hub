@@ -16,6 +16,7 @@ import {
   getRunningSessions,
   getSessionByClaudeSessionId,
   getSessionByThreadId,
+  getLatestSessionByThreadPrefix,
   type SessionRow,
 } from "../infra/db";
 import {
@@ -56,6 +57,13 @@ import {
 
 const DEFAULT_CLAUDE_PATH = resolve(homedir(), ".local", "bin", "claude");
 const TMUX_SESSION_PREFIX = "claude-";
+
+/**
+ * `stopped_reason` written by the startup orphan-tmux sweep (Issue #246).
+ * Exported so tests assert one source of truth, mirroring
+ * {@link import("./orphan-dispatch-reaper").ORPHAN_REAP_REASON}.
+ */
+export const ORPHAN_TMUX_REAP_REASON: StopReason = "orphan_tmux_reaped";
 
 /**
  * Resolve the `claude` executable path at use-time (not module-load-time) so the
@@ -2258,9 +2266,13 @@ export class SessionManager {
 
   private async recoverFromDb(): Promise<void> {
     const rows = getRunningSessions();
+    // Issue #246: names handled by this pass, so the orphan sweep below does not
+    // look at (or re-kill) a session this loop already dealt with.
+    const handled = new Set<string>();
     for (const row of rows) {
       if (row.thread_id) {
         const tmuxName = this.tmuxSessionName(row.thread_id);
+        handled.add(tmuxName);
         if (await this.effects.tmux.hasSession(tmuxName)) {
           console.log(
             `[SessionManager] Found running tmux session ${tmuxName}, killing (supervisor restart)`
@@ -2274,6 +2286,81 @@ export class SessionManager {
       // them here would discard uncommitted work without an explicit teardown.
       // Only /session stop removes a worktree (Q3).
       updateSessionStatus(row.id, "stopped", "supervisor_restart");
+    }
+    await this.reapOrphanTmuxSessions(handled);
+  }
+
+  /**
+   * Reap orphan tmux sessions — the GC blind spot of Issue #246.
+   *
+   * {@link recoverFromDb}'s loop above only walks DB `status='running'` rows, so
+   * a session that reached **DB=stopped while its tmux stayed alive** is invisible
+   * to it. That combination is reachable: {@link watchTmuxSession}'s tmux_exited
+   * branch drops the session from the in-memory map and writes `stopped` to the
+   * DB but deliberately does NOT `killSession` (#154 keeps the worktree, and #238
+   * showed the "exit" can be a false teardown under tmux contention). The result
+   * is a tmux session nobody owns: gone from `this.sessions` so the idle Reaper /
+   * OrphanDispatchReaper never see it, and `status='stopped'` so the restart loop
+   * skips it. It squats CPU and its pane until the machine reboots — in the #238
+   * live repro even `/session stop` answered "no running sessions".
+   *
+   * The sweep runs from the tmux side instead of the DB side on purpose: asking
+   * tmux once for its live sessions costs a single call, whereas probing every
+   * distinct stopped thread would cost one `has-session` per row (108 on the
+   * live DB at the time of writing, and growing without bound) on every restart.
+   *
+   * Safety rules — an orphan is only killed on positive evidence of ownership:
+   *   - the name must carry our {@link TMUX_SESSION_PREFIX} (someone else's tmux
+   *     session on this socket is never touched),
+   *   - a DB row must claim the threadId prefix; an unknown name is logged and
+   *     left running,
+   *   - rows still marked `running` are skipped (the loop above owns them), and
+   *   - sessions live in memory *or mid-start* are skipped, so neither an active
+   *     session nor one being launched right now can be reaped.
+   * `listSessions()` returning [] on error/timeout (see its contract) means an
+   * unreachable tmux server reaps nothing rather than guessing.
+   *
+   * The mid-start guard is load-bearing, not belt-and-braces (PR #413 review).
+   * Recovery is kicked off from the constructor and nobody awaits it, so a
+   * `/session start` can run concurrently — and {@link launchStart} creates the
+   * tmux session (`newSession`) well before it publishes the session to
+   * `this.sessions` and inserts the DB row. In that window the brand-new tmux
+   * session is in neither, so a *previous* stopped row on the same thread would
+   * make this sweep kill the session the user just started. {@link pendingStarts}
+   * is registered synchronously before that first await (and released in
+   * start()/resumeSession()'s finally, including on failure), so excluding it
+   * closes the window exactly.
+   */
+  private async reapOrphanTmuxSessions(handled: Set<string>): Promise<void> {
+    const liveNames = await this.effects.tmux.listSessions();
+    const protectedNames = new Set(
+      [...this.sessions.keys(), ...this.pendingStarts].map((threadId) =>
+        this.tmuxSessionName(threadId)
+      )
+    );
+    for (const name of liveNames) {
+      if (!name.startsWith(TMUX_SESSION_PREFIX)) continue;
+      if (handled.has(name) || protectedNames.has(name)) continue;
+      const threadPrefix = name.slice(TMUX_SESSION_PREFIX.length);
+      const row = getLatestSessionByThreadPrefix(threadPrefix);
+      if (!row) {
+        console.warn(
+          `[SessionManager] tmux session ${name} matches our prefix but no DB row claims it — leaving it alone (#246)`
+        );
+        continue;
+      }
+      if (row.status === "running") continue;
+      console.log(
+        `[SessionManager] Reaping orphan tmux session ${name} (DB status=${row.status}, reason=${row.stopped_reason ?? "?"}) (#246)`
+      );
+      await this.effects.tmux.killSession(name);
+      this.cleanupRelayUrlFile(row.project_dir);
+      // Re-stamp the reason so the reap is auditable in the DB; the row is
+      // already `stopped`, and — as in the loop above — the worktree stays put
+      // because this is not an explicit teardown (#154). The reason is distinct
+      // from OrphanDispatchReaper's `orphan_reaped` so the two paths stay
+      // tellable apart (see StopReason in types.ts).
+      updateSessionStatus(row.id, "stopped", ORPHAN_TMUX_REAP_REASON);
     }
   }
 

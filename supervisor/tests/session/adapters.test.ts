@@ -178,6 +178,37 @@ describe("realTmuxAdapter.hasSession (#148 review)", () => {
   });
 });
 
+describe("realTmuxAdapter.listSessions (#246)", () => {
+  test("parses one session name per line and drops blanks", async () => {
+    execFileStdout = "claude-111111111111\nclaude-222222222222\n\n";
+
+    const names = await realTmuxAdapter.listSessions();
+
+    expect(names).toEqual(["claude-111111111111", "claude-222222222222"]);
+    expect(execFileCalls[0]?.file).toBe(TMUX_PATH);
+    expect(execFileCalls[0]?.args).toEqual([
+      ...TMUX_ARGS,
+      "list-sessions",
+      "-F",
+      "#{session_name}",
+    ]);
+  });
+
+  test("returns [] when tmux exits non-zero (no server running)", async () => {
+    // The orphan GC reads [] as "nothing to reap" — an unreachable tmux server
+    // must never be mistaken for "every session is gone".
+    execFileError = Object.assign(new Error("no server running"), { code: 1 });
+
+    expect(await realTmuxAdapter.listSessions()).toEqual([]);
+  });
+
+  test("passes a positive timeout", async () => {
+    await realTmuxAdapter.listSessions();
+
+    expect(execFileCalls[0]?.opts?.timeout).toBeGreaterThan(0);
+  });
+});
+
 describe("realTmuxAdapter.getPid (#148 review)", () => {
   test("uses execFile and parses pane_pid", async () => {
     execFileStdout = "12345\n";
