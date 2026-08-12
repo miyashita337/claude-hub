@@ -1,9 +1,13 @@
 import { test, expect, describe, beforeEach, afterEach } from "bun:test";
+import { mkdirSync } from "fs";
+import { tmpdir } from "os";
+import { resolve } from "path";
 
 import {
   SessionManager,
   ORPHAN_TMUX_REAP_REASON,
 } from "../../src/session/manager";
+import type { ChannelConfig } from "../../src/config/channels";
 import {
   createFakeEffects,
   type FakeSessionEffects,
@@ -159,6 +163,63 @@ describe("SessionManager orphan tmux GC (#246)", () => {
     expect(byId.get("restarted-new")).toBe("supervisor_restart");
     // The stale row is left untouched — it was not re-stamped as an orphan.
     expect(byId.get("restarted-old")).toBe("tmux_exited");
+  });
+
+  test("does not reap a session that is mid-start while recovery runs (PR #413 review)", async () => {
+    // Recovery is kicked off by the constructor and nobody awaits it, so a
+    // /session start can overlap it. launchStart creates the tmux session before
+    // it publishes to `sessions` / inserts the DB row, so during that window the
+    // only thing marking the session as ours is `pendingStarts`. With an older
+    // stopped row on the same thread present, a sweep that ignored pendingStarts
+    // would kill the session the user just started.
+    seedSession("previous-run", ORPHAN_THREAD, "stopped", "tmux_exited");
+
+    // Gate A holds the sweep inside listSessions; gate B holds launchStart at
+    // its PID poll — i.e. after newSession, before sessions.set.
+    let releaseSweep!: () => void;
+    const sweepGate = new Promise<void>((r) => (releaseSweep = r));
+    let releasePid!: () => void;
+    const pidGate = new Promise<void>((r) => (releasePid = r));
+
+    const realListSessions = effects.tmux.listSessions.bind(effects.tmux);
+    effects.tmux.listSessions = async () => {
+      await sweepGate;
+      return realListSessions();
+    };
+    const realGetPid = effects.tmux.getPid.bind(effects.tmux);
+    effects.tmux.getPid = async (name: string) => {
+      await pidGate;
+      return realGetPid(name);
+    };
+
+    const dir = resolve(tmpdir(), `orphan-gc-start-${process.pid}`);
+    mkdirSync(dir, { recursive: true });
+    const config: ChannelConfig = {
+      channelName: "test-channel",
+      dir,
+      displayName: "Test Channel",
+    };
+
+    manager = new SessionManager({ effects, gracefulKillTimeoutMs: 0 });
+    const started = manager.start(config, ORPHAN_THREAD);
+
+    // Let start() get past newSession and park on the PID poll.
+    while (!(await realListSessions()).includes(orphanTmux)) {
+      await new Promise((r) => setTimeout(r, 5));
+    }
+
+    releaseSweep();
+    await manager.recovery;
+
+    // The mid-start session survived, and the stale row was not re-stamped.
+    expect(await effects.tmux.hasSession(orphanTmux)).toBe(true);
+    expect(getSessionByThreadId(ORPHAN_THREAD)?.stopped_reason).toBe(
+      "tmux_exited"
+    );
+
+    releasePid();
+    await started;
+    expect(await effects.tmux.hasSession(orphanTmux)).toBe(true);
   });
 
   test("reaps nothing when tmux cannot be listed (empty list degrades safely)", async () => {

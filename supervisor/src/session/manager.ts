@@ -2315,21 +2315,32 @@ export class SessionManager {
    *   - a DB row must claim the threadId prefix; an unknown name is logged and
    *     left running,
    *   - rows still marked `running` are skipped (the loop above owns them), and
-   *   - sessions currently live in memory are skipped, so a future non-startup
-   *     caller cannot reap an active session.
+   *   - sessions live in memory *or mid-start* are skipped, so neither an active
+   *     session nor one being launched right now can be reaped.
    * `listSessions()` returning [] on error/timeout (see its contract) means an
    * unreachable tmux server reaps nothing rather than guessing.
+   *
+   * The mid-start guard is load-bearing, not belt-and-braces (PR #413 review).
+   * Recovery is kicked off from the constructor and nobody awaits it, so a
+   * `/session start` can run concurrently — and {@link launchStart} creates the
+   * tmux session (`newSession`) well before it publishes the session to
+   * `this.sessions` and inserts the DB row. In that window the brand-new tmux
+   * session is in neither, so a *previous* stopped row on the same thread would
+   * make this sweep kill the session the user just started. {@link pendingStarts}
+   * is registered synchronously before that first await (and released in
+   * start()/resumeSession()'s finally, including on failure), so excluding it
+   * closes the window exactly.
    */
   private async reapOrphanTmuxSessions(handled: Set<string>): Promise<void> {
     const liveNames = await this.effects.tmux.listSessions();
-    const inMemory = new Set(
-      Array.from(this.sessions.keys()).map((threadId) =>
+    const protectedNames = new Set(
+      [...this.sessions.keys(), ...this.pendingStarts].map((threadId) =>
         this.tmuxSessionName(threadId)
       )
     );
     for (const name of liveNames) {
       if (!name.startsWith(TMUX_SESSION_PREFIX)) continue;
-      if (handled.has(name) || inMemory.has(name)) continue;
+      if (handled.has(name) || protectedNames.has(name)) continue;
       const threadPrefix = name.slice(TMUX_SESSION_PREFIX.length);
       const row = getLatestSessionByThreadPrefix(threadPrefix);
       if (!row) {
