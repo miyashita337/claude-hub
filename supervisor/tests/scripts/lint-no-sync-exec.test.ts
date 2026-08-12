@@ -78,15 +78,26 @@ await execFileAsync("tmux", []);`;
     expect(lintSource("src/session/x.ts", src)).toHaveLength(0);
   });
 
-  test("the production src/session/** tree is clean (regression guard)", async () => {
-    const { Glob } = await import("bun");
-    const files = [...new Glob("src/session/**/*.ts").scanSync(".")];
-    expect(files.length).toBeGreaterThan(0);
-    const all = [];
-    for (const f of files) {
-      const text = await Bun.file(f).text();
-      all.push(...lintSource(f, text));
-    }
-    expect(all).toEqual([]);
-  });
+  // Same timing hazard, same reasoning as the sibling guard in
+  // lint-blocking-in-timers.test.ts (Issue #398): parsing all 49 src/session/**
+  // files with the TypeScript compiler is bounded CPU work that scales with the
+  // tree, and under CPU contention on a busy developer machine it overran Bun's
+  // 5000ms default even though it costs little on an uncontended runner. The
+  // budget below is sized to swallow that contention rather than to bound the
+  // work. Widen only this test; the fixture cases above keep the 5s default.
+  test(
+    "the production src/session/** tree is clean (regression guard)",
+    async () => {
+      const { Glob } = await import("bun");
+      const files = [...new Glob("src/session/**/*.ts").scanSync(".")];
+      expect(files.length).toBeGreaterThan(0);
+      const all = [];
+      for (const f of files) {
+        const text = await Bun.file(f).text();
+        all.push(...lintSource(f, text));
+      }
+      expect(all).toEqual([]);
+    },
+    120_000
+  );
 });
