@@ -80,10 +80,11 @@ await execFileAsync("tmux", []);`;
 
   // Same timing hazard, same reasoning as the sibling guard in
   // lint-blocking-in-timers.test.ts (Issue #398): parsing all 49 src/session/**
-  // files with the TypeScript compiler is bounded CPU work that grows with the
-  // tree, Bun's 5000ms default gave it no headroom on a loaded runner, and the
-  // budget below is sized to swallow CPU contention rather than to bound the work.
-  // Widen only this test; the fixture cases above keep the 5s default.
+  // files with the TypeScript compiler is bounded CPU work that scales with the
+  // tree, and under CPU contention on a busy developer machine it overran Bun's
+  // 5000ms default even though it costs little on an uncontended runner. The
+  // budget below is sized to swallow that contention rather than to bound the
+  // work. Widen only this test; the fixture cases above keep the 5s default.
   test(
     "the production src/session/** tree is clean (regression guard)",
     async () => {

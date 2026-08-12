@@ -86,19 +86,19 @@ setTimeout(doWork, 100);`;
   });
 
   // Unlike the fixture cases above, this one parses the *whole* source tree with
-  // the TypeScript compiler — ~1.7s of CPU for today's 66 files, and it grows with
-  // the tree. Bun's 5000ms default left almost no headroom, so a loaded CI runner
-  // tipped it over and the guard failed for timing reasons rather than a real
-  // violation (Issue #398).
+  // the TypeScript compiler, so its cost scales with the tree rather than with a
+  // fixed fixture. That cost is small when it gets a CPU to itself — 115ms on a
+  // CI runner — but it is not what sets the wall time. CPU contention is: the same
+  // scan ran 5.2s on a developer machine at load average 30 and 37s at load 45,
+  // against Bun's 5000ms default. That is why the guard failed for timing reasons
+  // rather than for a real violation (Issue #398).
   //
-  // The budget is deliberately far above the measured cost. Wall time here is set
-  // by CPU contention, not by the work: the same scan measured ~1.7s of CPU but
-  // took 37s wall on a developer machine at load average 45. A tight budget also
-  // buys nothing, because this body is bounded CPU work with no I/O, timers, or
-  // network — it has no hang mode to catch, it either finishes or the machine is
-  // starved. So the number is chosen to swallow contention, not to bound the work.
-  // Only this test is widened; the fixture cases keep the 5s default so a genuine
-  // hang there still fails fast.
+  // So the budget below is sized to swallow contention, not to bound the work, and
+  // it is deliberately far above the cost of the scan itself. A tight budget buys
+  // nothing here anyway: this body is bounded CPU work with no I/O, timers, or
+  // network, so it has no hang mode to catch — it either finishes or the machine
+  // is starved. Only this test is widened; the fixture cases keep the 5s default
+  // so a genuine hang there still fails fast.
   test(
     "the production source tree is clean (regression guard)",
     async () => {
