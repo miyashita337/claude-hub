@@ -5,7 +5,7 @@ process.env.SUPERVISOR_DB_PATH = ":memory:";
 
 // Reset module cache to pick up the env var
 // Import after setting env
-const { getDb, insertSession, updateSessionStatus, updateSessionActivity, getRunningSessions, getRunningSessionByThread, getRunningSessionsByChannel, getLastSessionByChannel, getSessionByClaudeSessionId, getSessionByThreadId } = await import("../../src/infra/db");
+const { getDb, insertSession, updateSessionStatus, updateSessionActivity, getRunningSessions, getRunningSessionByThread, getRunningSessionsByChannel, getLastSessionByChannel, getSessionByClaudeSessionId, getSessionByThreadId, getLatestSessionByThreadPrefix } = await import("../../src/infra/db");
 
 describe("infra/db (in-memory)", () => {
   beforeEach(() => {
@@ -107,6 +107,63 @@ describe("infra/db (in-memory)", () => {
 
     // No row → null (bun:sqlite convention, treated as "not found" by callers).
     expect(getSessionByThreadId("thread-never-seen")).toBeNull();
+  });
+
+  test("getLatestSessionByThreadPrefix maps a truncated tmux name back to its row (#246)", () => {
+    // The orphan GC only knows threadId.slice(0, 12) — the tmux session name
+    // keeps nothing more — so the lookup must match on that prefix.
+    insertSession({
+      id: "prefix-old",
+      channel_name: "team-salary",
+      thread_id: "123456789012345",
+      project_dir: "/tmp/test",
+      pid: null,
+      claude_session_id: null,
+      started_at: "2026-06-01T10:00:00.000Z",
+      last_activity_at: "2026-06-01T10:00:00.000Z",
+      status: "stopped",
+    });
+    insertSession({
+      id: "prefix-new",
+      channel_name: "team-salary",
+      thread_id: "123456789012999",
+      project_dir: "/tmp/test",
+      pid: null,
+      claude_session_id: null,
+      started_at: "2026-06-02T10:00:00.000Z",
+      last_activity_at: "2026-06-02T10:00:00.000Z",
+      status: "running",
+    });
+
+    // Both threads share the first 12 chars (the tmux name is the same for
+    // both): the newest row wins, mirroring getSessionByThreadId.
+    expect(getLatestSessionByThreadPrefix("123456789012")?.id).toBe("prefix-new");
+    // A longer prefix still resolves to the row it belongs to.
+    expect(getLatestSessionByThreadPrefix("123456789012345")?.id).toBe("prefix-old");
+    // Unknown prefix → not found, which the GC reads as "not ours".
+    expect(getLatestSessionByThreadPrefix("999999999999")).toBeNull();
+    // Empty prefix must never match everything (it would make the GC reap an
+    // arbitrary row's tmux session).
+    expect(getLatestSessionByThreadPrefix("")).toBeUndefined();
+  });
+
+  test("getLatestSessionByThreadPrefix treats LIKE wildcards literally (#246)", () => {
+    insertSession({
+      id: "wildcard-victim",
+      channel_name: "team-salary",
+      thread_id: "555555555555abc",
+      project_dir: "/tmp/test",
+      pid: null,
+      claude_session_id: null,
+      started_at: "2026-06-03T10:00:00.000Z",
+      last_activity_at: "2026-06-03T10:00:00.000Z",
+      status: "stopped",
+    });
+
+    // With a LIKE-based query these would match the row above; substr() keeps
+    // the comparison literal so an unrelated tmux name cannot claim it.
+    expect(getLatestSessionByThreadPrefix("_____________")).toBeNull();
+    expect(getLatestSessionByThreadPrefix("%")).toBeNull();
   });
 
   test("updateSessionStatus changes status and reason", () => {

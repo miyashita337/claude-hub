@@ -46,6 +46,10 @@ export class FakeTmuxAdapter implements TmuxAdapter {
     return this.sessions.has(name);
   }
 
+  async listSessions(): Promise<string[]> {
+    return this.list();
+  }
+
   async getPid(name: string): Promise<number | null> {
     return this.sessions.get(name)?.pid ?? null;
   }

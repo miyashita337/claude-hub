@@ -44,6 +44,18 @@ export interface TmuxAdapter {
   newSession(name: string, command: string): Promise<void>;
   killSession(name: string): Promise<void>;
   hasSession(name: string): Promise<boolean>;
+  /**
+   * Every live session name on the supervisor's tmux socket
+   * (`tmux list-sessions -F '#{session_name}'`). Used by the orphan GC
+   * (Issue #246) to find tmux sessions the DB believes are already stopped.
+   *
+   * Returns `[]` both when no tmux server is running (the expected empty case)
+   * and when the call fails or times out: "liveness unknown" must degrade to
+   * "nothing to reap" so the GC can never kill a session on incomplete
+   * information. This is the mirror image of {@link hasSession}'s #238/#369
+   * contract — both resolve uncertainty in favour of leaving tmux alone.
+   */
+  listSessions(): Promise<string[]>;
   getPid(name: string): Promise<number | null>;
   ensureSocketConfigured(): Promise<void>;
   /**
@@ -289,6 +301,26 @@ export const realTmuxAdapter: TmuxAdapter = {
         `[tmux] has-session: no session ${name} (exit=${e?.code ?? "?"})`
       );
       return false;
+    }
+  },
+  async listSessions() {
+    try {
+      const { stdout } = await execFileAsync(
+        TMUX_PATH,
+        [...TMUX_ARGS, "list-sessions", "-F", "#{session_name}"],
+        { encoding: "utf8", timeout: TMUX_CALL_TIMEOUT_MS }
+      );
+      return stdout
+        .split("\n")
+        .map((line) => line.trim())
+        .filter((line) => line.length > 0);
+    } catch (err) {
+      // "no server running on ..." is the ordinary idle case and exits non-zero,
+      // so it must stay quiet. A timeout is worth surfacing (the server is
+      // wedged) but still yields [] — see the interface doc: the GC treats an
+      // empty list as "no orphans", never as "kill everything".
+      warnIfTmuxTimeout("list-sessions", "*", err);
+      return [];
     }
   },
   async getPid(name) {

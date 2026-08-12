@@ -273,6 +273,33 @@ export function getSessionByThreadId(
     .get(threadId) as SessionRow | undefined;
 }
 
+/**
+ * Most-recent session row whose `thread_id` starts with `prefix`, regardless of
+ * status. Used by the orphan GC (Issue #246) to map a live tmux session name
+ * back to its owning row: the name only carries the first 12 characters of the
+ * threadId (`SessionManager.tmuxSessionNameFor`), so an exact match is
+ * impossible and the truncated prefix is all we have.
+ *
+ * `substr(thread_id, 1, ?)` — rather than `LIKE prefix || '%'` — keeps the
+ * comparison literal: `_` and `%` in a prefix would otherwise be treated as
+ * LIKE wildcards and could match an unrelated thread (a tmux session belonging
+ * to another row must never be reaped on a fuzzy match).
+ *
+ * Returns `undefined` when no row owns the prefix, which the GC reads as "not
+ * ours — leave it alone".
+ */
+export function getLatestSessionByThreadPrefix(
+  prefix: string
+): SessionRow | undefined {
+  if (prefix.length === 0) return undefined;
+  const db = getDb();
+  return db
+    .prepare(
+      `SELECT * FROM sessions WHERE substr(thread_id, 1, ?) = ? ORDER BY started_at DESC LIMIT 1`
+    )
+    .get(prefix.length, prefix) as SessionRow | undefined;
+}
+
 export function getRunningSessionsByChannel(
   channelName: string
 ): SessionRow[] {

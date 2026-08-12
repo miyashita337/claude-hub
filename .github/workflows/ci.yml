@@ -131,6 +131,7 @@ jobs:
                    tests/session/manager.test.ts \
                    tests/session/manager-resume.test.ts \
                    tests/session/manager-liveness.test.ts \
+                   tests/session/manager-orphan-gc.test.ts \
                    tests/commands/session-interaction.test.ts \
                    tests/commands/session-resume.test.ts \
                    tests/hooks/stop-relay.test.ts \

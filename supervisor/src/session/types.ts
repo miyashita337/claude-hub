@@ -65,4 +65,8 @@ export interface SessionHealthInfo {
   lastActivityAt: string;
 }
 
-export type StopReason = "manual" | "idle_timeout" | "resource_limit" | "error" | "tmux_exited" | "supervisor_restart" | "self_heal_restart" | "goal_complete" | "orphan_reaped" | "health_reaped" | "headless_exited" | "headless_timeout";
+// `orphan_reaped` is the OrphanDispatchReaper's idle-dispatch reap;
+// `orphan_tmux_reaped` is the startup sweep for a tmux session whose DB row was
+// already stopped (Issue #246). They are kept distinct so the DB says which of
+// the two paths retired a session.
+export type StopReason = "manual" | "idle_timeout" | "resource_limit" | "error" | "tmux_exited" | "supervisor_restart" | "self_heal_restart" | "goal_complete" | "orphan_reaped" | "orphan_tmux_reaped" | "health_reaped" | "headless_exited" | "headless_timeout";
