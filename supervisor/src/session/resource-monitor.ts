@@ -18,26 +18,42 @@ export interface ResourceMonitorDeps {
    * periodic observation half. Defaults to a fresh observe-mode controller.
    */
   admission?: AdmissionController;
+  /**
+   * Poll interval. Defaults to {@link RESOURCE_CHECK_INTERVAL_MS} (30 s).
+   * Injectable so a test can drive `start()`/`stop()` without a 30 s wall-clock
+   * wait — same seam as {@link import("./reaper").ReaperDeps}.checkIntervalMs.
+   */
+  checkIntervalMs?: number;
+  /**
+   * Per-session RSS ceiling in MB. Defaults to {@link
+   * MAX_MEMORY_PER_SESSION_MB} (2 GB). Injectable so a test can exercise the
+   * over-limit teardown branch against a REAL `ps` reading of a real pid
+   * (lowering the ceiling instead of faking the measurement), the same way
+   * {@link import("./reaper").ReaperDeps}.idleTimeoutMs makes the reap branch
+   * reachable without waiting out the real threshold.
+   */
+  maxMemoryMb?: number;
 }
 
 export class ResourceMonitor {
   private timer: ReturnType<typeof setInterval> | null = null;
   private readonly admission: AdmissionController;
+  private readonly checkIntervalMs: number;
+  private readonly maxMemoryMb: number;
 
   constructor(
     private sessionManager: SessionManager,
     deps: ResourceMonitorDeps = {},
   ) {
     this.admission = deps.admission ?? new AdmissionController();
+    this.checkIntervalMs = deps.checkIntervalMs ?? RESOURCE_CHECK_INTERVAL_MS;
+    this.maxMemoryMb = deps.maxMemoryMb ?? MAX_MEMORY_PER_SESSION_MB;
   }
 
   start(): void {
-    this.timer = setInterval(
-      () => this.check(),
-      RESOURCE_CHECK_INTERVAL_MS
-    );
+    this.timer = setInterval(() => this.check(), this.checkIntervalMs);
     console.log(
-      `[ResourceMonitor] Started (check every ${RESOURCE_CHECK_INTERVAL_MS / 1000}s, limit ${MAX_MEMORY_PER_SESSION_MB}MB)`
+      `[ResourceMonitor] Started (check every ${this.checkIntervalMs / 1000}s, limit ${this.maxMemoryMb}MB)`
     );
   }
 
@@ -74,9 +90,9 @@ export class ResourceMonitor {
         if (isNaN(rssKB)) continue;
 
         const rssMB = rssKB / 1024;
-        if (rssMB > MAX_MEMORY_PER_SESSION_MB) {
+        if (rssMB > this.maxMemoryMb) {
           console.error(
-            `[ResourceMonitor] ${session.channelName} (PID ${session.pid}) exceeded memory limit: ${rssMB.toFixed(0)}MB > ${MAX_MEMORY_PER_SESSION_MB}MB`
+            `[ResourceMonitor] ${session.channelName} (PID ${session.pid}) exceeded memory limit: ${rssMB.toFixed(0)}MB > ${this.maxMemoryMb}MB`
           );
           await this.sessionManager.stop(threadId, "resource_limit");
         }

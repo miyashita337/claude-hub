@@ -30,16 +30,42 @@ const DEFAULT_SOCKET_ARGS: readonly string[] = [];
  * Async (execFile, not execFileSync) so the 2 s probe never blocks the
  * Supervisor's single Discord event loop if tmux is slow to respond
  * (gemini-code-assist review on #213).
+ *
+ * `tmuxPath` defaults to the real {@link TMUX_PATH} and exists only so a test
+ * can point the probe at a stub executable (#405). Faking the binary — rather
+ * than the function — keeps the real `execFile` call, its 2 s timeout and the
+ * `resolve(!err)` mapping under test, while never touching the DEFAULT tmux
+ * socket where the operator's live claudeHubExit session lives (CLAUDE.md
+ * absolute rule: the Supervisor must not manage that session's lifecycle).
  */
-export function claudeHubExitSessionAlive(): Promise<boolean> {
+export function claudeHubExitSessionAlive(
+  tmuxPath: string = TMUX_PATH
+): Promise<boolean> {
   return new Promise((resolve) => {
     execFile(
-      TMUX_PATH,
+      tmuxPath,
       ["has-session", "-t", CLAUDEHUBEXIT_TMUX_SESSION],
       { timeout: 2000 },
       (err) => resolve(!err)
     );
   });
+}
+
+/**
+ * Seams for {@link compactClaudeHubExit} (#405). Both default to the real
+ * cross-socket implementations; a test overrides them so the send *sequence*
+ * (empty-intent guard → liveness probe → relay) is verified without a live
+ * claudeHubExit session on the default tmux socket.
+ */
+export interface CompactClaudeHubExitDeps {
+  /** Liveness probe. Defaults to {@link claudeHubExitSessionAlive}. */
+  isAlive?: () => Promise<boolean>;
+  /** Key relay. Defaults to {@link sendToPane}. */
+  send?: (
+    tmuxSessionName: string,
+    text: string,
+    socketArgs: readonly string[]
+  ) => Promise<void>;
 }
 
 /**
@@ -53,19 +79,24 @@ export function claudeHubExitSessionAlive(): Promise<boolean> {
  * (mode-exit / Escape / `send-keys -l` / `C-m`) so the battle-tested,
  * injection-safe relay path is the single source of truth (RW-019/045/047).
  */
-export async function compactClaudeHubExit(intent: string): Promise<void> {
+export async function compactClaudeHubExit(
+  intent: string,
+  deps: CompactClaudeHubExitDeps = {}
+): Promise<void> {
   if (!intent.trim()) {
     throw new Error("compact intent must be non-empty (RW-032)");
   }
+  const isAlive = deps.isAlive ?? claudeHubExitSessionAlive;
+  const send = deps.send ?? sendToPane;
   // Pre-flight liveness probe. There is a benign TOCTOU vs the send below (the
   // session could die in the gap), but sendToPane would then throw anyway and
   // the command layer surfaces it the same way — so this only upgrades the
   // user-facing message to a clear "session dead" instead of a raw tmux error.
   // Worth one extra cross-socket RTT on a manual, infrequent command.
-  if (!(await claudeHubExitSessionAlive())) {
+  if (!(await isAlive())) {
     throw new Error("claudeHubExit session dead");
   }
-  await sendToPane(
+  await send(
     CLAUDEHUBEXIT_TMUX_SESSION,
     `/compact ${intent}`,
     DEFAULT_SOCKET_ARGS
