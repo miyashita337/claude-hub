@@ -581,3 +581,57 @@ describe("ask timeout (Issue #416, 5 hours)", () => {
     expect(hasRecentAsk("never-asked")).toBe(false);
   });
 });
+
+/**
+ * Issue #416, second-order effect. The relay ceiling (15 min by default) is now
+ * much SHORTER than a legitimate ask (5h), a relationship that was inverted
+ * before this change. Left alone, every long question would draw a
+ * "応答が返りませんでした" notice into the thread underneath a question the user
+ * was still deciding on, and would tear down the dialog watchdog that #423
+ * depends on.
+ */
+describe("relay ceiling vs. a live question (Issue #416)", () => {
+  afterEach(() => {
+    stopRelayServer();
+  });
+
+  test("the relay re-arms while an ask is pending, and times out normally once it resolves", async () => {
+    startRelayServer();
+    const port = getRelayPort();
+    const threadId = "thread-relay-vs-ask";
+
+    let registered!: () => void;
+    const asked = new Promise<void>((r) => {
+      registered = r;
+    });
+    onAskUser(() => registered());
+
+    // Not awaited: this request parks until the question is answered.
+    const askDone = fetch(`http://localhost:${port}/ask/${threadId}`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ question: "決めてください", timeout_ms: 10_000 }),
+    });
+    await asked;
+
+    const CEILING_MS = 60;
+    let settled = false;
+    const relay = waitForRelay(threadId, CEILING_MS).then((r) => {
+      settled = true;
+      return r;
+    });
+
+    // Several ceilings elapse. Waiting on the user is not a lost turn.
+    await new Promise((r) => setTimeout(r, CEILING_MS * 6));
+    expect(settled).toBe(false);
+    expect(hasPendingAsk(threadId)).toBe(true);
+
+    // The re-arm is bounded, not permanent: once the question is out of the way
+    // the relay honours its ordinary contract on the very next cycle.
+    resolveAskUser(threadId, "案1");
+    expect((await askDone).status).toBe(200);
+    const result = await relay;
+    expect(result.error).toBe("Response timeout");
+    expect(result.chunks).toEqual([RELAY_TIMEOUT_USER_MESSAGE]);
+  }, 15_000);
+});

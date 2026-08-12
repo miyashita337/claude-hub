@@ -824,12 +824,31 @@ export function waitForRelay(
   }
 
   return new Promise<RelayResult>((resolve) => {
-    const timer = setTimeout(() => {
+    // Issue #416: the relay ceiling (15 min by default, 60 min max) is now far
+    // SHORTER than an ask can legitimately wait (5h). Firing here while a
+    // question is on screen would tell the thread "応答が返りませんでした"
+    // directly underneath a question the user is still deciding on, and would
+    // tear down the dialog watchdog that #423 relies on to page instead of
+    // pressing keys. A session parked inside the PreToolUse hook is not a lost
+    // turn — it is blocked on the user by our own design — so re-arm instead.
+    // Bounded: the ask itself is capped at MAX_ASK_TIMEOUT_MS, after which
+    // hasPendingAsk goes false and the next cycle times out normally.
+    const fire = () => {
+      const entry = pendingRequests.get(threadId);
+      // Superseded or cancelled while we slept: that path already resolved this
+      // promise and owns the map entry. Do nothing rather than resolve twice.
+      if (!entry || entry.resolve !== resolve) return;
+
+      if (pendingAsks.has(threadId)) {
+        entry.timer = setTimeout(fire, timeoutMs);
+        return;
+      }
+
       pendingRequests.delete(threadId);
       resolve({ text: "", chunks: [RELAY_TIMEOUT_USER_MESSAGE], error: "Response timeout" });
-    }, timeoutMs);
+    };
 
-    pendingRequests.set(threadId, { resolve, timer });
+    pendingRequests.set(threadId, { resolve, timer: setTimeout(fire, timeoutMs) });
   });
 }
 
