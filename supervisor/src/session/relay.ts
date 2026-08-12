@@ -234,6 +234,146 @@ export function flattenForSendKeys(text: string): string {
 }
 
 /**
+ * Issue #422: `tmux send-keys` exits 0 whenever the *target pane exists* — it
+ * says nothing about the foreground application having consumed the bytes.
+ * Measured on 2026-08-13 (`tmux -L wt422test`, pane running `stty -echo; sleep`):
+ * `send-keys -l <probe>` → `exit=0`, and `capture-pane -p -S -` grep for the
+ * probe → 0 hits. That is byte-for-byte the #422 symptom: the Supervisor logged
+ * a successful relay while the message left no trace anywhere in the pane.
+ *
+ * So delivery has to be *observed*, not inferred from the exit code. After
+ * typing the literal we re-read the pane and require the message's own text to
+ * appear; anything else (TUI busy right after a turn, raw-mode stdin not being
+ * drained, an unrendered modal) surfaces as a send failure instead of silence.
+ *
+ * The probe is a prefix of the user's own message — deliberately NOT a TUI
+ * literal such as "? for shortcuts". Matching on TUI chrome breaks on every
+ * Claude Code redesign (RW-027 / `thin-scaffolding.md`); the user's text does not.
+ */
+export const DELIVERY_PROBE_MAX_CHARS = 16;
+
+/**
+ * Wait schedule between "typed the literal" and "give up on this attempt".
+ * Front-loaded so a healthy pane costs ~80ms, with a long tail because the
+ * incident happened under load1≈22-46 on a 10-core box (observed in
+ * supervisor.stderr.log around the #422 timestamps) where the Ink TUI needs
+ * far longer than usual to render a keystroke.
+ */
+export const DELIVERY_VERIFY_BACKOFF_MS: readonly number[] = [
+  80, 150, 250, 400, 600, 800,
+];
+
+/**
+ * How many times the literal may be typed. 2 = one retype after a confirmed
+ * non-render. Bounded on purpose: a retype is only safe because the pane was
+ * re-read and the text was provably absent, and each extra attempt widens the
+ * window where a late render turns into duplicated input.
+ */
+export const DELIVERY_MAX_TYPE_ATTEMPTS = 2;
+
+/**
+ * `RelayResult.error` marker for a send that tmux accepted but the pane never
+ * showed. Kept free of tmux internals so it stays safe in logs, and distinct
+ * from a thrown `send-keys` error so the two are greppable apart.
+ */
+export const SEND_UNVERIFIED_ERROR =
+  "send-keys was accepted but the text never appeared in the pane (#422)";
+
+/**
+ * Whitespace-stripped prefix of the message, used as the delivery probe.
+ *
+ * Whitespace is removed from BOTH sides of the comparison so a soft-wrapped
+ * input line (the TUI breaks long input across rows) still matches: the row
+ * break is whitespace in `capture-pane` output and disappears on both sides.
+ * `Array.from` splits by code point so a surrogate pair is never cut in half.
+ */
+export function buildDeliveryProbe(text: string): string {
+  return Array.from(text.replace(/\s+/g, ""))
+    .slice(0, DELIVERY_PROBE_MAX_CHARS)
+    .join("");
+}
+
+/**
+ * Count non-overlapping probe hits in a pane capture (whitespace-insensitive,
+ * see {@link buildDeliveryProbe}). Plain `indexOf`, never a RegExp: the probe is
+ * user text and would otherwise need escaping.
+ */
+export function countProbeOccurrences(pane: string, probe: string): number {
+  if (!probe) return 0;
+  const hay = pane.replace(/\s+/g, "");
+  let count = 0;
+  let from = 0;
+  for (;;) {
+    const hit = hay.indexOf(probe, from);
+    if (hit < 0) return count;
+    count++;
+    from = hit + probe.length;
+  }
+}
+
+/**
+ * Whether {@link sendToPane} verifies delivery for this text by default.
+ *
+ * Slash commands are excluded: typing `/compact …` opens the TUI's command
+ * picker, which re-renders the input row into its own widget, so "did my text
+ * appear verbatim" is not a reliable signal there. Retyping a slash command on
+ * a false negative would *execute it twice* — a worse failure than the silent
+ * drop this guards against. Natural-language messages (the #422 loss path, and
+ * the overwhelming majority of relays) are always verified.
+ */
+export function shouldVerifyDelivery(text: string): boolean {
+  return !text.trimStart().startsWith("/");
+}
+
+/**
+ * Read the visible pane. Returns `null` when tmux itself could not be queried,
+ * which the caller treats as "inconclusive" rather than "not delivered" — a
+ * broken observer must not manufacture a delivery failure (and must not trigger
+ * a retype).
+ */
+async function capturePaneText(
+  sessionName: string,
+  socketArgs: readonly string[]
+): Promise<string | null> {
+  try {
+    const { stdout } = await execFileAsync(
+      TMUX_PATH,
+      [...socketArgs, "capture-pane", "-p", "-t", sessionName],
+      { timeout: 3000 }
+    );
+    return stdout.toString();
+  } catch (err) {
+    console.warn(
+      `[Relay] capture-pane failed for ${sessionName} (delivery unverified):`,
+      summarizeExecError(err)
+    );
+    return null;
+  }
+}
+
+export interface SendToPaneOptions {
+  /**
+   * Verify that the typed text actually appeared in the pane (Issue #422).
+   * Defaults to {@link shouldVerifyDelivery} for the given text.
+   */
+  verify?: boolean;
+  /** Override the poll schedule (tests only; production uses the default). */
+  verifyBackoffMs?: readonly number[];
+  /**
+   * Test seam, never set in production: called right after each literal is
+   * typed, with the 1-based attempt number.
+   *
+   * The #422 regression test has to guarantee that attempt #1 lands while the
+   * pane is still swallowing input. Timing that with a wall-clock sleep makes
+   * the case silently degrade into a healthy-pane test on a loaded machine (a
+   * green test that proves nothing), so the drop window is closed from this
+   * hook instead — the same injected-seam approach the dialog watchdog uses for
+   * its clock (#190).
+   */
+  onAttemptTyped?: (attempt: number) => void | Promise<void>;
+}
+
+/**
  * Type one line into the pane and submit it, without waiting for any relay
  * response. This is the shared send sequence used by {@link relayMessage}
  * (which then waits for the Stop-hook POST) and by fire-and-forget sends such
@@ -247,8 +387,14 @@ export function flattenForSendKeys(text: string): string {
  *      would otherwise swallow the input (#33).
  *   3. `send-keys -l <literal>` — argv-based, no shell, so backticks/$/quotes
  *      can't corrupt long input.
- *   4. A brief pause, then `C-m` (Enter) as a separate call — the Ink TUI can
- *      drop an Enter sent in the same call as a long literal (#32).
+ *   4. Issue #422: re-read the pane until the text shows up, retyping once if
+ *      it provably did not. Throws {@link SEND_UNVERIFIED_ERROR} rather than
+ *      returning, so the caller reports a failure instead of waiting out the
+ *      relay timeout on a message the TUI never saw.
+ *   5. A brief pause, then `C-m` (Enter) as a separate call — the Ink TUI can
+ *      drop an Enter sent in the same call as a long literal (#32). Enter is
+ *      sent only once the text is confirmed present, so a failed send can never
+ *      submit a half-typed or empty prompt.
  *
  * Newlines are flattened to spaces because `send-keys -l` would submit at the
  * first newline.
@@ -260,15 +406,70 @@ export async function sendToPane(
   // claude-hub` socket; pass `[]` to reach the claudeHubExit session on the
   // default socket. The send sequence (mode-exit/Escape/-l/C-m) is identical on
   // either socket, so this stays the single source of truth (no dead copy).
-  socketArgs: readonly string[] = TMUX_ARGS
+  socketArgs: readonly string[] = TMUX_ARGS,
+  options?: SendToPaneOptions
 ): Promise<void> {
   const literalText = flattenForSendKeys(text);
   await ensurePaneNotInMode(tmuxSessionName, socketArgs);
   await tmuxSend(tmuxSessionName, ["Escape"], socketArgs);
   await new Promise((r) => setTimeout(r, 50));
-  await tmuxSend(tmuxSessionName, ["-l", literalText], socketArgs);
+  await typeLiteral(tmuxSessionName, literalText, socketArgs, options);
   await new Promise((r) => setTimeout(r, 100));
   await tmuxSend(tmuxSessionName, ["C-m"], socketArgs);
+}
+
+/**
+ * Type the literal and (unless disabled) confirm it rendered. Extracted from
+ * {@link sendToPane} so the verification loop stays readable and the unverified
+ * path is byte-for-byte the pre-#422 behaviour.
+ */
+async function typeLiteral(
+  tmuxSessionName: string,
+  literalText: string,
+  socketArgs: readonly string[],
+  options?: SendToPaneOptions
+): Promise<void> {
+  const verify = options?.verify ?? shouldVerifyDelivery(literalText);
+  const probe = buildDeliveryProbe(literalText);
+  // A whitespace-only message has no probe to look for; typing it unverified
+  // matches the old behaviour and costs nothing (there is nothing to lose).
+  if (!verify || !probe) {
+    await tmuxSend(tmuxSessionName, ["-l", literalText], socketArgs);
+    await options?.onAttemptTyped?.(1);
+    return;
+  }
+
+  const backoff = options?.verifyBackoffMs ?? DELIVERY_VERIFY_BACKOFF_MS;
+  const before = await capturePaneText(tmuxSessionName, socketArgs);
+  // Baseline, not mere presence: the same short text ("状況報告。") may already
+  // be on screen from an earlier turn, so delivery means the count went UP.
+  const baseline = before === null ? null : countProbeOccurrences(before, probe);
+
+  for (let attempt = 1; attempt <= DELIVERY_MAX_TYPE_ATTEMPTS; attempt++) {
+    await tmuxSend(tmuxSessionName, ["-l", literalText], socketArgs);
+    await options?.onAttemptTyped?.(attempt);
+    if (baseline === null) return; // observer broken → do not claim a failure
+
+    for (const waitMs of backoff) {
+      await new Promise((r) => setTimeout(r, waitMs));
+      const after = await capturePaneText(tmuxSessionName, socketArgs);
+      if (after === null) return; // observer broke mid-flight → inconclusive
+      if (countProbeOccurrences(after, probe) > baseline) {
+        if (attempt > 1) {
+          console.log(
+            `[Relay] delivery verified for ${tmuxSessionName} after retype (attempt ${attempt})`
+          );
+        }
+        return;
+      }
+    }
+    console.warn(
+      `[Relay] typed text never rendered in pane ${tmuxSessionName} ` +
+        `(attempt ${attempt}/${DELIVERY_MAX_TYPE_ATTEMPTS}, ${literalText.length} chars)`
+    );
+  }
+
+  throw new Error(SEND_UNVERIFIED_ERROR);
 }
 
 /**
@@ -421,12 +622,23 @@ export async function relayMessage(
     // NEVER forward it into the Discord chunk (it would surface as a bogus
     // `not in a mode` "response"). buildSendFailureResult returns a clean,
     // actionable notice instead.
+    //
+    // Issue #422: the verification failure is not an execFile error, so
+    // summarizeExecError would print an empty `{}` and hide the one case we
+    // added the check for. Log its marker verbatim — it carries no tmux
+    // internals by construction.
+    const isUnverified =
+      err instanceof Error && err.message === SEND_UNVERIFIED_ERROR;
     console.error(
       `[Relay] sendToPane failed for ${tmuxSessionName}:`,
-      summarizeExecError(err)
+      isUnverified ? SEND_UNVERIFIED_ERROR : summarizeExecError(err)
     );
     return buildSendFailureResult(err);
   }
+  // Issue #422: the ONLY log line that means "the message is in the pane".
+  // `[Bot] Relaying message …` is printed before the send even starts, so it
+  // could never be used to tell an attempt apart from a delivery.
+  console.log(`[Relay] delivered to pane ${tmuxSessionName}`);
 
   // Segment (c): tmux send 完了 → waitForRelay 開始までの隙間 (大体ゼロ、
   // でも明示的に記録しておくことで設計レビュー時の sanity check になる)
