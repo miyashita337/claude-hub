@@ -85,15 +85,33 @@ setTimeout(doWork, 100);`;
     expect(v[0]!.callee).toBe("execSync");
   });
 
-  test("the production source tree is clean (regression guard)", async () => {
-    const { Glob } = await import("bun");
-    const files = [...new Glob("src/**/*.ts").scanSync(".")];
-    expect(files.length).toBeGreaterThan(0);
-    const all = [];
-    for (const f of files) {
-      const text = await Bun.file(f).text();
-      all.push(...lintSource(f, text));
-    }
-    expect(all).toEqual([]);
-  });
+  // Unlike the fixture cases above, this one parses the *whole* source tree with
+  // the TypeScript compiler — ~1.7s of CPU for today's 66 files, and it grows with
+  // the tree. Bun's 5000ms default left almost no headroom, so a loaded CI runner
+  // tipped it over and the guard failed for timing reasons rather than a real
+  // violation (Issue #398).
+  //
+  // The budget is deliberately far above the measured cost. Wall time here is set
+  // by CPU contention, not by the work: the same scan measured ~1.7s of CPU but
+  // took 37s wall on a developer machine at load average 45. A tight budget also
+  // buys nothing, because this body is bounded CPU work with no I/O, timers, or
+  // network — it has no hang mode to catch, it either finishes or the machine is
+  // starved. So the number is chosen to swallow contention, not to bound the work.
+  // Only this test is widened; the fixture cases keep the 5s default so a genuine
+  // hang there still fails fast.
+  test(
+    "the production source tree is clean (regression guard)",
+    async () => {
+      const { Glob } = await import("bun");
+      const files = [...new Glob("src/**/*.ts").scanSync(".")];
+      expect(files.length).toBeGreaterThan(0);
+      const all = [];
+      for (const f of files) {
+        const text = await Bun.file(f).text();
+        all.push(...lintSource(f, text));
+      }
+      expect(all).toEqual([]);
+    },
+    120_000
+  );
 });
