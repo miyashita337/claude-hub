@@ -97,6 +97,40 @@ describe("latency-logger", () => {
     expect(record.error_segment).toBe("b");
   });
 
+  test("setDelivered(true) records delivered:true (#223)", () => {
+    const tracker = createLatencyTracker("delivered-ok");
+    tracker.setDelivered(true);
+    const record = tracker.flush();
+
+    expect(record.delivered).toBe(true);
+    const written = JSON.parse(readFileSync(logPath, "utf8").trim());
+    expect(written.delivered).toBe(true);
+  });
+
+  test("setDelivered(false) records delivered:false alongside error_segment (#223)", () => {
+    // The tmux-send failure path: the turn errored in segment "b" AND nothing
+    // reached the user. Both facts are recorded — error_segment says where it
+    // broke, delivered says whether the user got an answer.
+    const tracker = createLatencyTracker("delivered-drop");
+    tracker.setError("b");
+    tracker.setDelivered(false);
+    const record = tracker.flush();
+
+    expect(record.delivered).toBe(false);
+    expect(record.error_segment).toBe("b");
+  });
+
+  test("delivered is omitted entirely when setDelivered is never called (#223)", () => {
+    // Back-compat: records written before #223 carry no `delivered` key, and the
+    // consumer excludes them from the rate rather than counting them as drops.
+    const tracker = createLatencyTracker("no-delivery-info");
+    const record = tracker.flush();
+
+    expect(record.delivered).toBeUndefined();
+    const written = JSON.parse(readFileSync(logPath, "utf8").trim());
+    expect("delivered" in written).toBe(false);
+  });
+
   test("getLatencyLogPath returns the currently configured path", () => {
     expect(getLatencyLogPath()).toBe(logPath);
   });

@@ -45,6 +45,19 @@ export interface RelayLatencyRecord {
   total_ms: number;
   /** error 発生 segment 名 (success 時は undefined) */
   error_segment?: string;
+  /**
+   * この relay ターンの応答がユーザーに届いたか (Issue #223)。
+   *
+   * true = 応答 chunk を返せた / false = tmux 送信失敗 or relay 待ち失敗で届かず。
+   * 「届いたか」の二値だけを持つ: 失敗の内訳は既に error_segment ("b" = 送信失敗、
+   * "d_e_c" = 待ち失敗) が持っており、欠けていたのは二値化と日次到達率の算出手段
+   * だけだったため (Issue #223 の設計)。
+   *
+   * optional なのは #223 以前に書かれた行との互換のため。consumer
+   * (scripts/analyze-relay-latency.sh) は field を持つ行だけを attempts に数え、
+   * 旧行が到達率を薄めないようにしている。
+   */
+  delivered?: boolean;
 }
 
 let logPath = DEFAULT_LATENCY_LOG_PATH;
@@ -99,6 +112,11 @@ export interface LatencyTracker {
   markStart(segment: keyof typeof SEGMENT_NAMES): void;
   markEnd(segment: keyof typeof SEGMENT_NAMES): void;
   setError(segment: string): void;
+  /**
+   * この relay ターンが応答を届けられたかを記録する (Issue #223)。
+   * flush() の前に呼ぶ。呼ばなければ delivered field は出力されない。
+   */
+  setDelivered(ok: boolean): void;
   flush(): RelayLatencyRecord;
 }
 
@@ -107,6 +125,7 @@ export function createLatencyTracker(sessionId: string): LatencyTracker {
   const segments: Partial<Record<keyof typeof SEGMENT_NAMES, number>> = {};
   const trackerStart = performance.now();
   let errorSegment: string | undefined;
+  let delivered: boolean | undefined;
 
   return {
     markStart(segment) {
@@ -123,6 +142,9 @@ export function createLatencyTracker(sessionId: string): LatencyTracker {
     setError(segment) {
       errorSegment = segment;
     },
+    setDelivered(ok) {
+      delivered = ok;
+    },
     flush() {
       const record: RelayLatencyRecord = {
         timestamp: new Date().toISOString(),
@@ -133,6 +155,9 @@ export function createLatencyTracker(sessionId: string): LatencyTracker {
       };
       if (errorSegment) {
         record.error_segment = errorSegment;
+      }
+      if (delivered !== undefined) {
+        record.delivered = delivered;
       }
       recordRelayLatency(record);
       return record;
