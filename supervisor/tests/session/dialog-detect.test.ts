@@ -157,6 +157,145 @@ describe("detectDialog — Claude Code TUI dialogs", () => {
     expect(AUTO_ACCEPT_KEYS["numbered-choice"]).toEqual(["1", "C-m"]);
     expect(AUTO_ACCEPT_KEYS["press-enter"]).toEqual(["C-m"]);
     expect(AUTO_ACCEPT_KEYS["feedback-survey"]).toEqual(["0", "C-m"]);
+    // Issue #423: no key is safe to press in an AskUserQuestion — every one of
+    // them selects an option and reports it to Claude as the user's decision.
+    expect(AUTO_ACCEPT_KEYS["ask-user-question"]).toEqual([]);
+  });
+});
+
+/**
+ * Issue #423. On 2026-08-12 two AskUserQuestion prompts were "answered" without
+ * the 会長 touching anything: the /ask relay died in ~13s (#416), the hook fell
+ * back to the TUI, and the watchdog auto-accepted the resulting dialog with
+ * option 1. Three issues were then designed on top of the fabricated decisions.
+ *
+ * The pane fixtures below follow the capture attached to Issue #304 (Claude Code
+ * v2.1.228): the question, the model's options, then the harness-appended
+ * `N. Type something.` / `N. Chat about this` affordances and a navigation
+ * footer.
+ */
+describe("detectDialog — AskUserQuestion is never auto-accepted (Issue #423)", () => {
+  const askPane = [
+    "□ 受信経路",
+    "タップ後に Mac で実行する受信経路はどれにしますか？",
+    "",
+    "❯ 1. 案1: Tailscale HTTP receiver（推奨）",
+    "     タップ1回で完結。claude-hub supervisor に受信エンドポイントを同居。",
+    "  2. 案2: Discord 経由",
+    "  3. 案3: iOS ショートカット + SSH",
+    "  4. Type something.",
+    "",
+    "  5. Chat about this",
+    "",
+    "Enter to select · ↑/↓ to navigate · Esc to cancel",
+  ].join("\n");
+
+  test("detects the AskUserQuestion picker and refuses auto-accept", () => {
+    const result = detectDialog(askPane);
+    expect(result).not.toBeNull();
+    expect(result!.kind).toBe("ask-user-question");
+    expect(result!.autoAcceptable).toBe(false);
+  });
+
+  test("wins over numbered-choice when the options render as 1. Yes / 2. No", () => {
+    // The incident shape: a binary question whose options match the
+    // `numbered-choice` pattern exactly. Before #423 this was classified as
+    // numbered-choice and answered with `1` — i.e. the user's decision was
+    // invented. Ordering in detectDialog is what prevents it, so assert the
+    // classification, not just "not auto-acceptable".
+    const yesNoPane = [
+      "□ 方針確認",
+      "この方針で進めますか？",
+      "",
+      "  1. Yes — 推奨案で進める",
+      "  2. No — 別案を検討する",
+      "  3. Type something.",
+      "",
+      "  4. Chat about this",
+      "",
+      "Enter to select · ↑/↓ to navigate · Esc to cancel",
+    ].join("\n");
+
+    // Guard: without the affordance lines this pane IS a numbered-choice, so
+    // the test above is exercising the ordering and not a shape that never
+    // matched numbered-choice in the first place.
+    const withoutAffordances = detectDialog(
+      ["  1. Yes — 推奨案で進める", "  2. No — 別案を検討する"].join("\n"),
+    );
+    expect(withoutAffordances!.kind).toBe("numbered-choice");
+
+    const result = detectDialog(yesNoPane);
+    expect(result!.kind).toBe("ask-user-question");
+    expect(result!.autoAcceptable).toBe(false);
+  });
+
+  test("the feedback survey keeps its first-position dismissal (no collision)", () => {
+    // ask-user-question is checked before the auto-acceptable families but
+    // AFTER the survey, so the survey is still dismissed with `0` (#153).
+    const survey = [
+      "● How is Claude doing this session? (optional)",
+      "1: Bad  2: OK  3: Good  0: Dismiss",
+    ].join("\n");
+    expect(detectDialog(survey)!.kind).toBe("feedback-survey");
+  });
+
+  /**
+   * PR #431 review, should-2. The pattern used to require the line to END right
+   * after the affordance and to carry a `N.` prefix. Both are rendering details,
+   * and when they drift the match fails — which drops the dialog into the
+   * auto-acceptable families and re-opens the exact hazard this kind exists to
+   * close. Each case below is a rendering change that must NOT disarm the guard.
+   */
+  describe("drift tolerance: rendering changes must not fall back to auto-accept", () => {
+    const variants: Array<[string, string]> = [
+      ["trailing border glyph", "  4. Type something.                    │"],
+      ["trailing hint", "  5. Chat about this  (Esc to cancel)"],
+      ["leading border glyph", "│  4. Type something."],
+      ["cursor marker on the affordance", "❯ 5. Chat about this"],
+      ["parenthesis numbering", "  4) Type something."],
+      ["no numbering at all", "  • Chat about this"],
+      ["no punctuation after the phrase", "  4. Type something"],
+      ["double-width space padding", "  5. Chat about this   "],
+    ];
+
+    for (const [name, line] of variants) {
+      test(`${name} still classifies as ask-user-question`, () => {
+        // Rendered with options that WOULD otherwise match numbered-choice, so a
+        // failure here means "auto-accepted with option 1", not merely "missed".
+        const pane = [
+          "□ 方針確認",
+          "この方針で進めますか？",
+          "",
+          "  1. Yes — 推奨案で進める",
+          "  2. No — 別案を検討する",
+          line,
+        ].join("\n");
+        const result = detectDialog(pane);
+        expect(result!.kind).toBe("ask-user-question");
+        expect(result!.autoAcceptable).toBe(false);
+        // The whole line is reported so [Dialog] logs show what actually matched.
+        expect(result!.line).toBe(line.trim());
+      });
+    }
+
+    test("prose merely mentioning the phrase mid-sentence does not match", () => {
+      // The one asymmetry that costs more than a heartbeat: a wrongly withheld
+      // auto-accept stalls the session. So the phrase must OPEN the line.
+      const pane = [
+        "I will type something into the box and chat about this later.",
+        "Permission required",
+        "  ❯ Yes",
+        "    No",
+      ].join("\n");
+      expect(detectDialog(pane)!.kind).toBe("ink-confirm");
+    });
+  });
+
+  test("does not disturb the ordinary auto-acceptable families", () => {
+    expect(detectDialog("Permission required\n  ❯ Yes\n    No\n")!.kind).toBe(
+      "ink-confirm",
+    );
+    expect(detectDialog("rm -rf x\nProceed? (y/N)\n")!.kind).toBe("bash-yn");
   });
 });
 

@@ -6,6 +6,7 @@ import {
   SESSION_IDLE_BACKSTOP_MS,
 } from "../config/channels";
 import { markTitleStopped } from "./thread-title";
+import { hasPendingAsk } from "./relay-server";
 
 /**
  * Resolve the effective idle-reap threshold (Phase 5b / #293). The primary
@@ -34,6 +35,15 @@ export interface ReaperDeps {
   checkIntervalMs?: number;
   /** Clock injection for deterministic tests. Defaults to `Date.now`. */
   now?: () => number;
+  /**
+   * Issue #416: is this thread blocked on an unanswered AskUserQuestion?
+   * Such a session looks idle — it is parked inside the PreToolUse hook and
+   * emits no progress — but it is idle *on purpose*, waiting for the user. With
+   * the ask budget at 5h against a 6h idle horizon, a session that was already
+   * quiet for an hour would be reaped mid-question, destroying the very thing
+   * the wait exists for. Defaults to the relay server's live pending map.
+   */
+  isAwaitingAsk?: (threadId: string) => boolean;
 }
 
 /** Minimal snapshot captured before stop() removes the session, for the resume導線. */
@@ -47,6 +57,7 @@ export class Reaper {
   private readonly idleTimeoutMs: number;
   private readonly checkIntervalMs: number;
   private readonly now: () => number;
+  private readonly isAwaitingAsk: (threadId: string) => boolean;
 
   constructor(
     private sessionManager: SessionManager,
@@ -56,6 +67,7 @@ export class Reaper {
     this.idleTimeoutMs = deps.idleTimeoutMs ?? resolveIdleTimeoutMs();
     this.checkIntervalMs = deps.checkIntervalMs ?? IDLE_CHECK_INTERVAL_MS;
     this.now = deps.now ?? Date.now;
+    this.isAwaitingAsk = deps.isAwaitingAsk ?? hasPendingAsk;
   }
 
   start(): void {
@@ -87,6 +99,16 @@ export class Reaper {
     for (const [threadId, session] of Array.from(this.sessionManager.entries())) {
       const idleMs = now - session.lastActivityAt.getTime();
       if (idleMs > this.idleTimeoutMs) {
+        // Issue #416: spare a session that is waiting on the user's answer.
+        // Logged (not silent) so a session held past the horizon is still
+        // observable — an ask can only hold it for the ask timeout, after which
+        // the next scan reaps it normally.
+        if (this.isAwaitingAsk(threadId)) {
+          console.log(
+            `[Reaper] Thread ${threadId} (${session.channelName}) idle for ${(idleMs / 1000 / 60 / 60).toFixed(1)}h but awaiting an AskUserQuestion answer — sparing (#416)`,
+          );
+          continue;
+        }
         const snapshot: ReapedSessionInfo = {
           claudeSessionId: session.claudeSessionId,
           branch: session.branch,

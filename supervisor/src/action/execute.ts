@@ -110,8 +110,15 @@ export type ExecuteResult =
 export interface ExecuteDeps {
   /** Resolve a target to a tmux session name, or null when none matches. */
   resolveSession: (target: string) => Promise<string | null>;
-  /** Send the keystrokes to the pane (production: relay.ts `sendToPane`). */
-  send: (tmuxSession: string, text: string) => Promise<void>;
+  /**
+   * Send the keystrokes to the pane (production: relay.ts `sendToPane`).
+   *
+   * The result is intentionally `unknown`: `sendToPane` now returns a delivery
+   * verdict (#422), but this path only sends slash commands, which skip
+   * verification, so there is nothing here to act on. Widening the type keeps
+   * the seam honest instead of pretending the callee returns nothing.
+   */
+  send: (tmuxSession: string, text: string) => Promise<unknown>;
 }
 
 /**

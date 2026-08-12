@@ -182,3 +182,83 @@ describe("Reaper.check", () => {
     expect(sessions.size).toBe(0); // all removed
   });
 });
+
+/**
+ * Issue #416 (Journey AC #4): with the ask wait at 5h against a 6h idle
+ * horizon, a session that was already quiet for an hour when the question was
+ * asked would be reaped while the 会長 was still deciding — destroying the
+ * session the answer was meant for.
+ */
+describe("Reaper.check — sessions awaiting an AskUserQuestion answer", () => {
+  test("spares an over-threshold session that is waiting on the user, reaps its neighbour", async () => {
+    const NOW = 1000 * HOUR;
+    const sessions = new Map<string, SessionInfo>([
+      [
+        "asking",
+        makeSession({
+          threadId: "asking",
+          lastActivityAt: new Date(NOW - 8 * HOUR), // well past the horizon
+        }),
+      ],
+      [
+        "plain-idle",
+        makeSession({
+          threadId: "plain-idle",
+          lastActivityAt: new Date(NOW - 8 * HOUR),
+        }),
+      ],
+    ]);
+    const { manager, stopCalls } = makeManager(sessions);
+    const thread = {
+      isThread: () => true,
+      name: "🟢 x",
+      send: async () => {},
+      setName: async () => {},
+      setArchived: async () => {},
+    };
+    const client = {
+      channels: { cache: { get: () => thread }, fetch: async () => thread },
+    } as unknown as Client;
+
+    const reaper = new Reaper(manager, client, {
+      idleTimeoutMs: 6 * HOUR,
+      now: () => NOW,
+      isAwaitingAsk: (threadId) => threadId === "asking",
+    });
+    await reaper.check();
+
+    // Only the sparing is conditional — an equally idle session with no
+    // outstanding question is still reaped, so this is not a blanket reprieve.
+    expect(stopCalls).toEqual([
+      { threadId: "plain-idle", reason: "idle_timeout" },
+    ]);
+    expect(sessions.has("asking")).toBe(true);
+  });
+
+  test("reaps normally once the question has been answered", async () => {
+    const NOW = 1000 * HOUR;
+    const sessions = new Map<string, SessionInfo>([
+      ["answered", makeSession({ threadId: "answered", lastActivityAt: new Date(NOW - 8 * HOUR) })],
+    ]);
+    const { manager, stopCalls } = makeManager(sessions);
+    const thread = {
+      isThread: () => true,
+      name: "🟢 x",
+      send: async () => {},
+      setName: async () => {},
+      setArchived: async () => {},
+    };
+    const client = {
+      channels: { cache: { get: () => thread }, fetch: async () => thread },
+    } as unknown as Client;
+
+    const reaper = new Reaper(manager, client, {
+      idleTimeoutMs: 6 * HOUR,
+      now: () => NOW,
+      isAwaitingAsk: () => false, // ask resolved before this scan
+    });
+    await reaper.check();
+
+    expect(stopCalls).toEqual([{ threadId: "answered", reason: "idle_timeout" }]);
+  });
+});

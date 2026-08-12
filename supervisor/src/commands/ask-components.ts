@@ -12,6 +12,7 @@ import {
   type AccessDecision,
   type AccessQuery,
 } from "../config/access-policy";
+import { askWaitNotice } from "../session/relay-server";
 import { safeRespond } from "./safe-respond";
 
 /**
@@ -337,6 +338,12 @@ export interface AskPromptInput {
   question: string;
   options?: string[];
   multiSelect?: boolean;
+  /**
+   * Effective wait budget for this ask (`AskUserEvent.timeoutMs`, #416). Passed
+   * through to the footer so the post states the real deadline. Omitted falls
+   * back to the relay's current default — never to a hardcoded duration.
+   */
+  timeoutMs?: number;
 }
 
 export interface AskPromptMessage {
@@ -373,7 +380,7 @@ export function buildAskPrompt(
 
   if (rawOptions.length === 0) {
     return {
-      content: joinContent(head, [], TEXT_FOOTER),
+      content: joinContent(head, [], askFooter("text", input.timeoutMs)),
       components: [],
       kind: "text",
     };
@@ -387,7 +394,7 @@ export function buildAskPrompt(
       content: joinContent(
         head,
         list,
-        `⚠️ 選択肢が ${rawOptions.length} 件あり Discord の上限（${MAX_SELECT_OPTIONS} 件）を超えるため、ボタン/メニューを表示できません。\n${TEXT_FOOTER}`
+        `⚠️ 選択肢が ${rawOptions.length} 件あり Discord の上限（${MAX_SELECT_OPTIONS} 件）を超えるため、ボタン/メニューを表示できません。\n${askFooter("text", input.timeoutMs)}`
       ),
       components: [],
       kind: "text",
@@ -406,11 +413,7 @@ export function buildAskPrompt(
   });
 
   return {
-    content: joinContent(
-      head,
-      list,
-      kind === "buttons" ? BUTTON_FOOTER : SELECT_FOOTER
-    ),
+    content: joinContent(head, list, askFooter(kind, input.timeoutMs)),
     components: [
       kind === "buttons"
         ? buildButtonRow(token, options, false)
@@ -421,15 +424,27 @@ export function buildAskPrompt(
   };
 }
 
-// The relay owns the ask timeout (relay-server.ts DEFAULT_ASK_TIMEOUT_MS) and
-// #416 is changing it. Naming a duration here would go stale silently, so the
-// footers state the consequence without the number.
-const TEXT_FOOTER =
-  "このスレッドへの次の返信がそのまま回答として送られます（タイムアウトすると TUI ダイアログに戻ります）。";
-const BUTTON_FOOTER =
-  "下のボタンをタップして回答してください（このスレッドへの返信でも回答できます）。";
-const SELECT_FOOTER =
-  "下のメニューから選択して回答してください（このスレッドへの返信でも回答できます）。";
+/**
+ * Closing lines of the post: how to answer, then the relay's own wait notice.
+ *
+ * `askWaitNotice` (relay-server.ts, #416) already says both "a text reply in
+ * this thread is the answer" and how long the relay will wait, plus the #423
+ * line that no option is auto-selected once it falls back to the TUI. Those
+ * belong to the server that owns the timeout — restating any of it here is how
+ * the old hardcoded "約 5 分" survived two changes to the real value. So the
+ * component kinds only prepend the tap instruction and reuse the notice
+ * verbatim; the text kind is the notice alone.
+ */
+function askFooter(kind: AskComponentKind, timeoutMs?: number): string {
+  const notice = askWaitNotice(timeoutMs);
+  if (kind === "buttons") {
+    return `下のボタンをタップして回答してください。\n${notice}`;
+  }
+  if (kind === "select") {
+    return `下のメニューから選択して回答してください。\n${notice}`;
+  }
+  return notice;
+}
 
 /**
  * Assemble the post under Discord's content ceiling. Only the option list is

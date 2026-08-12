@@ -20,6 +20,7 @@ import {
   parseAskCustomId,
   shouldUseButtons,
   splitOption,
+  type AskComponentKind,
 } from "../../src/commands/ask-components";
 
 /**
@@ -218,6 +219,40 @@ describe("hybrid layout branch (#412)", () => {
     };
     expect(menu.min_values).toBe(1);
     expect(menu.max_values).toBe(3);
+  });
+
+  test("every layout states the real wait budget and the no-auto-select line (#416 / #423)", () => {
+    const registry = new AskPromptRegistry();
+    const fiveHours = 5 * 60 * 60 * 1000;
+    const cases: { options?: string[]; kind: AskComponentKind }[] = [
+      { kind: "text" },
+      { options: ["A", "B"], kind: "buttons" },
+      { options: ["A", "B", "C", "D", "E", "F"], kind: "select" },
+    ];
+
+    for (const { options, kind } of cases) {
+      const prompt = buildAskPrompt(
+        {
+          threadId: "thread-1",
+          question: "方針は？",
+          ...(options ? { options } : {}),
+          timeoutMs: fiveHours,
+        },
+        registry
+      );
+      expect(prompt.kind).toBe(kind);
+      // The stated deadline is #416's whole point. A future merge that drops it
+      // (or pins a hardcoded duration again) fails here.
+      expect(prompt.content).toContain("約 5 時間");
+      // #423: the owner must be able to see that nothing is auto-selected.
+      expect(prompt.content).toContain("自動で選ばれることはありません");
+      // Quoted from the relay's notice exactly once — the footers must not
+      // restate the text-reply sentence next to it.
+      const restated = prompt.content.split(
+        "このスレッドへの次の返信がそのまま回答として送られます"
+      ).length;
+      expect(restated).toBe(2);
+    }
   });
 
   test("no options (multi-question ask): text only, reply path unchanged", () => {
