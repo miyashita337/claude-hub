@@ -174,8 +174,10 @@ describe("findHookTimeoutShortfalls (Issue #416)", () => {
       DEFAULT_ASK_TIMEOUT_MS
     );
     // The recommended value covers any ASK_TIMEOUT_MS the server would accept,
-    // so the user never has to come back and raise it again.
-    expect(ASK_HOOK_RECOMMENDED_TIMEOUT_SEC * 1000).toBeGreaterThanOrEqual(
+    // so the user never has to come back and raise it again — and strictly
+    // exceeds it, so Claude Code does not kill the hook in the same instant
+    // curl is giving up (a tie there discards an answer that already arrived).
+    expect(ASK_HOOK_RECOMMENDED_TIMEOUT_SEC * 1000).toBeGreaterThan(
       MAX_ASK_TIMEOUT_MS
     );
   });

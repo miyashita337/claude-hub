@@ -48,13 +48,15 @@ export interface RequiredHook {
 export const ASK_HOOK_MIN_TIMEOUT_SEC = Math.ceil(DEFAULT_ASK_TIMEOUT_MS / 1000);
 
 /**
- * Value to recommend in the warning: the server's hard cap, which is also the
- * curl budget in ask-user-relay.sh. Setting the hook timeout here covers every
- * reachable `ASK_TIMEOUT_MS` in one go, so the user never has to revisit it.
+ * Value to recommend in the warning: the server's hard cap (which is also the
+ * curl budget in ask-user-relay.sh) plus a minute of headroom. Covers every
+ * reachable `ASK_TIMEOUT_MS` in one go, so the user never has to revisit it,
+ * and the headroom keeps Claude Code from killing the hook at the exact instant
+ * curl is giving up — at equal values the two race, and losing the race throws
+ * away an answer that had already arrived.
  */
-export const ASK_HOOK_RECOMMENDED_TIMEOUT_SEC = Math.ceil(
-  MAX_ASK_TIMEOUT_MS / 1000,
-);
+export const ASK_HOOK_RECOMMENDED_TIMEOUT_SEC =
+  Math.ceil(MAX_ASK_TIMEOUT_MS / 1000) + 60;
 
 /**
  * Claude Code's `timeout` default for a command hook when settings.json omits
