@@ -1,6 +1,10 @@
-import { test, expect, describe } from "bun:test";
+import { test, expect, describe, spyOn } from "bun:test";
 import { readFileSync } from "fs";
 import { resolve } from "path";
+import type {
+  AccessDecision,
+  AccessQuery,
+} from "../../src/config/access-policy";
 import {
   ASK_COMPONENT_PREFIX,
   AskPromptRegistry,
@@ -41,17 +45,26 @@ function makeInteraction(opts: {
   /** Present → a String Select interaction; absent → a button. */
   values?: string[];
   channelId?: string;
+  parentId?: string;
+  userId?: string;
   messageContent?: string;
   updateThrows?: boolean;
   editThrows?: boolean;
 }) {
   const replies: ReplyRecord[] = [];
   const isSelect = opts.values !== undefined;
+  const channelId = opts.channelId ?? "thread-1";
 
   const interaction = {
     customId: opts.customId,
     values: opts.values ?? [],
-    channelId: opts.channelId ?? "thread-1",
+    channelId,
+    channel: {
+      id: channelId,
+      isThread: () => true,
+      parentId: opts.parentId ?? "parent-1",
+    },
+    user: { id: opts.userId ?? "user-owner" },
     deferred: false,
     replied: false,
     isStringSelectMenu: () => isSelect,
@@ -83,16 +96,26 @@ function makeInteraction(opts: {
   return { interaction, replies };
 }
 
-function makeHandler(opts: { pending?: boolean; registry: AskPromptRegistry }) {
+function makeHandler(opts: {
+  pending?: boolean;
+  registry: AskPromptRegistry;
+  /** Access gate verdict. Default: allow (the owner clicking their own thread). */
+  access?: AccessDecision;
+}) {
   const resolved: { threadId: string; answer: string }[] = [];
+  const accessQueries: AccessQuery[] = [];
   const handler = createAskComponentHandler({
     hasPendingAsk: () => opts.pending ?? true,
     resolveAskUser: (threadId, answer) => {
       resolved.push({ threadId, answer });
     },
     registry: opts.registry,
+    checkAccess: (query) => {
+      accessQueries.push(query);
+      return opts.access ?? { allowed: true, reason: "allowed" };
+    },
   });
-  return { handler, resolved };
+  return { handler, resolved, accessQueries };
 }
 
 /** Read the customIds out of a built row, in order. */
@@ -440,6 +463,86 @@ describe("ask component handler (#412)", () => {
     );
   });
 
+  test("an EXPIRED prompt cannot answer the newer question (PR #427 must-2)", async () => {
+    const registry = new AskPromptRegistry();
+    const first = buildAskPrompt(
+      { threadId: "thread-1", question: "Q1", options: ["案A"] },
+      registry
+    );
+
+    // 1) The relay times out and the 会長 clicks the dead message: state = expired.
+    const expiredRun = makeHandler({ registry, pending: false });
+    const stale = makeInteraction({
+      customId: `${ASK_COMPONENT_PREFIX}${first.token}:0`,
+    });
+    await expiredRun.handler(stale.interaction as never);
+    expect(expiredRun.resolved).toHaveLength(0);
+
+    // 2) A NEW ask arrives on the same thread and is now the pending one.
+    buildAskPrompt(
+      { threadId: "thread-1", question: "Q2", options: ["案X"] },
+      registry
+    );
+
+    // 3) Clicking the OLD message must not answer Q2 with Q1's option.
+    // hasPendingAsk is per-thread, so without superseding the expired prompt
+    // this used to sail through and resolve the new ask.
+    const { handler, resolved } = makeHandler({ registry });
+    const again = makeInteraction({
+      customId: `${ASK_COMPONENT_PREFIX}${first.token}:0`,
+    });
+    await handler(again.interaction as never);
+
+    expect(resolved).toHaveLength(0);
+    expect(again.replies.find((r) => r.kind === "reply")?.content).toBeDefined();
+  });
+
+  test("expired is terminal: a re-click keeps reporting expiry, not the newer ask's state", async () => {
+    const registry = new AskPromptRegistry();
+    const prompt = buildAskPrompt(
+      { threadId: "thread-1", question: "方針は？", options: ["案A"] },
+      registry
+    );
+    const first = makeHandler({ registry, pending: false });
+    const click1 = makeInteraction({
+      customId: `${ASK_COMPONENT_PREFIX}${prompt.token}:0`,
+    });
+    await first.handler(click1.interaction as never);
+
+    // Same prompt, but now the thread has a pending ask again (a later question).
+    const second = makeHandler({ registry, pending: true });
+    const click2 = makeInteraction({
+      customId: `${ASK_COMPONENT_PREFIX}${prompt.token}:0`,
+    });
+    await second.handler(click2.interaction as never);
+
+    expect(second.resolved).toHaveLength(0);
+    expect(click2.replies.find((r) => r.kind === "reply")?.content).toContain(
+      "期限"
+    );
+  });
+
+  test("a long question is trimmed, the recorded choice is not (PR #427 should-4)", async () => {
+    const registry = new AskPromptRegistry();
+    const prompt = buildAskPrompt(
+      { threadId: "thread-1", question: "方針は？", options: ["案A"] },
+      registry
+    );
+    const { handler } = makeHandler({ registry });
+    const { interaction, replies } = makeInteraction({
+      customId: `${ASK_COMPONENT_PREFIX}${prompt.token}:0`,
+      // A question already at the content ceiling: appending the choice and
+      // truncating the whole thing would drop exactly the choice.
+      messageContent: "長".repeat(1900),
+    });
+
+    await handler(interaction as never);
+
+    const update = replies.find((r) => r.kind === "update");
+    expect(update?.content).toContain("✅ 選択: 案A");
+    expect((update?.content ?? "").length).toBeLessThanOrEqual(2000);
+  });
+
   test("unknown token (restart / evicted) is reported, not ignored", async () => {
     const registry = new AskPromptRegistry();
     const { handler, resolved } = makeHandler({ registry });
@@ -527,6 +630,123 @@ describe("ask component handler (#412)", () => {
     // take it down with it.
     await handler(interaction as never);
     expect(resolved).toEqual([{ threadId: "thread-1", answer: "案A" }]);
+  });
+});
+
+// --- authorization (#427 review must-1) ------------------------------------
+
+describe("tap authorization (#412 / PR #427 must-1)", () => {
+  test("a tap from a sender the policy denies never answers", async () => {
+    const registry = new AskPromptRegistry();
+    const prompt = buildAskPrompt(
+      { threadId: "thread-1", question: "方針は？", options: ["案A", "案B"] },
+      registry
+    );
+    const { handler, resolved } = makeHandler({
+      registry,
+      access: { allowed: false, reason: "sender_not_allowlisted" },
+    });
+    const { interaction, replies } = makeInteraction({
+      customId: `${ASK_COMPONENT_PREFIX}${prompt.token}:0`,
+      userId: "user-stranger",
+    });
+
+    await handler(interaction as never);
+
+    // A tap and a text reply commit the same thing — the owner's answer — so an
+    // un-gated tap would be the same failure class this feature exists to fix.
+    expect(resolved).toHaveLength(0);
+    const reply = replies.find((r) => r.kind === "reply");
+    expect(reply?.content).toContain("権限がありません");
+    expect(reply?.flags).toBe(64);
+    // Denied clicks must not silently disarm the message for the real owner.
+    expect(replies.some((r) => r.kind === "update")).toBe(false);
+  });
+
+  test("the gate is keyed on the parent channel and treats a click as addressed to the bot", async () => {
+    const registry = new AskPromptRegistry();
+    const prompt = buildAskPrompt(
+      { threadId: "thread-1", question: "方針は？", options: ["案A"] },
+      registry
+    );
+    const { handler, resolved, accessQueries } = makeHandler({ registry });
+    const { interaction } = makeInteraction({
+      customId: `${ASK_COMPONENT_PREFIX}${prompt.token}:0`,
+      parentId: "parent-1",
+      userId: "user-owner",
+    });
+
+    await handler(interaction as never);
+
+    // Same key as messageCreate (`parentId ?? threadId`), so the two answer
+    // paths cannot be allow-listed differently.
+    expect(accessQueries).toEqual([
+      { channelKey: "parent-1", userId: "user-owner", isMention: true },
+    ]);
+    // isMention: true is load-bearing — every group defaults requireMention:true,
+    // so passing false here would deny every tap.
+    expect(resolved).toHaveLength(1);
+  });
+
+  test("a denied tap is logged with the reason only (no snowflake, no body)", async () => {
+    const registry = new AskPromptRegistry();
+    const prompt = buildAskPrompt(
+      { threadId: "thread-1", question: "秘密の質問", options: ["案A"] },
+      registry
+    );
+    const { handler } = makeHandler({
+      registry,
+      access: { allowed: false, reason: "policy_unavailable" },
+    });
+    const { interaction } = makeInteraction({
+      customId: `${ASK_COMPONENT_PREFIX}${prompt.token}:0`,
+      userId: "111222333444555666",
+    });
+    const warn = spyOn(console, "warn").mockImplementation(() => {});
+
+    try {
+      await handler(interaction as never);
+      const lines = warn.mock.calls.map((c) => c.join(" "));
+      expect(lines.some((l) => l.includes("policy_unavailable"))).toBe(true);
+      expect(lines.some((l) => l.includes("111222333444555666"))).toBe(false);
+      expect(lines.some((l) => l.includes("秘密の質問"))).toBe(false);
+    } finally {
+      warn.mockRestore();
+    }
+  });
+});
+
+// --- decision trail (#427 review should-1) ---------------------------------
+
+describe("decision trail (#412 / PR #427 should-1)", () => {
+  test("a successful answer is logged with thread, token and choice, without the raw user id", async () => {
+    const registry = new AskPromptRegistry();
+    const prompt = buildAskPrompt(
+      { threadId: "thread-1", question: "方針は？", options: ["案A", "案B"] },
+      registry
+    );
+    const { handler } = makeHandler({ registry });
+    const { interaction } = makeInteraction({
+      customId: `${ASK_COMPONENT_PREFIX}${prompt.token}:1`,
+      userId: "111222333444555666",
+    });
+    const log = spyOn(console, "log").mockImplementation(() => {});
+
+    try {
+      await handler(interaction as never);
+      const lines = log.mock.calls.map((c) => c.join(" "));
+      const answered = lines.find((l) => l.includes("answered"));
+      // "I tapped it and nothing happened" must be answerable from the log.
+      expect(answered).toBeDefined();
+      expect(answered).toContain("thread-1");
+      expect(answered).toContain(prompt.token!);
+      expect(answered).toContain("案B");
+      // The actor is identified by a hash, never the snowflake.
+      expect(answered).not.toContain("111222333444555666");
+      expect(answered).toMatch(/actor [0-9a-f]{8}/);
+    } finally {
+      log.mockRestore();
+    }
   });
 });
 

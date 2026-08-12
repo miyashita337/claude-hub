@@ -1,3 +1,4 @@
+import { createHash } from "crypto";
 import {
   ActionRowBuilder,
   ButtonBuilder,
@@ -6,6 +7,11 @@ import {
   type ButtonInteraction,
   type StringSelectMenuInteraction,
 } from "discord.js";
+import {
+  evaluateAccess,
+  type AccessDecision,
+  type AccessQuery,
+} from "../config/access-policy";
 import { safeRespond } from "./safe-respond";
 
 /**
@@ -42,6 +48,11 @@ export const ASK_COMPONENT_PREFIX = "ask:";
  * Discord API limits (docs.discord.com/developers — Message Components).
  * Encoded as named constants so the truncation sites read as "the API says so"
  * rather than as magic numbers.
+ *
+ * `CUSTOM_ID_LIMIT` is the exception: nothing truncates a customId, because a
+ * truncated one would index the wrong option. The token keeps it far under 100
+ * chars by construction, and ask-components.test.ts asserts the built ids stay
+ * within the limit — verified, not clamped.
  */
 export const CUSTOM_ID_LIMIT = 100;
 /** Max buttons in one ActionRow. Also the button/select branch threshold. */
@@ -127,10 +138,19 @@ export class AskPromptRegistry {
   constructor(private readonly capacity = 50) {}
 
   /**
-   * Register a posted prompt and return its token. Any earlier prompt for the
-   * same thread is marked `superseded`: the relay replaces an in-flight ask
-   * (relay-server resolves the displaced one with 499), so a click on the older
-   * message would otherwise answer the NEW question with the OLD option.
+   * Register a posted prompt and return its token. Every earlier prompt for the
+   * same thread that has NOT been answered is marked `superseded`: the relay
+   * replaces an in-flight ask (relay-server resolves the displaced one with
+   * 499), so a click on the older message would otherwise answer the NEW
+   * question with the OLD option.
+   *
+   * The condition is `!== "answered"` rather than `=== "pending"` because
+   * `hasPendingAsk` is per-THREAD while a token is per-MESSAGE: an `expired`
+   * prompt left un-superseded still passes the state checks, and by the time it
+   * is clicked the thread may have a *different* ask pending — which it would
+   * then answer (#427 review must-2). The structural fix is to carry an ask id
+   * through `hasPendingAsk` / `resolveAskUser`; that touches relay-server.ts,
+   * which #416 is editing, so it is deferred there.
    */
   register(input: {
     threadId: string;
@@ -139,7 +159,7 @@ export class AskPromptRegistry {
     multiSelect: boolean;
   }): string {
     for (const prompt of this.prompts.values()) {
-      if (prompt.threadId === input.threadId && prompt.state === "pending") {
+      if (prompt.threadId === input.threadId && prompt.state !== "answered") {
         prompt.state = "superseded";
       }
     }
@@ -158,6 +178,12 @@ export class AskPromptRegistry {
     // answered" rather than "expired". Bound the map anyway — the supervisor is
     // long-lived, and an evicted prompt degrades to the expired message, which
     // is accurate for one that old.
+    //
+    // Eviction is by insertion order and does NOT skip `pending` entries, so a
+    // live question can age out of the registry once ~50 asks have been posted
+    // since. That degrades safely: its buttons report "already finished" and the
+    // text-reply path still resolves the ask. It is not a correctness hole, but
+    // do not read the bound as "answered-only".
     while (this.prompts.size > this.capacity) {
       const oldest = this.prompts.keys().next().value;
       if (oldest === undefined) break;
@@ -202,6 +228,21 @@ export function parseAskCustomId(
  * inspection of the option text — the two inputs fully decide the layout.
  * Buttons only when every option fits one ActionRow AND a single answer is
  * wanted; a select otherwise.
+ *
+ * DEAD PATH TODAY (#427 review should-3): in production this returns `true`
+ * every time, so the select branch — and the >25 fallback in
+ * {@link buildAskPrompt} — run only under unit tests. Two reasons:
+ *
+ *   1. AskUserQuestion carries at most 4 options (+ Other), i.e. never > 5
+ *   2. `multiSelect` is dropped before it reaches us: hooks/ask-user-relay.sh
+ *      flattens each option to a `label — description` string and AskUserEvent
+ *      has no such field
+ *
+ * ENABLING CONDITION: the hook + `/ask` payload start carrying `multiSelect`
+ * (and structured options). That work lands with the relay-server changes in
+ * #416; bot.ts already reads the flag defensively, so the branch switches on by
+ * itself. If that never happens, delete the select path rather than keeping it
+ * as unexercised surface (agent-output-quality.md #4).
  */
 export function shouldUseButtons(
   optionCount: number,
@@ -316,6 +357,10 @@ export interface AskPromptMessage {
  * options than a select can hold. The over-limit case is stated in the message
  * and logged rather than truncated: dropping choices silently would let the
  * user answer a question they were never shown all of.
+ *
+ * The over-limit branch shares the select path's reachability caveat — see
+ * {@link shouldUseButtons}. Today AskUserQuestion never sends more than 5
+ * options, so only the no-options and buttons branches run in production.
  */
 export function buildAskPrompt(
   input: AskPromptInput,
@@ -436,6 +481,27 @@ export interface AskComponentHandlerDeps {
   /** relay-server: hand the answer back to the blocked hook. */
   resolveAskUser: (threadId: string, answer: string) => void;
   registry?: AskPromptRegistry;
+  /**
+   * access.json gate. Defaults to the live policy evaluation — the same
+   * function messageCreate uses before relaying a thread message
+   * (`bot.ts` の evaluateAccess 呼び出し). Injectable so tests exercise
+   * allow/deny without a policy file on disk.
+   */
+  checkAccess?: (query: AccessQuery) => AccessDecision;
+}
+
+/**
+ * Short, non-reversible id for "who clicked", for the decision audit line.
+ *
+ * The house rule for these logs is that they carry no raw snowflakes
+ * (access-policy.ts の reason enum 方針と同じ). A raw `interaction.user.id`
+ * would break that, but "which of the allowed users answered" is exactly what a
+ * decision trail needs — so the id is hashed. The same person hashes to the same
+ * value across lines, and the value cannot be pasted back into an API call.
+ */
+function actorTag(userId: string): string {
+  if (!userId) return "unknown";
+  return createHash("sha256").update(userId).digest("hex").slice(0, 8);
 }
 
 /**
@@ -448,6 +514,7 @@ export interface AskComponentHandlerDeps {
  */
 export function createAskComponentHandler(deps: AskComponentHandlerDeps) {
   const registry = deps.registry ?? askPrompts;
+  const checkAccess = deps.checkAccess ?? ((query) => evaluateAccess(query));
 
   return async (
     interaction: ButtonInteraction | StringSelectMenuInteraction
@@ -492,11 +559,69 @@ export function createAskComponentHandler(deps: AskComponentHandlerDeps) {
       return;
     }
 
+    // Authorize the CLICKER before anything else about the question is
+    // disclosed or decided (#427 review must-1). A tap and a text reply produce
+    // the SAME thing — the 会長's answer — so they must pass the same gate;
+    // messageCreate runs evaluateAccess on `parentId ?? threadId` before
+    // relaying, and this is that path's twin. Without it, anyone who can see the
+    // thread could commit a decision as the owner, which is the same class of
+    // failure (an answer the owner never gave) this whole feature was built to
+    // fix.
+    //
+    // `isMention: true` is deliberate, not a bypass: `requireMention` exists so
+    // the bot ignores channel chatter not addressed to it, and a component
+    // click IS addressed to it — Discord routes the interaction to the app that
+    // sent the message, by customId. With every group defaulting to
+    // requireMention:true, passing false here would deny every tap and leave the
+    // feature dead. The gate that matters for a click is `allowFrom`.
+    {
+      const channel = interaction.channel;
+      const parentChannelId =
+        (channel?.isThread() ? channel.parentId : null) ?? prompt.threadId;
+      const userId = interaction.user?.id ?? "";
+      const decision = userId
+        ? checkAccess({
+            channelKey: parentChannelId,
+            userId,
+            isMention: true,
+          })
+        : ({
+            allowed: false,
+            reason: "sender_not_allowlisted",
+          } satisfies AccessDecision);
+      if (!decision.allowed) {
+        // Same shape as the messageCreate denial log: coarse reason enum, no
+        // user snowflake, no message body.
+        console.warn(
+          `[ask-components] tap denied (reason=${decision.reason}) on thread ${prompt.threadId}; not answered`
+        );
+        await safeRespond(interaction, {
+          content:
+            "🚫 この質問に回答する権限がありません（このスレッドの許可リストに登録されたユーザーのみ回答できます）。",
+          ephemeral: true,
+        });
+        return;
+      }
+    }
+
     if (prompt.state === "answered") {
       await safeRespond(interaction, {
         content: `ℹ️ この質問は回答済みです（選択: ${prompt.answer ?? "—"}）。`,
         ephemeral: true,
       });
+      return;
+    }
+    if (prompt.state === "expired") {
+      // Terminal, like `answered`: an ask never becomes pending again once the
+      // relay gave up on it. Re-deciding from `hasPendingAsk` below would read
+      // the state of whatever ask is pending NOW, which is a different question
+      // (#427 review must-2).
+      await safeRespond(interaction, {
+        content:
+          "⌛ この質問は回答期限が切れています（セッションは TUI ダイアログに戻っています）。",
+        ephemeral: true,
+      });
+      await disableStaleMessage(interaction, prompt);
       return;
     }
     if (prompt.state === "superseded") {
@@ -546,17 +671,35 @@ export function createAskComponentHandler(deps: AskComponentHandlerDeps) {
 
     // Mark and resolve synchronously — no await in between — so a double click
     // (or a button and a select racing) cannot resolve the same ask twice.
+    //
+    // Multi-select answers are joined with ", ". UNVERIFIED: whether the native
+    // AskUserQuestion dialog returns multiple labels as one comma-joined string,
+    // an array, or newline-separated is not confirmed against the tool's
+    // contract. It does not bite today (the select path is unreachable in
+    // production — see shouldUseButtons), but confirm the shape when the hook
+    // starts forwarding multiSelect.
     const answer = chosen.map((option) => option.answer).join(", ");
     prompt.state = "answered";
     prompt.answer = answer;
     deps.resolveAskUser(prompt.threadId, answer);
 
-    const base = interaction.message?.content ?? "";
-    const chosenLine = `✅ 選択: ${answer}`;
-    const content = truncate(
-      base ? `${base}\n\n${chosenLine}` : chosenLine,
-      CONTENT_LIMIT
+    // The decision trail (#427 review should-1). This is the 会長's input point:
+    // when someone later says "I tapped it and nothing happened", this line is
+    // the only evidence that the tap existed and what it chose. Actor is hashed
+    // (see actorTag) so the trail carries no snowflake.
+    console.log(
+      `[ask-components] answered thread ${prompt.threadId} (token ${parsed.token}, actor ${actorTag(interaction.user?.id ?? "")}, kind ${prompt.kind}): ${answer}`
     );
+
+    const base = interaction.message?.content ?? "";
+    const chosenLine = truncate(`✅ 選択: ${answer}`, CONTENT_LIMIT);
+    // Trim the QUESTION, never the choice (#427 review should-4). Appending and
+    // truncating the whole thing drops the tail first, which is exactly the line
+    // that records what was decided.
+    const baseBudget = CONTENT_LIMIT - chosenLine.length - 2;
+    const trimmedBase =
+      baseBudget > 0 ? truncate(base, baseBudget) : "";
+    const content = trimmedBase ? `${trimmedBase}\n\n${chosenLine}` : chosenLine;
     try {
       await interaction.update({
         content,
