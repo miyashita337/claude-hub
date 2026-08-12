@@ -396,3 +396,41 @@ describe("DispatchHealthReaper.check — the silence × child-process quadrants"
     expect(thread.sent.length).toBe(1);
   });
 });
+
+/**
+ * Issue #416: this reaper, not the 6h idle one, is what would actually kill a
+ * 5h ask — its horizon is 2h and a session parked inside the PreToolUse hook is
+ * silent with no CI/build child, so it satisfies every existing reap condition.
+ * stop() also removes the worktree, so the loss would not be recoverable.
+ */
+describe("DispatchHealthReaper — sessions awaiting an AskUserQuestion answer (#416)", () => {
+  const now = 3_000_000_000_000;
+
+  test("spares a silent, probe-idle session that is waiting on the user", async () => {
+    const sessions = new Map<string, SessionInfo>([
+      ["t9", silentSession("t9", "corp-dispatch-9", 3, now)],
+    ]);
+    const { manager, stopCalls } = makeManager(sessions);
+    const thread: ThreadStub = {
+      name: "🟢 corp-dispatch-9",
+      sent: [],
+      archived: false,
+      renamedTo: null,
+    };
+    const { probe, calls } = fixedProbe("idle"); // would otherwise be reaped
+    const reaper = new DispatchHealthReaper(manager, makeClient(thread), {
+      now: () => now,
+      silenceThresholdMs: SILENCE,
+      probe,
+      isAwaitingAsk: (threadId) => threadId === "t9",
+    });
+
+    await reaper.check();
+
+    expect(stopCalls).toEqual([]);
+    expect(thread.archived).toBe(false);
+    // Short-circuits before the probe: no reason to shell out for a session we
+    // already know we are keeping.
+    expect(calls).toEqual([]);
+  });
+});

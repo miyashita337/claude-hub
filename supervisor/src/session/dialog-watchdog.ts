@@ -99,6 +99,17 @@ export interface DialogWatchdogOptions {
   maxBackoffMs?: number;
   /** Override max auto-accept attempts — tests can drop to 1 for speed. */
   maxAutoAcceptAttempts?: number;
+  /**
+   * Issue #423: withhold auto-accept for ANY detected kind while this returns
+   * true. `relay.ts` wires it to "an AskUserQuestion was relayed for this
+   * thread moments ago" (relay-server state), so the dialog the hook's fallback
+   * leaves on screen is never answered by the machine even if its rendered
+   * shape matches an auto-acceptable family — no TUI literal involved, so a
+   * future Ink redesign cannot silently re-open the hole that
+   * {@link import("./dialog-detect").DialogKind} `ask-user-question` closes.
+   * Omitted (production default) means "never suppress".
+   */
+  suppressAutoAccept?: () => boolean;
   /** Inject a custom capture function — tests pass a fake to avoid spawning
    *  tmux. Defaults to {@link captureViaTmux}. May be sync or async: the tick
    *  awaits it, so a sync fake (returning a string) stays compatible while the
@@ -201,6 +212,7 @@ export function startDialogWatchdog(
     pollIntervalMs = POLL_INTERVAL_MS,
     maxBackoffMs = MAX_BACKOFF_MS,
     maxAutoAcceptAttempts = MAX_AUTO_ACCEPT_ATTEMPTS,
+    suppressAutoAccept,
     capture = captureViaTmux,
     sendKeys = sendKeysViaTmux,
     setTimer = (cb, ms) => setTimeout(() => void cb(), ms),
@@ -212,6 +224,15 @@ export function startDialogWatchdog(
   let consecutiveAttempts = 0;
   let heartbeatFired = false;
   let stopped = false;
+  /**
+   * Issue #423: latches once we decline to auto-accept, and only clears when
+   * the pane goes clean (the no-match branch below). Without it, a dialog that
+   * was correctly declined on tick N could be auto-accepted on tick N+1 — the
+   * `suppressAutoAccept` grace window can lapse while the dialog is still on
+   * screen, and a re-render can change which pattern matches. Once a dialog is
+   * a human's to answer it stays that way for its whole lifetime.
+   */
+  let manualOnly = false;
   let timerHandle: WatchdogTimerHandle | null = null;
 
   // Recursive setTimeout instead of setInterval: each tick is awaited end-to-end
@@ -249,6 +270,7 @@ export function startDialogWatchdog(
         lastKind = null;
         consecutiveAttempts = 0;
         heartbeatFired = false;
+        manualOnly = false;
         return;
       }
 
@@ -264,7 +286,19 @@ export function startDialogWatchdog(
         );
       }
 
-      if (consecutiveAttempts < maxAutoAcceptAttempts) {
+      // Issue #423: two independent reasons to keep hands off — the detected
+      // family is a question for the user (`autoAcceptable: false`), or the
+      // caller knows an AskUserQuestion was just relayed for this session. Both
+      // latch, so the decision survives a re-render that changes which pattern
+      // matches.
+      if (!manualOnly && (!match.autoAcceptable || suppressAutoAccept?.() === true)) {
+        manualOnly = true;
+        console.warn(
+          `[Dialog] manual-only on ${tmuxSessionName}: kind=${match.kind} — auto-accept withheld (Issue #423); only a human may answer this`
+        );
+      }
+
+      if (!manualOnly && consecutiveAttempts < maxAutoAcceptAttempts) {
         const keys = AUTO_ACCEPT_KEYS[match.kind];
         consecutiveAttempts++;
         console.warn(
@@ -282,9 +316,11 @@ export function startDialogWatchdog(
         return;
       }
 
-      // Auto-accept budget exhausted — fire heartbeat once per dialog and
-      // keep polling (the user may dismiss it manually, after which lastKind
-      // resets via the no-match branch).
+      // Auto-accept budget exhausted (or never granted, for a manual-only
+      // dialog — that path lands here on the FIRST tick, so the user is paged
+      // immediately instead of after the retry budget). Fire the heartbeat once
+      // per dialog and keep polling (the user may answer manually, after which
+      // lastKind resets via the no-match branch).
       if (!heartbeatFired) {
         heartbeatFired = true;
         console.warn(

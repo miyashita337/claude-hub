@@ -12,6 +12,16 @@ import {
   RELAY_TIMEOUT_USER_MESSAGE,
   DEFAULT_ASK_TIMEOUT_MS,
   MAX_ASK_TIMEOUT_MS,
+  RELAY_IDLE_TIMEOUT_SEC,
+  readAskTimeoutMs,
+  formatAskWaitLabel,
+  askWaitNotice,
+  askExpiredNotice,
+  onAskUser,
+  onAskExpired,
+  resolveAskUser,
+  hasPendingAsk,
+  hasRecentAsk,
   type LateResponseEvent,
   type ProgressEvent,
 } from "../../src/session/relay-server";
@@ -439,4 +449,211 @@ describe("ask timeout (Issue #255, proposal E)", () => {
     // --max-time would just hang the hook with no chance of a reply.
     expect(maxTimeSeconds * 1000).toBeLessThanOrEqual(MAX_ASK_TIMEOUT_MS);
   });
+});
+
+/**
+ * Issue #416: the ask wait goes from 5 minutes to 5 hours, because the 会長
+ * reads the morning report on mobile hours after delivery. Four values have to
+ * move together (server default, server cap, curl budget, Claude Code's hook
+ * timeout) and the socket has to survive the wait.
+ *
+ * On the idle timeout specifically, measured on Bun 1.3.11 against a real
+ * server holding 20s: a GET whose body is never read is cut at ~12s, but a POST
+ * whose JSON body IS read completes normally — and POST-with-body is what
+ * hooks/ask-user-relay.sh sends. So the behavioural test below passes with or
+ * without `idleTimeout: 0`; the structural test is what actually locks the
+ * option in place.
+ */
+describe("ask timeout (Issue #416, 5 hours)", () => {
+  const HOUR = 60 * 60 * 1000;
+
+  test("the default is 5 hours and the cap is above it", () => {
+    expect(DEFAULT_ASK_TIMEOUT_MS).toBe(5 * HOUR);
+    expect(MAX_ASK_TIMEOUT_MS).toBeGreaterThan(DEFAULT_ASK_TIMEOUT_MS);
+  });
+
+  test("readAskTimeoutMs: default / env override / clamp / invalid input", () => {
+    expect(readAskTimeoutMs({})).toBe(DEFAULT_ASK_TIMEOUT_MS);
+    expect(readAskTimeoutMs({ ASK_TIMEOUT_MS: String(2 * HOUR) })).toBe(2 * HOUR);
+    // Never past the cap: the curl budget in the hook is a static literal and
+    // cannot follow an env var, so exceeding it would just hang the hook.
+    expect(readAskTimeoutMs({ ASK_TIMEOUT_MS: String(99 * HOUR) })).toBe(
+      MAX_ASK_TIMEOUT_MS,
+    );
+    for (const bad of ["abc", "0", "-5", ""]) {
+      expect(readAskTimeoutMs({ ASK_TIMEOUT_MS: bad })).toBe(
+        DEFAULT_ASK_TIMEOUT_MS,
+      );
+    }
+  });
+
+  test("the thread notices state the real wait, not a stale hardcoded one", () => {
+    expect(formatAskWaitLabel(5 * HOUR)).toBe("約 5 時間");
+    expect(formatAskWaitLabel(30 * 60_000)).toBe("約 30 分");
+    // The pre-#416 wording promised "約 5 分" — the value it described had
+    // already changed twice underneath it.
+    expect(askWaitNotice(5 * HOUR)).toContain("約 5 時間");
+    expect(askWaitNotice(5 * HOUR)).not.toContain("約 5 分");
+    // #423: the notice must not imply the TUI fallback decides anything.
+    expect(askWaitNotice(5 * HOUR)).toContain("自動で選ばれることはありません");
+    expect(askExpiredNotice(5 * HOUR)).toContain("自動では回答していません");
+  });
+
+  test("the expiry notice quotes the question and states the new deadline", () => {
+    // PR #431 review should-6: this arrives up to 5h after the question, by
+    // which point the thread has scrolled — "期限切れ" alone doesn't say which
+    // question expired.
+    const notice = askExpiredNotice(5 * HOUR, "案 A と 案 B のどちらで進めますか？");
+    expect(notice).toContain("> 案 A と 案 B のどちらで進めますか？");
+    // should-3: the reaper clock is restarted at expiry, so say so — otherwise
+    // "後で attach して答えよう" runs against a horizon already consumed by the wait.
+    expect(notice).toContain("数え直されます");
+    // Multi-line questions stay inside the blockquote so they can't read as
+    // instructions from the bot.
+    expect(askExpiredNotice(5 * HOUR, "一行目\n二行目")).toContain("> 二行目");
+    // Long questions are excerpted rather than risking Discord's 2000-char cap.
+    const long = askExpiredNotice(5 * HOUR, "あ".repeat(500));
+    expect(long).toContain("…");
+    expect(long.length).toBeLessThan(600);
+    // Absent / blank question degrades to the plain notice (no empty quote).
+    expect(askExpiredNotice(5 * HOUR, "   ")).not.toContain(">");
+  });
+
+  test("the server pins idleTimeout off so a multi-hour hold is our choice, not Bun's default", () => {
+    // Bun's default is 10s and its maximum is 255s, so a 5h wait is only
+    // expressible as 0. This assertion exists because no behavioural test can
+    // catch the option being dropped (see the block comment above) — a 5h hold
+    // currently survives by way of an undocumented Bun behaviour, and this is
+    // what makes it survive by configuration instead.
+    expect(RELAY_IDLE_TIMEOUT_SEC).toBe(0);
+  });
+
+  test(
+    "an in-flight /ask survives 30s without the socket being closed (Journey AC #2)",
+    async () => {
+      startRelayServer();
+      const port = getRelayPort();
+      const HOLD_MS = 30_000; // > Bun's 10s default idleTimeout (cut observed at 13s)
+
+      onAskUser((event) => {
+        setTimeout(() => resolveAskUser(event.threadId, "遅れて届いた回答"), HOLD_MS);
+      });
+
+      const started = Date.now();
+      const res = await fetch(`http://localhost:${port}/ask/thread-slow`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ question: "どちらにしますか？" }),
+      });
+      const elapsed = Date.now() - started;
+
+      expect(res.status).toBe(200);
+      expect(await res.json()).toEqual({ answer: "遅れて届いた回答" });
+      // The hold really elapsed — a fast 200 would mean the test proved nothing.
+      // This guards the *behaviour* (an unanswered ask stays open long enough to
+      // answer) against any future change that closes it early, whether that is
+      // an idle timeout, a keep-alive limit, or a body-handling change in Bun.
+      expect(elapsed).toBeGreaterThanOrEqual(HOLD_MS - 500);
+    },
+    60_000,
+  );
+
+  test("an expired ask notifies onAskExpired so Discord can say so (AC-3)", async () => {
+    startRelayServer();
+    const port = getRelayPort();
+    const expired: Array<{ threadId: string; question: string; timeoutMs: number }> =
+      [];
+
+    onAskUser(() => {}); // subscriber present, but never answers
+    onAskExpired((event) => expired.push(event));
+
+    const res = await fetch(`http://localhost:${port}/ask/thread-expire`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ question: "放置される質問", timeout_ms: 80 }),
+    });
+
+    expect(res.status).toBe(504);
+    expect(expired).toEqual([
+      { threadId: "thread-expire", question: "放置される質問", timeoutMs: 80 },
+    ]);
+  });
+
+  test("hasRecentAsk stays true after the ask ends, so the fallback dialog is protected (#423)", async () => {
+    startRelayServer();
+    const port = getRelayPort();
+    onAskUser(() => {});
+
+    await fetch(`http://localhost:${port}/ask/thread-recent`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ question: "q", timeout_ms: 50 }),
+    });
+
+    // The TUI dialog the hook falls back to only appears AFTER the request
+    // settles, which is exactly when hasPendingAsk goes false. hasRecentAsk is
+    // what the dialog watchdog consults, so it must outlive the request.
+    expect(hasPendingAsk("thread-recent")).toBe(false);
+    expect(hasRecentAsk("thread-recent")).toBe(true);
+    // Window-scoped, not permanent: an ask from long ago must not disable
+    // auto-accept for the rest of the session. Deterministic because the bound
+    // is exclusive — with an inclusive one this depended on whether the assert
+    // landed in the same millisecond as the ask settling (it flaked in CI).
+    expect(hasRecentAsk("thread-recent", 0)).toBe(false);
+    expect(hasRecentAsk("never-asked")).toBe(false);
+  });
+});
+
+/**
+ * Issue #416, second-order effect. The relay ceiling (15 min by default) is now
+ * much SHORTER than a legitimate ask (5h), a relationship that was inverted
+ * before this change. Left alone, every long question would draw a
+ * "応答が返りませんでした" notice into the thread underneath a question the user
+ * was still deciding on, and would tear down the dialog watchdog that #423
+ * depends on.
+ */
+describe("relay ceiling vs. a live question (Issue #416)", () => {
+  afterEach(() => {
+    stopRelayServer();
+  });
+
+  test("the relay re-arms while an ask is pending, and times out normally once it resolves", async () => {
+    startRelayServer();
+    const port = getRelayPort();
+    const threadId = "thread-relay-vs-ask";
+
+    let registered!: () => void;
+    const asked = new Promise<void>((r) => {
+      registered = r;
+    });
+    onAskUser(() => registered());
+
+    // Not awaited: this request parks until the question is answered.
+    const askDone = fetch(`http://localhost:${port}/ask/${threadId}`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ question: "決めてください", timeout_ms: 10_000 }),
+    });
+    await asked;
+
+    const CEILING_MS = 60;
+    let settled = false;
+    const relay = waitForRelay(threadId, CEILING_MS).then((r) => {
+      settled = true;
+      return r;
+    });
+
+    // Several ceilings elapse. Waiting on the user is not a lost turn.
+    await new Promise((r) => setTimeout(r, CEILING_MS * 6));
+    expect(settled).toBe(false);
+    expect(hasPendingAsk(threadId)).toBe(true);
+
+    // The re-arm is bounded, not permanent: once the question is out of the way
+    // the relay honours its ordinary contract on the very next cycle.
+    resolveAskUser(threadId, "案1");
+    expect((await askDone).status).toBe(200);
+    const result = await relay;
+    expect(result.error).toBe("Response timeout");
+    expect(result.chunks).toEqual([RELAY_TIMEOUT_USER_MESSAGE]);
+  }, 15_000);
 });

@@ -500,3 +500,133 @@ describe("dialog-watchdog poll is non-blocking (#227 / #250 AC-3)", () => {
     watchdog.stop();
   });
 });
+
+/**
+ * Issue #423: the machine must never answer a question addressed to the user.
+ * Two independent brakes are asserted here — the detected kind
+ * (`autoAcceptable: false`) and the caller-supplied `suppressAutoAccept` — plus
+ * the latch that keeps a declined dialog declined for its whole lifetime.
+ */
+describe("dialog-watchdog — AskUserQuestion is never auto-accepted (Issue #423)", () => {
+  const ASK_PANE = [
+    "□ 受信経路",
+    "タップ後に Mac で実行する受信経路はどれにしますか？",
+    "",
+    "  1. Yes — 推奨案で進める",
+    "  2. No — 別案を検討する",
+    "  3. Type something.",
+    "",
+    "  4. Chat about this",
+  ].join("\n");
+
+  test("sends no keys for a non-auto-acceptable dialog and pages on the FIRST tick", async () => {
+    const clock = createVirtualClock();
+    const sentKeys: string[][] = [];
+    const heartbeats: DialogMatch[] = [];
+    const watchdog = startDialogWatchdog({
+      tmuxSessionName: "test-ask",
+      pollIntervalMs: SHORT_TICK_MS,
+      // Budget of 2 would normally mean two auto-accepts before any heartbeat;
+      // a manual-only dialog must skip straight to paging the user.
+      maxAutoAcceptAttempts: 2,
+      capture: () => ASK_PANE,
+      sendKeys: (_, keys) => {
+        sentKeys.push(keys);
+      },
+      onHeartbeat: (m) => {
+        heartbeats.push(m);
+      },
+      setTimer: clock.setTimer,
+      clearTimer: clock.clearTimer,
+    });
+    await clock.advance(SHORT_TICK_MS * 5);
+    watchdog.stop();
+
+    expect(sentKeys).toEqual([]);
+    expect(heartbeats.length).toBe(1);
+    expect(heartbeats[0]!.kind).toBe("ask-user-question");
+  });
+
+  test("suppressAutoAccept withholds keys even for an otherwise auto-acceptable dialog", async () => {
+    const clock = createVirtualClock();
+    const sentKeys: string[][] = [];
+    const watchdog = startDialogWatchdog({
+      tmuxSessionName: "test-suppressed",
+      pollIntervalMs: SHORT_TICK_MS,
+      maxAutoAcceptAttempts: 2,
+      // A plain ink-confirm — auto-acceptable by shape. The relay knows an
+      // AskUserQuestion was just relayed for this thread, so it must not be
+      // touched regardless of how it renders.
+      capture: () => "Permission required\n  ❯ Yes\n    No\n",
+      suppressAutoAccept: () => true,
+      sendKeys: (_, keys) => {
+        sentKeys.push(keys);
+      },
+      setTimer: clock.setTimer,
+      clearTimer: clock.clearTimer,
+    });
+    await clock.advance(SHORT_TICK_MS * 5);
+    watchdog.stop();
+
+    expect(sentKeys).toEqual([]);
+  });
+
+  test("the decision latches: a dialog declined once stays declined after the grace window lapses", async () => {
+    const clock = createVirtualClock();
+    const sentKeys: string[][] = [];
+    let suppressed = true;
+    const watchdog = startDialogWatchdog({
+      tmuxSessionName: "test-latch",
+      pollIntervalMs: SHORT_TICK_MS,
+      maxAutoAcceptAttempts: 2,
+      capture: () => "Permission required\n  ❯ Yes\n    No\n",
+      // True only for the first tick, mirroring ASK_FALLBACK_GRACE_MS elapsing
+      // while the same dialog is still on screen. Without the latch the very
+      // next tick would auto-accept it.
+      suppressAutoAccept: () => {
+        const value = suppressed;
+        suppressed = false;
+        return value;
+      },
+      sendKeys: (_, keys) => {
+        sentKeys.push(keys);
+      },
+      setTimer: clock.setTimer,
+      clearTimer: clock.clearTimer,
+    });
+    await clock.advance(SHORT_TICK_MS * 6);
+    watchdog.stop();
+
+    expect(sentKeys).toEqual([]);
+  });
+
+  test("the latch clears once the pane is clean, so later dialogs auto-accept again", async () => {
+    const clock = createVirtualClock();
+    const sentKeys: string[][] = [];
+    // ask dialog → answered (clean pane) → an ordinary confirm appears later.
+    const panes = [
+      ASK_PANE,
+      "",
+      "Permission required\n  ❯ Yes\n    No\n",
+      "Permission required\n  ❯ Yes\n    No\n",
+    ];
+    let i = 0;
+    const watchdog = startDialogWatchdog({
+      tmuxSessionName: "test-latch-clear",
+      pollIntervalMs: SHORT_TICK_MS,
+      maxAutoAcceptAttempts: 2,
+      capture: () => panes[Math.min(i++, panes.length - 1)]!,
+      sendKeys: (_, keys) => {
+        sentKeys.push(keys);
+      },
+      setTimer: clock.setTimer,
+      clearTimer: clock.clearTimer,
+    });
+    await clock.advance(SHORT_TICK_MS * 5);
+    watchdog.stop();
+
+    // The confirm that appeared AFTER the question was answered is still
+    // handled normally — #423 must not turn the watchdog off wholesale.
+    expect(sentKeys).toContainEqual(["C-m"]);
+  });
+});

@@ -36,6 +36,32 @@ describe("buildDialogStuckHandler", () => {
     expect(pushover).toHaveBeenCalledTimes(1);
   });
 
+  // Issue #423: an AskUserQuestion that reached the TUI is a question that
+  // never got to Discord — not a stuck dialog. The notice has to say so, and
+  // has to say nothing was auto-selected: the incident's first question from
+  // the 会長 was whether he had answered.
+  test("says the question was not delivered and nothing was auto-selected (Issue #423)", async () => {
+    const thread = makeThread();
+    const pushover = mock(async () => true);
+    const handler = buildDialogStuckHandler(thread, { pushover });
+
+    await handler({
+      kind: "ask-user-question",
+      line: "3. Type something.",
+      tmuxSessionName: "claude-abc123",
+    });
+
+    const msg = thread.sent[0]!;
+    expect(msg).toContain("質問");
+    expect(msg).toContain("自動では選ばれません");
+    // Still tells the user how to reach the session.
+    expect(msg).toContain("tmux -L claude-hub attach -t claude-abc123");
+    // Must NOT reuse the generic "手動操作要求" framing — that wording is what
+    // made an invented answer indistinguishable from a real one.
+    expect(msg).not.toContain("手動操作要求");
+    expect(pushover).toHaveBeenCalledTimes(1);
+  });
+
   test("uses 'ブロック中' phrasing for stall (unknown dialog)", async () => {
     const thread = makeThread();
     const pushover = mock(async () => true);

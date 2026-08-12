@@ -31,6 +31,25 @@ export interface DialogStuckHandlerOptions {
 }
 
 function buildMessage(info: DialogStuckInfo): string {
+  // Issue #423: an AskUserQuestion dialog is not a stuck dialog — it is a
+  // question that never reached Discord (the /ask relay timed out or failed, so
+  // the hook fell back to the TUI). Say that plainly, and say that nothing was
+  // auto-selected: the incident that produced this branch fabricated two
+  // decisions, and the user's first question afterwards was "did I answer
+  // that?". The generic "手動操作要求" wording could not answer it.
+  if (info.kind === "ask-user-question") {
+    return [
+      "❓ Claude が**あなたに質問**していますが、Discord へ届けられませんでした（中継のタイムアウトまたは失敗）。",
+      "選択肢は自動では選ばれません（Issue #423）。回答するまでセッションはこの画面で待機します。",
+      "tmux attach して回答してください:",
+      "```",
+      `tmux -L ${TMUX_SOCKET} attach -t ${info.tmuxSessionName}`,
+      "```",
+      info.line ? `検出行: \`${info.line.replace(/`/g, "'")}\`` : "",
+    ]
+      .filter(Boolean)
+      .join("\n");
+  }
   const label =
     info.kind === "stall"
       ? "応答待ちでブロック中"
