@@ -23,6 +23,14 @@
  *    accept a different prompt that legitimately needed user input. Prefer
  *    to miss a novel dialog (and timeout, which is observable) than to
  *    auto-accept the wrong thing.
+ *  - Issue #423 applies that same principle to a whole family: AskUserQuestion
+ *    exists to make a *human* decide, so it is detected as its own kind and is
+ *    NEVER auto-accepted. Pressing a key there does not merely dismiss a
+ *    dialog — it fabricates an answer that Claude cannot distinguish from the
+ *    user's own, which is strictly worse than stalling (a stall is observable;
+ *    a fabricated decision is not). It is matched BEFORE the auto-acceptable
+ *    families so a question whose options happen to render like `1. Yes` /
+ *    `2. No` cannot be classified as `numbered-choice`.
  *  - The matched line is returned so log lines can include the actual text
  *    that triggered detection — required for [Dialog] log entries to be
  *    useful when diagnosing false positives.
@@ -33,14 +41,15 @@ export type DialogKind =
   | "bash-yn"
   | "numbered-choice"
   | "press-enter"
-  | "feedback-survey";
+  | "feedback-survey"
+  | "ask-user-question";
 
 export interface DialogMatch {
   /** Detected dialog family. */
   kind: DialogKind;
-  /** Whether the watchdog should attempt auto-accept. All known kinds today
-   *  are auto-acceptable, but we keep the field for future families (e.g.,
-   *  free-form input prompts) where we'd post a heartbeat instead. */
+  /** Whether the watchdog may attempt auto-accept. False for
+   *  {@link DialogKind} `ask-user-question` (Issue #423): the machine must not
+   *  answer a question addressed to the user. The watchdog pages instead. */
   autoAcceptable: boolean;
   /** Line that triggered detection — used in `[Dialog]` log lines. */
   line: string;
@@ -59,6 +68,13 @@ export interface DialogMatch {
  *    "How is Claude doing this session?" survey looks like a numbered choice,
  *    but options 1/2/3 *submit* feedback (1 = "Bad"). Only `0` (Dismiss)
  *    clears it without side effects, so this kind MUST press 0, never 1.
+ *  - ask-user-question: EMPTY on purpose (Issue #423). Every key in this
+ *    dialog selects an option, and a selected option is delivered to Claude as
+ *    the user's own decision. There is no "dismiss without side effects" key,
+ *    so the only safe machine action is to send nothing and page the user.
+ *    The map stays total over DialogKind so a new family cannot be added
+ *    without deciding its keys, and the empty list is a second line of defence
+ *    for any caller that forgets to check `autoAcceptable`.
  *
  * Each entry is an argv list passed to `tmux send-keys -t <session> ...`.
  * Multiple entries mean multiple sequential send-keys calls (with no
@@ -70,7 +86,48 @@ export const AUTO_ACCEPT_KEYS: Record<DialogKind, string[]> = {
   "numbered-choice": ["1", "C-m"],
   "press-enter": ["C-m"],
   "feedback-survey": ["0", "C-m"],
+  "ask-user-question": [],
 };
+
+/**
+ * Options Claude Code appends to every AskUserQuestion picker in addition to
+ * the model's own choices — the free-text entry and the "discuss it instead"
+ * escape hatch. They are harness-rendered (not model- or user-authored), which
+ * makes them the most reliable marker of "this dialog is asking the *user* to
+ * decide".
+ *
+ * Evidence: pane capture in Issue #304 (Claude Code v2.1.228) shows
+ *   `❯ 1. 案1: …` / `2. 案2: …` / `4. Type something.` / `5. Chat about this`
+ * under the question header, with `Enter to select · ↑/↓ to navigate` below.
+ *
+ * A literal from the TUI is a fragile matcher in general (RW-027: a Claude Code
+ * update silently broke a ready-marker pattern), so the consequences of drift
+ * are deliberately asymmetric here:
+ *  - marker present but not a question → we withhold auto-accept and page. Cost:
+ *    one extra Discord heartbeat.
+ *  - marker renamed by a future TUI → this kind stops matching; the dialog then
+ *    falls through to the auto-acceptable families, which is exactly the #423
+ *    hazard. `relay.ts` therefore ALSO suppresses auto-accept from supervisor
+ *    state (an /ask POST was relayed for this thread moments ago), which needs
+ *    no TUI literal at all. Keep both.
+ *
+ * The pattern is therefore written to fail toward "this might be a question"
+ * (PR #431 review, should-2). Everything except the affordance phrase itself is
+ * optional or unanchored, because each of those details is a way for a harmless
+ * rendering change to silently reopen the hazard:
+ *  - no end anchor: a border glyph, an ` (Esc)` hint or an ellipsis appended to
+ *    the line must not turn the match off
+ *  - the leading number is optional and accepts `.` or `)`: an unnumbered or
+ *    differently-punctuated list still matches
+ *  - any non-alphanumeric run may precede it: cursor markers (`❯`), bullets and
+ *    box-drawing borders are all absorbed
+ * What stays strict is the START of the line: the phrase must open the line
+ * (after decoration), so prose that merely mentions it mid-sentence does not
+ * match. That is the one place where a false positive costs more than a
+ * heartbeat — a wrongly withheld auto-accept stalls the session.
+ */
+const ASK_OPTION_MARKER =
+  /^[^\p{L}\p{N}\n]*(?:\d+\s*[.)]\s*)?(?:Type something|Chat about this)\b.*$/mu;
 
 /** Number of trailing lines to inspect. Dialogs render at the bottom of
  *  the visible pane; older content is scrollback noise. */
@@ -111,6 +168,23 @@ export function detectDialog(paneText: string): DialogMatch | null {
         };
       }
     }
+  }
+
+  // 0.5. AskUserQuestion (Issue #423). Checked before every auto-acceptable
+  //    family: a question rendered as `1. Yes` / `2. No` would otherwise match
+  //    `numbered-choice` (case 3) and be answered with option 1 — the exact
+  //    incident this kind exists to prevent, where two decisions were
+  //    fabricated and three issues were designed on top of them.
+  //    It cannot collide with `feedback-survey` (case 0, which requires the
+  //    survey question plus a `0: Dismiss` option), so that kind keeps its
+  //    documented first position and still gets auto-dismissed.
+  const askMatch = windowText.match(ASK_OPTION_MARKER);
+  if (askMatch) {
+    return {
+      kind: "ask-user-question",
+      autoAcceptable: false,
+      line: askMatch[0].trim(),
+    };
   }
 
   // 1. Ink-style confirm: lines beginning with "❯ Yes" (the cursor marker)

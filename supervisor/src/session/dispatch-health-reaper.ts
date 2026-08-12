@@ -8,6 +8,7 @@ import {
   DISPATCH_HEALTH_CHECK_INTERVAL_MS,
 } from "../config/channels";
 import { markTitleStopped } from "./thread-title";
+import { hasPendingAsk } from "./relay-server";
 
 /**
  * Dispatch health reaper (Issue #279) — the health-aware front line for the
@@ -71,6 +72,12 @@ export interface DispatchHealthReaperDeps {
    * defaults to {@link realBusyChildProbe} over the session's tmux pane.
    */
   probe?: (threadId: string) => Promise<BusyProbeResult>;
+  /**
+   * Issue #416: is this thread blocked on an unanswered AskUserQuestion? Such a
+   * session is silent and has no busy child, so every other guard here would
+   * clear it for reaping. Defaults to the relay server's live pending map.
+   */
+  isAwaitingAsk?: (threadId: string) => boolean;
 }
 
 function envInt(name: string, fallback: number): number {
@@ -99,6 +106,7 @@ export class DispatchHealthReaper {
   private readonly checkIntervalMs: number;
   private readonly silenceThresholdMs: number;
   private readonly probe: (threadId: string) => Promise<BusyProbeResult>;
+  private readonly isAwaitingAsk: (threadId: string) => boolean;
 
   constructor(
     private sessionManager: SessionManager,
@@ -116,6 +124,7 @@ export class DispatchHealthReaper {
       deps.probe ??
       ((threadId) =>
         realBusyChildProbe(SessionManager.tmuxSessionNameFor(threadId)));
+    this.isAwaitingAsk = deps.isAwaitingAsk ?? hasPendingAsk;
   }
 
   start(): void {
@@ -173,6 +182,17 @@ export class DispatchHealthReaper {
    * let ActivityWatchdog keep nudging / the 48h orphan reaper backstop it.
    */
   private async evaluate(threadId: string, idleMs: number): Promise<void> {
+    // Issue #416: a session parked on an unanswered AskUserQuestion is silent
+    // with no busy child — it would satisfy every reap condition here — but it
+    // is waiting for the user by design. At a 2h silence horizon against a 5h
+    // ask budget this reaper, not the 6h idle one, is what would actually kill
+    // the wait, and stop() also removes the worktree.
+    if (this.isAwaitingAsk(threadId)) {
+      console.log(
+        `[DispatchHealthReaper] Thread ${threadId} silent ${(idleMs / 1000 / 60 / 60).toFixed(1)}h but awaiting an AskUserQuestion answer; sparing (#416)`
+      );
+      return;
+    }
     let probe: BusyProbeResult;
     try {
       probe = await this.probe(threadId);

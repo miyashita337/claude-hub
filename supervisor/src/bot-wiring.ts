@@ -52,6 +52,9 @@ export const READY_WIRING_IDS = [
   "relay:progress",
   "relay:sessionsQuery",
   "relay:askUser",
+  // Issue #416: without this subscriber an expired ask is silent in Discord —
+  // the thread keeps showing a question nobody is waiting on any more.
+  "relay:askExpired",
   "relay:lateResponse",
   "relay:hubWork",
   "relay:channelPost",
@@ -88,6 +91,7 @@ export interface ReadyWiringHandlers {
   "relay:progress": Parameters<typeof RelayServer.onProgress>[0];
   "relay:sessionsQuery": Parameters<typeof RelayServer.onSessionsQuery>[0];
   "relay:askUser": Parameters<typeof RelayServer.onAskUser>[0];
+  "relay:askExpired": Parameters<typeof RelayServer.onAskExpired>[0];
   "relay:lateResponse": Parameters<typeof RelayServer.onLateResponse>[0];
   "relay:hubWork": Parameters<typeof RelayServer.onHubWork>[0];
   "relay:channelPost": Parameters<typeof RelayServer.onChannelPost>[0];
@@ -154,6 +158,7 @@ export interface WiringTargets {
     onProgress: typeof RelayServer.onProgress;
     onSessionsQuery: typeof RelayServer.onSessionsQuery;
     onAskUser: typeof RelayServer.onAskUser;
+    onAskExpired: typeof RelayServer.onAskExpired;
     onLateResponse: typeof RelayServer.onLateResponse;
     onHubWork: typeof RelayServer.onHubWork;
     onChannelPost: typeof RelayServer.onChannelPost;
@@ -221,6 +226,11 @@ export function createDiscordWiringSurface(
         case "relay:askUser":
           targets.relay.onAskUser(
             handler as ReadyWiringHandlers["relay:askUser"],
+          );
+          return;
+        case "relay:askExpired":
+          targets.relay.onAskExpired(
+            handler as ReadyWiringHandlers["relay:askExpired"],
           );
           return;
         case "relay:lateResponse":

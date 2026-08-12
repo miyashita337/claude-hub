@@ -34,6 +34,10 @@
 
 import { resolveWorktreePath } from "./worktree";
 import { formatForDiscord } from "./output-formatter";
+import {
+  buildDialogStuckHandler,
+  type DialogStuckInfo,
+} from "./dialog-stuck-handler";
 
 /** Literal trigger token. Exposed so external callers (corp) can match it. */
 export const DISPATCH_PREFIX = "/dispatch";
@@ -237,7 +241,21 @@ export interface DispatchSessionManager {
    * TUI is still booting (RW-025 / RW-047 timing class).
    */
   waitForInputReady(threadId: string): Promise<boolean>;
-  sendMessage(threadId: string, message: string): Promise<unknown>;
+  /**
+   * `options.onDialogStuck` is forwarded to the relay's dialog watchdog. Passing
+   * it is not optional in practice for dispatch (PR #431 review, should-4): a
+   * dispatch session has no human watching its pane, so a dialog the watchdog
+   * refuses to auto-accept — which since #423 includes every AskUserQuestion —
+   * would otherwise stall with the news going no further than console.warn.
+   */
+  sendMessage(
+    threadId: string,
+    message: string,
+    attachments?: unknown[],
+    options?: {
+      onDialogStuck?: (info: DialogStuckInfo) => void | Promise<void>;
+    },
+  ): Promise<unknown>;
   /**
    * Headless executor path (Epic #285 Phase 2 / #287). Runs `claude -p
    * "<initialCommand>"` in the branch worktree to completion and resolves with
@@ -374,9 +392,31 @@ export async function runDispatch(
     );
   }
 
+  // PR #431 review (should-4). The remaining silent-stall path after #423: when
+  // POST /ask fails outright (connection refused, or 503 because no subscriber
+  // is registered) the hook falls back immediately, so no ask is ever pending
+  // and the expiry notice never fires — nothing tells the thread. The dialog
+  // watchdog does see it, but only reports through `onDialogStuck`, which this
+  // path has never supplied. The thread already exists and `postToThread`
+  // already writes to it, so the heartbeat costs one adapter.
+  const poster = args.postToThread;
+  if (!poster) {
+    console.warn(
+      `[Dispatch] no postToThread for thread ${threadId}; a dialog needing a human will only reach the log`,
+    );
+  }
+  const onDialogStuck = poster
+    ? buildDialogStuckHandler({ send: (content) => poster(threadId, content) })
+    : undefined;
+
   const initialCommand = `/${command} ${issueNumber}`;
   try {
-    await sessionManager.sendMessage(threadId, initialCommand);
+    await sessionManager.sendMessage(
+      threadId,
+      initialCommand,
+      undefined,
+      onDialogStuck ? { onDialogStuck } : undefined,
+    );
   } catch (err) {
     return { ok: false, stage: "inject", error: errMsg(err) };
   }

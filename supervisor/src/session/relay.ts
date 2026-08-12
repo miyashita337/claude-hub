@@ -2,7 +2,7 @@ import { execFile } from "child_process";
 import { promisify } from "util";
 import { resolve } from "path";
 import { mkdirSync, writeFileSync } from "fs";
-import { waitForRelay, type RelayResult } from "./relay-server";
+import { waitForRelay, hasRecentAsk, type RelayResult } from "./relay-server";
 import { persistAttachments } from "./attachment-store";
 import { TMUX_PATH, TMUX_ARGS } from "./tmux";
 import { createLatencyTracker } from "./latency-logger";
@@ -456,6 +456,12 @@ export async function relayMessage(
   // to stderr inside the watchdog so the dialog surfaces in supervisor logs.
   const watchdog = startDialogWatchdog({
     tmuxSessionName,
+    // Issue #423: the shape detector (`ask-user-question`) is the first line of
+    // defence and depends on a TUI literal. This is the second, and depends on
+    // nothing rendered: if an AskUserQuestion was relayed for this thread just
+    // now, the dialog on screen is the hook's fallback, so no key may be sent
+    // no matter which pattern the pane happens to match.
+    suppressAutoAccept: () => hasRecentAsk(threadId),
     onHeartbeat: options?.onDialogStuck
       ? (match) =>
           pageOnce({

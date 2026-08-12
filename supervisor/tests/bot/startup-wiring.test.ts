@@ -79,6 +79,7 @@ function makeRelayTargets() {
       onProgress: capture("onProgress"),
       onSessionsQuery: capture("onSessionsQuery"),
       onAskUser: capture("onAskUser"),
+      onAskExpired: capture("onAskExpired"),
       onLateResponse: capture("onLateResponse"),
       onHubWork: capture("onHubWork"),
       onChannelPost: capture("onChannelPost"),
@@ -106,6 +107,7 @@ function makeReadyHandlers(): ReadyWiringHandlers {
     "relay:progress": () => {},
     "relay:sessionsQuery": () => [],
     "relay:askUser": () => {},
+    "relay:askExpired": () => {},
     "relay:lateResponse": () => {},
     "relay:hubWork": async () => ({
       ok: true as const,
@@ -166,6 +168,10 @@ const EXPECTED_READY_WIRING: ReadyWiringId[] = [
   "relay:progress",
   "relay:sessionsQuery",
   "relay:askUser",
+  // Issue #416: expiry notice for an unanswered ask. Losing this subscriber is
+  // silent in the same way #370 was — the question stays in the thread looking
+  // live while the session has already fallen back to the TUI.
+  "relay:askExpired",
   "relay:lateResponse",
   "relay:hubWork",
   "relay:channelPost",
@@ -279,6 +285,7 @@ describe("wiring surface targets the right sink (#383)", () => {
       onProgress: [ready["relay:progress"]],
       onSessionsQuery: [ready["relay:sessionsQuery"]],
       onAskUser: [ready["relay:askUser"]],
+      onAskExpired: [ready["relay:askExpired"]],
       onLateResponse: [ready["relay:lateResponse"]],
       // #370's regression: this subscriber going missing left AskUserQuestion
       // stranded in the TUI. onHubWork / onChannelPost fail-close to 503, which
