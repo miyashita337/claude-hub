@@ -8,10 +8,15 @@ import {
   buildDeliveryProbe,
   countProbeOccurrences,
   shouldVerifyDelivery,
+  deliveryNoticeFor,
   DELIVERY_PROBE_MAX_CHARS,
   DELIVERY_MAX_TYPE_ATTEMPTS,
   DELIVERY_VERIFY_BACKOFF_MS,
+  CAPTURE_PANE_TIMEOUT_MS,
   SEND_UNVERIFIED_ERROR,
+  DUPLICATE_INPUT_USER_MESSAGE,
+  UNVERIFIED_DELIVERY_USER_MESSAGE,
+  type PaneReader,
 } from "../../src/session/relay";
 import { TMUX_ARGS, ensureSocketConfigured } from "../../src/session/tmux";
 
@@ -214,6 +219,37 @@ describe("delivery probe helpers (#422)", () => {
     expect(shouldVerifyDelivery("status? / maybe")).toBe(true);
   });
 
+  test("only unclean verdicts produce a user notice", () => {
+    // Verified deliveries must stay silent — a notice on every turn would train
+    // the user to ignore the one that matters.
+    expect(deliveryNoticeFor("verified")).toBeNull();
+    expect(deliveryNoticeFor("verified-retyped")).toBeNull();
+    expect(deliveryNoticeFor("skipped-slash")).toBeNull();
+    expect(deliveryNoticeFor("skipped-no-probe")).toBeNull();
+    expect(deliveryNoticeFor("duplicate")).toBe(DUPLICATE_INPUT_USER_MESSAGE);
+    expect(deliveryNoticeFor("unverified-observer")).toBe(
+      UNVERIFIED_DELIVERY_USER_MESSAGE
+    );
+  });
+
+  test("notices carry no tmux internals and say what the user should do", () => {
+    for (const msg of [
+      DUPLICATE_INPUT_USER_MESSAGE,
+      UNVERIFIED_DELIVERY_USER_MESSAGE,
+    ]) {
+      expect(msg).not.toMatch(/send-keys|capture-pane|not in a mode/i);
+      // Actionable: every notice ends in something the user can actually do.
+      expect(msg).toMatch(/再送|送り直/);
+    }
+  });
+
+  test("capture timeout leaves room for the whole poll budget", () => {
+    // If the reader gave up sooner than the polls run, the verification would
+    // report "observer unavailable" on a merely slow — but alive — tmux server.
+    const budget = DELIVERY_VERIFY_BACKOFF_MS.reduce((a, b) => a + b, 0);
+    expect(CAPTURE_PANE_TIMEOUT_MS).toBeGreaterThan(budget);
+  });
+
   test("shipped poll schedule stays slow enough for a loaded box", () => {
     // The incident ran at load1≈22-46 on a 10-core machine (supervisor.stderr
     // .log). A schedule that gives up in a few hundred ms would retype into a
@@ -354,14 +390,164 @@ describe("sendToPane delivery verification against a real pane (#422)", () => {
       startDropPane(name, dir); // never renders — a verified send would throw here
       try {
         await waitForOpenMarker(name);
-        await expect(
-          sendToPane(name, "/compact 続きの作業", TMUX_ARGS, {
-            verifyBackoffMs: FAST_BACKOFF,
-          })
-        ).resolves.toBeUndefined();
+        const outcome = await sendToPane(name, "/compact 続きの作業", TMUX_ARGS, {
+          verifyBackoffMs: FAST_BACKOFF,
+        });
+        expect(outcome.verdict).toBe("skipped-slash");
+        // Skipped is NOT verified: the log and any future consumer must not read
+        // this as "the pane was observed to hold the command".
+        expect(outcome.verified).toBe(false);
       } finally {
         killSession(name);
         rmSync(dir, { recursive: true, force: true });
+      }
+    },
+    30_000
+  );
+});
+
+/**
+ * The branches below are decided entirely by what the pane reader returns, so
+ * they are driven through the injected reader instead of by racing a real tmux
+ * server (PR #428 review, should-3 / should-4 / should-2). `tmuxSend` still runs
+ * against a real pane — only the *observation* is scripted, so the send sequence
+ * under test is the production one.
+ */
+function scriptedReader(frames: readonly (string | null)[]): PaneReader {
+  let i = 0;
+  return async () => {
+    // Past the end, keep returning the last frame: the number of polls that run
+    // depends on timing, and the test should assert on the verdict, not on an
+    // exact call count.
+    const frame = i < frames.length ? frames[i] : frames[frames.length - 1];
+    i++;
+    return frame ?? null;
+  };
+}
+
+describe("delivery verification edge cases via an injected pane reader (#422)", () => {
+  const payload = "状況報告。";
+  const probe = buildDeliveryProbe(payload);
+
+  itmux(
+    "a reader that fails before typing yields 'unverified-observer', not a failure",
+    async () => {
+      const name = makeSessionName("obs-pre");
+      startEchoPane(name);
+      try {
+        const outcome = await sendToPane(name, payload, TMUX_ARGS, {
+          verifyBackoffMs: FAST_BACKOFF,
+          capturePane: scriptedReader([null]),
+        });
+        // A broken observer must never manufacture a delivery failure...
+        expect(outcome.verdict).toBe("unverified-observer");
+        // ...and must never be reported as a confirmed delivery either.
+        expect(outcome.verified).toBe(false);
+        // The message is still typed: falling back to pre-#422 behaviour beats
+        // refusing to send because the observer is down.
+        expect(capturePane(name)).toContain(payload);
+      } finally {
+        killSession(name);
+      }
+    },
+    30_000
+  );
+
+  itmux(
+    "a reader that fails mid-flight yields 'unverified-observer'",
+    async () => {
+      const name = makeSessionName("obs-mid");
+      startEchoPane(name);
+      try {
+        const outcome = await sendToPane(name, payload, TMUX_ARGS, {
+          verifyBackoffMs: FAST_BACKOFF,
+          // baseline OK, then the reader dies on the first poll.
+          capturePane: scriptedReader(["", null]),
+        });
+        expect(outcome.verdict).toBe("unverified-observer");
+        expect(outcome.verified).toBe(false);
+      } finally {
+        killSession(name);
+      }
+    },
+    30_000
+  );
+
+  itmux(
+    "should-3: a baseline occurrence scrolling out does not force a retype",
+    async () => {
+      const name = makeSessionName("scroll");
+      startEchoPane(name);
+      try {
+        const attempts: number[] = [];
+        const outcome = await sendToPane(name, payload, TMUX_ARGS, {
+          verifyBackoffMs: FAST_BACKOFF,
+          onAttemptTyped: (n) => void attempts.push(n),
+          capturePane: scriptedReader([
+            probe, //          baseline: an earlier turn's copy is on screen (1)
+            "", //             poll 1: it scrolled off the visible pane (0)
+            probe, //          poll 2: our input rendered (1)
+          ]),
+        });
+        // Against a fixed baseline of 1 this would read as "count never rose"
+        // and retype — producing the very duplicate this review flagged.
+        expect(outcome.verdict).toBe("verified");
+        expect(attempts).toEqual([1]);
+      } finally {
+        killSession(name);
+      }
+    },
+    30_000
+  );
+
+  itmux(
+    "should-2: both types rendering is reported as 'duplicate', not silent success",
+    async () => {
+      const name = makeSessionName("dup");
+      startEchoPane(name);
+      try {
+        const attempts: number[] = [];
+        const outcome = await sendToPane(name, payload, TMUX_ARGS, {
+          verifyBackoffMs: FAST_BACKOFF,
+          onAttemptTyped: (n) => void attempts.push(n),
+          capturePane: scriptedReader([
+            "", //                        baseline: nothing on screen (0)
+            "", "", "", "", //            attempt 1 polls: never renders (0)
+            `${probe} ${probe}`, //       after the retype BOTH renders land (2)
+          ]),
+        });
+        expect(attempts).toEqual([1, 2]);
+        expect(outcome.verdict).toBe("duplicate");
+        // Still delivered — the text IS in the pane, so this is not a failure...
+        expect(outcome.verified).toBe(true);
+        // ...but the user is told, which is the point.
+        expect(deliveryNoticeFor(outcome.verdict)).toBe(DUPLICATE_INPUT_USER_MESSAGE);
+      } finally {
+        killSession(name);
+      }
+    },
+    30_000
+  );
+
+  itmux(
+    "a single rise after a retype is 'verified-retyped', not 'duplicate'",
+    async () => {
+      const name = makeSessionName("retype");
+      startEchoPane(name);
+      try {
+        const outcome = await sendToPane(name, payload, TMUX_ARGS, {
+          verifyBackoffMs: FAST_BACKOFF,
+          capturePane: scriptedReader([
+            "", //             baseline (0)
+            "", "", "", "", // attempt 1 polls: lost (0)
+            probe, //          retype lands once (1)
+          ]),
+        });
+        expect(outcome.verdict).toBe("verified-retyped");
+        expect(outcome.verified).toBe(true);
+        expect(deliveryNoticeFor(outcome.verdict)).toBeNull();
+      } finally {
+        killSession(name);
       }
     },
     30_000

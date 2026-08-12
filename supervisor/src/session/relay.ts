@@ -280,7 +280,67 @@ export const SEND_UNVERIFIED_ERROR =
   "send-keys was accepted but the text never appeared in the pane (#422)";
 
 /**
+ * How the send ended, from the pane's point of view. Every value except
+ * `"verified"` / `"verified-retyped"` means the text was NOT observed, so the
+ * caller must not report it as a confirmed delivery (PR #428 review, should-1:
+ * a single `delivered` log line covered five different situations, and the next
+ * incident is diagnosed from exactly that line).
+ */
+export type DeliveryVerdict =
+  /** The text appeared after the first type. */
+  | "verified"
+  /** The text appeared only after a retype — the first keystrokes were lost. */
+  | "verified-retyped"
+  /**
+   * The text appeared, but the count rose by 2 — the delayed first type AND the
+   * retype both rendered, so the pane now holds the message twice.
+   */
+  | "duplicate"
+  /** Slash command: verification is deliberately skipped ({@link shouldVerifyDelivery}). */
+  | "skipped-slash"
+  /** Whitespace-only message: no probe to look for. */
+  | "skipped-no-probe"
+  /** `capture-pane` was unusable, so delivery could not be judged either way. */
+  | "unverified-observer";
+
+export interface SendOutcome {
+  verdict: DeliveryVerdict;
+  /** True only when the text was actually observed in the pane. */
+  verified: boolean;
+}
+
+/** Verdicts that mean "the pane was observed to hold the text". */
+function isVerified(verdict: DeliveryVerdict): boolean {
+  return (
+    verdict === "verified" ||
+    verdict === "verified-retyped" ||
+    verdict === "duplicate"
+  );
+}
+
+/**
+ * `capture-pane` timeout. Deliberately above the whole poll budget
+ * (sum of {@link DELIVERY_VERIFY_BACKOFF_MS} = 2.28s) so a slow-but-alive tmux
+ * server is waited out rather than reported as an observer failure.
+ *
+ * PR #428 review (should-5) is right that the very condition this guard exists
+ * for — load1≈22-46 — is also when tmux itself can be slow, and a timeout here
+ * silently degrades back to pre-#422 behaviour. The answer is NOT a bigger
+ * guessed number (measured: `capture-pane` ≈190ms at load1≈31, 20 calls in
+ * 3.79s — 3s is ~15× that): it is that an observer failure now yields
+ * `"unverified-observer"`, which is logged distinctly and surfaced to the user
+ * instead of passing as a delivery.
+ */
+export const CAPTURE_PANE_TIMEOUT_MS = 3000;
+
+/**
  * Whitespace-stripped prefix of the message, used as the delivery probe.
+ *
+ * Trade-off (PR #428 review, nit-1): stripping whitespace on both sides makes
+ * `"a b c"` and `"abc"` compare equal, so the match is slightly LOOSER than the
+ * real text. That direction is chosen on purpose — a loose match can only cause
+ * a false "delivered" (fail-open, i.e. the pre-#422 behaviour), whereas a strict
+ * match would break on every soft-wrapped input row and cause retypes.
  *
  * Whitespace is removed from BOTH sides of the comparison so a soft-wrapped
  * input line (the TUI breaks long input across rows) still matches: the row
@@ -320,6 +380,14 @@ export function countProbeOccurrences(pane: string, probe: string): number {
  * a false negative would *execute it twice* — a worse failure than the silent
  * drop this guards against. Natural-language messages (the #422 loss path, and
  * the overwhelming majority of relays) are always verified.
+ *
+ * UNVERIFIED (PR #428 review, q-1): the picker-rendering claim above is a
+ * hypothesis, not a measurement — the TUI was never driven to confirm whether
+ * the typed slash text stays matchable in `capture-pane`. It is the conservative
+ * assumption (skipping verification preserves the pre-#422 behaviour exactly and
+ * cannot double-execute a command). If it turns out the text IS matchable, the
+ * better shape is "verify but never retype": that removes the silent drop on
+ * this path with zero double-execution risk. Measure before changing it.
  */
 export function shouldVerifyDelivery(text: string): boolean {
   return !text.trimStart().startsWith("/");
@@ -331,25 +399,28 @@ export function shouldVerifyDelivery(text: string): boolean {
  * broken observer must not manufacture a delivery failure (and must not trigger
  * a retype).
  */
-async function capturePaneText(
+export type PaneReader = (
   sessionName: string,
   socketArgs: readonly string[]
-): Promise<string | null> {
+) => Promise<string | null>;
+
+const capturePaneText: PaneReader = async (sessionName, socketArgs) => {
   try {
     const { stdout } = await execFileAsync(
       TMUX_PATH,
       [...socketArgs, "capture-pane", "-p", "-t", sessionName],
-      { timeout: 3000 }
+      { timeout: CAPTURE_PANE_TIMEOUT_MS }
     );
     return stdout.toString();
   } catch (err) {
     console.warn(
-      `[Relay] capture-pane failed for ${sessionName} (delivery unverified):`,
+      `[Relay] capture-pane failed for ${sessionName} — delivery cannot be verified ` +
+        `(falling back to pre-#422 behaviour for this send):`,
       summarizeExecError(err)
     );
     return null;
   }
-}
+};
 
 export interface SendToPaneOptions {
   /**
@@ -371,6 +442,16 @@ export interface SendToPaneOptions {
    * its clock (#190).
    */
   onAttemptTyped?: (attempt: number) => void | Promise<void>;
+  /**
+   * Test seam, never set in production: replaces the `capture-pane` reader.
+   *
+   * The two "observer unavailable" early-returns are the safety valve that stops
+   * a broken observer from manufacturing a delivery failure, but they were not
+   * pinned by any test (PR #428 review, should-4). Injecting the reader lets a
+   * test drive `null` (capture failed) and scripted pane contents (scroll-out,
+   * double render) deterministically, without racing a real tmux server.
+   */
+  capturePane?: PaneReader;
 }
 
 /**
@@ -408,14 +489,20 @@ export async function sendToPane(
   // either socket, so this stays the single source of truth (no dead copy).
   socketArgs: readonly string[] = TMUX_ARGS,
   options?: SendToPaneOptions
-): Promise<void> {
+): Promise<SendOutcome> {
   const literalText = flattenForSendKeys(text);
   await ensurePaneNotInMode(tmuxSessionName, socketArgs);
   await tmuxSend(tmuxSessionName, ["Escape"], socketArgs);
   await new Promise((r) => setTimeout(r, 50));
-  await typeLiteral(tmuxSessionName, literalText, socketArgs, options);
+  const verdict = await typeLiteral(
+    tmuxSessionName,
+    literalText,
+    socketArgs,
+    options
+  );
   await new Promise((r) => setTimeout(r, 100));
   await tmuxSend(tmuxSessionName, ["C-m"], socketArgs);
+  return { verdict, verified: isVerified(verdict) };
 }
 
 /**
@@ -428,7 +515,7 @@ async function typeLiteral(
   literalText: string,
   socketArgs: readonly string[],
   options?: SendToPaneOptions
-): Promise<void> {
+): Promise<DeliveryVerdict> {
   const verify = options?.verify ?? shouldVerifyDelivery(literalText);
   const probe = buildDeliveryProbe(literalText);
   // A whitespace-only message has no probe to look for; typing it unverified
@@ -436,32 +523,55 @@ async function typeLiteral(
   if (!verify || !probe) {
     await tmuxSend(tmuxSessionName, ["-l", literalText], socketArgs);
     await options?.onAttemptTyped?.(1);
-    return;
+    return verify ? "skipped-no-probe" : "skipped-slash";
   }
 
   const backoff = options?.verifyBackoffMs ?? DELIVERY_VERIFY_BACKOFF_MS;
-  const before = await capturePaneText(tmuxSessionName, socketArgs);
+  const readPane = options?.capturePane ?? capturePaneText;
+  const before = await readPane(tmuxSessionName, socketArgs);
+  if (before === null) {
+    // Observer broken before we even typed → judge nothing, but still type so
+    // the message has its normal chance of landing.
+    await tmuxSend(tmuxSessionName, ["-l", literalText], socketArgs);
+    await options?.onAttemptTyped?.(1);
+    return "unverified-observer";
+  }
   // Baseline, not mere presence: the same short text ("状況報告。") may already
   // be on screen from an earlier turn, so delivery means the count went UP.
-  const baseline = before === null ? null : countProbeOccurrences(before, probe);
+  //
+  // The baseline is a FLOOR, not a constant (PR #428 review, should-3): the
+  // pane capture covers only the visible screen, so a pre-existing occurrence
+  // can scroll off while we wait. Without this, that scroll-out would look like
+  // "count did not rise" → a false negative → an unnecessary retype (i.e. the
+  // duplicate this same review flags). Tracking the minimum seen count absorbs
+  // it. The residual risk is a false "delivered" (fail-open = pre-#422
+  // behaviour), never a false failure.
+  let floor = countProbeOccurrences(before, probe);
 
   for (let attempt = 1; attempt <= DELIVERY_MAX_TYPE_ATTEMPTS; attempt++) {
     await tmuxSend(tmuxSessionName, ["-l", literalText], socketArgs);
     await options?.onAttemptTyped?.(attempt);
-    if (baseline === null) return; // observer broken → do not claim a failure
 
     for (const waitMs of backoff) {
       await new Promise((r) => setTimeout(r, waitMs));
-      const after = await capturePaneText(tmuxSessionName, socketArgs);
-      if (after === null) return; // observer broke mid-flight → inconclusive
-      if (countProbeOccurrences(after, probe) > baseline) {
-        if (attempt > 1) {
-          console.log(
-            `[Relay] delivery verified for ${tmuxSessionName} after retype (attempt ${attempt})`
+      const after = await readPane(tmuxSessionName, socketArgs);
+      if (after === null) return "unverified-observer"; // broke mid-flight
+      const count = countProbeOccurrences(after, probe);
+      if (count > floor) {
+        // A rise of 2 on the retype means BOTH types rendered: the first one
+        // was merely late, not lost, so the pane now holds the message twice.
+        // Reported rather than silently submitted — the whole point of #422 is
+        // that the relay must not hide what it did to the pane.
+        if (attempt > 1 && count - floor >= 2) {
+          console.warn(
+            `[Relay] duplicate input in pane ${tmuxSessionName}: the delayed first ` +
+              `type rendered after the retype (count ${floor}→${count})`
           );
+          return "duplicate";
         }
-        return;
+        return attempt > 1 ? "verified-retyped" : "verified";
       }
+      floor = Math.min(floor, count);
     }
     console.warn(
       `[Relay] typed text never rendered in pane ${tmuxSessionName} ` +
@@ -548,6 +658,34 @@ export const RELAY_ERROR_USER_MESSAGE =
   "⚠️ Claude Code への中継中にエラーが発生しました（一時的な障害の可能性があります）。`/session status` で状態を確認し、少し待ってから再送してください。復旧しない場合は `/session stop` → `/session start` で再起動するか、`/session resume` で会話履歴付きに復帰してください。詳細は Supervisor のログに記録されています。";
 
 /**
+ * Issue #422 / PR #428 review (should-2): the delayed first type and the retype
+ * both rendered, so Claude is about to read the message twice. The text IS
+ * delivered, so the send is not failed — but it is not silent either.
+ */
+export const DUPLICATE_INPUT_USER_MESSAGE =
+  "⚠️ 送信時に入力が二重に入った可能性があります（1 回目の入力が遅れて描画され、再入力と重なりました。#422）。Claude に同じ文が 2 回続けて渡っているかもしれません。応答が不自然なら元の内容で送り直してください。";
+
+/**
+ * PR #428 review (should-5): `capture-pane` itself failed, so this send fell
+ * back to pre-#422 behaviour — it may have landed, it may have vanished, and
+ * the Supervisor cannot tell. Saying so is the whole point; the failure mode
+ * this PR exists to kill is exactly "looked fine in the log".
+ */
+export const UNVERIFIED_DELIVERY_USER_MESSAGE =
+  "⚠️ メッセージは送信しましたが、tmux ペインを読み取れなかったため **到達を確認できていません**（高負荷時に起こります。#422）。応答が返らない場合は届いていない可能性があるので、再送してください。";
+
+/**
+ * Map a non-clean verdict to the notice the user should see, or null when the
+ * delivery was verified and needs no comment. Pure + exported so the wording and
+ * the "verified verdicts stay silent" contract are unit-testable.
+ */
+export function deliveryNoticeFor(verdict: DeliveryVerdict): string | null {
+  if (verdict === "duplicate") return DUPLICATE_INPUT_USER_MESSAGE;
+  if (verdict === "unverified-observer") return UNVERIFIED_DELIVERY_USER_MESSAGE;
+  return null;
+}
+
+/**
  * Build the {@link RelayResult} for a send-keys failure. Pure + exported so a
  * unit test can lock that raw tmux internals never reach the user-facing chunk
  * while the diagnostic cause is still carried in `error` (Issue #74). By the
@@ -606,10 +744,11 @@ export async function relayMessage(
   // full sequence and its rationale (Issue #73 copy-mode, #33 modal clear, #32
   // dropped Enter, argv-no-shell safety) live in sendToPane, shared with the
   // fire-and-forget compact path (Issue #200).
+  let outcome: SendOutcome;
   try {
     // Segment (b): tmux 経路
     tracker.markStart("b");
-    await sendToPane(tmuxSessionName, fullMessage);
+    outcome = await sendToPane(tmuxSessionName, fullMessage);
     tracker.markEnd("b");
   } catch (err) {
     tracker.markEnd("b");
@@ -635,10 +774,16 @@ export async function relayMessage(
     );
     return buildSendFailureResult(err);
   }
-  // Issue #422: the ONLY log line that means "the message is in the pane".
-  // `[Bot] Relaying message …` is printed before the send even starts, so it
-  // could never be used to tell an attempt apart from a delivery.
-  console.log(`[Relay] delivered to pane ${tmuxSessionName}`);
+  // Issue #422: the send-side record. `[Bot] Relay start …` is printed before
+  // the send even begins, so it could never tell an attempt apart from a
+  // delivery. The verdict is carried here because "delivered" alone covered
+  // five different situations, only two of which mean the pane was observed
+  // (PR #428 review, should-1) — and the next incident is diagnosed from
+  // exactly this line.
+  console.log(
+    `[Relay] send finished for ${tmuxSessionName}: ${outcome.verdict} ` +
+      `(pane observed: ${outcome.verified ? "yes" : "no"})`
+  );
 
   // Segment (c): tmux send 完了 → waitForRelay 開始までの隙間 (大体ゼロ、
   // でも明示的に記録しておくことで設計レビュー時の sanity check になる)
@@ -715,6 +860,16 @@ export async function relayMessage(
   // else means a response chunk was produced for this turn.
   tracker.setDelivered(!result.error);
   tracker.flush();
+
+  // PR #428 review (should-2 / should-5): a send that was duplicated or could
+  // not be observed still produced a response, so it is not a failure — but the
+  // user is the only one who can judge a doubled prompt or decide to resend, and
+  // they cannot do that from a Supervisor log they never see. Prepend the notice
+  // so it arrives with the turn it belongs to.
+  const notice = deliveryNoticeFor(outcome.verdict);
+  if (notice) {
+    result = { ...result, chunks: [notice, ...result.chunks] };
+  }
 
   // Note: downloaded attachments are intentionally NOT deleted here. They used
   // to be unlinked 5 minutes after each relay, which made material screenshots

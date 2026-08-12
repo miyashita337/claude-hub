@@ -59,8 +59,14 @@ export interface SessionStore {
 /** 副作用アダプタ（テストは fake を注入する。実体は {@link createRealEffects}）。 */
 export interface SessionCtlEffects {
   store: SessionStore;
-  /** relay.ts sendToPane 相当（copy-mode 解除 → Escape → -l → C-m、-L claude-hub）。 */
-  sendText(tmuxSessionName: string, text: string): Promise<void>;
+  /**
+   * relay.ts sendToPane 相当（copy-mode 解除 → Escape → -l → C-m、-L claude-hub）。
+   *
+   * 戻り値が `unknown` なのは意図的: sendToPane は #422 以降 配達 verdict を返すが、
+   * ここは注入した内容を待たない fire-and-forget 経路なので判定を使わない。void と
+   * 偽らずに広げておく（fake 実装は今までどおり何も返さなくてよい）。
+   */
+  sendText(tmuxSessionName: string, text: string): Promise<unknown>;
   hasTmuxSession(tmuxSessionName: string): Promise<boolean>;
   killTmuxSession(tmuxSessionName: string): Promise<void>;
   /** process.kill 相当。配達できたら true。 */
