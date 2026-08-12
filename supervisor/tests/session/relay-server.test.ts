@@ -499,6 +499,26 @@ describe("ask timeout (Issue #416, 5 hours)", () => {
     expect(askExpiredNotice(5 * HOUR)).toContain("自動では回答していません");
   });
 
+  test("the expiry notice quotes the question and states the new deadline", () => {
+    // PR #431 review should-6: this arrives up to 5h after the question, by
+    // which point the thread has scrolled — "期限切れ" alone doesn't say which
+    // question expired.
+    const notice = askExpiredNotice(5 * HOUR, "案 A と 案 B のどちらで進めますか？");
+    expect(notice).toContain("> 案 A と 案 B のどちらで進めますか？");
+    // should-3: the reaper clock is restarted at expiry, so say so — otherwise
+    // "後で attach して答えよう" runs against a horizon already consumed by the wait.
+    expect(notice).toContain("数え直されます");
+    // Multi-line questions stay inside the blockquote so they can't read as
+    // instructions from the bot.
+    expect(askExpiredNotice(5 * HOUR, "一行目\n二行目")).toContain("> 二行目");
+    // Long questions are excerpted rather than risking Discord's 2000-char cap.
+    const long = askExpiredNotice(5 * HOUR, "あ".repeat(500));
+    expect(long).toContain("…");
+    expect(long.length).toBeLessThan(600);
+    // Absent / blank question degrades to the plain notice (no empty quote).
+    expect(askExpiredNotice(5 * HOUR, "   ")).not.toContain(">");
+  });
+
   test("the server pins idleTimeout off so a multi-hour hold is our choice, not Bun's default", () => {
     // Bun's default is 10s and its maximum is 255s, so a 5h wait is only
     // expressible as 0. This assertion exists because no behavioural test can

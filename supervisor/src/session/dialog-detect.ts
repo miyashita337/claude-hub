@@ -110,9 +110,24 @@ export const AUTO_ACCEPT_KEYS: Record<DialogKind, string[]> = {
  *    hazard. `relay.ts` therefore ALSO suppresses auto-accept from supervisor
  *    state (an /ask POST was relayed for this thread moments ago), which needs
  *    no TUI literal at all. Keep both.
+ *
+ * The pattern is therefore written to fail toward "this might be a question"
+ * (PR #431 review, should-2). Everything except the affordance phrase itself is
+ * optional or unanchored, because each of those details is a way for a harmless
+ * rendering change to silently reopen the hazard:
+ *  - no end anchor: a border glyph, an ` (Esc)` hint or an ellipsis appended to
+ *    the line must not turn the match off
+ *  - the leading number is optional and accepts `.` or `)`: an unnumbered or
+ *    differently-punctuated list still matches
+ *  - any non-alphanumeric run may precede it: cursor markers (`❯`), bullets and
+ *    box-drawing borders are all absorbed
+ * What stays strict is the START of the line: the phrase must open the line
+ * (after decoration), so prose that merely mentions it mid-sentence does not
+ * match. That is the one place where a false positive costs more than a
+ * heartbeat — a wrongly withheld auto-accept stalls the session.
  */
 const ASK_OPTION_MARKER =
-  /^\s*(?:❯\s*)?\d+\.\s+(?:Type something\.?|Chat about this)\s*$/m;
+  /^[^\p{L}\p{N}\n]*(?:\d+\s*[.)]\s*)?(?:Type something|Chat about this)\b.*$/mu;
 
 /** Number of trailing lines to inspect. Dialogs render at the bottom of
  *  the visible pane; older content is scrollback noise. */

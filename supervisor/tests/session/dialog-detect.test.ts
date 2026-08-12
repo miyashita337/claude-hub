@@ -239,6 +239,58 @@ describe("detectDialog — AskUserQuestion is never auto-accepted (Issue #423)",
     expect(detectDialog(survey)!.kind).toBe("feedback-survey");
   });
 
+  /**
+   * PR #431 review, should-2. The pattern used to require the line to END right
+   * after the affordance and to carry a `N.` prefix. Both are rendering details,
+   * and when they drift the match fails — which drops the dialog into the
+   * auto-acceptable families and re-opens the exact hazard this kind exists to
+   * close. Each case below is a rendering change that must NOT disarm the guard.
+   */
+  describe("drift tolerance: rendering changes must not fall back to auto-accept", () => {
+    const variants: Array<[string, string]> = [
+      ["trailing border glyph", "  4. Type something.                    │"],
+      ["trailing hint", "  5. Chat about this  (Esc to cancel)"],
+      ["leading border glyph", "│  4. Type something."],
+      ["cursor marker on the affordance", "❯ 5. Chat about this"],
+      ["parenthesis numbering", "  4) Type something."],
+      ["no numbering at all", "  • Chat about this"],
+      ["no punctuation after the phrase", "  4. Type something"],
+      ["double-width space padding", "  5. Chat about this   "],
+    ];
+
+    for (const [name, line] of variants) {
+      test(`${name} still classifies as ask-user-question`, () => {
+        // Rendered with options that WOULD otherwise match numbered-choice, so a
+        // failure here means "auto-accepted with option 1", not merely "missed".
+        const pane = [
+          "□ 方針確認",
+          "この方針で進めますか？",
+          "",
+          "  1. Yes — 推奨案で進める",
+          "  2. No — 別案を検討する",
+          line,
+        ].join("\n");
+        const result = detectDialog(pane);
+        expect(result!.kind).toBe("ask-user-question");
+        expect(result!.autoAcceptable).toBe(false);
+        // The whole line is reported so [Dialog] logs show what actually matched.
+        expect(result!.line).toBe(line.trim());
+      });
+    }
+
+    test("prose merely mentioning the phrase mid-sentence does not match", () => {
+      // The one asymmetry that costs more than a heartbeat: a wrongly withheld
+      // auto-accept stalls the session. So the phrase must OPEN the line.
+      const pane = [
+        "I will type something into the box and chat about this later.",
+        "Permission required",
+        "  ❯ Yes",
+        "    No",
+      ].join("\n");
+      expect(detectDialog(pane)!.kind).toBe("ink-confirm");
+    });
+  });
+
   test("does not disturb the ordinary auto-acceptable families", () => {
     expect(detectDialog("Permission required\n  ❯ Yes\n    No\n")!.kind).toBe(
       "ink-confirm",

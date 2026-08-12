@@ -20,7 +20,11 @@ import { OrphanDispatchReaper } from "./session/orphan-dispatch-reaper";
 import { DispatchHealthReaper } from "./session/dispatch-health-reaper";
 import { ActivityWatchdog } from "./session/session-activity-watchdog";
 import { ResourceMonitor } from "./session/resource-monitor";
-import { createSessionCommand, createSessionHandler } from "./commands/session";
+import {
+  createSessionCommand,
+  createSessionHandler,
+  claudeHubExitPrimaryChannelId,
+} from "./commands/session";
 import {
   COMPACT_BUTTON_ID,
   createCompactButtonHandler,
@@ -50,7 +54,10 @@ import {
   askExpiredNotice,
 } from "./session/relay-server";
 import { runHubWork, HUB_WORK_PARENT_CHANNEL } from "./session/hub-work";
-import { checkHookWiring } from "./infra/hook-wiring-check";
+import {
+  checkHookWiring,
+  formatHookWiringAlert,
+} from "./infra/hook-wiring-check";
 import {
   extractFilePaths,
   collectAttachableFiles,
@@ -455,8 +462,36 @@ export async function startBot(token: string): Promise<void> {
     // Issue #370 A-2: warn (never fail) about supervisor relay hooks that
     // exist on disk but are not wired into ~/.claude/settings.json.
     // ask-user-relay.sh sat unwired for months because nothing checked this.
-    for (const warning of checkHookWiring()) {
+    //
+    // PR #431 review, should-5: console.error alone does not reach anybody.
+    // supervisor.stderr.log is ~1.4MB and dominated by a per-30s ResourceMonitor
+    // line, so a once-per-startup warning is buried on arrival — the same
+    // "logged but unread" failure #422 was about. These warnings are only useful
+    // if a human edits settings.json, so also post them where a human looks.
+    const hookWarnings = checkHookWiring();
+    for (const warning of hookWarnings) {
       console.error(warning);
+    }
+    if (hookWarnings.length > 0) {
+      const hijoguchiId = claudeHubExitPrimaryChannelId();
+      if (!hijoguchiId) {
+        // Not silent: say that the escalation path itself is missing, rather
+        // than letting the warning quietly stay log-only.
+        console.error(
+          "[HookWiring] HIJOGUCHI_CHANNEL_ID が未設定のため、上記の警告はログにしか出せません。",
+        );
+      } else {
+        void (async () => {
+          try {
+            const channel = await client.channels.fetch(hijoguchiId);
+            if (!channel?.isTextBased() || !("send" in channel)) return;
+            const alert = formatHookWiringAlert(hookWarnings);
+            if (alert) await channel.send(alert);
+          } catch (err) {
+            console.error("[HookWiring] Discord への警告投稿に失敗:", err);
+          }
+        })();
+      }
     }
 
     // Register progress callback to send tool progress to Discord threads.
@@ -524,11 +559,23 @@ export async function startBot(token: string): Promise<void> {
     const handleAskExpired: ReadyWiringHandlers["relay:askExpired"] = (
       event,
     ) => {
+      // PR #431 review, should-3. The reapers spare a session only while the ask
+      // is pending, and `lastActivityAt` was last touched BEFORE the question —
+      // so at expiry the session is already ~5h "silent" and the 2h dispatch
+      // health horizon is long past. Without this, the notice below invites the
+      // user to attach and answer while the next reaper scan is about to remove
+      // the session and its worktree. Restart the clock at the moment we hand
+      // the decision back to the human. Done before the post so a Discord
+      // failure cannot cost the reprieve.
+      sessionManager.touchActivity(event.threadId);
+
       void (async () => {
         try {
           const channel = await client.channels.fetch(event.threadId);
           if (!channel?.isThread()) return;
-          await channel.send(askExpiredNotice(event.timeoutMs));
+          await channel.send(
+            askExpiredNotice(event.timeoutMs, event.question),
+          );
         } catch (err) {
           console.error(
             `[Bot] Failed to post ask expiry to thread ${event.threadId}:`,
@@ -1310,6 +1357,11 @@ export async function startBot(token: string): Promise<void> {
     // into a TUI that is not accepting input, so resolve the ask and stop.
     if (hasPendingAsk(threadId)) {
       resolveAskUser(threadId, messageText);
+      // The session was parked for up to 5h with no activity recorded (#416), so
+      // its idle age is stale by the whole wait. Answering IS activity — record
+      // it now rather than leaving the session one reaper scan from removal
+      // while it resumes work.
+      sessionManager.touchActivity(threadId);
       try {
         await message.react("✅");
       } catch {

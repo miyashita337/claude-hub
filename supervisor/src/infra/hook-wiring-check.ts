@@ -218,3 +218,26 @@ export function checkHookWiring(
 
   return warnings;
 }
+
+/**
+ * Render warnings for a human-facing channel (PR #431 review, should-5).
+ *
+ * `console.error` alone does not reach anybody: supervisor.stderr.log is ~1.4MB
+ * and dominated by a per-30s ResourceMonitor line, so a once-per-startup warning
+ * is buried on arrival — the "logged but unread" failure #422 was about. These
+ * warnings only matter if a human edits settings.json, so they have to go where
+ * a human looks.
+ *
+ * Pure and separate from {@link checkHookWiring} so the escalation message is
+ * testable without a Discord client. Returns null for an empty list so a caller
+ * cannot accidentally post an alert about nothing.
+ */
+export function formatHookWiringAlert(warnings: string[]): string | null {
+  if (warnings.length === 0) return null;
+  return [
+    "🔧 **supervisor 起動時の hook 配線チェックで問題を検出しました**",
+    "（`~/.claude/settings.json` を直すまで、起動のたびにこの通知が出ます）",
+    "",
+    ...warnings.map((w) => `- ${w}`),
+  ].join("\n");
+}

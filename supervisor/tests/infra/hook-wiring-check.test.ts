@@ -10,6 +10,7 @@ import { tmpdir } from "os";
 import {
   findMissingHookWiring,
   findHookTimeoutShortfalls,
+  formatHookWiringAlert,
   checkHookWiring,
   REQUIRED_SUPERVISOR_HOOKS,
   ASK_HOOK_MIN_TIMEOUT_SEC,
@@ -288,5 +289,27 @@ describe("checkHookWiring (file wrapper)", () => {
     } finally {
       rmSync(dir, { recursive: true, force: true });
     }
+  });
+});
+
+/**
+ * PR #431 review, should-5. A warning that only reaches `console.error` is a
+ * warning nobody acts on — supervisor.stderr.log is ~1.4MB and dominated by a
+ * per-30s ResourceMonitor line. These warnings are only useful if a human edits
+ * settings.json, so the escalation message is a pure function that bot.ts posts
+ * to the hijoguchi channel.
+ */
+describe("formatHookWiringAlert (Issue #416 / #431 should-5)", () => {
+  test("renders every warning as a bullet and says why it keeps repeating", () => {
+    const alert = formatHookWiringAlert(["[HookWiring] A", "[HookWiring] B"]);
+    expect(alert).toContain("- [HookWiring] A");
+    expect(alert).toContain("- [HookWiring] B");
+    // The operator has to know this is on them to fix, not a transient blip.
+    expect(alert).toContain("settings.json");
+    expect(alert).toContain("起動のたびに");
+  });
+
+  test("returns null for no warnings so a healthy startup never posts", () => {
+    expect(formatHookWiringAlert([])).toBeNull();
   });
 });

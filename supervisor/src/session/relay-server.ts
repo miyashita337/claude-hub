@@ -192,12 +192,48 @@ export function askWaitNotice(ms: number = readAskTimeoutMs()): string {
   );
 }
 
-/** Notice posted when the wait elapsed with no reply (Issue #416 AC-3). */
-export function askExpiredNotice(ms: number = readAskTimeoutMs()): string {
-  return (
-    `⏰ 質問の回答待ちが期限切れになりました（${formatAskWaitLabel(ms)}無応答）。\n` +
-    "自動では回答していません。回答するにはセッションに tmux attach するか、`/session status` で状態を確認してください。"
+/** Longest question excerpt quoted back in the expiry notice. Keeps the notice
+ *  well inside Discord's 2000-char limit however long the question was. */
+const EXPIRED_QUESTION_EXCERPT = 300;
+
+/**
+ * Notice posted when the wait elapsed with no reply (Issue #416 AC-3).
+ *
+ * Quotes the question (PR #431 review, should-6). This notice can arrive five
+ * hours after the question, by which point the thread has scrolled and "the
+ * question expired" alone does not identify which one — the reader has to go
+ * looking for it before they can decide whether to act.
+ */
+export function askExpiredNotice(
+  ms: number = readAskTimeoutMs(),
+  question?: string,
+): string {
+  const lines = [
+    `⏰ 質問の回答待ちが期限切れになりました（${formatAskWaitLabel(ms)}無応答）。`,
+  ];
+
+  const trimmed = question?.trim();
+  if (trimmed) {
+    const excerpt =
+      trimmed.length > EXPIRED_QUESTION_EXCERPT
+        ? `${trimmed.slice(0, EXPIRED_QUESTION_EXCERPT)}…`
+        : trimmed;
+    // Blockquote every line: a multi-line question must not break out of the
+    // quote and read as part of the notice's own instructions.
+    lines.push("", ...excerpt.split("\n").map((line) => `> ${line}`));
+  }
+
+  lines.push(
+    "",
+    "自動では回答していません。回答するにはセッションに tmux attach するか、`/session status` で状態を確認してください。",
+    // PR #431 review, should-3: say what the deadline now is. The reaper clock
+    // is restarted when this fires (bot.ts touches activity), so the answer is
+    // "the normal idle grace, counted from now" rather than a horizon that was
+    // silently consumed by the wait itself.
+    "このセッションの回収猶予はこの通知の時点から数え直されます。無音のままなら通常のアイドル回収の対象になります。",
   );
+
+  return lines.join("\n");
 }
 
 /**
