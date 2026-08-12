@@ -30,6 +30,11 @@ import {
   createCompactButtonHandler,
   withCompactButton,
 } from "./commands/compact-button";
+import {
+  buildAskPrompt,
+  createAskComponentHandler,
+  isAskComponentId,
+} from "./commands/ask-components";
 import { CHANNEL_MAP, MAX_SESSIONS } from "./config/channels";
 import { RELAY_ERROR_USER_MESSAGE, type AttachmentInfo } from "./session/relay";
 import { buildDialogStuckHandler } from "./session/dialog-stuck-handler";
@@ -50,7 +55,6 @@ import {
   onAskExpired,
   hasPendingAsk,
   resolveAskUser,
-  askWaitNotice,
   askExpiredNotice,
 } from "./session/relay-server";
 import { runHubWork, HUB_WORK_PARENT_CHANNEL } from "./session/hub-work";
@@ -400,6 +404,12 @@ export async function startBot(token: string): Promise<void> {
   const orchestrateLaunchLock = new OrchestrateLaunchLock();
   const sessionHandler = createSessionHandler(sessionManager);
   const compactButtonHandler = createCompactButtonHandler(sessionManager);
+  // Issue #412: tap-to-answer components for AskUserQuestion. The relay
+  // functions are injected so the handler stays testable without a live server.
+  const askComponentHandler = createAskComponentHandler({
+    hasPendingAsk,
+    resolveAskUser,
+  });
 
   // Per-thread progress buffer (Issue #119): coalesce PostToolUse events
   // within a 2-second window so tool-heavy turns don't trip Discord's
@@ -529,20 +539,35 @@ export async function startBot(token: string): Promise<void> {
         try {
           const channel = await client.channels.fetch(event.threadId);
           if (!channel?.isThread()) return;
-          const lines = [`❓ **Claude からの質問**`, event.question];
-          if (event.options?.length) {
-            lines.push("", ...event.options.map((o, i) => `${i + 1}. ${o}`));
-          }
-          // Issue #416: the deadline is stated by the relay server that owns it
-          // (askWaitNotice(event.timeoutMs)) rather than repeated here. The old
-          // hardcoded "約 5 分" outlived two changes to the actual value.
-          lines.push("", askWaitNotice(event.timeoutMs));
-          // Discord caps a message at 2000 chars; a long option list must not
-          // kill the whole question post.
-          const body = lines.join("\n");
-          await channel.send(
-            body.length > 1900 ? `${body.slice(0, 1900)}…` : body
-          );
+          // Issue #412: the post now carries buttons (or a select) so the
+          // question can be answered with a tap. Text replies still resolve the
+          // ask via hasPendingAsk in messageCreate — components are an added
+          // path, not a replacement.
+          //
+          // Issue #416: the deadline is not restated here. buildAskPrompt ends
+          // the post with the relay server's own askWaitNotice(timeoutMs), so
+          // the wait budget has exactly one owner — the old hardcoded "約 5 分"
+          // outlived two changes to the actual value.
+          //
+          // multiSelect is read defensively: AskUserEvent does not carry the
+          // flag (the hook flattens options to `label — description` strings and
+          // drops it). Reading it now means the select path switches on by
+          // itself once the payload grows the field.
+          const multiSelect =
+            (event as { multiSelect?: unknown }).multiSelect === true;
+          const prompt = buildAskPrompt({
+            threadId: event.threadId,
+            question: event.question,
+            options: event.options,
+            multiSelect,
+            timeoutMs: event.timeoutMs,
+          });
+          await channel.send({
+            content: prompt.content,
+            ...(prompt.components.length
+              ? { components: prompt.components }
+              : {}),
+          });
         } catch (err) {
           console.error(
             `[Bot] Failed to post AskUserQuestion to thread ${event.threadId}:`,
@@ -800,6 +825,19 @@ export async function startBot(token: string): Promise<void> {
 
   // Handle slash commands + message components
   const handleInteractionCreate = (interaction: Interaction): void => {
+    // #412: AskUserQuestion answer components. Checked before the compact
+    // branch because this is the only branch that also accepts a String Select
+    // — a select interaction is not a button, so it would otherwise fall
+    // through to the chat-input guard and be dropped.
+    if (interaction.isButton() || interaction.isStringSelectMenu()) {
+      if (isAskComponentId(interaction.customId)) {
+        askComponentHandler(interaction).catch(async (err) => {
+          console.error("[Bot] Ask component error:", err);
+          await safeReplyError(interaction, err);
+        });
+        return;
+      }
+    }
     // #364: the one-click compact button. Component interactions are routed by
     // customId to the app that sent the message, so unlike a top-level
     // `/compact` slash command this can never be captured by another bot.

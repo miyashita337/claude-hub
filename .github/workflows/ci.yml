@@ -162,6 +162,7 @@ jobs:
                    tests/scripts/traceability-metrics.test.ts \
                    tests/commands/session-compact.test.ts \
                    tests/commands/compact-button.test.ts \
+                   tests/commands/ask-components.test.ts \
                    tests/session/manager-compact-concurrency.test.ts \
                    tests/commands/session-start-access.test.ts \
                    tests/commands/session-start-branch.test.ts \
