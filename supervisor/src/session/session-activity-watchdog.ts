@@ -218,6 +218,14 @@ export interface ActivityWatchdogDeps {
   isAlive(threadId: string): boolean | Promise<boolean>;
   /** Deliver a warning (best-effort; throwing is caught per-session). */
   notify(threadId: string, warning: ActivityWarning): void | Promise<void>;
+  /**
+   * Issue #416: is this thread blocked on an unanswered AskUserQuestion? Such a
+   * session is quiet by design — the question is already in the thread and the
+   * user is the one being waited on — so a "silent for N minutes" nudge is
+   * noise that competes with the question itself. Optional; omitted means
+   * "never awaiting" (the pre-#416 behaviour).
+   */
+  isAwaitingAsk?(threadId: string): boolean;
   thresholds?: ActivityThresholds;
   intervalMs?: number;
   /** Injectable clock for tests. */
@@ -293,6 +301,11 @@ export class ActivityWatchdog {
       }
       if (!alive) continue;
       aliveCount++;
+
+      // Issue #416: waiting on the user's answer is not silence worth paging
+      // about. Skipping before the tracker also means no warning is *consumed*
+      // — if the session is still quiet once the ask resolves, it warns then.
+      if (this.deps.isAwaitingAsk?.(threadId)) continue;
 
       const ageMs = now - session.startedAt.getTime();
       const idleMs = now - session.lastActivityAt.getTime();

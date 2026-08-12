@@ -92,17 +92,30 @@ PAYLOAD=$(echo "$INPUT" | jq -c '
       { question: ($qs | map(.question // "") | join("\n")) }
     end')
 
-# Forward to the supervisor and wait for the user's reply. --max-time matches
-# the relay-server's DEFAULT_ASK_TIMEOUT_MS (300s since Issue #255) plus a small
-# buffer for the round trip; the server itself enforces the real timeout.
-# INVARIANT: this MUST stay >= DEFAULT_ASK_TIMEOUT_MS/1000, or curl gives up
-# before the server and the user's late reply is wasted. relay-server.test.ts
-# locks `--max-time*1000 >= DEFAULT_ASK_TIMEOUT_MS`.
+# Forward to the supervisor and wait for the user's reply. The server enforces
+# the real deadline; this budget only has to outlast it.
+#
+# Issue #416: 310s -> 21600s (6h). The server default is now 5h
+# (DEFAULT_ASK_TIMEOUT_MS) because the 会長 reads the morning report on mobile
+# hours after delivery, and ASK_TIMEOUT_MS can raise it up to MAX_ASK_TIMEOUT_MS
+# (6h). This is set to exactly MAX/1000 so *any* configured value is covered
+# without curl outliving the server's hard cap.
+#
+# INVARIANT (locked by relay-server.test.ts against this literal):
+#   DEFAULT_ASK_TIMEOUT_MS <= --max-time * 1000 <= MAX_ASK_TIMEOUT_MS
+# Below the lower bound, curl gives up first and the user's answer is wasted;
+# above the upper bound, the hook hangs past any moment the server could reply.
+#
+# NOTE: Claude Code kills the hook at the `timeout` configured for it in
+# ~/.claude/settings.json (seconds; default 600). That value must also be raised
+# past this budget, or IT becomes the effective ceiling. When it does cut in, the
+# hook is killed, the tool proceeds and the TUI dialog opens — which since Issue
+# #423 is a wait for a human, not a fabricated answer.
 RESPONSE=$(printf '%s' "$PAYLOAD" | \
   curl -s -X POST "$ASK_URL" \
     -H "Content-Type: application/json" \
     -d @- \
-    --max-time 310)
+    --max-time 21600)
 CURL_EXIT=$?
 
 if [ $CURL_EXIT -ne 0 ] || [ -z "$RESPONSE" ]; then

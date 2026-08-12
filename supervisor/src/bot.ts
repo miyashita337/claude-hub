@@ -43,8 +43,11 @@ import {
   onHubWork,
   onChannelPost,
   onAskUser,
+  onAskExpired,
   hasPendingAsk,
   resolveAskUser,
+  askWaitNotice,
+  askExpiredNotice,
 } from "./session/relay-server";
 import { runHubWork, HUB_WORK_PARENT_CHANNEL } from "./session/hub-work";
 import { checkHookWiring } from "./infra/hook-wiring-check";
@@ -276,6 +279,7 @@ export async function startBot(token: string): Promise<void> {
       onProgress,
       onSessionsQuery,
       onAskUser,
+      onAskExpired,
       onLateResponse,
       onHubWork,
       onChannelPost,
@@ -338,6 +342,8 @@ export async function startBot(token: string): Promise<void> {
     entries: () => sessionManager.entries(),
     isAlive: async (threadId) =>
       (await sessionManager.livenessOf(threadId)) === "alive",
+    // Issue #416: don't nudge a session that is waiting on the user's answer.
+    isAwaitingAsk: hasPendingAsk,
     notify: async (threadId, warning) => {
       try {
         const channel = await client.channels.fetch(threadId);
@@ -492,10 +498,10 @@ export async function startBot(token: string): Promise<void> {
           if (event.options?.length) {
             lines.push("", ...event.options.map((o, i) => `${i + 1}. ${o}`));
           }
-          lines.push(
-            "",
-            "このスレッドへの次の返信がそのまま回答として送られます（約 5 分でタイムアウトし、TUI ダイアログに戻ります）。"
-          );
+          // Issue #416: the deadline is stated by the relay server that owns it
+          // (askWaitNotice(event.timeoutMs)) rather than repeated here. The old
+          // hardcoded "約 5 分" outlived two changes to the actual value.
+          lines.push("", askWaitNotice(event.timeoutMs));
           // Discord caps a message at 2000 chars; a long option list must not
           // kill the whole question post.
           const body = lines.join("\n");
@@ -506,6 +512,27 @@ export async function startBot(token: string): Promise<void> {
           console.error(
             `[Bot] Failed to post AskUserQuestion to thread ${event.threadId}:`,
             err
+          );
+        }
+      })();
+    };
+
+    // Issue #416 (Journey AC #3): the ask expired unanswered. Say so in the
+    // thread — otherwise the question posted above stays on screen looking live
+    // while the session has already fallen back to the TUI dialog, and the user
+    // answers into a void. Also states that nothing was auto-selected (#423).
+    const handleAskExpired: ReadyWiringHandlers["relay:askExpired"] = (
+      event,
+    ) => {
+      void (async () => {
+        try {
+          const channel = await client.channels.fetch(event.threadId);
+          if (!channel?.isThread()) return;
+          await channel.send(askExpiredNotice(event.timeoutMs));
+        } catch (err) {
+          console.error(
+            `[Bot] Failed to post ask expiry to thread ${event.threadId}:`,
+            err,
           );
         }
       })();
@@ -694,6 +721,7 @@ export async function startBot(token: string): Promise<void> {
       "relay:progress": handleProgress,
       "relay:sessionsQuery": handleSessionsQuery,
       "relay:askUser": handleAskUser,
+      "relay:askExpired": handleAskExpired,
       "relay:lateResponse": handleLateResponse,
       "relay:hubWork": handleHubWork,
       "relay:channelPost": handleChannelPost,

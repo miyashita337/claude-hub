@@ -12,6 +12,16 @@ import {
   RELAY_TIMEOUT_USER_MESSAGE,
   DEFAULT_ASK_TIMEOUT_MS,
   MAX_ASK_TIMEOUT_MS,
+  RELAY_IDLE_TIMEOUT_SEC,
+  readAskTimeoutMs,
+  formatAskWaitLabel,
+  askWaitNotice,
+  askExpiredNotice,
+  onAskUser,
+  onAskExpired,
+  resolveAskUser,
+  hasPendingAsk,
+  hasRecentAsk,
   type LateResponseEvent,
   type ProgressEvent,
 } from "../../src/session/relay-server";
@@ -438,5 +448,136 @@ describe("ask timeout (Issue #255, proposal E)", () => {
     // the server can never answer later than MAX_ASK_TIMEOUT_MS, so a larger
     // --max-time would just hang the hook with no chance of a reply.
     expect(maxTimeSeconds * 1000).toBeLessThanOrEqual(MAX_ASK_TIMEOUT_MS);
+  });
+});
+
+/**
+ * Issue #416: the ask wait goes from 5 minutes to 5 hours, because the 会長
+ * reads the morning report on mobile hours after delivery. Four values have to
+ * move together (server default, server cap, curl budget, Claude Code's hook
+ * timeout) and the socket has to survive the wait.
+ *
+ * On the idle timeout specifically, measured on Bun 1.3.11 against a real
+ * server holding 20s: a GET whose body is never read is cut at ~12s, but a POST
+ * whose JSON body IS read completes normally — and POST-with-body is what
+ * hooks/ask-user-relay.sh sends. So the behavioural test below passes with or
+ * without `idleTimeout: 0`; the structural test is what actually locks the
+ * option in place.
+ */
+describe("ask timeout (Issue #416, 5 hours)", () => {
+  const HOUR = 60 * 60 * 1000;
+
+  test("the default is 5 hours and the cap is above it", () => {
+    expect(DEFAULT_ASK_TIMEOUT_MS).toBe(5 * HOUR);
+    expect(MAX_ASK_TIMEOUT_MS).toBeGreaterThan(DEFAULT_ASK_TIMEOUT_MS);
+  });
+
+  test("readAskTimeoutMs: default / env override / clamp / invalid input", () => {
+    expect(readAskTimeoutMs({})).toBe(DEFAULT_ASK_TIMEOUT_MS);
+    expect(readAskTimeoutMs({ ASK_TIMEOUT_MS: String(2 * HOUR) })).toBe(2 * HOUR);
+    // Never past the cap: the curl budget in the hook is a static literal and
+    // cannot follow an env var, so exceeding it would just hang the hook.
+    expect(readAskTimeoutMs({ ASK_TIMEOUT_MS: String(99 * HOUR) })).toBe(
+      MAX_ASK_TIMEOUT_MS,
+    );
+    for (const bad of ["abc", "0", "-5", ""]) {
+      expect(readAskTimeoutMs({ ASK_TIMEOUT_MS: bad })).toBe(
+        DEFAULT_ASK_TIMEOUT_MS,
+      );
+    }
+  });
+
+  test("the thread notices state the real wait, not a stale hardcoded one", () => {
+    expect(formatAskWaitLabel(5 * HOUR)).toBe("約 5 時間");
+    expect(formatAskWaitLabel(30 * 60_000)).toBe("約 30 分");
+    // The pre-#416 wording promised "約 5 分" — the value it described had
+    // already changed twice underneath it.
+    expect(askWaitNotice(5 * HOUR)).toContain("約 5 時間");
+    expect(askWaitNotice(5 * HOUR)).not.toContain("約 5 分");
+    // #423: the notice must not imply the TUI fallback decides anything.
+    expect(askWaitNotice(5 * HOUR)).toContain("自動で選ばれることはありません");
+    expect(askExpiredNotice(5 * HOUR)).toContain("自動では回答していません");
+  });
+
+  test("the server pins idleTimeout off so a multi-hour hold is our choice, not Bun's default", () => {
+    // Bun's default is 10s and its maximum is 255s, so a 5h wait is only
+    // expressible as 0. This assertion exists because no behavioural test can
+    // catch the option being dropped (see the block comment above) — a 5h hold
+    // currently survives by way of an undocumented Bun behaviour, and this is
+    // what makes it survive by configuration instead.
+    expect(RELAY_IDLE_TIMEOUT_SEC).toBe(0);
+  });
+
+  test(
+    "an in-flight /ask survives 30s without the socket being closed (Journey AC #2)",
+    async () => {
+      startRelayServer();
+      const port = getRelayPort();
+      const HOLD_MS = 30_000; // > Bun's 10s default idleTimeout (cut observed at 13s)
+
+      onAskUser((event) => {
+        setTimeout(() => resolveAskUser(event.threadId, "遅れて届いた回答"), HOLD_MS);
+      });
+
+      const started = Date.now();
+      const res = await fetch(`http://localhost:${port}/ask/thread-slow`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ question: "どちらにしますか？" }),
+      });
+      const elapsed = Date.now() - started;
+
+      expect(res.status).toBe(200);
+      expect(await res.json()).toEqual({ answer: "遅れて届いた回答" });
+      // The hold really elapsed — a fast 200 would mean the test proved nothing.
+      // This guards the *behaviour* (an unanswered ask stays open long enough to
+      // answer) against any future change that closes it early, whether that is
+      // an idle timeout, a keep-alive limit, or a body-handling change in Bun.
+      expect(elapsed).toBeGreaterThanOrEqual(HOLD_MS - 500);
+    },
+    60_000,
+  );
+
+  test("an expired ask notifies onAskExpired so Discord can say so (AC-3)", async () => {
+    startRelayServer();
+    const port = getRelayPort();
+    const expired: Array<{ threadId: string; question: string; timeoutMs: number }> =
+      [];
+
+    onAskUser(() => {}); // subscriber present, but never answers
+    onAskExpired((event) => expired.push(event));
+
+    const res = await fetch(`http://localhost:${port}/ask/thread-expire`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ question: "放置される質問", timeout_ms: 80 }),
+    });
+
+    expect(res.status).toBe(504);
+    expect(expired).toEqual([
+      { threadId: "thread-expire", question: "放置される質問", timeoutMs: 80 },
+    ]);
+  });
+
+  test("hasRecentAsk stays true after the ask ends, so the fallback dialog is protected (#423)", async () => {
+    startRelayServer();
+    const port = getRelayPort();
+    onAskUser(() => {});
+
+    await fetch(`http://localhost:${port}/ask/thread-recent`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ question: "q", timeout_ms: 50 }),
+    });
+
+    // The TUI dialog the hook falls back to only appears AFTER the request
+    // settles, which is exactly when hasPendingAsk goes false. hasRecentAsk is
+    // what the dialog watchdog consults, so it must outlive the request.
+    expect(hasPendingAsk("thread-recent")).toBe(false);
+    expect(hasRecentAsk("thread-recent")).toBe(true);
+    // Window-scoped, not permanent: an ask from long ago must not disable
+    // auto-accept for the rest of the session.
+    expect(hasRecentAsk("thread-recent", 0)).toBe(false);
+    expect(hasRecentAsk("never-asked")).toBe(false);
   });
 });

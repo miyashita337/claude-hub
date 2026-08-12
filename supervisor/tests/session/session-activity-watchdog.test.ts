@@ -517,3 +517,43 @@ describe("ActivityWatchdog timer lifecycle (#405)", () => {
     }
   });
 });
+
+/**
+ * Issue #416: a session waiting on an unanswered AskUserQuestion is quiet by
+ * design — the question is already in the thread and the user is the one being
+ * waited on. Nudging "silent for N minutes" on top of it is noise competing
+ * with the question itself.
+ */
+describe("ActivityWatchdog — sessions awaiting an AskUserQuestion answer", () => {
+  type FakeSession = { startedAt: Date; lastActivityAt: Date };
+
+  test("skips the nudge while awaiting an answer, and warns once the ask resolves", async () => {
+    const nowRef = { t: 0 };
+    const sessions = new Map<string, FakeSession>([
+      ["asking", { startedAt: new Date(0), lastActivityAt: new Date(0) }],
+    ]);
+    const notifications: Array<{ threadId: string; warning: ActivityWarning }> = [];
+    let awaiting = true;
+    const wd = new ActivityWatchdog({
+      entries: () => sessions.entries(),
+      isAlive: () => true,
+      isAwaitingAsk: () => awaiting,
+      notify: (threadId, warning) => {
+        notifications.push({ threadId, warning });
+      },
+      thresholds: T,
+      now: () => nowRef.t,
+    });
+
+    nowRef.t = T.quietMs + 1;
+    await wd.check();
+    expect(notifications).toEqual([]);
+
+    // The warning was skipped, not consumed: once the question is answered and
+    // the session is STILL silent, the nudge it would have got now fires.
+    awaiting = false;
+    nowRef.t = T.quietMs + 2;
+    await wd.check();
+    expect(notifications.map((n) => n.warning.level)).toEqual(["quiet"]);
+  });
+});
