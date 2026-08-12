@@ -72,7 +72,9 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      # tmux is required by tests/session/relay.test.ts (Issue #73 / AC-7).
+      # tmux is required by tests/session/relay.test.ts (Issue #73 / AC-7) and
+      # tests/session/relay-delivery-verify.test.ts (#422 — drives a real pane
+      # that swallows input, which is only reproducible against real tmux).
       # Without it the new copy-mode / hyphen-payload regression tests
       # `tmuxAvailable()` check fails and they auto-skip, which drops patch
       # coverage of relay.ts and produces a codecov/patch FAIL on the PR.
@@ -143,6 +145,7 @@ jobs:
                    tests/session/dialog-watchdog.test.ts \
                    tests/session/relay-send-failure.test.ts \
                    tests/session/relay-error-notice.test.ts \
+                   tests/session/relay-delivery-verify.test.ts \
                    tests/scripts/lint-blocking-in-timers.test.ts \
                    tests/scripts/lint-no-sync-exec.test.ts \
                    tests/session/notify-pushover.test.ts \

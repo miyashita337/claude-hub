@@ -1453,9 +1453,13 @@ export async function startBot(token: string): Promise<void> {
 
       let relaySucceeded = false;
 
-      // Relay to Claude Code
+      // Relay to Claude Code.
+      // Issue #422: this line marks the START of the attempt, not a delivery —
+      // the old "Relaying message" wording read as "relayed" and made a message
+      // that never reached the pane look successfully handled in the log.
+      // `[Relay] delivered to pane …` (relay.ts) is the delivery record.
       console.log(
-        `[Bot] Relaying message in thread ${threadId} (${messageText.length} chars, ${attachments.length} attachments)`
+        `[Bot] Relay start in thread ${threadId} (${messageText.length} chars, ${attachments.length} attachments)`
       );
       try {
         const result = await sessionManager.sendMessage(
