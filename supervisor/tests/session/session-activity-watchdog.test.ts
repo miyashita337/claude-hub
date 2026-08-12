@@ -1,4 +1,4 @@
-import { test, expect, describe } from "bun:test";
+import { test, expect, describe, spyOn } from "bun:test";
 import {
   classifyActivity,
   buildActivityWarning,
@@ -341,6 +341,62 @@ describe("ActivityWatchdog.check (periodic scan)", () => {
     expect(notifications).toHaveLength(2);
   });
 
+  test("an isAlive() rejection skips that session and does not abort the scan (#405)", async () => {
+    const nowRef = { t: 7 * HOUR };
+    const sessions = new Map<string, FakeSession>([
+      ["boom", { startedAt: new Date(0), lastActivityAt: new Date(0) }],
+      ["ok", { startedAt: new Date(0), lastActivityAt: new Date(0) }],
+    ]);
+    const notified: string[] = [];
+    const warnSpy = spyOn(console, "warn").mockImplementation(() => {});
+    const wd = new ActivityWatchdog({
+      entries: () => sessions.entries(),
+      isAlive: async (id) => {
+        if (id === "boom") throw new Error("tmux unreachable");
+        return true;
+      },
+      notify: (threadId) => {
+        notified.push(threadId);
+      },
+      thresholds: T,
+      now: () => nowRef.t,
+    });
+    try {
+      await wd.check();
+      // "boom" is skipped (liveness unknown → stay quiet, the reaper owns it)
+      // but the scan continues to "ok".
+      expect(notified).toEqual(["ok"]);
+      expect(warnSpy).toHaveBeenCalled();
+      expect(String(warnSpy.mock.calls[0]![0])).toContain("isAlive(boom) threw");
+    } finally {
+      warnSpy.mockRestore();
+    }
+  });
+
+  test("awaits an async isAlive (the real sessionManager.livenessOf shape, #227 PR-3)", async () => {
+    const nowRef = { t: 7 * HOUR };
+    const sessions = new Map<string, FakeSession>([
+      ["a", { startedAt: new Date(0), lastActivityAt: new Date(0) }],
+    ]);
+    const notified: string[] = [];
+    const wd = new ActivityWatchdog({
+      entries: () => sessions.entries(),
+      // Resolves on a later microtask: a non-awaiting implementation would see
+      // a truthy Promise for a DEAD session and warn about it.
+      isAlive: async () => {
+        await Promise.resolve();
+        return false;
+      },
+      notify: (threadId) => {
+        notified.push(threadId);
+      },
+      thresholds: T,
+      now: () => nowRef.t,
+    });
+    await wd.check();
+    expect(notified).toHaveLength(0);
+  });
+
   test("a notify() failure does not abort the scan of other sessions", async () => {
     const nowRef = { t: 7 * HOUR };
     const sessions = new Map<string, FakeSession>([
@@ -362,5 +418,102 @@ describe("ActivityWatchdog.check (periodic scan)", () => {
     // both were visited despite the first throwing
     expect(seen).toContain("boom");
     expect(seen).toContain("ok");
+  });
+});
+
+describe("ActivityWatchdog timer lifecycle (#405)", () => {
+  type FakeSession = { startedAt: Date; lastActivityAt: Date };
+
+  function makeWatchdog(intervalMs: number) {
+    const sessions = new Map<string, FakeSession>();
+    let scans = 0;
+    const wd = new ActivityWatchdog({
+      // entries() is called exactly once per check() pass, so it is an exact
+      // tick counter — no wall-clock assumption beyond "a tick happened".
+      entries: () => {
+        scans++;
+        return sessions.entries();
+      },
+      isAlive: () => true,
+      notify: () => {},
+      thresholds: T,
+      intervalMs,
+      now: () => 0,
+    });
+    return { wd, scans: () => scans };
+  }
+
+  test("start() drives check() on the configured interval and stop() halts it", async () => {
+    const logSpy = spyOn(console, "log").mockImplementation(() => {});
+    const debugSpy = spyOn(console, "debug").mockImplementation(() => {});
+    const { wd, scans } = makeWatchdog(5);
+    try {
+      wd.start();
+      expect(String(logSpy.mock.calls[0]![0])).toContain(
+        "[ActivityWatchdog] Started"
+      );
+
+      const deadline = Date.now() + 2000;
+      while (scans() < 2 && Date.now() < deadline) {
+        await Bun.sleep(5);
+      }
+      expect(scans()).toBeGreaterThanOrEqual(2);
+
+      wd.stop();
+      const afterStop = scans();
+      await Bun.sleep(40); // >= 8 intervals: a live timer would tick again
+      expect(scans()).toBe(afterStop);
+    } finally {
+      wd.stop();
+      logSpy.mockRestore();
+      debugSpy.mockRestore();
+    }
+  });
+
+  test("start() is idempotent — a second call does not add a second timer", async () => {
+    const logSpy = spyOn(console, "log").mockImplementation(() => {});
+    const debugSpy = spyOn(console, "debug").mockImplementation(() => {});
+    const { wd, scans } = makeWatchdog(10);
+    try {
+      wd.start();
+      wd.start(); // early-returns; the log line is the observable proof
+      expect(logSpy).toHaveBeenCalledTimes(1);
+
+      const deadline = Date.now() + 2000;
+      while (scans() < 1 && Date.now() < deadline) {
+        await Bun.sleep(5);
+      }
+      wd.stop();
+      const afterStop = scans();
+      // A leaked second interval would keep ticking after the single stop().
+      await Bun.sleep(50);
+      expect(scans()).toBe(afterStop);
+    } finally {
+      wd.stop();
+      logSpy.mockRestore();
+      debugSpy.mockRestore();
+    }
+  });
+
+  test("stop() is safe before start() and idempotent", () => {
+    const { wd } = makeWatchdog(10);
+    expect(() => wd.stop()).not.toThrow();
+    expect(() => wd.stop()).not.toThrow();
+  });
+
+  test("the interval is unref'd so a running watchdog never holds the process open", () => {
+    const logSpy = spyOn(console, "log").mockImplementation(() => {});
+    const { wd } = makeWatchdog(60_000);
+    try {
+      wd.start();
+      // White-box on purpose: "does not keep the event loop alive" has no
+      // black-box assertion short of hanging the suite. hasRef() is the direct
+      // read of the flag start() sets.
+      const timer = (wd as unknown as { timer: { hasRef(): boolean } }).timer;
+      expect(timer.hasRef()).toBe(false);
+    } finally {
+      wd.stop();
+      logSpy.mockRestore();
+    }
   });
 });

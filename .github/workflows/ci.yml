@@ -150,6 +150,8 @@ jobs:
                    tests/session/stall-heartbeat.test.ts \
                    tests/session/context-budget.test.ts \
                    tests/session/session-activity-watchdog.test.ts \
+                   tests/session/resource-monitor.test.ts \
+                   tests/session/primary-compact.test.ts \
                    tests/hijoguchi-routing/p0.test.ts \
                    tests/e2e/ac-verification.test.ts \
                    tests/scripts/lint-gating-coverage.test.ts \
