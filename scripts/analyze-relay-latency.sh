@@ -92,6 +92,46 @@ else
   echo "dominant: n/a (no segment data)"
 fi
 
+# === Delivery (Issue #223): 到達率 ===
+#
+# 「relay 応答がユーザーに届いたか」の二値 (writer 側 latency-logger.ts の
+# delivered field) を全期間 + 日次で集計する。修正の前後で日次 rate を見比べれば
+# silent regression (誰も気付かない到達率の劣化, RW-023 型) を検知できる。
+#
+# attempts は delivered field を持つ行だけを数える: #223 以前の行は field 自体が
+# 無く、delivered とも dropped とも判定できないため、分母に入れると rate が
+# 実態より低く出てしまう。
+DELIVERY=$(jq -rs '
+  [.[] | select(.delivered != null)] as $rec |
+  ($rec | length) as $attempts |
+  ([$rec[] | select(.delivered)] | length) as $delivered |
+  "\($attempts)|\($delivered)"' "${LOG_PATH}")
+DELIVERY_ATTEMPTS=$(echo "${DELIVERY}" | cut -d'|' -f1)
+DELIVERY_OK=$(echo "${DELIVERY}" | cut -d'|' -f2)
+
+echo
+if [ "${DELIVERY_ATTEMPTS}" -eq 0 ]; then
+  echo "=== Delivery (全期間) ==="
+  echo "attempts=0 (delivered field を持つ計測がまだありません)"
+else
+  DELIVERY_DROPPED=$((DELIVERY_ATTEMPTS - DELIVERY_OK))
+  DELIVERY_RATE=$(jq -rn --argjson d "${DELIVERY_OK}" --argjson a "${DELIVERY_ATTEMPTS}" \
+    '($d / $a * 1000 | round / 10)')
+  echo "=== Delivery (全期間) ==="
+  echo "attempts=${DELIVERY_ATTEMPTS} delivered=${DELIVERY_OK} dropped=${DELIVERY_DROPPED} rate=${DELIVERY_RATE}%"
+
+  echo
+  echo "=== Delivery (日次) ==="
+  jq -rs '
+    [.[] | select(.delivered != null)]
+    | group_by(.timestamp[:10])[]
+    | . as $day
+    | ($day | length) as $attempts
+    | ([$day[] | select(.delivered)] | length) as $delivered
+    | "\($day[0].timestamp[:10]) attempts=\($attempts) delivered=\($delivered) dropped=\($attempts - $delivered) rate=\($delivered / $attempts * 1000 | round / 10)%"
+  ' "${LOG_PATH}"
+fi
+
 # error_segment 集計 (ある場合のみ)
 ERROR_COUNT=$(jq -s '[.[] | select(.error_segment != null)] | length' "${LOG_PATH}")
 if [ "${ERROR_COUNT}" -gt 0 ]; then

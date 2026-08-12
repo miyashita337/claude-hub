@@ -190,6 +190,7 @@ jobs:
                    tests/session/dispatch-queue.test.ts \
                    tests/session/admission.test.ts \
                    tests/session/latency-logger.test.ts \
+                   tests/scripts/analyze-relay-latency.test.ts \
                    tests/session/manager-input-ready.test.ts \
                    tests/session/progress-buffer.test.ts \
                    tests/session/salvage-reply.test.ts \

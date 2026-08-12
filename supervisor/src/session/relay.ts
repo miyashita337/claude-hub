@@ -413,6 +413,9 @@ export async function relayMessage(
   } catch (err) {
     tracker.markEnd("b");
     tracker.setError("b");
+    // Issue #223: the message never reached the pane, so this turn delivered
+    // nothing to the user — the dropped half of the delivery rate.
+    tracker.setDelivered(false);
     tracker.flush();
     // Issue #74: keep the raw tmux cause in logs + `RelayResult.error`, but
     // NEVER forward it into the Discord chunk (it would surface as a bogus
@@ -495,6 +498,10 @@ export async function relayMessage(
   if (result.error) {
     tracker.setError("d_e_c");
   }
+  // Issue #223: `result.error` covers both the relay timeout and an error
+  // response, i.e. exactly the cases where the user got no answer back. Anything
+  // else means a response chunk was produced for this turn.
+  tracker.setDelivered(!result.error);
   tracker.flush();
 
   // Note: downloaded attachments are intentionally NOT deleted here. They used
