@@ -1,4 +1,4 @@
-import { test, expect, describe } from "bun:test";
+import { test, expect, describe, setDefaultTimeout } from "bun:test";
 import { execFileSync } from "child_process";
 import { existsSync, mkdtempSync, writeFileSync } from "fs";
 import { tmpdir, homedir } from "os";
@@ -18,6 +18,16 @@ import {
  * the cross-language contract, plus a best-effort round-trip against the real
  * action-token.sh source when it is reachable from origin/main.
  */
+
+// Every test here mints tokens by spawning bash + openssl (and the round-trip
+// test also shells out to git twice), so the file is subprocess-bound rather
+// than compute-bound. Spawn latency has a long tail: measuring the round-trip
+// helper over 40 local samples gave min 1272ms / p50 2396ms / p90 4972ms /
+// max 30671ms, i.e. p90 sits right on bun's 5000ms default. That made
+// unrelated tests time out at ~1 run in 25 with nothing else running
+// (Issue #401 AC-1 surfaced it in `isExpired` and in the round-trip test).
+// Raise the budget for the file; no assertion or timing expectation changes.
+setDefaultTimeout(60_000);
 
 const KEY = "test-shared-key-abc123";
 
@@ -156,9 +166,39 @@ describe("action/token verifySignature (contract with openssl)", () => {
     const token = genToken("compact", "/Users/x/wt/issue-441");
     const parsed = parseToken(token);
     if (!parsed.ok) throw new Error("parse failed");
-    // Flip a character in the signature.
-    const badSig = parsed.sig.slice(0, -1) + (parsed.sig.endsWith("A") ? "B" : "A");
+    // Flip the FIRST character: all six of its bits map to real digest bits, so
+    // any change alters the decoded bytes. Do NOT tamper the LAST character —
+    // two of its bits are dropped on decode, so rewriting them leaves the bytes
+    // identical and this assertion fails ~1/16 of the time (Issue #401). The
+    // next test pins that decode behaviour so the reason stays visible.
+    const badSig = (parsed.sig.startsWith("A") ? "B" : "A") + parsed.sig.slice(1);
+    expect(badSig).not.toBe(parsed.sig);
     expect(verifySignature(parsed.payload, badSig, KEY)).toBe(false);
+  });
+
+  // Why the tamper above must not touch the last character (Issue #401): a
+  // 32-byte HMAC is 43 base64url chars, and 42 of them already carry 252 bits.
+  // The last char therefore holds only 4 significant bits plus 2 that decode
+  // drops, so rewriting those 2 produces a DIFFERENT STRING for the SAME BYTES.
+  // That is signature malleability (several encodings of one digest), not
+  // forgery — an attacker still needs the correct 32 bytes, and the nonce is in
+  // the payload — so verifySignature accepting it is correct, not a hole.
+  test("non-canonical signature encoding decodes to the same bytes and still verifies", () => {
+    const B64URL = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_";
+    const token = genToken("compact", "/Users/x/wt/issue-441");
+    const parsed = parseToken(token);
+    if (!parsed.ok) throw new Error("parse failed");
+    expect(parsed.sig).toHaveLength(43);
+
+    // A canonical 43rd char always lands on a 4-char boundary (low 2 bits zero),
+    // so the three chars after it re-encode the very same 32 bytes.
+    const lastIdx = B64URL.indexOf(parsed.sig.slice(-1));
+    expect(lastIdx % 4).toBe(0);
+    const nonCanonical = parsed.sig.slice(0, -1) + B64URL.charAt(lastIdx + 1);
+
+    expect(nonCanonical).not.toBe(parsed.sig);
+    expect(base64urlToBuffer(nonCanonical).equals(base64urlToBuffer(parsed.sig))).toBe(true);
+    expect(verifySignature(parsed.payload, nonCanonical, KEY)).toBe(true);
   });
 
   test("tampered payload (target swapped) fails verification", () => {
