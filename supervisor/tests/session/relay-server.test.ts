@@ -576,7 +576,9 @@ describe("ask timeout (Issue #416, 5 hours)", () => {
     expect(hasPendingAsk("thread-recent")).toBe(false);
     expect(hasRecentAsk("thread-recent")).toBe(true);
     // Window-scoped, not permanent: an ask from long ago must not disable
-    // auto-accept for the rest of the session.
+    // auto-accept for the rest of the session. Deterministic because the bound
+    // is exclusive — with an inclusive one this depended on whether the assert
+    // landed in the same millisecond as the ask settling (it flaked in CI).
     expect(hasRecentAsk("thread-recent", 0)).toBe(false);
     expect(hasRecentAsk("never-asked")).toBe(false);
   });

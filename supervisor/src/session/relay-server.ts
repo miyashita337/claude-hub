@@ -376,7 +376,12 @@ export function hasRecentAsk(
 ): boolean {
   if (pendingAsks.has(threadId)) return true;
   const at = askActivityAt.get(threadId);
-  return at !== undefined && Date.now() - at <= windowMs;
+  // Exclusive bound. With `<=`, a window of 0 still matched for the remainder
+  // of the millisecond the ask settled in — so "no grace window" depended on
+  // how fast the caller ran (it failed in CI and passed locally). Exclusive
+  // makes `windowMs: 0` mean exactly "only while pending"; at the production
+  // 60s window the difference is one millisecond.
+  return at !== undefined && Date.now() - at < windowMs;
 }
 
 /**
