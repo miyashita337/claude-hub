@@ -27,13 +27,17 @@
 #   own PATH omits) the lookup could not run at all. Every claude older than
 #   IDLE_MINUTES was therefore reported idle, including sessions mid-task.
 #
-#   Two positive signals replace it, tried in order:
+#   Two positive signals replace it:
 #     1. tmux pane activity — #{session_activity} / #{window_activity} of the
 #        pane whose pane_pid is the process (epoch seconds).
 #     2. transcript mtime — newest *.jsonl under
 #        $HOME/.claude/projects/<cwd with every [^A-Za-z0-9-] replaced by ->,
 #        the process cwd coming from lsof.
-#   Neither available => `unknown` => protected.
+#   Either one proving recent activity is enough to protect; when the first
+#   says "quiet" the second is consulted too and the NEWER reading wins, since
+#   the two measure different things (pane output vs. transcript writes) and a
+#   stale source must not veto a fresh one. Neither readable, or a reading that
+#   is not a usable epoch => `unknown` => protected.
 #
 # Exit codes:
 #   0 — completed (dry-run reported, or kills succeeded / no candidates)
@@ -51,6 +55,7 @@ ALLOWLIST="${CLEANUP_CLAUDE_ALLOWLIST_PIDS:-}"
 # deterministically without touching a live claude process.
 TMUX_BIN="${CLEANUP_CLAUDE_TMUX_BIN:-tmux}"
 LSOF_BIN="${CLEANUP_CLAUDE_LSOF_BIN:-lsof}"
+LSOF_FALLBACK="${CLEANUP_CLAUDE_LSOF_FALLBACK:-/usr/sbin/lsof}"
 PROJECTS_DIR="${CLEANUP_CLAUDE_PROJECTS_DIR:-${HOME:-}/.claude/projects}"
 KILL_GRACE_SECONDS="${CLEANUP_CLAUDE_KILL_GRACE_SECONDS:-10}"
 
@@ -70,6 +75,8 @@ Environment:
   CLEANUP_CLAUDE_LIST_SCRIPT         Override the process lister (testing)
   CLEANUP_CLAUDE_TMUX_BIN            Override the tmux binary (testing)
   CLEANUP_CLAUDE_LSOF_BIN            Override the lsof binary (testing)
+  CLEANUP_CLAUDE_LSOF_FALLBACK       Path tried when lsof is off PATH
+                                     (default /usr/sbin/lsof)
   CLEANUP_CLAUDE_PROJECTS_DIR        Override ~/.claude/projects (testing)
 EOF
 }
@@ -145,7 +152,13 @@ etime_to_minutes() {
     2) minutes="${parts[0]}" ;;
     *) minutes=0 ;;
   esac
-  echo $(( days * 24 * 60 + 10#$hours * 60 + 10#$minutes ))
+  # 10# on every field, days included: macOS `ps` zero-pads the day count
+  # ("08-01:02:03"), and bash reads a leading-zero literal as octal — so `08`
+  # and `09` are an arithmetic error that kills the whole run under `set -e`
+  # (even --dry-run, leaving the operator with no listing at all), while `10`
+  # through `17` are silently understated. Pre-existing; fixed here because it
+  # is the same class as the guards this script relies on (#430 review, should-4).
+  echo $(( 10#$days * 24 * 60 + 10#$hours * 60 + 10#$minutes ))
 }
 
 mtime_of() {
@@ -192,10 +205,38 @@ tmux_last_activity() {
     $1 == target {
       latest = $2 + 0;
       if ($3 + 0 > latest) latest = $3 + 0;
-      print latest;
+      # A tmux that does not understand these format variables substitutes the
+      # empty string, and "" + 0 is 0 — an epoch that reads as "idle since
+      # 1970", i.e. the most killable value there is. Printing nothing instead
+      # sends that case to `unknown`, which is what the header promises for
+      # "tmux answered but the answer is unusable" (#430 review, must-1).
+      if (latest > 0) print latest;
       exit;
     }
   ' <<<"$PANE_SNAPSHOT"
+}
+
+# Absolute path to a usable lsof, or non-zero when there is none.
+#
+# `lsof` off PATH is one half of the original defect: macOS ships it in
+# /usr/sbin, and the PATH the supervisor hands its tmux sessions
+# (~/.local/bin:~/.bun/bin:/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin) has
+# no /usr/sbin. Leaving the default as the bare name meant the transcript
+# source was dead by default in exactly the context this script runs in,
+# so processes with no tmux pane (interactive / orphan) could never be
+# observed at all (#430 review, should-2).
+resolve_lsof() {
+  if command -v "$LSOF_BIN" >/dev/null 2>&1; then
+    command -v "$LSOF_BIN"
+    return 0
+  fi
+  # Only fall back for the default; an explicit override that does not resolve
+  # is an operator error and must not be silently replaced.
+  if [ "$LSOF_BIN" = "lsof" ] && [ -x "$LSOF_FALLBACK" ]; then
+    echo "$LSOF_FALLBACK"
+    return 0
+  fi
+  return 1
 }
 
 # Epoch seconds of the newest transcript *.jsonl belonging to the process's
@@ -211,9 +252,10 @@ tmux_last_activity() {
 # or the rule changed) yields empty => `unknown` => protected, never "idle".
 transcript_last_mtime() {
   local pid="$1"
-  command -v "$LSOF_BIN" >/dev/null 2>&1 || return 0
+  local lsof_bin
+  lsof_bin=$(resolve_lsof) || return 0
   local cwd
-  cwd=$("$LSOF_BIN" -a -p "$pid" -d cwd -Fn 2>/dev/null | awk '/^n/{sub(/^n/,""); print; exit}')
+  cwd=$("$lsof_bin" -a -p "$pid" -d cwd -Fn 2>/dev/null | awk '/^n/{sub(/^n/,""); print; exit}')
   [ -z "$cwd" ] && return 0
   local encoded dir
   encoded=$(printf '%s' "$cwd" | sed 's/[^A-Za-z0-9-]/-/g')
@@ -235,7 +277,9 @@ transcript_last_mtime() {
 # Prints "<state> <detail>" where state is one of:
 #   active  — measured activity within the threshold: do not touch
 #   idle    — measured activity older than the threshold: eligible
-#   unknown — no observation source answered: protected (fail-safe)
+#   unknown — no source produced a usable reading: protected (fail-safe).
+#             Covers both "nothing answered" and "something answered with a
+#             value we cannot trust" (see tmux_last_activity's zero guard).
 #
 # The `unknown` state is the whole point of Issue #430. The previous
 # implementation had no such state: any failure to observe was reported as
@@ -243,31 +287,50 @@ transcript_last_mtime() {
 # kill candidate on this host.
 observe_activity() {
   local pid="$1" threshold_min="$2"
-  local now cutoff ts age_min
+  local now cutoff age_min
   now=$(date +%s)
   cutoff=$(( now - threshold_min * 60 ))
 
-  ts=$(tmux_last_activity "$pid")
-  if [ -z "$ts" ]; then
-    ts=$(transcript_last_mtime "$pid")
-    if [ -n "$ts" ]; then
-      age_min=$(( (now - ts) / 60 ))
-      if [ "$ts" -gt "$cutoff" ]; then
-        echo "active transcript-mtime ${age_min}m-ago"
-      else
-        echo "idle transcript-mtime ${age_min}m-ago"
-      fi
-      return 0
-    fi
+  local ts_tmux ts_file best source
+  ts_tmux=$(tmux_last_activity "$pid")
+
+  # Any single source proving recent activity is enough to protect, so stop as
+  # soon as one does. This also keeps the common case cheap: an lsof lookup
+  # costs ~0.5s per process, and a session tmux already vouched for does not
+  # need one.
+  if [ -n "$ts_tmux" ] && [ "$ts_tmux" -gt "$cutoff" ]; then
+    echo "active tmux-activity $(( (now - ts_tmux) / 60 ))m-ago"
+    return 0
+  fi
+
+  # tmux said "quiet" (or said nothing). Before treating that as idle, ask the
+  # other source — the sources measure different things (pane output vs.
+  # transcript writes) and the older one must not veto the newer. The same
+  # reasoning already applies inside tmux_last_activity, which takes the max of
+  # session_activity and window_activity (#430 review, should-3).
+  ts_file=$(transcript_last_mtime "$pid")
+
+  best=""
+  source=""
+  if [ -n "$ts_tmux" ]; then
+    best="$ts_tmux"
+    source="tmux-activity"
+  fi
+  if [ -n "$ts_file" ] && { [ -z "$best" ] || [ "$ts_file" -gt "$best" ]; }; then
+    best="$ts_file"
+    source="transcript-mtime"
+  fi
+
+  if [ -z "$best" ]; then
     echo "unknown no-activity-source (tmux pane and transcript both unreadable)"
     return 0
   fi
 
-  age_min=$(( (now - ts) / 60 ))
-  if [ "$ts" -gt "$cutoff" ]; then
-    echo "active tmux-activity ${age_min}m-ago"
+  age_min=$(( (now - best) / 60 ))
+  if [ "$best" -gt "$cutoff" ]; then
+    echo "active ${source} ${age_min}m-ago"
   else
-    echo "idle tmux-activity ${age_min}m-ago"
+    echo "idle ${source} ${age_min}m-ago"
   fi
 }
 
@@ -285,11 +348,12 @@ print_protected_reasons() {
   for r in "${PROTECTED_REASONS[@]}"; do echo "    - $r"; done
 }
 
-# Final-line-of-defense: verify a PID's argv[0] is actually `claude` (or
-# ends in `/claude`) before we'd ever signal it. The lister regex is
-# loose enough to include tmux/awk subshells whose argv embeds "claude"
-# somewhere; the category filter usually catches those, but if anything
-# slips through to the kill loop, this guard refuses to fire.
+# Final-line-of-defense: verify a PID's argv[0] is actually `claude` (or ends
+# in `/claude`) before we'd ever signal it. The lister regex is loose enough to
+# include tmux/awk subshells whose argv embeds "claude" somewhere; the category
+# filter usually catches those, but if anything slips through, this guard
+# refuses to fire. Called twice — once when the candidate is selected and again
+# in the kill loop, immediately before the signal.
 is_genuine_claude_executable() {
   local pid="$1"
   local argv0
@@ -396,6 +460,13 @@ for c in "${CANDIDATES[@]}"; do
   recheck=$(observe_activity "$pid" "$IDLE_MINUTES")
   if [ "${recheck%% *}" != "idle" ]; then
     echo "  -> SKIP $pid (re-check before signal: $recheck)"
+    continue
+  fi
+  # Re-assert identity here, not only at selection time, so the guard below
+  # holds at the instant the signal is sent — a pid can be recycled between
+  # the two, and this is the last statement before kill.
+  if ! is_genuine_claude_executable "$pid"; then
+    echo "  -> SKIP $pid (argv0 is no longer claude)"
     continue
   fi
   echo "  -> SIGTERM $pid"

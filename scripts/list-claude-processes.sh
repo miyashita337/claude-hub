@@ -49,8 +49,11 @@ tmux_session_for_pid() {
   fi
   # Try the supervisor socket first (Issue #83), then default.
   for socket_args in "-L claude-hub" ""; do
-    # shellcheck disable=SC2086
     local panes
+    # Directive must sit on the command it covers, not on the declaration above
+    # it: $socket_args is split into argv on purpose ("-L claude-hub" is two
+    # words), which is what SC2086 flags.
+    # shellcheck disable=SC2086
     panes=$(tmux $socket_args list-panes -a -F '#{pane_pid} #{session_name}' 2>/dev/null || true)
     [ -z "$panes" ] && continue
     local sess
@@ -109,7 +112,12 @@ is_supervisor_tmux_chain() {
   local pid="$1"
   local cur="$pid"
   for _ in 1 2 3 4 5 6 7 8 9 10; do
-    [ -z "$cur" ] || [ "$cur" = "0" ] || [ "$cur" = "1" ] && return 1
+    # `case` rather than a `||` chain ending in `&& return 1`: that form works
+    # only because `||` and `&&` share a precedence and associate left, so
+    # adding one more condition silently changes what the `&&` applies to.
+    case "$cur" in
+      "" | 0 | 1) return 1 ;;
+    esac
     local cmd
     cmd=$(ps -p "$cur" -o command= 2>/dev/null || true)
     if [ -z "$cmd" ]; then
