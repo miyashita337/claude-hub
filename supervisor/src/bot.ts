@@ -1020,7 +1020,14 @@ export async function startBot(token: string): Promise<void> {
         try {
           await postToThread(
             dispatchThread.id,
-            buildDispatchFailureNotice(result.stage, config.displayName, branch, issueNumber, command)
+            buildDispatchFailureNotice(
+              result.stage,
+              config.displayName,
+              branch,
+              issueNumber,
+              command,
+              { sessionStopped: result.sessionStopped }
+            )
           );
         } catch (err) {
           console.error(

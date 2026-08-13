@@ -278,7 +278,7 @@ export const DELIVERY_VERIFY_BACKOFF_MS: readonly number[] = [
  * no-retype path waits exactly as long before crying failure (~2× the backoff
  * schedule) as the retype path does, instead of being half as tolerant.
  */
-export const DELIVERY_MAX_TYPE_ATTEMPTS = 2;
+export const DELIVERY_MAX_VERIFY_ROUNDS = 2;
 
 /**
  * `RelayResult.error` marker for a send that tmux accepted but the pane never
@@ -398,6 +398,19 @@ export function countProbeOccurrences(pane: string, probe: string): number {
  * *below* the prompt while the input row itself stays on screen and matchable.
  * So the premise for skipping verification — "the picker re-renders the input
  * row, so the text is not matchable" — is false: slash text IS observable.
+ *
+ * Re-measured for the TUI BUILT-IN `/compact` (PR #434 review, should-3), since
+ * a built-in need not render like a user-defined command and its callers
+ * (auto self-heal, the Pushover one-tap, `/session compact`) surface a failure
+ * to a human rather than retrying:
+ *
+ *     send-keys -t probe -l '/compact テスト用の意図'
+ *       → row 15 reads `❯ /compact テスト用の意図`, count 0 before / 1 after
+ *     send-keys -t probe -l '/compact'   (bare: the built-in's own picker state)
+ *       → row 15 reads `❯ /compact`, still matchable
+ *
+ * Same result as the user-defined command, so the no-retype path is measured on
+ * both kinds of slash command rather than extrapolated from one.
  *
  * Only the *retype* was ever unsafe. Hence the split this function encodes:
  * verify everything, retype only what is safe to retype. That closes the silent
@@ -567,7 +580,7 @@ async function typeLiteral(
   // path a later round means "still watching", not "typed again".
   let typed = 0;
 
-  for (let round = 1; round <= DELIVERY_MAX_TYPE_ATTEMPTS; round++) {
+  for (let round = 1; round <= DELIVERY_MAX_VERIFY_ROUNDS; round++) {
     if (round === 1 || retypeAllowed) {
       await tmuxSend(tmuxSessionName, ["-l", literalText], socketArgs);
       typed++;
@@ -583,10 +596,19 @@ async function typeLiteral(
         // A rise of 2 after a retype means BOTH types rendered: the first one
         // was merely late, not lost, so the pane now holds the message twice.
         // Reported rather than silently submitted — the whole point of #422 is
-        // that the relay must not hide what it did to the pane. Gated on
-        // `typed > 1` because a rise of 2 without a retype is not something we
-        // did: it is the user's own text already on screen, and calling that a
-        // duplicate would put a scary notice on a perfectly clean send.
+        // that the relay must not hide what it did to the pane.
+        //
+        // Gated on `typed > 1` = "this loop typed twice". That is not quite the
+        // same as "the literal was sent twice": `tmuxSend` retries the same
+        // `send-keys -l` once on a timeout / `not in a mode`, and a send that
+        // reached the pane before the execFile timed out lands twice without
+        // this counter noticing (PR #434 review, should-2 — a blind spot that
+        // predates #429; #428's `attempt > 1` had it too). So a rise of 2 with
+        // `typed === 1` is usually the user's own text already on screen, but
+        // it can also be that inner retry. It is deliberately NOT reported as
+        // `duplicate`: on this path the notice would fire on ordinary clean
+        // sends, and the inner retry is bounded and rare. Tracked separately
+        // rather than papered over here.
         if (typed > 1 && count - floor >= 2) {
           console.warn(
             `[Relay] duplicate input in pane ${tmuxSessionName}: the delayed first ` +
@@ -600,7 +622,7 @@ async function typeLiteral(
     }
     console.warn(
       `[Relay] typed text never rendered in pane ${tmuxSessionName} ` +
-        `(round ${round}/${DELIVERY_MAX_TYPE_ATTEMPTS}, typed ${typed}×, ` +
+        `(round ${round}/${DELIVERY_MAX_VERIFY_ROUNDS}, typed ${typed}×, ` +
         `retype ${retypeAllowed ? "allowed" : "withheld (#429)"}, ${literalText.length} chars)`
     );
   }

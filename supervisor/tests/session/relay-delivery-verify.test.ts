@@ -10,7 +10,7 @@ import {
   allowsRetype,
   deliveryNoticeFor,
   DELIVERY_PROBE_MAX_CHARS,
-  DELIVERY_MAX_TYPE_ATTEMPTS,
+  DELIVERY_MAX_VERIFY_ROUNDS,
   DELIVERY_VERIFY_BACKOFF_MS,
   CAPTURE_PANE_TIMEOUT_MS,
   SEND_UNVERIFIED_ERROR,
@@ -261,7 +261,7 @@ describe("delivery probe helpers (#422)", () => {
     expect(DELIVERY_VERIFY_BACKOFF_MS[0]).toBeLessThanOrEqual(100);
     const total = DELIVERY_VERIFY_BACKOFF_MS.reduce((a, b) => a + b, 0);
     expect(total).toBeGreaterThanOrEqual(1000);
-    expect(DELIVERY_MAX_TYPE_ATTEMPTS).toBeGreaterThanOrEqual(2);
+    expect(DELIVERY_MAX_VERIFY_ROUNDS).toBeGreaterThanOrEqual(2);
   });
 });
 
@@ -443,15 +443,20 @@ describe("sendToPane delivery verification against a real pane (#422)", () => {
   );
 
   itmux(
-    "#429: a slash command that renders LATE is verified without a retype",
+    "#429: a pane that recovers mid-flight is still typed into exactly once",
     async () => {
-      // The false-negative case that makes "verify but never retype" worth the
-      // trouble: attempt 1 is swallowed, the pane recovers, and the text shows
-      // up during a later watch round. The retype path would have typed again
-      // by then (and #428 would have called it `duplicate`); here the same
-      // recovery costs zero extra keystrokes.
-      const name = makeSessionName("slash-late");
-      const dir = mkdtempSync(join(tmpdir(), "relay429-late-"));
+      // PR #434 review, nit-3: this case cannot pin a verdict. Whether the
+      // recovered pane renders inside the remaining watch budget is a race with
+      // the real tty, so asserting "verified" here would be flaky. The verdict
+      // for the late-render path is pinned deterministically by the scripted
+      // reader below ("text that shows up only in a LATER round").
+      //
+      // What this case CAN pin, against a real tmux, is the invariant that
+      // matters for a slash command: no matter how the race lands, the literal
+      // is put on the wire once. A regression that reinstates the retype fails
+      // here even when the timing goes the other way.
+      const name = makeSessionName("slash-recover");
+      const dir = mkdtempSync(join(tmpdir(), "relay429-recover-"));
       const flag = join(dir, "reopen");
       startDropPane(name, dir, flag);
       try {
@@ -461,18 +466,18 @@ describe("sendToPane delivery verification against a real pane (#422)", () => {
           verifyBackoffMs: FAST_BACKOFF,
           onAttemptTyped: (n) => {
             typedAttempts.push(n);
-            // Echo comes back right after the (lost) first type; the literal
-            // itself is gone, so this asserts the WATCH rounds, not a retype.
+            // Reopen echo the instant the (swallowed) first type is done, so
+            // the recovery happens during the WATCH rounds, not before them.
             if (n === 1) writeFileSync(flag, "");
           },
         }).catch((err) => err as Error);
 
-        // Whatever the outcome, the invariant under test is the same one:
-        // the command was typed exactly once.
         expect(typedAttempts).toEqual([1]);
-        // And it is never reported as a retype/duplicate, because it wasn't.
+        // Never a retype verdict, because no retype happened — whichever way
+        // the race resolved.
         if (!(outcome instanceof Error)) {
-          expect(["verified", "unverified-observer"]).toContain(outcome.verdict);
+          expect(outcome.verdict).not.toBe("verified-retyped");
+          expect(outcome.verdict).not.toBe("duplicate");
         }
       } finally {
         killSession(name);

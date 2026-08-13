@@ -271,6 +271,18 @@ export interface DispatchSessionManager {
     },
   ): Promise<DispatchSendResult>;
   /**
+   * Tear the session down. Called only when the injection failed (#429 / PR
+   * #434 review, should-4): the session started, but the command never rendered
+   * and the Enter was withheld, so nothing has run and there is no work to
+   * lose. Leaving it up was the worst of both worlds — it held a MAX_SESSIONS
+   * slot doing nothing while the queue, told `started=false`, freed its slot
+   * and admitted the next dispatch over the limit.
+   *
+   * Required rather than optional: an unwired `stop` would silently reinstate
+   * exactly that leak (agent-output-quality #1).
+   */
+  stop(threadId: string, reason?: "error"): Promise<void>;
+  /**
    * Headless executor path (Epic #285 Phase 2 / #287). Runs `claude -p
    * "<initialCommand>"` in the branch worktree to completion and resolves with
    * the captured output. Optional so a tmux-only fake still satisfies the
@@ -343,8 +355,15 @@ export type RunDispatchResult =
     }
   | {
       ok: false;
-      stage: "thread" | "start" | "inject" | "output";
+      stage: DispatchFailureStage;
       error: string;
+      /**
+       * `inject` only: whether the started-but-idle session was torn down
+       * (#429 / PR #434 review, should-4). Carried so the thread notice can say
+       * which of the two states the reader is looking at instead of guessing —
+       * a failed teardown leaves a session that still needs attention.
+       */
+      sessionStopped?: boolean;
     };
 
 /** Stage of a failed dispatch, as reported by {@link runDispatch}. */
@@ -365,6 +384,11 @@ export type DispatchFailureStage = "thread" | "start" | "inject" | "output";
  * withheld. Someone reading this thread has to know the session is idle rather
  * than working, because the recovery is theirs to trigger (corp#107 / #108
  * re-injects a `failed` dispatch; a human re-runs `/dispatch`).
+ *
+ * `sessionStopped` (inject only) picks between the two real outcomes instead of
+ * asserting one: normally the idle session is torn down, but if the teardown
+ * itself failed a session is still sitting there and saying otherwise would send
+ * the reader looking for the wrong thing (PR #434 review, should-4).
  */
 export function buildDispatchFailureNotice(
   stage: DispatchFailureStage,
@@ -372,18 +396,24 @@ export function buildDispatchFailureNotice(
   branch: string,
   issueNumber: number,
   command: DispatchCommand,
+  options?: { sessionStopped?: boolean },
 ): string {
   const head =
     `❌ **${displayName}** のディスパッチに失敗しました\n\n` +
     `🌿 ブランチ: \`${branch}\`\n` +
     `▶️ 初期コマンド: \`/${command} ${issueNumber}\`\n`;
+  const injectTail =
+    options?.sessionStopped === false
+      ? "**このセッションの停止にも失敗した**ため、セッションが残っている可能性があります。" +
+        "`/session status` で確認し、必要なら `/session stop` で停止してください。"
+      : "何も実行していないため、このセッションは停止しました（枠は解放済み）。";
   const detail: Record<DispatchFailureStage, string> = {
     thread: "🧵 スレッドを作成できませんでした。",
     start: "🚀 セッションを起動できませんでした。",
     inject:
       "⌨️ セッションは起動しましたが、初期コマンドが画面に出たことを確認できませんでした" +
       "（#422 / #429）。**二重実行を避けるため自動での再入力はしていません**" +
-      "（Enter も送っていません）。このセッションは待機したままなので、" +
+      `（Enter も送っていません）。${injectTail}` +
       "内容を確認のうえ再ディスパッチしてください。",
     output: "📤 実行結果をスレッドへ投稿できませんでした。",
   };
@@ -476,7 +506,7 @@ export async function runDispatch(
       onDialogStuck ? { onDialogStuck } : undefined,
     );
   } catch (err) {
-    return { ok: false, stage: "inject", error: errMsg(err) };
+    return injectFailure(sessionManager, threadId, errMsg(err));
   }
 
   // Issue #429: this is the silent-stall site. `sendMessage` resolves with a
@@ -491,10 +521,44 @@ export async function runDispatch(
   // job is simply still running past RELAY_TIMEOUT_MS — reporting that as a
   // failed dispatch would trade a silent drop for a false alarm.
   if (relay.sendFailed) {
-    return { ok: false, stage: "inject", error: relay.error ?? "send failed" };
+    return injectFailure(sessionManager, threadId, relay.error ?? "send failed");
   }
 
   return { ok: true, mode: "tmux", threadId, injected: initialCommand };
+}
+
+/**
+ * Report a failed injection, tearing the started-but-idle session down first
+ * (#429 / PR #434 review, should-4).
+ *
+ * Stopping is safe precisely because of what failed: the command never rendered,
+ * so the Enter was never sent and the session has executed nothing. Leaving it
+ * running was the inconsistent state — the queue frees its slot on `ok:false`
+ * (`dispatch-queue.ts` runItem: "no session started → free it here"), whose
+ * premise does not hold at this stage, so an abandoned session held a
+ * MAX_SESSIONS slot while the queue admitted another dispatch in its place.
+ * Stopping makes `started=false` true rather than merely assumed.
+ *
+ * A failed teardown is reported, not swallowed: the dispatch failure is what the
+ * caller must act on, so it always wins, but `sessionStopped` tells the thread
+ * whether a session is still sitting there.
+ */
+async function injectFailure(
+  sessionManager: DispatchSessionManager,
+  threadId: string,
+  error: string,
+): Promise<RunDispatchResult> {
+  let sessionStopped = true;
+  try {
+    await sessionManager.stop(threadId, "error");
+  } catch (stopErr) {
+    sessionStopped = false;
+    console.error(
+      `[Dispatch] injection failed for thread ${threadId} and the session could not be stopped:`,
+      errMsg(stopErr),
+    );
+  }
+  return { ok: false, stage: "inject", error, sessionStopped };
 }
 
 /**

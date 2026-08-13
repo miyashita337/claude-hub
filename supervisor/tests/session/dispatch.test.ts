@@ -172,6 +172,12 @@ describe("runDispatch readiness ordering (RW-025/047)", () => {
         calls.push(`send:${message}`);
         return {};
       },
+      // Recorded, not ignored: this describe pins the CALL ORDER, so a stray
+      // teardown (#429 stops the session when the injection fails) has to show
+      // up in `calls` rather than pass unnoticed.
+      stop: async () => {
+        calls.push("stop");
+      },
     };
     return { sm, calls };
   }
@@ -253,6 +259,9 @@ describe("runDispatch readiness ordering (RW-025/047)", () => {
       sendMessage: async (_t: string, message: string) => {
         calls.push(`send:${message}`);
         return {};
+      },
+      stop: async () => {
+        calls.push("stop");
       },
     };
     const r = await runDispatch({
