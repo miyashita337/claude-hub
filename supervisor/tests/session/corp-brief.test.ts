@@ -1,5 +1,6 @@
 import { describe, test, expect } from "bun:test";
 import {
+  BRIEF_DEDUP_WINDOW_MS,
   BRIEF_DISABLED_ENV,
   BRIEF_PREFIX,
   buildBriefInjection,
@@ -52,7 +53,8 @@ const ONE_SESSION: BriefSessionRef[] = [{ threadId: "thread-1" }];
 /**
  * Base input for the evaluator. `env` / `envAllowedSourceIds` are always passed
  * explicitly so a stray `CORP_BRIEF_DISABLED` / `DISPATCH_ALLOWED_SOURCE_IDS`
- * in the developer's shell cannot change the verdict under test.
+ * in the developer's shell cannot change the verdict under test. `askPending`
+ * defaults to "nothing outstanding" so only the tests that care set it.
  */
 function input(over: Partial<BriefTriggerInput> = {}): BriefTriggerInput {
   return {
@@ -61,6 +63,7 @@ function input(over: Partial<BriefTriggerInput> = {}): BriefTriggerInput {
     sourceId: CORP_BOT_ID,
     policy: allowingPolicy(),
     sessions: ONE_SESSION,
+    askPending: () => false,
     env: {},
     envAllowedSourceIds: [],
     ...over,
@@ -106,6 +109,32 @@ describe("isBriefCommand / parseBriefCommand", () => {
     // never silently dropped and never forwarded into the session.
     const r = parseBriefCommand("/brief 2026-08-13 rm -rf ~");
     expect(r.kind).toBe("error");
+  });
+
+  test("rejects extra content on a following line (LF / CRLF / CR)", () => {
+    // A multi-line body is the most ordinary shape for a bot post, so this is
+    // the likeliest way free text would try to ride along. It is refused today
+    // because the split is `/\s+/` (newlines are whitespace) — pin it, so a
+    // future line-oriented rewrite ("look at the first line only", `split(" ")`)
+    // fails here instead of quietly forwarding the rest into the HQ session.
+    for (const sep of ["\n", "\r\n", "\r"]) {
+      const r = parseBriefCommand(`/brief 2026-08-13${sep}rm -rf ~`);
+      expect(r.kind).toBe("error");
+    }
+  });
+
+  test("rejects control characters riding on the date token", () => {
+    // NUL / ESC / RTL-override attached to an otherwise valid date. None of
+    // these are whitespace, so they stay part of the token and the anchored
+    // date regex refuses them rather than trimming them off. Written as \\u
+    // escapes on purpose — an invisible byte in a test file is unreviewable.
+    for (const bad of [
+      "/brief 2026-08-13\u0000",
+      "/brief 2026-08-13\u001b[31m",
+      "/brief \u202e2026-08-13",
+    ]) {
+      expect(parseBriefCommand(bad).kind).toBe("error");
+    }
   });
 
   test("rejects a malformed date", () => {
@@ -261,6 +290,120 @@ describe("evaluateBriefTrigger — trigger handling", () => {
     );
     expect(d.action).toBe("ambiguous");
     if (d.action === "ambiguous") expect(d.count).toBe(2);
+  });
+});
+
+/**
+ * PR #432 review, must-1. This is the one capability `/dispatch` and
+ * `/orchestrate` do not have: they only ever type into a session they just
+ * started, while `/brief` types into a session that was ALREADY running and
+ * whose state it does not own. `sendToPane` leads every send with `Escape`, so
+ * injecting while the chairman has an AskUserQuestion open could discard the
+ * pending decision — or, if Escape picks a fallback dialog's default, answer it
+ * on their behalf. That is the failure class #412 / #416 / #423 just closed.
+ */
+describe("evaluateBriefTrigger — never interrupts a pending decision (#432 must-1)", () => {
+  test("defers instead of injecting when the target thread is awaiting an answer", () => {
+    const d = evaluateBriefTrigger(input({ askPending: () => true }));
+    expect(d.action).toBe("deferred");
+    if (d.action === "deferred") {
+      expect(d.threadId).toBe("thread-1");
+      expect(d.date).toBe("2026-08-13");
+    }
+  });
+
+  test("the guard is asked about the RESOLVED target thread, not any thread", () => {
+    // A pending ask on some other thread must not block this channel's brief,
+    // and a pending ask on the target must block it — so the predicate has to
+    // receive the thread the injection would actually go to.
+    const asked: string[] = [];
+    const d = evaluateBriefTrigger(
+      input({
+        sessions: [{ threadId: "thread-target" }],
+        askPending: (threadId) => {
+          asked.push(threadId);
+          return threadId === "someone-else";
+        },
+      }),
+    );
+    expect(asked).toEqual(["thread-target"]);
+    expect(d.action).toBe("inject");
+  });
+
+  test("the ask guard runs even for an otherwise perfect trigger", () => {
+    // Guards against a refactor that checks askPending only on some branch:
+    // authorized, well-formed, exactly one target — and still deferred.
+    const d = evaluateBriefTrigger(
+      input({ policy: allowingPolicy(), askPending: () => true }),
+    );
+    expect(d.action).not.toBe("inject");
+  });
+
+  test("no target session means no ask question to answer (no_session wins)", () => {
+    // Ordering check: with zero candidates there is no thread to ask about, so
+    // the predicate must not be consulted with a bogus id.
+    let called = false;
+    const d = evaluateBriefTrigger(
+      input({
+        sessions: [],
+        askPending: () => {
+          called = true;
+          return true;
+        },
+      }),
+    );
+    expect(d.action).toBe("no_session");
+    expect(called).toBe(false);
+  });
+});
+
+/**
+ * PR #432 review, should-1. corp retrying a failed delivery (or a manual
+ * re-post) must not interrupt the running conversation twice for the same day.
+ */
+describe("evaluateBriefTrigger — same-day idempotency (#432 should-1)", () => {
+  const NOW = 1_760_000_000_000;
+
+  test("a repeat of the same date inside the window is not injected again", () => {
+    const d = evaluateBriefTrigger(
+      input({
+        nowMs: NOW,
+        recentBrief: { date: "2026-08-13", atMs: NOW - 60_000 },
+      }),
+    );
+    expect(d.action).toBe("duplicate");
+    if (d.action === "duplicate") expect(d.elapsedMs).toBe(60_000);
+  });
+
+  test("a repeat AFTER the window is allowed (a deliberate re-trigger stays possible)", () => {
+    const d = evaluateBriefTrigger(
+      input({
+        nowMs: NOW,
+        recentBrief: { date: "2026-08-13", atMs: NOW - BRIEF_DEDUP_WINDOW_MS - 1 },
+      }),
+    );
+    expect(d.action).toBe("inject");
+  });
+
+  test("a different date is never a duplicate", () => {
+    const d = evaluateBriefTrigger(
+      input({
+        content: "/brief 2026-08-14",
+        nowMs: NOW,
+        recentBrief: { date: "2026-08-13", atMs: NOW - 60_000 },
+      }),
+    );
+    expect(d.action).toBe("inject");
+  });
+
+  test("de-dup does not mask a deferred/no_session retry", () => {
+    // The caller records only on `inject`, so a brief that ended as deferred
+    // leaves no record — this pins the evaluator side of that contract: with no
+    // record, the retry is evaluated normally rather than swallowed.
+    const d = evaluateBriefTrigger(
+      input({ nowMs: NOW, recentBrief: undefined, askPending: () => false }),
+    );
+    expect(d.action).toBe("inject");
   });
 });
 

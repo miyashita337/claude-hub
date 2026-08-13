@@ -27,6 +27,11 @@
  *      オーケストレーター（branch が `orchestrate-` 始まり）だけは機械的な印で
  *      候補から除き（{@link selectBriefTargets}）、残りがちょうど 1 件のときだけ
  *      注入する。0 件 / 2 件以上は注入せず通知する（推測で選ばない）。
+ *   5. **稼働中セッションへ打鍵する唯一の外部トリガー**なので、割り込みの安全弁を 2 つ持つ:
+ *      対象スレッドが AskUserQuestion の回答待ちなら注入しない（`askPending`）、
+ *      同じ日付を直近に注入済みなら二度割り込まない（{@link BRIEF_DEDUP_WINDOW_MS}）。
+ *      dispatch / orchestrate は**自分が起こしたばかりのセッション**にしか打鍵しないため
+ *      この論点を持たない。ここだけは brief のほうが強い能力を持つ。
  *
  * *誰が* トリガーできるかは access policy 側の設定であり、本モジュールは corp 固有の
  * 送信元を一切ハードコードしない（`dispatch.ts` と同じ方針）。#corp が最初の利用者
@@ -176,6 +181,24 @@ export function selectBriefTargets(
   );
 }
 
+/**
+ * 同じ日付の brief を再び受けても投入しない時間窓（冪等性）。
+ *
+ * corp 側の配信リトライや手動 re-post で同じ `(channel, date)` が二度来ると、
+ * **稼働中の会話に二度割り込む**（`enqueueForThread` が直列化するので状態は壊れないが、
+ * 会長との対話は二度中断される）。corp の dispatch スケジューラが 30 分周期なので、
+ * その 1 サイクル分をまたいで吸収できる 60 分を既定にする。窓を無期限にしないのは、
+ * 初回の注入がセッション側で活きなかったときに**同じ日付で意図的に再投入する**余地を
+ * 残すため（無期限だと当日中は二度と起こせなくなる）。
+ */
+export const BRIEF_DEDUP_WINDOW_MS = 60 * 60_000;
+
+/** 直近に注入済みの brief（冪等性判定の入力）。 */
+export interface RecentBrief {
+  date: string;
+  atMs: number;
+}
+
 export interface BriefTriggerInput {
   /** 受信メッセージ本文。 */
   content: string;
@@ -187,6 +210,23 @@ export interface BriefTriggerInput {
   policy: AccessPolicy | null;
   /** 当該チャンネルで running のセッション（`listRunningByChannel` の結果）。 */
   sessions: BriefSessionRef[];
+  /**
+   * 対象スレッドで AskUserQuestion が保留中（またはその直後の猶予窓）か。
+   *
+   * **必須**（省略可にしない）。この経路は「既に走っていて状態の分からないセッション」へ
+   * 打鍵する唯一の外部トリガーで、`sendToPane` は毎回先頭に `Escape` を送る。会長が
+   * 回答を検討している最中に打てば、保留中の決裁が本人不在で消えるか、最悪 fallback
+   * dialog の既定が選ばれる（#412 / #416 / #423 が閉じた失敗クラスそのもの）。
+   * 呼び出し側は `hasRecentAsk`（= 保留中 + settle 直後の猶予）を渡すこと。
+   */
+  askPending: (threadId: string) => boolean;
+  /**
+   * 同じチャンネルで直近に注入した brief。`undefined` = 記録なし。
+   * {@link BRIEF_DEDUP_WINDOW_MS} 以内に同じ日付が来たら投入しない。
+   */
+  recentBrief?: RecentBrief;
+  /** 冪等性判定の基準時刻。省略時 `Date.now()`。 */
+  nowMs?: number;
   /** kill-switch 判定用。省略時 `process.env`。 */
   env?: Record<string, string | undefined>;
   /** `DISPATCH_ALLOWED_SOURCE_IDS` 相当。省略時 env から読む（dispatch と共用）。 */
@@ -208,6 +248,10 @@ export type BriefDecision =
   | { action: "rejected"; reason: string }
   /** 注入する（対象スレッドがちょうど 1 件）。 */
   | { action: "inject"; date: string; threadId: string; text: string }
+  /** 同じ日付を直近に注入済み → 二度割り込まない（冪等性）。 */
+  | { action: "duplicate"; date: string; elapsedMs: number }
+  /** 対象セッションが会長の回答待ち → 注入せず通知（割り込まない）。 */
+  | { action: "deferred"; date: string; threadId: string }
   /** 稼働中セッションが無い → 注入せず通知（サイレントに落とさない）。 */
   | { action: "no_session"; date: string }
   /** 稼働中セッションが複数 → 曖昧なので注入せず通知（推測で選ばない）。 */
@@ -220,11 +264,14 @@ export type BriefDecision =
  *   2. kill-switch
  *   3. **認可**（fail-closed。ここを通らなければパースもしない）
  *   4. コマンドのパース（自由文を拒否）
- *   5. 投入先スレッドの決定（1 件のときだけ inject）
+ *   5. 冪等性（同じ日付を直近に注入済みなら二度割り込まない）
+ *   6. 投入先スレッドの決定（1 件のときだけ先へ進む）
+ *   7. **回答待ちの割り込み回避**（保留中なら注入しない）
  *
  * 3 が 4 より先なのは既存 `handleDispatchMessage` と同じ順序で、認可されない送信元の
  * 入力を一切解釈しないため（`tests/guards/access-enforcement-wired.test.ts` が
- * dispatch と同様にこの順序を固定する）。
+ * dispatch と同様にこの順序を固定する）。7 が最後なのは、対象スレッドが確定して
+ * 初めて「そのスレッドが回答待ちか」を問えるため。
  */
 export function evaluateBriefTrigger(input: BriefTriggerInput): BriefDecision {
   if (!isBriefCommand(input.content)) return { action: "ignore" };
@@ -254,6 +301,19 @@ export function evaluateBriefTrigger(input: BriefTriggerInput): BriefDecision {
   }
 
   const { date } = parsed;
+
+  // 冪等性: 同じ日付を直近に注入済みなら、稼働中の会話へ二度割り込まない。
+  // 記録は inject したときだけ残す契約なので、no_session / deferred で終わった
+  // brief の再送はここで止まらない（止めると回復手段が消える）。
+  const now = input.nowMs ?? Date.now();
+  const recent = input.recentBrief;
+  if (recent && recent.date === date) {
+    const elapsedMs = now - recent.atMs;
+    if (elapsedMs >= 0 && elapsedMs < BRIEF_DEDUP_WINDOW_MS) {
+      return { action: "duplicate", date, elapsedMs };
+    }
+  }
+
   const sessions = selectBriefTargets(input.sessions);
   if (sessions.length === 0) {
     return { action: "no_session", date };
@@ -262,10 +322,21 @@ export function evaluateBriefTrigger(input: BriefTriggerInput): BriefDecision {
     return { action: "ambiguous", date, count: sessions.length };
   }
 
+  const threadId = (sessions[0] as BriefSessionRef).threadId;
+
+  // 会長が AskUserQuestion に回答している最中（およびその直後の猶予窓）には
+  // 打鍵しない。人間の relay 経路は同じ状況で tmux へ流さず resolveAskUser へ
+  // 回している（bot.ts / #370）。こちらは Discord の返信ではなく生の打鍵で、
+  // しかも `sendToPane` は先頭に Escape を送るため、割り込みの害はより大きい。
+  // no_session / ambiguous と同じ「推測で触らない」方針の延長。
+  if (input.askPending(threadId)) {
+    return { action: "deferred", date, threadId };
+  }
+
   return {
     action: "inject",
     date,
-    threadId: (sessions[0] as BriefSessionRef).threadId,
+    threadId,
     text: buildBriefInjection(date),
   };
 }

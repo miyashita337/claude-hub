@@ -54,6 +54,7 @@ import {
   onAskUser,
   onAskExpired,
   hasPendingAsk,
+  hasRecentAsk,
   resolveAskUser,
   askExpiredNotice,
 } from "./session/relay-server";
@@ -90,6 +91,7 @@ import {
   BRIEF_DISABLED_ENV,
   evaluateBriefTrigger,
   isBriefCommand,
+  type RecentBrief,
 } from "./session/corp-brief";
 import {
   ORCHESTRATE_PREFIX,
@@ -1252,6 +1254,12 @@ export async function startBot(token: string): Promise<void> {
     }
   }
 
+  // Issue #426: the last brief injected per channel, for the (channel, date)
+  // idempotency guard. In-memory on purpose: it only has to outlive corp's
+  // delivery retries (minutes), and a Supervisor restart re-arming the trigger
+  // is the safer failure direction than persisting a stale "already delivered".
+  const recentBriefByChannel = new Map<string, RecentBrief>();
+
   // Issue #426: handle a `/brief <YYYY-MM-DD>` message from an allowed external
   // source (corp's dispatch bot) — wake the channel's ALREADY RUNNING session so
   // it puts the morning brief's proposals to the chairman (corp#112 AC-1).
@@ -1286,15 +1294,23 @@ export async function startBot(token: string): Promise<void> {
       return false;
     }
 
-    // All of the decision logic (kill-switch → authorization → parse → target
-    // resolution, in that order) lives in the pure evaluator so it is testable
-    // without a gateway or a real SessionManager. Only the side effects are here.
+    // All of the decision logic (kill-switch → authorization → parse →
+    // idempotency → target resolution → ask guard, in that order) lives in the
+    // pure evaluator so it is testable without a gateway or a real
+    // SessionManager. Only the side effects are here.
     const decision = evaluateBriefTrigger({
       content,
       channelId: message.channel.id,
       sourceId: message.author.id,
       policy: loadAccessPolicy(),
       sessions: sessionManager.listRunningByChannel(channelName),
+      // `hasRecentAsk`, not `hasPendingAsk`: the TUI dialog the ask hook falls
+      // back to appears AFTER the ask settles, so `hasPendingAsk` alone is false
+      // at exactly the moment a dangerous dialog is on screen
+      // (relay-server.ts). This path types into the pane — and `sendToPane`
+      // leads with Escape — so it takes the wider of the two windows.
+      askPending: hasRecentAsk,
+      recentBrief: recentBriefByChannel.get(channelName),
     });
 
     const textChannel = message.channel as TextChannel;
@@ -1317,6 +1333,13 @@ export async function startBot(token: string): Promise<void> {
         console.warn(
           `[Bot] Brief disabled by kill-switch (${BRIEF_DISABLED_ENV}) in channel ${channelName}; not injected`
         );
+        // The kill-switch is a deliberate operator action, but corp cannot see
+        // this Supervisor's env — from its side the post would just vanish.
+        // Same "never fail silently" bar as no_session / ambiguous, minus the
+        // page (nothing is broken).
+        await postToChannel(
+          `🛑 朝レポの決裁依頼は kill-switch（\`${BRIEF_DISABLED_ENV}\`）で停止中のため実行しませんでした。`
+        );
         return true;
 
       case "denied":
@@ -1337,6 +1360,43 @@ export async function startBot(token: string): Promise<void> {
         await postToChannel(`⚠️ ${decision.reason}`);
         return true;
 
+      case "duplicate":
+        // Idempotency: corp retrying its delivery (or a manual re-post) must not
+        // interrupt the running conversation twice for the same day. Not a
+        // failure — the brief WAS delivered — so it is logged and posted but
+        // never paged.
+        console.log(
+          `[Bot] Brief already delivered in channel ${channelName} (date=${decision.date}, ${Math.round(decision.elapsedMs / 1000)}s ago); not injected again`
+        );
+        await postToChannel(
+          `ℹ️ 朝レポ（${decision.date}）の決裁依頼は既に実行済みのため、二重の割り込みを避けて見送りました。`
+        );
+        return true;
+
+      case "deferred":
+        // The one capability /dispatch and /orchestrate do not have: this types
+        // into a session that was ALREADY running, whose state we do not own.
+        // While an AskUserQuestion is outstanding the chairman may be mid-decision,
+        // and `sendToPane` leads with Escape — injecting here could discard a
+        // pending decision (or worse, answer it) with the chairman not present.
+        // The human relay path refuses the same way (#370), so this does too.
+        console.warn(
+          `[Bot] Brief deferred in channel ${channelName} (date=${decision.date}, thread=${decision.threadId}): an AskUserQuestion is outstanding; not injected`
+        );
+        await postToChannel(
+          `⏸️ 朝レポ（${decision.date}）の決裁依頼を見送りました。**${config.displayName}** が会長の回答待ち（AskUserQuestion）のため、` +
+            `割り込むと保留中の決裁を壊すおそれがあります。\n` +
+            `先に保留中の質問へ回答してください。回答後、朝レポの決裁が必要なら会長がスレッドで指示してください` +
+            `（corp は自動で再送しません）。`
+        );
+        notifyPushover(
+          "朝レポの決裁依頼を見送り",
+          `#${channelName} が回答待ちのため ${decision.date} の朝レポ決裁を投入しませんでした。保留中の質問に回答してください。`
+        ).catch((err) =>
+          console.warn("[Bot] brief deferred pushover failed:", err)
+        );
+        return true;
+
       case "no_session":
         // AC-3: must not fail silently. The brief arrived but there was nobody
         // to hand it to — say so on the channel and page, so a stopped CEO
@@ -1344,9 +1404,13 @@ export async function startBot(token: string): Promise<void> {
         console.warn(
           `[Bot] Brief undeliverable in channel ${channelName} (date=${decision.date}): no running session`
         );
+        // Addressed to the chairman, not to corp: corp posted this trigger and
+        // will not post it again on its own, so "resend it" would be an
+        // instruction with nobody to carry it out. Say what a human can do.
         await postToChannel(
-          `⚠️ 朝レポ（${decision.date}）の着信を受けましたが、**${config.displayName}** の稼働中セッションがありません。\n` +
-            `\`/session start <branch>\` で起動してから再送してください（決裁は未実行です）。`
+          `⚠️ 朝レポ（${decision.date}）の着信を受けましたが、**${config.displayName}** の稼働中セッションがありません（決裁は未実行）。\n` +
+            `\`/session start <branch>\` で起動したうえで、スレッドで朝レポの決裁を指示してください。` +
+            `corp は自動で再送しません。`
         );
         notifyPushover(
           "朝レポの決裁依頼が未達",
@@ -1365,8 +1429,8 @@ export async function startBot(token: string): Promise<void> {
           `[Bot] Brief ambiguous in channel ${channelName} (date=${decision.date}, candidates=${decision.count}); not injected`
         );
         await postToChannel(
-          `⚠️ 朝レポ（${decision.date}）の着信を受けましたが、**${config.displayName}** で投入先候補が ${decision.count} 件あるため特定できません。\n` +
-            `不要なセッションを停止してから再送してください（決裁は未実行です）。`
+          `⚠️ 朝レポ（${decision.date}）の着信を受けましたが、**${config.displayName}** で投入先候補が ${decision.count} 件あるため特定できません（決裁は未実行）。\n` +
+            `不要なセッションを停止したうえで、スレッドで朝レポの決裁を指示してください。corp は自動で再送しません。`
         );
         notifyPushover(
           "朝レポの決裁依頼が未達",
@@ -1380,6 +1444,15 @@ export async function startBot(token: string): Promise<void> {
         console.log(
           `[Bot] Brief accepted in channel ${channelName} (date=${decision.date}, thread=${decision.threadId})`
         );
+        // Recorded at DECISION time, not after the relay resolves: the relay
+        // takes minutes, and a retry arriving in that window is exactly the
+        // double-interruption this guards against. Only the `inject` branch
+        // records, so a brief that ended as deferred / no_session stays
+        // re-triggerable.
+        recentBriefByChannel.set(channelName, {
+          date: decision.date,
+          atMs: Date.now(),
+        });
         // Non-blocking on purpose: sendMessage waits for the session's Stop hook
         // (minutes), so awaiting it inside the gateway handler would stall
         // MessageCreate — the same reason dispatch hands off to its queue rather

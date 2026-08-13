@@ -160,6 +160,16 @@ describe("brief trigger is wired fail-closed (#426)", () => {
     expect(evalIdx).toBeLessThan(injectIdx);
   });
 
+  test("bot.ts feeds the real ask guard into the evaluator (#432 must-1)", async () => {
+    // The evaluator requires `askPending`, so it cannot be forgotten — but it
+    // CAN be defeated by passing a constant. This pins the live predicate:
+    // `hasRecentAsk` (pending + the post-settle grace window), not
+    // `hasPendingAsk`, because the TUI dialog the ask hook falls back to appears
+    // after the ask settles. This path types into the pane, Escape first.
+    const src = await read("src/bot.ts");
+    expect(src).toContain("askPending: hasRecentAsk");
+  });
+
   test("brief denial logs do not interpolate raw source/channel ids or body", async () => {
     const src = await read("src/bot.ts");
     const denialLines = src
