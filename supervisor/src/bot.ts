@@ -1357,19 +1357,20 @@ export async function startBot(token: string): Promise<void> {
         return true;
 
       case "ambiguous":
-        // Two or more running sessions on this channel: which one is "the CEO"
-        // is not decidable from here, and guessing would inject HQ instructions
-        // into the wrong session. Refuse and report (AC-3 applies equally).
+        // Two or more candidate sessions remain after the orchestrator filter:
+        // which one is "the CEO" is not decidable from here, and guessing would
+        // inject HQ instructions into the wrong session. Refuse and report
+        // (AC-3 applies equally — this must not fail silently either).
         console.warn(
-          `[Bot] Brief ambiguous in channel ${channelName} (date=${decision.date}, running=${decision.count}); not injected`
+          `[Bot] Brief ambiguous in channel ${channelName} (date=${decision.date}, candidates=${decision.count}); not injected`
         );
         await postToChannel(
-          `⚠️ 朝レポ（${decision.date}）の着信を受けましたが、**${config.displayName}** で ${decision.count} 件のセッションが稼働中のため投入先を特定できません。\n` +
+          `⚠️ 朝レポ（${decision.date}）の着信を受けましたが、**${config.displayName}** で投入先候補が ${decision.count} 件あるため特定できません。\n` +
             `不要なセッションを停止してから再送してください（決裁は未実行です）。`
         );
         notifyPushover(
           "朝レポの決裁依頼が未達",
-          `#${channelName} で ${decision.count} 件のセッションが稼働中のため ${decision.date} の朝レポ決裁の投入先を特定できませんでした。`
+          `#${channelName} で投入先候補が ${decision.count} 件あるため ${decision.date} の朝レポ決裁を投入できませんでした。`
         ).catch((err) =>
           console.warn("[Bot] brief ambiguous pushover failed:", err)
         );

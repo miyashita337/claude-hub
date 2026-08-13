@@ -7,10 +7,12 @@ import {
   isBriefCommand,
   isBriefDisabled,
   parseBriefCommand,
+  selectBriefTargets,
   type BriefSessionRef,
   type BriefTriggerInput,
 } from "../../src/session/corp-brief";
 import type { AccessPolicy } from "../../src/config/access-policy";
+import { ORCHESTRATE_BRANCH_PREFIX } from "../../src/session/orchestrate";
 
 /**
  * Issue #426: corp posts `/brief <YYYY-MM-DD>` to a known channel and the
@@ -253,12 +255,68 @@ describe("evaluateBriefTrigger — trigger handling", () => {
     if (d.action === "no_session") expect(d.date).toBe("2026-08-13");
   });
 
-  test("refuses to guess when several sessions are running", () => {
+  test("refuses to guess when several candidate sessions are running", () => {
     const d = evaluateBriefTrigger(
       input({ sessions: [{ threadId: "thread-1" }, { threadId: "thread-2" }] }),
     );
     expect(d.action).toBe("ambiguous");
     if (d.action === "ambiguous") expect(d.count).toBe(2);
+  });
+});
+
+describe("selectBriefTargets — orchestrator sessions are not candidates", () => {
+  test("drops orchestrator sessions, keeps the rest", () => {
+    const kept = selectBriefTargets([
+      { threadId: "ceo" },
+      { threadId: "orc", branch: `${ORCHESTRATE_BRANCH_PREFIX}20260813-0700` },
+      { threadId: "worktree", branch: "corp-brief-work" },
+    ]);
+    expect(kept.map((s) => s.threadId)).toEqual(["ceo", "worktree"]);
+  });
+
+  test("an orchestrator running alongside the CEO session does not block the brief", () => {
+    // Regression for the failure mode CodeRabbit flagged on PR #432: without
+    // the filter this pair is `ambiguous`, so the morning brief silently never
+    // reaches the CEO whenever an orchestrator happens to be up.
+    const d = evaluateBriefTrigger(
+      input({
+        sessions: [
+          { threadId: "thread-1", branch: "corp" },
+          {
+            threadId: "thread-orc",
+            branch: `${ORCHESTRATE_BRANCH_PREFIX}20260813-0700`,
+          },
+        ],
+      }),
+    );
+    expect(d.action).toBe("inject");
+    if (d.action === "inject") expect(d.threadId).toBe("thread-1");
+  });
+
+  test("an orchestrator alone is not a target (no CEO session to ask)", () => {
+    const d = evaluateBriefTrigger(
+      input({
+        sessions: [
+          {
+            threadId: "thread-orc",
+            branch: `${ORCHESTRATE_BRANCH_PREFIX}20260813-0700`,
+          },
+        ],
+      }),
+    );
+    expect(d.action).toBe("no_session");
+  });
+
+  test("two non-orchestrator sessions still refuse (the filter narrows, it does not guess)", () => {
+    const d = evaluateBriefTrigger(
+      input({
+        sessions: [
+          { threadId: "thread-1", branch: "corp" },
+          { threadId: "thread-2", branch: "corp-dispatch-99" },
+        ],
+      }),
+    );
+    expect(d.action).toBe("ambiguous");
   });
 
   test("the injected text carries no caller-supplied text", () => {

@@ -24,7 +24,9 @@
  *      これが「本社セッションへ任意の指示を注入して承認ゲートを迂回する」ことに対する
  *      主防御になる。レポート本文は CEO セッションが自分で `~/corp` から読む。
  *   4. 投入先スレッドは `listRunningByChannel(<channel>)` で**決定的に**解決する。
- *      ちょうど 1 件のときだけ注入し、0 件 / 2 件以上は注入せず通知する（推測で選ばない）。
+ *      オーケストレーター（branch が `orchestrate-` 始まり）だけは機械的な印で
+ *      候補から除き（{@link selectBriefTargets}）、残りがちょうど 1 件のときだけ
+ *      注入する。0 件 / 2 件以上は注入せず通知する（推測で選ばない）。
  *
  * *誰が* トリガーできるかは access policy 側の設定であり、本モジュールは corp 固有の
  * 送信元を一切ハードコードしない（`dispatch.ts` と同じ方針）。#corp が最初の利用者
@@ -41,6 +43,7 @@ import {
   type AccessPolicy,
   type DispatchDecisionReason,
 } from "../config/access-policy";
+import { ORCHESTRATE_BRANCH_PREFIX } from "./orchestrate";
 
 /** リテラルのトリガートークン。corp 側が同じ文字列を post する。 */
 export const BRIEF_PREFIX = "/brief";
@@ -149,6 +152,28 @@ export function buildBriefInjection(date: string): string {
 /** 投入先候補セッションの最小面（実 SessionInfo が構造的に満たす）。 */
 export interface BriefSessionRef {
   threadId: string;
+  branch?: string;
+}
+
+/**
+ * 投入先の候補から、CEO セッションでないと**決定的に**判る行を除く。
+ *
+ * `listRunningByChannel` は channelName と status でしか絞らないため、#corp では
+ * `/orchestrate` で起動したオーケストレーター（branch が
+ * {@link ORCHESTRATE_BRANCH_PREFIX} 始まり）も同じ候補集合に入る。これを残すと
+ * CEO セッションとの同時稼働で毎回 `ambiguous`（＝朝レポ未達）になる。
+ *
+ * 除外の根拠は `orchestrateBranchName()` が付ける固定 prefix という**機械的な印**
+ * だけに限る（推測でセッションを選り分けない）。それ以外の候補が複数残る場合は
+ * 従来どおり `ambiguous` に倒す。hub work セッションは channelName が
+ * `claude-hub-work` なので、そもそも #corp の候補に入らない。
+ */
+export function selectBriefTargets(
+  sessions: readonly BriefSessionRef[],
+): BriefSessionRef[] {
+  return sessions.filter(
+    (s) => !(s.branch ?? "").startsWith(ORCHESTRATE_BRANCH_PREFIX),
+  );
 }
 
 export interface BriefTriggerInput {
@@ -229,7 +254,7 @@ export function evaluateBriefTrigger(input: BriefTriggerInput): BriefDecision {
   }
 
   const { date } = parsed;
-  const sessions = input.sessions;
+  const sessions = selectBriefTargets(input.sessions);
   if (sessions.length === 0) {
     return { action: "no_session", date };
   }
