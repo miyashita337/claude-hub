@@ -188,6 +188,7 @@ jobs:
                    tests/session/dispatch-integration.test.ts \
                    tests/session/dispatch-headless.test.ts \
                    tests/session/dispatch-report.test.ts \
+                   tests/session/corp-brief.test.ts \
                    tests/session/artifact-probe.test.ts \
                    tests/session/orchestrate.test.ts \
                    tests/session/adapters-executor.test.ts \
