@@ -226,6 +226,20 @@ export interface DispatchHeadlessOutcome {
  * Minimal SessionManager surface the dispatch orchestrator needs. Keeping it
  * structural lets tests inject a fake without the real tmux/claude stack.
  */
+/**
+ * The part of the relay's result the dispatch transport actually reads (#429).
+ *
+ * Structural on purpose: `RelayResult` satisfies it by construction, but the
+ * orchestrator stays free of the relay module (the rest of this interface is
+ * `unknown`-typed for the same reason). It used to be plain `unknown`, which is
+ * precisely why a failed injection could not be distinguished from a good one.
+ */
+export interface DispatchSendResult {
+  error?: string;
+  /** The pane never received the text — see `RelayResult.sendFailed`. */
+  sendFailed?: boolean;
+}
+
 export interface DispatchSessionManager {
   start(
     config: unknown,
@@ -255,7 +269,7 @@ export interface DispatchSessionManager {
     options?: {
       onDialogStuck?: (info: DialogStuckInfo) => void | Promise<void>;
     },
-  ): Promise<unknown>;
+  ): Promise<DispatchSendResult>;
   /**
    * Headless executor path (Epic #285 Phase 2 / #287). Runs `claude -p
    * "<initialCommand>"` in the branch worktree to completion and resolves with
@@ -332,6 +346,49 @@ export type RunDispatchResult =
       stage: "thread" | "start" | "inject" | "output";
       error: string;
     };
+
+/** Stage of a failed dispatch, as reported by {@link runDispatch}. */
+export type DispatchFailureStage = "thread" | "start" | "inject" | "output";
+
+/**
+ * User-facing notice for a dispatch that did not get off the ground (#429).
+ *
+ * Pure + exported so the wording is unit-testable and so the one rule that
+ * matters here is enforceable: the raw cause (a tmux `not in a mode`, an
+ * ETIMEDOUT, an absolute path in an fs error) NEVER reaches Discord — same
+ * contract as `SEND_FAILURE_USER_MESSAGE` in relay.ts. The stage is a fixed
+ * enum, and everything else interpolated is data the dispatch line already
+ * carried in public. Diagnostics stay in the Supervisor log.
+ *
+ * The `inject` wording is deliberately explicit that NOTHING was re-sent
+ * automatically: the command was typed once, never rendered, and the Enter was
+ * withheld. Someone reading this thread has to know the session is idle rather
+ * than working, because the recovery is theirs to trigger (corp#107 / #108
+ * re-injects a `failed` dispatch; a human re-runs `/dispatch`).
+ */
+export function buildDispatchFailureNotice(
+  stage: DispatchFailureStage,
+  displayName: string,
+  branch: string,
+  issueNumber: number,
+  command: DispatchCommand,
+): string {
+  const head =
+    `❌ **${displayName}** のディスパッチに失敗しました\n\n` +
+    `🌿 ブランチ: \`${branch}\`\n` +
+    `▶️ 初期コマンド: \`/${command} ${issueNumber}\`\n`;
+  const detail: Record<DispatchFailureStage, string> = {
+    thread: "🧵 スレッドを作成できませんでした。",
+    start: "🚀 セッションを起動できませんでした。",
+    inject:
+      "⌨️ セッションは起動しましたが、初期コマンドが画面に出たことを確認できませんでした" +
+      "（#422 / #429）。**二重実行を避けるため自動での再入力はしていません**" +
+      "（Enter も送っていません）。このセッションは待機したままなので、" +
+      "内容を確認のうえ再ディスパッチしてください。",
+    output: "📤 実行結果をスレッドへ投稿できませんでした。",
+  };
+  return `${head}\n${detail[stage]}\n\n詳細は Supervisor のログに記録されています。`;
+}
 
 /**
  * Orchestrate a validated dispatch: create the thread, start the session in the
@@ -410,8 +467,9 @@ export async function runDispatch(
     : undefined;
 
   const initialCommand = `/${command} ${issueNumber}`;
+  let relay: DispatchSendResult;
   try {
-    await sessionManager.sendMessage(
+    relay = await sessionManager.sendMessage(
       threadId,
       initialCommand,
       undefined,
@@ -419,6 +477,21 @@ export async function runDispatch(
     );
   } catch (err) {
     return { ok: false, stage: "inject", error: errMsg(err) };
+  }
+
+  // Issue #429: this is the silent-stall site. `sendMessage` resolves with a
+  // RESULT on a failed send (the relay converts the throw into a user-facing
+  // chunk), so the catch above never fires for the one failure mode that
+  // matters here: the pane never received `/impl <N>`. Before #429 that landed
+  // as `ok: true` — the thread got a cheerful "dispatched" banner, the ledger
+  // stayed `dispatched`, and the session sat there doing nothing.
+  //
+  // Only `sendFailed` is treated as a dispatch failure. A plain `error` is
+  // usually the relay timeout, which means the command WAS delivered and the
+  // job is simply still running past RELAY_TIMEOUT_MS — reporting that as a
+  // failed dispatch would trade a silent drop for a false alarm.
+  if (relay.sendFailed) {
+    return { ok: false, stage: "inject", error: relay.error ?? "send failed" };
   }
 
   return { ok: true, mode: "tmux", threadId, injected: initialCommand };
