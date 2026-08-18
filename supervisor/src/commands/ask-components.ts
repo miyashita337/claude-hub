@@ -425,6 +425,45 @@ export function buildAskPrompt(
 }
 
 /**
+ * Minimal Discord channel surface `postAskUserPrompt` needs to deliver a post.
+ * Deliberately narrower than discord.js's `Channel` union (which not every
+ * member satisfies — only text-based / thread channels have `.send()`) so a
+ * caller can pass an already-narrowed `ThreadChannel` (bot.ts, after its own
+ * `isThread()` check) or a hermetic fake (tests) without a cast.
+ */
+export interface AskPostChannel {
+  send(options: {
+    content: string;
+    components?: AskComponentRow[];
+  }): Promise<unknown>;
+}
+
+/**
+ * Build the AskUserQuestion post and actually deliver it (Issue #436 V-2).
+ *
+ * Split out from `buildAskPrompt` so "does this reach Discord in the right
+ * shape" is answerable without a live bot token: tests can pass a fake
+ * `AskPostChannel` and assert on the captured `send()` call. Previously
+ * nothing fed `buildAskPrompt`'s output into an actual send in any test —
+ * bot-wiring tests only checked that the handler was registered, never that
+ * it produced a correct post. Kept side-effect-free otherwise: callers own
+ * channel resolution (`client.channels.fetch` + `isThread()`) and error
+ * handling, same as before this was extracted.
+ */
+export async function postAskUserPrompt(
+  channel: AskPostChannel,
+  input: AskPromptInput,
+  registry: AskPromptRegistry = askPrompts
+): Promise<AskPromptMessage> {
+  const prompt = buildAskPrompt(input, registry);
+  await channel.send({
+    content: prompt.content,
+    ...(prompt.components.length ? { components: prompt.components } : {}),
+  });
+  return prompt;
+}
+
+/**
  * Closing lines of the post: how to answer, then the relay's own wait notice.
  *
  * `askWaitNotice` (relay-server.ts, #416) already says both "a text reply in
