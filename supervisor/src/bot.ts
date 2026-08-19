@@ -31,9 +31,9 @@ import {
   withCompactButton,
 } from "./commands/compact-button";
 import {
-  buildAskPrompt,
   createAskComponentHandler,
   isAskComponentId,
+  postAskUserPrompt,
 } from "./commands/ask-components";
 import { CHANNEL_MAP, MAX_SESSIONS } from "./config/channels";
 import { RELAY_ERROR_USER_MESSAGE, type AttachmentInfo } from "./session/relay";
@@ -555,18 +555,16 @@ export async function startBot(token: string): Promise<void> {
           // itself once the payload grows the field.
           const multiSelect =
             (event as { multiSelect?: unknown }).multiSelect === true;
-          const prompt = buildAskPrompt({
+          // Issue #436 V-2: build + send is `postAskUserPrompt` (not inlined
+          // here) so an E2E test can drive this exact call with a fake channel
+          // and assert on what actually reaches `send()`, not just on
+          // `buildAskPrompt`'s return value.
+          await postAskUserPrompt(channel, {
             threadId: event.threadId,
             question: event.question,
             options: event.options,
             multiSelect,
             timeoutMs: event.timeoutMs,
-          });
-          await channel.send({
-            content: prompt.content,
-            ...(prompt.components.length
-              ? { components: prompt.components }
-              : {}),
           });
         } catch (err) {
           console.error(

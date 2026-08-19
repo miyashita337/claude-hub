@@ -18,9 +18,11 @@ import {
   createAskComponentHandler,
   isAskComponentId,
   parseAskCustomId,
+  postAskUserPrompt,
   shouldUseButtons,
   splitOption,
   type AskComponentKind,
+  type AskPostChannel,
 } from "../../src/commands/ask-components";
 
 /**
@@ -801,18 +803,117 @@ describe("coupled contracts (#412)", () => {
     expect(hook).toContain(`"${OPTION_SEPARATOR}"`);
   });
 
-  test("bot.ts sends the built components, not just the text", () => {
-    // #370's failure class: a relay path that exists but is not wired. The
-    // components only reach Discord if handleAskUser passes them to send() —
-    // assert the call site so a future edit cannot drop them back to text-only
-    // while every unit test above still passes.
+  test("bot.ts wires handleAskUser through postAskUserPrompt", () => {
+    // #370's failure class: a relay path that exists but is not wired. Text
+    // matching can only prove bot.ts calls the right function, not that the
+    // function actually produces a correct post — that gap is closed by the
+    // postAskUserPrompt describe block below, which drives the real send().
     const bot = readFileSync(
       resolve(import.meta.dir, "../../src/bot.ts"),
       "utf8"
     );
-    expect(bot).toContain("buildAskPrompt({");
-    expect(bot).toMatch(/components:\s*prompt\.components/);
+    expect(bot).toMatch(/postAskUserPrompt\(channel,\s*{/);
     // And the interaction dispatcher must route both component kinds.
     expect(bot).toMatch(/isAskComponentId\(interaction\.customId\)/);
+  });
+});
+
+describe("postAskUserPrompt (Issue #436 V-2)", () => {
+  // Nothing before this point fed buildAskPrompt's output into an actual
+  // send(): ask-components.test.ts covers buildAskPrompt in isolation, and
+  // startup-wiring.test.ts only proves handleAskUser is registered — neither
+  // ever executes it. These tests drive the exact call bot.ts makes, with a
+  // fake channel standing in for the live Discord send that could not be
+  // verified for two days after #427/#431 shipped (Issue #436).
+  function makeChannel() {
+    const sent: {
+      content: string;
+      components?: unknown[];
+    }[] = [];
+    const channel: AskPostChannel = {
+      send: async (options) => {
+        sent.push(options);
+        return { id: "message-1" };
+      },
+    };
+    return { channel, sent };
+  }
+
+  test("delivers buttons for a 2-option question, with the real deadline and no-auto-select notice", async () => {
+    const registry = new AskPromptRegistry();
+    const { channel, sent } = makeChannel();
+
+    const prompt = await postAskUserPrompt(
+      channel,
+      {
+        threadId: "thread-1",
+        question: "A か B か？",
+        options: ["A", "B"],
+        timeoutMs: 5 * 60 * 60 * 1000,
+      },
+      registry
+    );
+
+    expect(sent).toHaveLength(1);
+    expect(prompt.kind).toBe("buttons");
+    // 期待2: the wait notice states the real deadline, not a stale hardcode.
+    expect(sent[0]!.content).toContain("約 5 時間");
+    // 期待3: the no-auto-select line (Issue #423) is present verbatim.
+    expect(sent[0]!.content).toContain(
+      "選択肢が自動で選ばれることはありません（Issue #423）"
+    );
+    // 期待1: components reach send(), not just the text.
+    expect(sent[0]!.components).toBeDefined();
+    expect(sent[0]!.components).toHaveLength(1);
+    const ids = customIds(sent[0]!.components![0]);
+    expect(ids).toHaveLength(2);
+  });
+
+  test("delivers a select menu once options exceed the button limit", async () => {
+    const registry = new AskPromptRegistry();
+    const { channel, sent } = makeChannel();
+
+    await postAskUserPrompt(
+      channel,
+      {
+        threadId: "thread-1",
+        question: "方針は？",
+        options: ["A", "B", "C", "D", "E", "F"],
+        timeoutMs: 30 * 60 * 1000,
+      },
+      registry
+    );
+
+    expect(sent).toHaveLength(1);
+    expect(sent[0]!.content).toContain("約 30 分");
+    const menu = rowJson(sent[0]!.components![0]).components[0] as {
+      options: { label: string }[];
+    };
+    expect(menu.options.map((o) => o.label)).toEqual([
+      "A",
+      "B",
+      "C",
+      "D",
+      "E",
+      "F",
+    ]);
+  });
+
+  test("sends text-only (no components key) when the ask carries no options", async () => {
+    // Multi-question asks flatten to a bare question with no options — the
+    // send() call must omit `components` entirely rather than send `[]`,
+    // matching what buildAskPrompt already guarantees for this shape.
+    const registry = new AskPromptRegistry();
+    const { channel, sent } = makeChannel();
+
+    await postAskUserPrompt(
+      channel,
+      { threadId: "thread-1", question: "自由記述でお願いします" },
+      registry
+    );
+
+    expect(sent).toHaveLength(1);
+    expect(sent[0]!.components).toBeUndefined();
+    expect(sent[0]!.content).toContain("自由記述でお願いします");
   });
 });
