@@ -66,9 +66,15 @@ ASK_URL=$(printf '%s' "$SUPERVISOR_RELAY_URL" | sed 's|/relay/|/ask/|')
 #   { "questions": [ { "question", "header", "multiSelect",
 #                      "options": [ { "label", "description" } ] } ] }
 # Single question: forward its text + options flattened to "label — description"
-# strings so Discord can list the choices. Multiple questions: forward all
-# question texts joined by newlines; per-question option mapping over one
-# free-text reply is ambiguous, so options are omitted.
+# strings so Discord can list the choices. Multiple questions (#443): forward
+# the joined text as `question` (unchanged, used for the deny-envelope wording
+# and the expiry notice) PLUS a structured `questions[]` array carrying each
+# sub-question's own text + flattened options, so relay-server / bot.ts can
+# post one tappable ActionRow per question instead of flattening every option
+# away. Before #443 this branch dropped `options` entirely — the only way to
+# answer 2+ questions was one free-text reply for the whole batch, which is
+# what let an unrelated message get read as the answer to every question at
+# once (see Issue #443's incident writeup).
 QUESTION_COUNT=$(echo "$INPUT" | jq -r '(.tool_input.questions // []) | length' 2>/dev/null)
 if [ -z "$QUESTION_COUNT" ] || [ "$QUESTION_COUNT" -eq 0 ] 2>/dev/null; then
   # Unknown / legacy shape — let the regular TUI dialog handle it.
@@ -81,15 +87,21 @@ if [ -z "$QUESTION_TEXT" ]; then
 fi
 
 PAYLOAD=$(echo "$INPUT" | jq -c '
+  def flatten_options: [ .[]?
+    | (.label // "")
+      + (if (.description // "") != "" then " — " + .description else "" end) ];
   (.tool_input.questions // []) as $qs
   | if ($qs | length) == 1 then
       { question: ($qs[0].question // ""),
-        options: [ $qs[0].options[]?
-          | (.label // "")
-            + (if (.description // "") != "" then " — " + .description else "" end) ] }
+        options: ($qs[0].options // [] | flatten_options) }
       | if (.options | length) == 0 then del(.options) else . end
     else
-      { question: ($qs | map(.question // "") | join("\n")) }
+      { question: ($qs | map(.question // "") | join("\n")),
+        questions: [ $qs[] | {
+          question: (.question // ""),
+          multiSelect: (.multiSelect // false),
+          options: (.options // [] | flatten_options)
+        } | if (.options | length) == 0 then del(.options) else . end ] }
     end')
 
 # Forward to the supervisor and wait for the user's reply. The server enforces

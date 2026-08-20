@@ -33,7 +33,11 @@ import {
   type AskUserEvent,
 } from "../../src/session/relay-server";
 import {
+  ASK_COMPONENT_PREFIX,
+  AskPromptRegistry,
+  createAskComponentHandler,
   postAskUserPrompt,
+  postMultiAskUserPrompt,
   type AskPostChannel,
 } from "../../src/commands/ask-components";
 
@@ -90,6 +94,40 @@ function makeHookInput(cwd: string, question: string, options: string[]) {
     },
     cwd,
   });
+}
+
+function makeMultiHookInput(
+  cwd: string,
+  questions: { question: string; options: string[] }[]
+) {
+  return JSON.stringify({
+    tool_name: "AskUserQuestion",
+    tool_input: {
+      questions: questions.map((q) => ({
+        question: q.question,
+        header: "test",
+        multiSelect: false,
+        options: q.options.map((label) => ({ label, description: "" })),
+      })),
+    },
+    cwd,
+  });
+}
+
+/** Minimal fake ButtonInteraction — just enough for createAskComponentHandler. */
+function makeTap(customId: string, threadId: string) {
+  return {
+    customId,
+    values: [],
+    channelId: threadId,
+    channel: { id: threadId, isThread: () => true, parentId: threadId },
+    user: { id: "user-owner" },
+    isStringSelectMenu: () => false,
+    message: { content: "", edit: async () => {} },
+    async reply() {},
+    async editReply() {},
+    async update() {},
+  };
 }
 
 async function runHook(env: TestEnv, input: string) {
@@ -175,5 +213,65 @@ describe("AskUserQuestion selector end-to-end (Issue #436 V-2)", () => {
 
     expect(exitCode).toBe(0);
     expect(stdout.trim()).toBe("");
+  });
+
+  test("multi-question round trip: hook -> relay -> per-question rows -> two taps -> hook answer (Issue #443)", async () => {
+    startRelayServer();
+    const port = getRelayPort();
+    const threadId = "thread-e2e-443";
+    env = setupEnv(`http://localhost:${port}/relay/${threadId}`);
+
+    const { channel, sent } = makeFakeChannel();
+    const registry = new AskPromptRegistry();
+    const askComponentHandler = createAskComponentHandler({
+      hasPendingAsk: () => true,
+      resolveAskUser,
+      registry,
+      // Bypass the Discord allowlist gate — this test drives the click
+      // handler directly, with no access.json configured for the fake
+      // thread, and access policy itself is covered elsewhere
+      // (ask-components.test.ts "tap authorization").
+      checkAccess: () => ({ allowed: true, reason: "allowed" }),
+    });
+
+    // Mirrors bot.ts's handleAskUser branch for event.questions (#443): post
+    // one ActionRow per question, then simulate the 会長 tapping each one in
+    // turn through the REAL click handler (not a shortcut resolveAskUser
+    // call) — this is what actually proves AC-1/AC-2 end to end.
+    onAskUser((event: AskUserEvent) => {
+      void postMultiAskUserPrompt(channel, {
+        threadId: event.threadId,
+        questions: event.questions ?? [],
+        timeoutMs: event.timeoutMs,
+      }, registry).then(async (prompt) => {
+        const tokens = prompt.tokens!;
+        await askComponentHandler(
+          makeTap(`${ASK_COMPONENT_PREFIX}${tokens[0]}:0`, threadId) as never,
+        );
+        await askComponentHandler(
+          makeTap(`${ASK_COMPONENT_PREFIX}${tokens[1]}:1`, threadId) as never,
+        );
+      });
+    });
+
+    const input = makeMultiHookInput(env.cwd, [
+      { question: "Q1: 承認しますか？", options: ["承認", "却下"] },
+      { question: "Q2: 優先度は？", options: ["高", "低"] },
+    ]);
+    const { stdout, exitCode } = await runHook(env, input);
+
+    expect(exitCode).toBe(0);
+
+    // 期待1 (AC-1): both questions reached Discord as their own tappable row,
+    // not flattened away.
+    expect(sent).toHaveLength(1);
+    expect(sent[0]!.components).toHaveLength(2);
+
+    // 期待2 (AC-2): the combined answer (both taps) travels all the way back
+    // through the hook's deny envelope.
+    const out = JSON.parse(stdout);
+    expect(out.hookSpecificOutput.permissionDecision).toBe("deny");
+    expect(out.hookSpecificOutput.permissionDecisionReason).toContain("承認");
+    expect(out.hookSpecificOutput.permissionDecisionReason).toContain("低");
   });
 });
