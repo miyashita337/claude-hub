@@ -217,16 +217,34 @@ export class AskPromptRegistry {
     // scan: falls through to evicting the oldest entry outright if every
     // candidate in the map is a live group member, so the map can never grow
     // unbounded even in that pathological case.
-    while (this.prompts.size > this.capacity) {
-      let victim: string | undefined;
-      for (const [tok, p] of this.prompts) {
-        const liveGroupMember = p.groupId !== undefined && p.state === "pending";
-        if (!liveGroupMember) {
-          victim = tok;
-          break;
+    if (this.prompts.size > this.capacity) {
+      // PR #444 review (CodeRabbit / Qodo): a group is "still open" as long as
+      // ANY sibling is pending — not just the pending ones individually. The
+      // original check only protected `state === "pending"` entries, so an
+      // ALREADY-ANSWERED sibling of a group that has not fully resolved yet
+      // was still evictable. Losing it would shrink `groupOf()`'s result,
+      // shifting the `Q<n>:` ordinals of the remaining siblings AND silently
+      // dropping that sibling's answer from the combined string sent back to
+      // Claude once the group does finish. Protecting the whole group (not
+      // just its pending members) closes that hole.
+      const openGroups = new Set<string>();
+      for (const p of this.prompts.values()) {
+        if (p.groupId !== undefined && p.state === "pending") {
+          openGroups.add(p.groupId);
         }
       }
-      this.prompts.delete(victim ?? this.prompts.keys().next().value!);
+      while (this.prompts.size > this.capacity) {
+        let victim: string | undefined;
+        for (const [tok, p] of this.prompts) {
+          const liveGroupMember =
+            p.groupId !== undefined && openGroups.has(p.groupId);
+          if (!liveGroupMember) {
+            victim = tok;
+            break;
+          }
+        }
+        this.prompts.delete(victim ?? this.prompts.keys().next().value!);
+      }
     }
     return token;
   }
@@ -265,14 +283,24 @@ export class AskPromptRegistry {
    */
   hasActiveMultiAsk(threadId: string): boolean {
     const counts = new Map<string, number>();
+    const hasPending = new Set<string>();
     for (const p of this.prompts.values()) {
       if (p.threadId !== threadId) continue;
       if (p.state === "superseded" || p.state === "expired") continue;
       if (p.groupId === undefined) continue;
       counts.set(p.groupId, (counts.get(p.groupId) ?? 0) + 1);
+      // PR #444 review (CodeRabbit / Qodo): a fully-answered group's entries
+      // stay in the registry as `"answered"` — they are never re-superseded
+      // (register()'s supersede loop deliberately skips `"answered"` prompts)
+      // — so without this, a group that finished answering would still count
+      // toward "active" here, and a LATER solo ask on the same thread would
+      // be wrongly told "this is a multi-question ask, tap the buttons"
+      // instead of accepting its plain-text reply. Only a group with at
+      // least one still-`"pending"` member is genuinely awaiting taps.
+      if (p.state === "pending") hasPending.add(p.groupId);
     }
-    for (const count of counts.values()) {
-      if (count > 1) return true;
+    for (const [groupId, count] of counts) {
+      if (count > 1 && hasPending.has(groupId)) return true;
     }
     return false;
   }
@@ -610,12 +638,27 @@ export function buildMultiAskPrompt(
   const canUseComponents =
     questions.length > 0 &&
     questions.length <= MAX_ASK_QUESTIONS_PER_MESSAGE &&
-    questions.every((q) => (q.options ?? []).length > 0);
+    questions.every((q) => {
+      const count = (q.options ?? []).length;
+      return count > 0 && count <= MAX_SELECT_OPTIONS;
+    });
 
   if (!canUseComponents) {
     if (questions.length > MAX_ASK_QUESTIONS_PER_MESSAGE) {
       console.warn(
         `[ask-components] ${questions.length} questions exceed the Discord ActionRow limit (${MAX_ASK_QUESTIONS_PER_MESSAGE}); posting without components (#443)`
+      );
+    }
+    // Review finding (PR #444): a per-question option count over
+    // MAX_SELECT_OPTIONS (25) would make buildSelectRow hand Discord a
+    // StringSelectMenu with more entries than its hard API ceiling — the
+    // send() call would fail outright, not degrade. Same whole-batch
+    // text fallback as the zero-options case: a free-text sub inside a
+    // tap-to-answer batch is the exact ambiguity buildAskPrompt's own
+    // over-limit branch already avoids for a solo ask.
+    if (questions.some((q) => (q.options ?? []).length > MAX_SELECT_OPTIONS)) {
+      console.warn(
+        `[ask-components] a question has more than ${MAX_SELECT_OPTIONS} options; posting the whole batch without components (#443)`
       );
     }
     const joined = questions.map((q) => q.question).join("\n");

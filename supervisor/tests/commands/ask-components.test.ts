@@ -1043,6 +1043,36 @@ describe("buildMultiAskPrompt (#443)", () => {
     }
   });
 
+  test("falls back to text (whole batch) when one question has more options than Discord's select ceiling (PR #444 review)", () => {
+    // Without this guard buildSelectRow would hand Discord a StringSelectMenu
+    // with > MAX_SELECT_OPTIONS entries — the actual send() call would fail
+    // outright rather than degrade, unlike the solo-ask path (buildAskPrompt)
+    // which already guards this.
+    const registry = new AskPromptRegistry();
+    const tooMany = Array.from({ length: MAX_SELECT_OPTIONS + 1 }, (_, i) => `選択肢${i + 1}`);
+    const warn = spyOn(console, "warn").mockImplementation(() => {});
+
+    try {
+      const prompt = buildMultiAskPrompt(
+        {
+          threadId: "thread-1",
+          questions: [
+            { question: "Q1", options: ["A", "B"] },
+            { question: "Q2（選択肢が多すぎる）", options: tooMany },
+          ],
+        },
+        registry
+      );
+      expect(prompt.kind).toBe("text");
+      expect(prompt.components).toHaveLength(0);
+      expect(registry.size()).toBe(0); // neither question got registered
+      expect(prompt.content).toContain("Q1");
+      expect(prompt.content).toContain("Q2（選択肢が多すぎる）");
+    } finally {
+      warn.mockRestore();
+    }
+  });
+
   test("falls back to text for zero questions", () => {
     const registry = new AskPromptRegistry();
     const prompt = buildMultiAskPrompt({ threadId: "thread-1", questions: [] }, registry);
@@ -1356,6 +1386,46 @@ describe("AskPromptRegistry eviction (#443 review should-2)", () => {
 
     expect(registry.get(solo.token!)).toBeUndefined();
   });
+
+  test("an ALREADY-ANSWERED sibling of a still-open group is protected too, not just pending ones (PR #444 review, must)", async () => {
+    const registry = new AskPromptRegistry(3);
+    // Two stale solo asks to absorb the evictions this test forces.
+    buildAskPrompt({ threadId: "thread-a", question: "old-1", options: ["x"] }, registry);
+    buildAskPrompt({ threadId: "thread-a", question: "old-2", options: ["x"] }, registry);
+
+    // Registered under "thread-1" — makeInteraction()'s default channelId —
+    // so the click below isn't rejected as cross-thread; the eviction pool
+    // (old-1/old-2) lives on the separate "thread-a" and is never clicked.
+    const prompt = buildMultiAskPrompt(
+      {
+        threadId: "thread-1",
+        questions: [
+          { question: "Q1", options: ["案A"] },
+          { question: "Q2", options: ["案B"] },
+        ],
+      },
+      registry
+    );
+    // size is now 4 (over capacity 3); registering already evicted once
+    // (see the sibling-preference test above) — answer Q1 so it becomes
+    // "answered" while Q2 is still pending, i.e. the group is NOT resolved.
+    const { handler } = makeHandler({ registry });
+    await handler(
+      makeInteraction({ customId: `${ASK_COMPONENT_PREFIX}${prompt.tokens![0]}:0` })
+        .interaction as never
+    );
+    expect(registry.get(prompt.tokens![0]!)?.state).toBe("answered");
+
+    // Force more eviction pressure without touching this group: register
+    // another unrelated solo ask that immediately supersedes old-2.
+    buildAskPrompt({ threadId: "thread-a", question: "old-3", options: ["x"] }, registry);
+
+    // A naive "protect pending members only" check would have evicted Q1
+    // (answered, not pending) the moment capacity pressure hit — losing its
+    // answer from the eventual combined response. It must still be here.
+    expect(registry.get(prompt.tokens![0]!)).toBeDefined();
+    expect(registry.get(prompt.tokens![1]!)).toBeDefined();
+  });
 });
 
 describe("hasActiveMultiAsk (#443 AC-3)", () => {
@@ -1407,5 +1477,38 @@ describe("hasActiveMultiAsk (#443 AC-3)", () => {
     // Smoke test only: proves the wrapper is callable without an explicit
     // registry (bot.ts calls it this way).
     expect(hasActiveMultiAsk("thread-that-has-never-asked-anything")).toBe(false);
+  });
+
+  test("false once a multi-question batch is FULLY answered, even though its entries stay in the registry (PR #444 review, must)", async () => {
+    // A completed group's members end up `"answered"`, which register()'s
+    // supersede loop deliberately never touches — they just sit there. A
+    // naive count-only check would still see 2+ entries for that groupId and
+    // report "active", wrongly blocking a LATER solo ask's plain-text reply.
+    const registry = new AskPromptRegistry();
+    const prompt = buildMultiAskPrompt(
+      {
+        threadId: "thread-1",
+        questions: [
+          { question: "Q1", options: ["A"] },
+          { question: "Q2", options: ["B"] },
+        ],
+      },
+      registry
+    );
+    const { handler } = makeHandler({ registry });
+    await handler(
+      makeInteraction({ customId: `${ASK_COMPONENT_PREFIX}${prompt.tokens![0]}:0` })
+        .interaction as never
+    );
+    await handler(
+      makeInteraction({ customId: `${ASK_COMPONENT_PREFIX}${prompt.tokens![1]}:0` })
+        .interaction as never
+    );
+
+    expect(hasActiveMultiAsk("thread-1", registry)).toBe(false);
+
+    // A subsequent solo ask on the same thread must not be treated as multi.
+    buildAskPrompt({ threadId: "thread-1", question: "Q3", options: ["C"] }, registry);
+    expect(hasActiveMultiAsk("thread-1", registry)).toBe(false);
   });
 });

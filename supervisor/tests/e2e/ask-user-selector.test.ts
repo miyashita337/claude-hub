@@ -251,6 +251,12 @@ describe("AskUserQuestion selector end-to-end (Issue #436 V-2)", () => {
         await askComponentHandler(
           makeTap(`${ASK_COMPONENT_PREFIX}${tokens[1]}:1`, threadId) as never,
         );
+      }).catch((err) => {
+        // CodeRabbit review (#444): an exception here would otherwise leave
+        // resolveAskUser uncalled — the hook's HTTP request would then hang
+        // for the full ASK_TIMEOUT_MS (5h default) and the test would time
+        // out with no useful message instead of failing fast on an assertion.
+        resolveAskUser(threadId, `E2E setup failed: ${err}`);
       });
     });
 
