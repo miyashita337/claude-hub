@@ -114,6 +114,14 @@ interface AskPrompt {
   state: AskPromptState;
   /** The answer sent to Claude, once answered through a component. */
   answer?: string;
+  /**
+   * Issue #443: shared by every sub-question of one multi-question ask, so
+   * they can be registered together without superseding each other (see
+   * {@link AskPromptRegistry.register}) and so the click handler can find its
+   * siblings ({@link AskPromptRegistry.groupOf}) to decide whether the whole
+   * ask is answered yet. `undefined` for a solo (single-question) ask.
+   */
+  groupId?: string;
 }
 
 /**
@@ -152,15 +160,29 @@ export class AskPromptRegistry {
    * then answer (#427 review must-2). The structural fix is to carry an ask id
    * through `hasPendingAsk` / `resolveAskUser`; that touches relay-server.ts,
    * which #416 is editing, so it is deferred there.
+   *
+   * `groupId` (Issue #443) opts a registration out of superseding its own
+   * siblings: every sub-question of one multi-question ask is registered with
+   * the SAME `groupId`, so posting Q2 does not immediately supersede Q1's
+   * still-unanswered buttons. A prompt belonging to a DIFFERENT group (or no
+   * group at all) is still superseded exactly as before — only a genuinely
+   * new ask, solo or multi, replaces the whole thread's pending question(s).
    */
   register(input: {
     threadId: string;
     kind: Exclude<AskComponentKind, "text">;
     options: AskOption[];
     multiSelect: boolean;
+    groupId?: string;
   }): string {
     for (const prompt of this.prompts.values()) {
-      if (prompt.threadId === input.threadId && prompt.state !== "answered") {
+      const sibling =
+        input.groupId !== undefined && prompt.groupId === input.groupId;
+      if (
+        prompt.threadId === input.threadId &&
+        prompt.state !== "answered" &&
+        !sibling
+      ) {
         prompt.state = "superseded";
       }
     }
@@ -173,6 +195,7 @@ export class AskPromptRegistry {
       options: input.options,
       multiSelect: input.multiSelect,
       state: "pending",
+      groupId: input.groupId,
     });
 
     // Answered prompts are kept so a repeat click can be told "already
@@ -181,14 +204,47 @@ export class AskPromptRegistry {
     // is accurate for one that old.
     //
     // Eviction is by insertion order and does NOT skip `pending` entries, so a
-    // live question can age out of the registry once ~50 asks have been posted
-    // since. That degrades safely: its buttons report "already finished" and the
-    // text-reply path still resolves the ask. It is not a correctness hole, but
-    // do not read the bound as "answered-only".
-    while (this.prompts.size > this.capacity) {
-      const oldest = this.prompts.keys().next().value;
-      if (oldest === undefined) break;
-      this.prompts.delete(oldest);
+    // solo live question can age out of the registry once ~50 asks have been
+    // posted since. That degrades safely: its buttons report "already
+    // finished" and the text-reply path still resolves the ask. It is not a
+    // correctness hole for a solo ask, but it WOULD be one for a multi-question
+    // group (Issue #443 review should-2): `groupOf()` only sees survivors, so
+    // evicting an unanswered sibling would let `allAnswered` in the click
+    // handler go true — and resolveAskUser fire — without that sibling ever
+    // being tapped. So a still-pending member of a multi-question group
+    // (`groupId` set) is skipped over here; only a solo prompt or an
+    // already-terminal (answered/superseded/expired) one is evicted. Bounded
+    // scan: falls through to evicting the oldest entry outright if every
+    // candidate in the map is a live group member, so the map can never grow
+    // unbounded even in that pathological case.
+    if (this.prompts.size > this.capacity) {
+      // PR #444 review (CodeRabbit / Qodo): a group is "still open" as long as
+      // ANY sibling is pending — not just the pending ones individually. The
+      // original check only protected `state === "pending"` entries, so an
+      // ALREADY-ANSWERED sibling of a group that has not fully resolved yet
+      // was still evictable. Losing it would shrink `groupOf()`'s result,
+      // shifting the `Q<n>:` ordinals of the remaining siblings AND silently
+      // dropping that sibling's answer from the combined string sent back to
+      // Claude once the group does finish. Protecting the whole group (not
+      // just its pending members) closes that hole.
+      const openGroups = new Set<string>();
+      for (const p of this.prompts.values()) {
+        if (p.groupId !== undefined && p.state === "pending") {
+          openGroups.add(p.groupId);
+        }
+      }
+      while (this.prompts.size > this.capacity) {
+        let victim: string | undefined;
+        for (const [tok, p] of this.prompts) {
+          const liveGroupMember =
+            p.groupId !== undefined && openGroups.has(p.groupId);
+          if (!liveGroupMember) {
+            victim = tok;
+            break;
+          }
+        }
+        this.prompts.delete(victim ?? this.prompts.keys().next().value!);
+      }
     }
     return token;
   }
@@ -200,6 +256,54 @@ export class AskPromptRegistry {
   size(): number {
     return this.prompts.size;
   }
+
+  /**
+   * Every prompt sharing `token`'s `groupId`, including itself, in
+   * registration order (Issue #443). A solo prompt (`groupId` undefined)
+   * returns just itself — so callers can treat "is the whole ask answered
+   * yet" the same way for a solo click and a multi-question one: check
+   * whether every entry in the returned array is `answered`.
+   */
+  groupOf(token: string): AskPrompt[] {
+    const prompt = this.prompts.get(token);
+    if (!prompt) return [];
+    if (prompt.groupId === undefined) return [prompt];
+    const siblings: AskPrompt[] = [];
+    for (const p of this.prompts.values()) {
+      if (p.groupId === prompt.groupId) siblings.push(p);
+    }
+    return siblings;
+  }
+
+  /**
+   * True while this thread has a still-live multi-question ask (2+ siblings,
+   * none superseded/expired) registered. `bot.ts`'s plain-text reply path
+   * uses this to refuse answering an entire batch of taps with one stray
+   * message (#443 AC-3) while leaving single-question text answers untouched.
+   */
+  hasActiveMultiAsk(threadId: string): boolean {
+    const counts = new Map<string, number>();
+    const hasPending = new Set<string>();
+    for (const p of this.prompts.values()) {
+      if (p.threadId !== threadId) continue;
+      if (p.state === "superseded" || p.state === "expired") continue;
+      if (p.groupId === undefined) continue;
+      counts.set(p.groupId, (counts.get(p.groupId) ?? 0) + 1);
+      // PR #444 review (CodeRabbit / Qodo): a fully-answered group's entries
+      // stay in the registry as `"answered"` — they are never re-superseded
+      // (register()'s supersede loop deliberately skips `"answered"` prompts)
+      // — so without this, a group that finished answering would still count
+      // toward "active" here, and a LATER solo ask on the same thread would
+      // be wrongly told "this is a multi-question ask, tap the buttons"
+      // instead of accepting its plain-text reply. Only a group with at
+      // least one still-`"pending"` member is genuinely awaiting taps.
+      if (p.state === "pending") hasPending.add(p.groupId);
+    }
+    for (const [groupId, count] of counts) {
+      if (count > 1 && hasPending.has(groupId)) return true;
+    }
+    return false;
+  }
 }
 
 /** Registry used by the running bot. Tests build their own instance. */
@@ -208,6 +312,23 @@ export const askPrompts = new AskPromptRegistry();
 /** Whether a component interaction belongs to this module. */
 export function isAskComponentId(customId: string): boolean {
   return customId.startsWith(ASK_COMPONENT_PREFIX);
+}
+
+/**
+ * Issue #443 AC-3: whether `threadId` currently has a live multi-question ask
+ * (2+ tappable sub-questions, not yet fully answered). `bot.ts`'s
+ * `messageCreate` handler checks this before letting a plain-text reply
+ * resolve a pending ask — a stray message must not be read as the answer to
+ * every question in the batch, only a tap on a specific question's row does
+ * that. Delegates to {@link AskPromptRegistry.hasActiveMultiAsk}; the
+ * `registry` param exists so tests can build an isolated instance instead of
+ * the module singleton.
+ */
+export function hasActiveMultiAsk(
+  threadId: string,
+  registry: AskPromptRegistry = askPrompts
+): boolean {
+  return registry.hasActiveMultiAsk(threadId);
 }
 
 export function parseAskCustomId(
@@ -230,20 +351,16 @@ export function parseAskCustomId(
  * Buttons only when every option fits one ActionRow AND a single answer is
  * wanted; a select otherwise.
  *
- * DEAD PATH TODAY (#427 review should-3): in production this returns `true`
- * every time, so the select branch — and the >25 fallback in
- * {@link buildAskPrompt} — run only under unit tests. Two reasons:
+ * MOSTLY DEAD PATH for a single-question ask (#427 review should-3): in
+ * production `shouldUseButtons` still returns `true` for {@link buildAskPrompt}
+ * every time, because a solo question carries at most 4 options (+ Other) and
+ * hooks/ask-user-relay.sh still drops `multiSelect` when flattening ONE
+ * question's options. The select branch there runs only under unit tests.
  *
- *   1. AskUserQuestion carries at most 4 options (+ Other), i.e. never > 5
- *   2. `multiSelect` is dropped before it reaches us: hooks/ask-user-relay.sh
- *      flattens each option to a `label — description` string and AskUserEvent
- *      has no such field
- *
- * ENABLING CONDITION: the hook + `/ask` payload start carrying `multiSelect`
- * (and structured options). That work lands with the relay-server changes in
- * #416; bot.ts already reads the flag defensively, so the branch switches on by
- * itself. If that never happens, delete the select path rather than keeping it
- * as unexercised surface (agent-output-quality.md #4).
+ * REACHABLE for a multi-question ask (Issue #443): `hooks/ask-user-relay.sh`
+ * forwards each sub-question's `multiSelect` flag and structured options in
+ * `questions[]`, so {@link buildMultiAskPrompt} can and does hit the select
+ * branch in production when a question asks for multiple selections.
  */
 export function shouldUseButtons(
   optionCount: number,
@@ -352,6 +469,12 @@ export interface AskPromptMessage {
   kind: AskComponentKind;
   /** Registry token; absent when the message carries no components. */
   token?: string;
+  /**
+   * Issue #443: one registry token per question, in question order — set
+   * instead of `token` by {@link buildMultiAskPrompt}. `components` holds one
+   * row per entry at the same index.
+   */
+  tokens?: string[];
 }
 
 /**
@@ -463,6 +586,163 @@ export async function postAskUserPrompt(
   return prompt;
 }
 
+/** One sub-question of a multi-question ask, as `buildMultiAskPrompt` needs it. */
+export interface AskSubQuestionInput {
+  question: string;
+  options?: string[];
+  multiSelect?: boolean;
+}
+
+export interface MultiAskPromptInput {
+  threadId: string;
+  questions: AskSubQuestionInput[];
+  /** Same meaning as {@link AskPromptInput.timeoutMs}. */
+  timeoutMs?: number;
+}
+
+/** Discord's ActionRow-per-message ceiling (docs.discord.com/developers). */
+export const MAX_ASK_QUESTIONS_PER_MESSAGE = 5;
+
+/**
+ * Build the thread post for a multi-question AskUserQuestion (Issue #443).
+ *
+ * Before this, `hooks/ask-user-relay.sh` flattened every question in
+ * `questions[]` down to one joined text with no options the moment there was
+ * more than one — `buildAskPrompt` then had nothing to build components from
+ * and fell back to plain text, so the only way to answer was one free-text
+ * reply for the whole batch (the #443 incident: an unrelated message got read
+ * as the answer to every proposal at once).
+ *
+ * Each sub-question is registered as its OWN `AskPromptRegistry` entry — same
+ * registration, same customId scheme (`buildButtonRow` / `buildSelectRow`,
+ * unchanged), same click handling as a solo ask — so none of that machinery
+ * needed to change. What is new is `groupId`: every sub-question of one batch
+ * shares it, which (a) stops them superseding each other on registration (the
+ * "one live ask per thread" rule in {@link AskPromptRegistry.register} would
+ * otherwise disable Q1's buttons the instant Q2 registers) and (b) lets
+ * {@link createAskComponentHandler} tell "wait for the rest of the group"
+ * apart from "this alone is the whole answer" ({@link AskPromptRegistry.groupOf}).
+ *
+ * Falls back to the old flattened text-only post when any sub-question has no
+ * options, there are zero questions, or there are more questions than Discord
+ * allows rows for — a free-text sub inside a tap-to-answer batch is exactly
+ * the ambiguous-mapping problem `ask-user-relay.sh`'s own comment calls out,
+ * so it is not attempted; the whole batch degrades together, not
+ * question-by-question.
+ */
+export function buildMultiAskPrompt(
+  input: MultiAskPromptInput,
+  registry: AskPromptRegistry = askPrompts
+): AskPromptMessage {
+  const { threadId, questions, timeoutMs } = input;
+  const canUseComponents =
+    questions.length > 0 &&
+    questions.length <= MAX_ASK_QUESTIONS_PER_MESSAGE &&
+    questions.every((q) => {
+      const count = (q.options ?? []).length;
+      return count > 0 && count <= MAX_SELECT_OPTIONS;
+    });
+
+  if (!canUseComponents) {
+    if (questions.length > MAX_ASK_QUESTIONS_PER_MESSAGE) {
+      console.warn(
+        `[ask-components] ${questions.length} questions exceed the Discord ActionRow limit (${MAX_ASK_QUESTIONS_PER_MESSAGE}); posting without components (#443)`
+      );
+    }
+    // Review finding (PR #444): a per-question option count over
+    // MAX_SELECT_OPTIONS (25) would make buildSelectRow hand Discord a
+    // StringSelectMenu with more entries than its hard API ceiling — the
+    // send() call would fail outright, not degrade. Same whole-batch
+    // text fallback as the zero-options case: a free-text sub inside a
+    // tap-to-answer batch is the exact ambiguity buildAskPrompt's own
+    // over-limit branch already avoids for a solo ask.
+    if (questions.some((q) => (q.options ?? []).length > MAX_SELECT_OPTIONS)) {
+      console.warn(
+        `[ask-components] a question has more than ${MAX_SELECT_OPTIONS} options; posting the whole batch without components (#443)`
+      );
+    }
+    const joined = questions.map((q) => q.question).join("\n");
+    return {
+      content: joinContent(
+        [`❓ **Claude からの質問**`, joined],
+        [],
+        askFooter("text", timeoutMs)
+      ),
+      components: [],
+      kind: "text",
+    };
+  }
+
+  const groupId = `${Date.now().toString(36)}${Math.random().toString(36).slice(2, 6)}`;
+  const tokens: string[] = [];
+  const rows: AskComponentRow[] = [];
+  const kinds: Exclude<AskComponentKind, "text">[] = [];
+  const blocks: string[] = [];
+
+  questions.forEach((q, i) => {
+    const rawOptions = q.options ?? [];
+    const multiSelect = q.multiSelect ?? false;
+    const options = rawOptions.map(toAskOption);
+    const kind = shouldUseButtons(options.length, multiSelect)
+      ? "buttons"
+      : "select";
+    const token = registry.register({
+      threadId,
+      kind,
+      options,
+      multiSelect,
+      groupId,
+    });
+    tokens.push(token);
+    kinds.push(kind);
+    rows.push(
+      kind === "buttons"
+        ? buildButtonRow(token, options, false)
+        : buildSelectRow(token, options, multiSelect, false)
+    );
+    const list = rawOptions.map((option, j) => `${j + 1}. ${option}`);
+    blocks.push([`**Q${i + 1}.** ${q.question}`, ...list].join("\n"));
+  });
+
+  const footer =
+    "各質問のボタン/メニューからそれぞれ回答してください（すべてに回答すると再開します）。\n" +
+    askWaitNotice(timeoutMs);
+  const head = `❓ **Claude からの質問（${questions.length}件）**`;
+  const body = [head, ...blocks].join("\n\n");
+  const budget = CONTENT_LIMIT - footer.length - 2;
+  const trimmedBody = body.length > budget ? truncate(body, budget) : body;
+
+  return {
+    content: `${trimmedBody}\n\n${footer}`,
+    components: rows,
+    // Best-effort summary: a batch can mix buttons and selects per question,
+    // but AskPromptMessage.kind has no "mixed" value. "select" whenever at
+    // least one row is one, since that is the row a caller most needs to know
+    // about (it is the branch that is otherwise unreachable in production —
+    // see shouldUseButtons).
+    kind: kinds.includes("select") ? "select" : "buttons",
+    tokens,
+  };
+}
+
+/**
+ * Build the multi-question post and deliver it (mirrors `postAskUserPrompt`,
+ * #436 V-2's rationale: an E2E test can drive this exact call with a fake
+ * channel and assert on what actually reaches `send()`).
+ */
+export async function postMultiAskUserPrompt(
+  channel: AskPostChannel,
+  input: MultiAskPromptInput,
+  registry: AskPromptRegistry = askPrompts
+): Promise<AskPromptMessage> {
+  const prompt = buildMultiAskPrompt(input, registry);
+  await channel.send({
+    content: prompt.content,
+    ...(prompt.components.length ? { components: prompt.components } : {}),
+  });
+  return prompt;
+}
+
 /**
  * Closing lines of the post: how to answer, then the relay's own wait notice.
  *
@@ -501,11 +781,23 @@ function joinContent(
   return `${trimmedBody}\n\n${footer}`;
 }
 
+/**
+ * Rebuild a prompt's row, enabled or disabled. Used both for the
+ * single-answered-row case (disabled) and, for a multi-question ask (#443),
+ * to rebuild every sibling row on each click — the still-pending ones stay
+ * enabled, the just-answered one (and any answered earlier) come back
+ * disabled, so `interaction.update()` can replace the whole `components` list
+ * at once (Discord has no partial-row patch).
+ */
+function buildRowForPrompt(prompt: AskPrompt, disabled: boolean): AskComponentRow {
+  return prompt.kind === "buttons"
+    ? buildButtonRow(prompt.token, prompt.options, disabled)
+    : buildSelectRow(prompt.token, prompt.options, prompt.multiSelect, disabled);
+}
+
 /** Rebuild the row in its disabled form (answer recorded, no further clicks). */
 function buildDisabledRow(prompt: AskPrompt): AskComponentRow {
-  return prompt.kind === "buttons"
-    ? buildButtonRow(prompt.token, prompt.options, true)
-    : buildSelectRow(prompt.token, prompt.options, prompt.multiSelect, true);
+  return buildRowForPrompt(prompt, true);
 }
 
 /**
@@ -515,11 +807,19 @@ function buildDisabledRow(prompt: AskPrompt): AskComponentRow {
  */
 async function disableStaleMessage(
   interaction: ButtonInteraction | StringSelectMenuInteraction,
-  prompt: AskPrompt
+  prompt: AskPrompt,
+  registry: AskPromptRegistry
 ): Promise<void> {
   try {
+    // Issue #443 review must-1: rebuild EVERY sibling row, not just the one
+    // clicked. `.edit({components})` replaces the whole array — for a
+    // multi-question ask the message carries N rows, and every call site here
+    // means the whole ask is dead (expired / superseded / no longer pending),
+    // so all siblings go disabled together, not just the row that was tapped.
+    // A solo ask's group is just itself, so this is unchanged there.
+    const group = registry.groupOf(prompt.token);
     await interaction.message?.edit({
-      components: [buildDisabledRow(prompt)],
+      components: group.map((p) => buildRowForPrompt(p, true)),
     });
   } catch (err) {
     console.warn(
@@ -675,7 +975,7 @@ export function createAskComponentHandler(deps: AskComponentHandlerDeps) {
           "⌛ この質問は回答期限が切れています（セッションは TUI ダイアログに戻っています）。",
         ephemeral: true,
       });
-      await disableStaleMessage(interaction, prompt);
+      await disableStaleMessage(interaction, prompt, registry);
       return;
     }
     if (prompt.state === "superseded") {
@@ -684,7 +984,7 @@ export function createAskComponentHandler(deps: AskComponentHandlerDeps) {
           "ℹ️ この質問は新しい質問に置き換えられています。最新のメッセージから回答してください。",
         ephemeral: true,
       });
-      await disableStaleMessage(interaction, prompt);
+      await disableStaleMessage(interaction, prompt, registry);
       return;
     }
 
@@ -719,7 +1019,7 @@ export function createAskComponentHandler(deps: AskComponentHandlerDeps) {
           "⌛ この質問は回答期限が切れています（セッションは TUI ダイアログに戻っています）。",
         ephemeral: true,
       });
-      await disableStaleMessage(interaction, prompt);
+      await disableStaleMessage(interaction, prompt, registry);
       return;
     }
 
@@ -735,7 +1035,24 @@ export function createAskComponentHandler(deps: AskComponentHandlerDeps) {
     const answer = chosen.map((option) => option.answer).join(", ");
     prompt.state = "answered";
     prompt.answer = answer;
-    deps.resolveAskUser(prompt.threadId, answer);
+
+    // Issue #443: a multi-question ask registers each sub-question as its own
+    // prompt sharing one groupId. `group` is every sibling (a solo ask's group
+    // is just itself, so this whole block behaves exactly as it did before
+    // #443 for a solo ask — see AskPromptRegistry.groupOf). resolveAskUser
+    // fires the ONE underlying /ask response, so it must fire once, only once
+    // ALL siblings are answered — resolving on the first tap would hand Claude
+    // an answer for questions nobody tapped yet.
+    const group = registry.groupOf(prompt.token);
+    const ordinal = group.indexOf(prompt) + 1;
+    const allAnswered = group.every((p) => p.state === "answered");
+    if (allAnswered) {
+      const combinedAnswer =
+        group.length > 1
+          ? group.map((p, i) => `Q${i + 1}: ${p.answer ?? ""}`).join("\n")
+          : answer;
+      deps.resolveAskUser(prompt.threadId, combinedAnswer);
+    }
 
     // The decision trail (#427 review should-1). This is the 会長's input point:
     // when someone later says "I tapped it and nothing happened", this line is
@@ -746,7 +1063,10 @@ export function createAskComponentHandler(deps: AskComponentHandlerDeps) {
     );
 
     const base = interaction.message?.content ?? "";
-    const chosenLine = truncate(`✅ 選択: ${answer}`, CONTENT_LIMIT);
+    const chosenLine = truncate(
+      group.length > 1 ? `✅ Q${ordinal} 選択: ${answer}` : `✅ 選択: ${answer}`,
+      CONTENT_LIMIT
+    );
     // Trim the QUESTION, never the choice (#427 review should-4). Appending and
     // truncating the whole thing drops the tail first, which is exactly the line
     // that records what was decided.
@@ -757,7 +1077,11 @@ export function createAskComponentHandler(deps: AskComponentHandlerDeps) {
     try {
       await interaction.update({
         content,
-        components: [buildDisabledRow(prompt)],
+        // Rebuild every sibling row (not just this one) — a multi-question ask
+        // posts them all in ONE message, and Discord has no way to patch a
+        // single ActionRow without resending the rest. Still-pending siblings
+        // stay tappable; this is a no-op array-of-one for a solo ask.
+        components: group.map((p) => buildRowForPrompt(p, p.state === "answered")),
       });
     } catch (err) {
       // The answer is already delivered; only the message update failed. Log it

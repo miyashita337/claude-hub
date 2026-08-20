@@ -173,12 +173,12 @@ describe("ask-user-relay.sh — supervisor session active", () => {
     );
   });
 
-  test("multiple questions: all question texts are forwarded, options omitted", async () => {
+  test("multiple questions: the joined question text AND a structured questions[] (with options) are both forwarded (#443)", async () => {
     const input = makeInput(
       {
         questions: [
           { question: "Q1 はどうしますか？", header: "Q1", multiSelect: false, options: [{ label: "a", description: "d1" }] },
-          { question: "Q2 はどうしますか？", header: "Q2", multiSelect: false, options: [{ label: "b", description: "d2" }] },
+          { question: "Q2 はどうしますか？", header: "Q2", multiSelect: true, options: [{ label: "b", description: "d2" }] },
         ],
       },
       env.dir,
@@ -188,11 +188,45 @@ describe("ask-user-relay.sh — supervisor session active", () => {
     expect(exitCode).toBe(0);
 
     const sent = JSON.parse(readFileSync(env.curlStdinFile, "utf8"));
-    // Both questions must reach Discord in one message; per-question option
-    // mapping is ambiguous over a free-text reply, so options are omitted.
+    // `question` stays the flattened, joined form — unchanged, still used for
+    // the deny-envelope wording and the expiry notice.
     expect(sent.question).toContain("Q1 はどうしますか？");
     expect(sent.question).toContain("Q2 はどうしますか？");
     expect(sent.options).toBeUndefined();
+    // Issue #443: `questions[]` carries each sub-question's own text +
+    // flattened options, so Discord can post a tappable row per question
+    // instead of falling back to one free-text reply for the whole batch.
+    expect(sent.questions).toEqual([
+      { question: "Q1 はどうしますか？", multiSelect: false, options: ["a — d1"] },
+      { question: "Q2 はどうしますか？", multiSelect: true, options: ["b — d2"] },
+    ]);
+  });
+
+  test("multiple questions where one has no options: that question's options key is omitted, not an empty array", async () => {
+    const input = makeInput(
+      {
+        questions: [
+          { question: "Q1 はどうしますか？", header: "Q1", multiSelect: false, options: [{ label: "a", description: "" }] },
+          { question: "Q2 は自由記述です", header: "Q2", multiSelect: false, options: [] },
+        ],
+      },
+      env.dir,
+    );
+
+    const { exitCode } = await runHook(env, input);
+    expect(exitCode).toBe(0);
+
+    const sent = JSON.parse(readFileSync(env.curlStdinFile, "utf8"));
+    expect(sent.questions[0]).toEqual({
+      question: "Q1 はどうしますか？",
+      multiSelect: false,
+      options: ["a"],
+    });
+    expect(sent.questions[1]).toEqual({
+      question: "Q2 は自由記述です",
+      multiSelect: false,
+    });
+    expect(sent.questions[1].options).toBeUndefined();
   });
 });
 
