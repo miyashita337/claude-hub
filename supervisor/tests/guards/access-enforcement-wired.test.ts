@@ -182,3 +182,58 @@ describe("brief trigger is wired fail-closed (#426)", () => {
     }
   });
 });
+
+/**
+ * Issue #429 (PR #434 review, question-1). The behavioural half lives in
+ * dispatch-integration.test.ts; this guard pins the bot.ts WIRING, because the
+ * defect being fixed was precisely a wiring gap: the `!result.ok` arm existed
+ * but only ever called `console.error`, so a dispatch that never reached the
+ * pane was invisible to the thread and to corp. A refactor that quietly returns
+ * to log-only would restore the silent stall while every unit test still
+ * passed — this catches that, in the same way the access gates above are
+ * pinned against silent removal.
+ */
+describe("dispatch failure reaches the thread, not just the log (#429)", () => {
+  test("bot.ts posts a failure notice on the !result.ok arm", async () => {
+    const src = await read("src/bot.ts");
+    // The notice builder is used (not a bare log, and not an ad-hoc string that
+    // could leak the raw tmux cause).
+    expect(src).toContain("buildDispatchFailureNotice");
+    // ...and it is handed to the thread poster.
+    const noticeIdx = src.indexOf("buildDispatchFailureNotice(");
+    const postIdx = src.lastIndexOf("postToThread(", noticeIdx);
+    expect(noticeIdx).toBeGreaterThan(-1);
+    expect(postIdx).toBeGreaterThan(-1);
+    // The post call opens immediately before the notice it sends.
+    expect(postIdx).toBeLessThan(noticeIdx);
+  });
+
+  test("the failure notice is built inside the dispatch failure branch", async () => {
+    const src = await read("src/bot.ts");
+    const failureIdx = src.indexOf("Dispatch failed (stage=");
+    const noticeIdx = src.indexOf("buildDispatchFailureNotice(");
+    expect(failureIdx).toBeGreaterThan(-1);
+    // The notice follows the failure log, i.e. it lives in the same arm rather
+    // than somewhere that could fire on a success.
+    expect(noticeIdx).toBeGreaterThan(failureIdx);
+  });
+
+  test("the raw cause cannot reach the thread through the notice", async () => {
+    // Same contract as SEND_FAILURE_USER_MESSAGE (#74): tmux internals and
+    // absolute paths stay in the Supervisor log. Enforced structurally — the
+    // builder takes no error/cause parameter at all — so this checks the shape
+    // rather than the wording (the wording itself is asserted behaviourally in
+    // dispatch-run.test.ts).
+    const src = await read("src/session/dispatch.ts");
+    const sigIdx = src.indexOf("export function buildDispatchFailureNotice(");
+    expect(sigIdx).toBeGreaterThan(-1);
+    const params = src.slice(sigIdx, src.indexOf("): string {", sigIdx));
+    expect(params).not.toMatch(/error|cause|err\b/i);
+
+    // And the call site passes no error either.
+    const bot = await read("src/bot.ts");
+    const callIdx = bot.indexOf("buildDispatchFailureNotice(");
+    expect(callIdx).toBeGreaterThan(-1);
+    expect(bot.slice(callIdx, callIdx + 400)).not.toContain("result.error");
+  });
+});

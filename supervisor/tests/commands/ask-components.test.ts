@@ -10,17 +10,23 @@ import {
   AskPromptRegistry,
   BUTTON_LABEL_LIMIT,
   CUSTOM_ID_LIMIT,
+  MAX_ASK_QUESTIONS_PER_MESSAGE,
   MAX_BUTTON_OPTIONS,
   MAX_SELECT_OPTIONS,
   OPTION_SEPARATOR,
   SELECT_DESCRIPTION_LIMIT,
   buildAskPrompt,
+  buildMultiAskPrompt,
   createAskComponentHandler,
+  hasActiveMultiAsk,
   isAskComponentId,
   parseAskCustomId,
+  postAskUserPrompt,
+  postMultiAskUserPrompt,
   shouldUseButtons,
   splitOption,
   type AskComponentKind,
+  type AskPostChannel,
 } from "../../src/commands/ask-components";
 
 /**
@@ -801,18 +807,708 @@ describe("coupled contracts (#412)", () => {
     expect(hook).toContain(`"${OPTION_SEPARATOR}"`);
   });
 
-  test("bot.ts sends the built components, not just the text", () => {
-    // #370's failure class: a relay path that exists but is not wired. The
-    // components only reach Discord if handleAskUser passes them to send() —
-    // assert the call site so a future edit cannot drop them back to text-only
-    // while every unit test above still passes.
+  test("bot.ts wires handleAskUser through postAskUserPrompt", () => {
+    // #370's failure class: a relay path that exists but is not wired. Text
+    // matching can only prove bot.ts calls the right function, not that the
+    // function actually produces a correct post — that gap is closed by the
+    // postAskUserPrompt describe block below, which drives the real send().
     const bot = readFileSync(
       resolve(import.meta.dir, "../../src/bot.ts"),
       "utf8"
     );
-    expect(bot).toContain("buildAskPrompt({");
-    expect(bot).toMatch(/components:\s*prompt\.components/);
+    expect(bot).toMatch(/postAskUserPrompt\(channel,\s*{/);
     // And the interaction dispatcher must route both component kinds.
     expect(bot).toMatch(/isAskComponentId\(interaction\.customId\)/);
+    // #443: a multi-question event must reach postMultiAskUserPrompt, and a
+    // plain-text reply must be gated by hasActiveMultiAsk before it can
+    // resolve a pending ask (AC-3) — same failure class as #370, one hop
+    // earlier: the branch existing but never being taken.
+    expect(bot).toMatch(/postMultiAskUserPrompt\(channel,\s*{/);
+    expect(bot).toMatch(/hasActiveMultiAsk\(threadId\)/);
+  });
+});
+
+describe("postAskUserPrompt (Issue #436 V-2)", () => {
+  // Nothing before this point fed buildAskPrompt's output into an actual
+  // send(): ask-components.test.ts covers buildAskPrompt in isolation, and
+  // startup-wiring.test.ts only proves handleAskUser is registered — neither
+  // ever executes it. These tests drive the exact call bot.ts makes, with a
+  // fake channel standing in for the live Discord send that could not be
+  // verified for two days after #427/#431 shipped (Issue #436).
+  function makeChannel() {
+    const sent: {
+      content: string;
+      components?: unknown[];
+    }[] = [];
+    const channel: AskPostChannel = {
+      send: async (options) => {
+        sent.push(options);
+        return { id: "message-1" };
+      },
+    };
+    return { channel, sent };
+  }
+
+  test("delivers buttons for a 2-option question, with the real deadline and no-auto-select notice", async () => {
+    const registry = new AskPromptRegistry();
+    const { channel, sent } = makeChannel();
+
+    const prompt = await postAskUserPrompt(
+      channel,
+      {
+        threadId: "thread-1",
+        question: "A か B か？",
+        options: ["A", "B"],
+        timeoutMs: 5 * 60 * 60 * 1000,
+      },
+      registry
+    );
+
+    expect(sent).toHaveLength(1);
+    expect(prompt.kind).toBe("buttons");
+    // 期待2: the wait notice states the real deadline, not a stale hardcode.
+    expect(sent[0]!.content).toContain("約 5 時間");
+    // 期待3: the no-auto-select line (Issue #423) is present verbatim.
+    expect(sent[0]!.content).toContain(
+      "選択肢が自動で選ばれることはありません（Issue #423）"
+    );
+    // 期待1: components reach send(), not just the text.
+    expect(sent[0]!.components).toBeDefined();
+    expect(sent[0]!.components).toHaveLength(1);
+    const ids = customIds(sent[0]!.components![0]);
+    expect(ids).toHaveLength(2);
+  });
+
+  test("delivers a select menu once options exceed the button limit", async () => {
+    const registry = new AskPromptRegistry();
+    const { channel, sent } = makeChannel();
+
+    await postAskUserPrompt(
+      channel,
+      {
+        threadId: "thread-1",
+        question: "方針は？",
+        options: ["A", "B", "C", "D", "E", "F"],
+        timeoutMs: 30 * 60 * 1000,
+      },
+      registry
+    );
+
+    expect(sent).toHaveLength(1);
+    expect(sent[0]!.content).toContain("約 30 分");
+    const menu = rowJson(sent[0]!.components![0]).components[0] as {
+      options: { label: string }[];
+    };
+    expect(menu.options.map((o) => o.label)).toEqual([
+      "A",
+      "B",
+      "C",
+      "D",
+      "E",
+      "F",
+    ]);
+  });
+
+  test("sends text-only (no components key) when the ask carries no options", async () => {
+    // Multi-question asks flatten to a bare question with no options — the
+    // send() call must omit `components` entirely rather than send `[]`,
+    // matching what buildAskPrompt already guarantees for this shape.
+    const registry = new AskPromptRegistry();
+    const { channel, sent } = makeChannel();
+
+    await postAskUserPrompt(
+      channel,
+      { threadId: "thread-1", question: "自由記述でお願いします" },
+      registry
+    );
+
+    expect(sent).toHaveLength(1);
+    expect(sent[0]!.components).toBeUndefined();
+    expect(sent[0]!.content).toContain("自由記述でお願いします");
+  });
+});
+
+// --- multi-question ask (Issue #443) ----------------------------------------
+
+describe("buildMultiAskPrompt (#443)", () => {
+  test("one ActionRow per question, each with its own token/customIds", () => {
+    const registry = new AskPromptRegistry();
+    const prompt = buildMultiAskPrompt(
+      {
+        threadId: "thread-1",
+        questions: [
+          { question: "Q1 はどうしますか？", options: ["案A", "案B"] },
+          { question: "Q2 はどうしますか？", options: ["案C"] },
+        ],
+      },
+      registry
+    );
+
+    expect(prompt.kind).not.toBe("text");
+    expect(prompt.components).toHaveLength(2);
+    expect(prompt.tokens).toHaveLength(2);
+    expect(prompt.token).toBeUndefined();
+
+    const row0 = customIds(prompt.components[0]);
+    const row1 = customIds(prompt.components[1]);
+    expect(row0).toEqual([
+      `${ASK_COMPONENT_PREFIX}${prompt.tokens![0]}:0`,
+      `${ASK_COMPONENT_PREFIX}${prompt.tokens![0]}:1`,
+    ]);
+    expect(row1).toEqual([`${ASK_COMPONENT_PREFIX}${prompt.tokens![1]}:0`]);
+    // Different tokens: each question is its own independent registry entry.
+    expect(prompt.tokens![0]).not.toBe(prompt.tokens![1]);
+
+    expect(prompt.content).toContain("Q1 はどうしますか？");
+    expect(prompt.content).toContain("Q2 はどうしますか？");
+    expect(prompt.content).toContain("再開します");
+  });
+
+  test("registering siblings does not supersede each other (unlike two unrelated asks)", () => {
+    const registry = new AskPromptRegistry();
+    const prompt = buildMultiAskPrompt(
+      {
+        threadId: "thread-1",
+        questions: [
+          { question: "Q1", options: ["案A"] },
+          { question: "Q2", options: ["案B"] },
+        ],
+      },
+      registry
+    );
+
+    // Both siblings are still pending — registering Q2 must not have disabled
+    // Q1's row the way a second unrelated buildAskPrompt call would.
+    const first = registry.get(prompt.tokens![0]!);
+    const second = registry.get(prompt.tokens![1]!);
+    expect(first?.state).toBe("pending");
+    expect(second?.state).toBe("pending");
+  });
+
+  test("a genuinely new ask still supersedes an unanswered multi-question batch", () => {
+    const registry = new AskPromptRegistry();
+    const multi = buildMultiAskPrompt(
+      {
+        threadId: "thread-1",
+        questions: [
+          { question: "Q1", options: ["案A"] },
+          { question: "Q2", options: ["案B"] },
+        ],
+      },
+      registry
+    );
+
+    // A later solo ask on the same thread replaces the whole pending batch.
+    buildAskPrompt({ threadId: "thread-1", question: "Q3", options: ["案C"] }, registry);
+
+    expect(registry.get(multi.tokens![0]!)?.state).toBe("superseded");
+    expect(registry.get(multi.tokens![1]!)?.state).toBe("superseded");
+  });
+
+  test("falls back to the flattened text-only post when a sub-question has no options", () => {
+    const registry = new AskPromptRegistry();
+    const prompt = buildMultiAskPrompt(
+      {
+        threadId: "thread-1",
+        questions: [
+          { question: "Q1 はどうしますか？", options: ["案A"] },
+          { question: "Q2 は自由記述です" }, // no options
+        ],
+      },
+      registry
+    );
+
+    expect(prompt.kind).toBe("text");
+    expect(prompt.components).toHaveLength(0);
+    expect(prompt.tokens).toBeUndefined();
+    expect(registry.size()).toBe(0);
+    expect(prompt.content).toContain("Q1 はどうしますか？");
+    expect(prompt.content).toContain("Q2 は自由記述です");
+  });
+
+  test("falls back to text when there are more questions than Discord has rows for", () => {
+    const registry = new AskPromptRegistry();
+    const questions = Array.from({ length: MAX_ASK_QUESTIONS_PER_MESSAGE + 1 }, (_, i) => ({
+      question: `Q${i + 1}`,
+      options: ["A"],
+    }));
+    const warn = spyOn(console, "warn").mockImplementation(() => {});
+
+    try {
+      const prompt = buildMultiAskPrompt({ threadId: "thread-1", questions }, registry);
+      expect(prompt.kind).toBe("text");
+      expect(prompt.components).toHaveLength(0);
+    } finally {
+      warn.mockRestore();
+    }
+  });
+
+  test("falls back to text (whole batch) when one question has more options than Discord's select ceiling (PR #444 review)", () => {
+    // Without this guard buildSelectRow would hand Discord a StringSelectMenu
+    // with > MAX_SELECT_OPTIONS entries — the actual send() call would fail
+    // outright rather than degrade, unlike the solo-ask path (buildAskPrompt)
+    // which already guards this.
+    const registry = new AskPromptRegistry();
+    const tooMany = Array.from({ length: MAX_SELECT_OPTIONS + 1 }, (_, i) => `選択肢${i + 1}`);
+    const warn = spyOn(console, "warn").mockImplementation(() => {});
+
+    try {
+      const prompt = buildMultiAskPrompt(
+        {
+          threadId: "thread-1",
+          questions: [
+            { question: "Q1", options: ["A", "B"] },
+            { question: "Q2（選択肢が多すぎる）", options: tooMany },
+          ],
+        },
+        registry
+      );
+      expect(prompt.kind).toBe("text");
+      expect(prompt.components).toHaveLength(0);
+      expect(registry.size()).toBe(0); // neither question got registered
+      expect(prompt.content).toContain("Q1");
+      expect(prompt.content).toContain("Q2（選択肢が多すぎる）");
+    } finally {
+      warn.mockRestore();
+    }
+  });
+
+  test("falls back to text for zero questions", () => {
+    const registry = new AskPromptRegistry();
+    const prompt = buildMultiAskPrompt({ threadId: "thread-1", questions: [] }, registry);
+    expect(prompt.kind).toBe("text");
+    expect(prompt.components).toHaveLength(0);
+  });
+
+  test("a question needing multiSelect gets a select row even below the button limit", () => {
+    const registry = new AskPromptRegistry();
+    const prompt = buildMultiAskPrompt(
+      {
+        threadId: "thread-1",
+        questions: [
+          { question: "Q1", options: ["案A", "案B"] },
+          { question: "Q2（複数選択可）", options: ["x", "y"], multiSelect: true },
+        ],
+      },
+      registry
+    );
+
+    expect(prompt.components).toHaveLength(2);
+    const menu = rowJson(prompt.components[1]).components[0] as {
+      max_values?: number;
+    };
+    expect(menu.max_values).toBe(2);
+  });
+});
+
+describe("postMultiAskUserPrompt (#443)", () => {
+  function makeChannel() {
+    const sent: { content: string; components?: unknown[] }[] = [];
+    const channel: AskPostChannel = {
+      send: async (options) => {
+        sent.push(options);
+        return { id: "message-1" };
+      },
+    };
+    return { channel, sent };
+  }
+
+  test("delivers all rows in a single send()", async () => {
+    const registry = new AskPromptRegistry();
+    const { channel, sent } = makeChannel();
+
+    const prompt = await postMultiAskUserPrompt(
+      channel,
+      {
+        threadId: "thread-1",
+        questions: [
+          { question: "Q1", options: ["案A", "案B"] },
+          { question: "Q2", options: ["案C"] },
+          { question: "Q3", options: ["案D"] },
+        ],
+        timeoutMs: 5 * 60 * 60 * 1000,
+      },
+      registry
+    );
+
+    expect(sent).toHaveLength(1);
+    expect(sent[0]!.components).toHaveLength(3);
+    expect(prompt.tokens).toHaveLength(3);
+  });
+});
+
+describe("multi-question click resolution (#443 AC-1/AC-2)", () => {
+  test("tapping one of two questions does not resolve; the other stays live", async () => {
+    const registry = new AskPromptRegistry();
+    const prompt = buildMultiAskPrompt(
+      {
+        threadId: "thread-1",
+        questions: [
+          { question: "Q1", options: ["案A", "案B"] },
+          { question: "Q2", options: ["案C"] },
+        ],
+      },
+      registry
+    );
+    const { handler, resolved } = makeHandler({ registry });
+    const { interaction, replies } = makeInteraction({
+      customId: `${ASK_COMPONENT_PREFIX}${prompt.tokens![0]}:1`, // Q1 -> 案B
+      messageContent: prompt.content,
+    });
+
+    await handler(interaction as never);
+
+    // The underlying /ask has not been resolved — Q2 was never tapped.
+    expect(resolved).toHaveLength(0);
+    const update = replies.find((r) => r.kind === "update");
+    expect(update?.content).toContain("✅ Q1 選択: 案B");
+    const rows = (update?.components ?? []) as unknown[];
+    expect(rows).toHaveLength(2);
+    // Q1's row is now disabled...
+    const row0 = rowJson(rows[0]).components as { disabled?: boolean }[];
+    expect(row0.every((c) => c.disabled === true)).toBe(true);
+    // ...Q2's row is untouched and still tappable.
+    const row1 = rowJson(rows[1]).components as { disabled?: boolean }[];
+    expect(row1.every((c) => c.disabled !== true)).toBe(true);
+  });
+
+  test("answering every question resolves the ask exactly once, combining all answers", async () => {
+    const registry = new AskPromptRegistry();
+    const prompt = buildMultiAskPrompt(
+      {
+        threadId: "thread-1",
+        questions: [
+          { question: "Q1", options: ["案A", "案B"] },
+          { question: "Q2", options: ["案C"] },
+        ],
+      },
+      registry
+    );
+    const { handler, resolved } = makeHandler({ registry });
+
+    const first = makeInteraction({
+      customId: `${ASK_COMPONENT_PREFIX}${prompt.tokens![0]}:1`,
+      messageContent: prompt.content,
+    });
+    await handler(first.interaction as never);
+    expect(resolved).toHaveLength(0);
+
+    const second = makeInteraction({
+      customId: `${ASK_COMPONENT_PREFIX}${prompt.tokens![1]}:0`,
+      // The message content by now already carries Q1's confirmation line —
+      // mirrors what interaction.update() actually left behind.
+      messageContent: `${prompt.content}\n\n✅ Q1 選択: 案B`,
+    });
+    await handler(second.interaction as never);
+
+    // Resolves exactly once, with both answers — never twice, never with
+    // just the second tap's answer.
+    expect(resolved).toEqual([
+      { threadId: "thread-1", answer: "Q1: 案B\nQ2: 案C" },
+    ]);
+
+    const update = second.replies.find((r) => r.kind === "update");
+    expect(update?.content).toContain("✅ Q1 選択: 案B");
+    expect(update?.content).toContain("✅ Q2 選択: 案C");
+    const rows = (update?.components ?? []) as unknown[];
+    for (const row of rows) {
+      const buttons = rowJson(row).components as { disabled?: boolean }[];
+      expect(buttons.every((c) => c.disabled === true)).toBe(true);
+    }
+  });
+
+  test("re-tapping an already-answered question in the batch is refused, not a second resolve", async () => {
+    const registry = new AskPromptRegistry();
+    const prompt = buildMultiAskPrompt(
+      {
+        threadId: "thread-1",
+        questions: [
+          { question: "Q1", options: ["案A"] },
+          { question: "Q2", options: ["案B"] },
+        ],
+      },
+      registry
+    );
+    const { handler, resolved } = makeHandler({ registry });
+
+    const first = makeInteraction({
+      customId: `${ASK_COMPONENT_PREFIX}${prompt.tokens![0]}:0`,
+    });
+    await handler(first.interaction as never);
+
+    const again = makeInteraction({
+      customId: `${ASK_COMPONENT_PREFIX}${prompt.tokens![0]}:0`,
+    });
+    await handler(again.interaction as never);
+
+    expect(resolved).toHaveLength(0); // Q2 never answered
+    const reply = again.replies.find((r) => r.kind === "reply");
+    expect(reply?.content).toContain("回答済み");
+  });
+
+  test("a solo ask still resolves on the first tap (group of one, unchanged behaviour)", async () => {
+    const registry = new AskPromptRegistry();
+    const prompt = buildAskPrompt(
+      { threadId: "thread-1", question: "方針は？", options: ["案A", "案B"] },
+      registry
+    );
+    const { handler, resolved } = makeHandler({ registry });
+    const { interaction } = makeInteraction({
+      customId: `${ASK_COMPONENT_PREFIX}${prompt.token}:1`,
+    });
+
+    await handler(interaction as never);
+
+    // Exactly the old solo format — no "Q1:" label, no group join.
+    expect(resolved).toEqual([{ threadId: "thread-1", answer: "案B" }]);
+  });
+
+  test("a click on a dead multi-question ask (relay timed out) disables EVERY sibling row, not just the one tapped (#443 review must-1)", async () => {
+    const registry = new AskPromptRegistry();
+    const prompt = buildMultiAskPrompt(
+      {
+        threadId: "thread-1",
+        questions: [
+          { question: "Q1", options: ["案A"] },
+          { question: "Q2", options: ["案B"] },
+          { question: "Q3", options: ["案C"] },
+        ],
+      },
+      registry
+    );
+    // pending: false -> the relay already gave up waiting on this thread.
+    const { handler } = makeHandler({ registry, pending: false });
+    const { interaction, replies } = makeInteraction({
+      customId: `${ASK_COMPONENT_PREFIX}${prompt.tokens![1]}:0`, // taps Q2 only
+    });
+
+    await handler(interaction as never);
+
+    const edit = replies.find((r) => r.kind === "messageEdit");
+    const rows = (edit?.components ?? []) as unknown[];
+    // A naive fix that only rebuilds the clicked row would drop Q1 and Q3
+    // from the message entirely (Discord replaces the whole array). All
+    // three must still be present, all disabled — the whole batch is dead,
+    // not just the tapped question.
+    expect(rows).toHaveLength(3);
+    for (const row of rows) {
+      const buttons = rowJson(row).components as { disabled?: boolean }[];
+      expect(buttons.every((c) => c.disabled === true)).toBe(true);
+    }
+  });
+
+  test("a superseded multi-question ask also disables every sibling row on a stale click", async () => {
+    const registry = new AskPromptRegistry();
+    const first = buildMultiAskPrompt(
+      {
+        threadId: "thread-1",
+        questions: [
+          { question: "Q1", options: ["案A"] },
+          { question: "Q2", options: ["案B"] },
+        ],
+      },
+      registry
+    );
+    buildAskPrompt({ threadId: "thread-1", question: "Q3", options: ["案C"] }, registry);
+
+    const { handler } = makeHandler({ registry });
+    const { interaction, replies } = makeInteraction({
+      customId: `${ASK_COMPONENT_PREFIX}${first.tokens![0]}:0`,
+    });
+    await handler(interaction as never);
+
+    const edit = replies.find((r) => r.kind === "messageEdit");
+    const rows = (edit?.components ?? []) as unknown[];
+    expect(rows).toHaveLength(2); // Q1 + Q2, not just Q1
+  });
+});
+
+describe("AskPromptRegistry eviction (#443 review should-2)", () => {
+  test("a still-pending member of an open multi-question group is skipped in favour of a stale entry", () => {
+    const registry = new AskPromptRegistry(3);
+    // Two solo asks on an unrelated thread: the second immediately supersedes
+    // the first, so the registry already holds one terminal (evictable) entry
+    // before the group below is registered.
+    buildAskPrompt({ threadId: "thread-a", question: "old-1", options: ["x"] }, registry);
+    buildAskPrompt({ threadId: "thread-a", question: "old-2", options: ["x"] }, registry);
+
+    // Registering this 2-member group pushes size from 2 -> 4, one over
+    // capacity, forcing exactly one eviction.
+    const prompt = buildMultiAskPrompt(
+      {
+        threadId: "thread-b",
+        questions: [
+          { question: "Q1", options: ["案A"] },
+          { question: "Q2", options: ["案B"] },
+        ],
+      },
+      registry
+    );
+
+    // Both siblings must survive — the eviction should have taken the stale
+    // superseded entry instead. Evicting either sibling would let groupOf()
+    // see only the other one and resolve the ask as if the evicted question
+    // had been answered.
+    expect(registry.get(prompt.tokens![0]!)).toBeDefined();
+    expect(registry.get(prompt.tokens![1]!)).toBeDefined();
+    expect(registry.size()).toBe(3);
+  });
+
+  test("bounds the map even in the pathological case where every live entry is a group member", () => {
+    // Capacity 1 with a 2-member group: there is no stale entry to sacrifice,
+    // so the safety net (never grow past capacity) must win over "never evict
+    // a live group member" — the map stays bounded even though it means one
+    // sibling goes down. This is the documented fallback, not the common case.
+    const registry = new AskPromptRegistry(1);
+    buildMultiAskPrompt(
+      {
+        threadId: "thread-1",
+        questions: [
+          { question: "Q1", options: ["案A"] },
+          { question: "Q2", options: ["案B"] },
+        ],
+      },
+      registry
+    );
+
+    expect(registry.size()).toBeLessThanOrEqual(1);
+  });
+
+  test("an answered or solo prompt is still evicted normally once capacity is exceeded", () => {
+    const registry = new AskPromptRegistry(1);
+    const solo = buildAskPrompt(
+      { threadId: "thread-1", question: "Q0", options: ["案Z"] },
+      registry
+    );
+    // A second, unrelated solo ask forces eviction pressure. The first one
+    // (superseded, i.e. terminal) is a safe eviction target.
+    buildAskPrompt({ threadId: "thread-1", question: "Q1", options: ["案A"] }, registry);
+
+    expect(registry.get(solo.token!)).toBeUndefined();
+  });
+
+  test("an ALREADY-ANSWERED sibling of a still-open group is protected too, not just pending ones (PR #444 review, must)", async () => {
+    const registry = new AskPromptRegistry(3);
+    // Two stale solo asks to absorb the evictions this test forces.
+    buildAskPrompt({ threadId: "thread-a", question: "old-1", options: ["x"] }, registry);
+    buildAskPrompt({ threadId: "thread-a", question: "old-2", options: ["x"] }, registry);
+
+    // Registered under "thread-1" — makeInteraction()'s default channelId —
+    // so the click below isn't rejected as cross-thread; the eviction pool
+    // (old-1/old-2) lives on the separate "thread-a" and is never clicked.
+    const prompt = buildMultiAskPrompt(
+      {
+        threadId: "thread-1",
+        questions: [
+          { question: "Q1", options: ["案A"] },
+          { question: "Q2", options: ["案B"] },
+        ],
+      },
+      registry
+    );
+    // size is now 4 (over capacity 3); registering already evicted once
+    // (see the sibling-preference test above) — answer Q1 so it becomes
+    // "answered" while Q2 is still pending, i.e. the group is NOT resolved.
+    const { handler } = makeHandler({ registry });
+    await handler(
+      makeInteraction({ customId: `${ASK_COMPONENT_PREFIX}${prompt.tokens![0]}:0` })
+        .interaction as never
+    );
+    expect(registry.get(prompt.tokens![0]!)?.state).toBe("answered");
+
+    // Force more eviction pressure without touching this group: register
+    // another unrelated solo ask that immediately supersedes old-2.
+    buildAskPrompt({ threadId: "thread-a", question: "old-3", options: ["x"] }, registry);
+
+    // A naive "protect pending members only" check would have evicted Q1
+    // (answered, not pending) the moment capacity pressure hit — losing its
+    // answer from the eventual combined response. It must still be here.
+    expect(registry.get(prompt.tokens![0]!)).toBeDefined();
+    expect(registry.get(prompt.tokens![1]!)).toBeDefined();
+  });
+});
+
+describe("hasActiveMultiAsk (#443 AC-3)", () => {
+  test("true while a multi-question batch has any unanswered sibling", () => {
+    const registry = new AskPromptRegistry();
+    buildMultiAskPrompt(
+      {
+        threadId: "thread-1",
+        questions: [
+          { question: "Q1", options: ["A"] },
+          { question: "Q2", options: ["B"] },
+        ],
+      },
+      registry
+    );
+
+    expect(hasActiveMultiAsk("thread-1", registry)).toBe(true);
+    expect(hasActiveMultiAsk("thread-other", registry)).toBe(false);
+  });
+
+  test("false for a solo (single-question) ask", () => {
+    const registry = new AskPromptRegistry();
+    buildAskPrompt(
+      { threadId: "thread-1", question: "方針は？", options: ["A", "B"] },
+      registry
+    );
+
+    expect(hasActiveMultiAsk("thread-1", registry)).toBe(false);
+  });
+
+  test("false once a newer ask has superseded the batch", () => {
+    const registry = new AskPromptRegistry();
+    buildMultiAskPrompt(
+      {
+        threadId: "thread-1",
+        questions: [
+          { question: "Q1", options: ["A"] },
+          { question: "Q2", options: ["B"] },
+        ],
+      },
+      registry
+    );
+    buildAskPrompt({ threadId: "thread-1", question: "Q3", options: ["C"] }, registry);
+
+    expect(hasActiveMultiAsk("thread-1", registry)).toBe(false);
+  });
+
+  test("defaults to the module-level registry when none is passed", () => {
+    // Smoke test only: proves the wrapper is callable without an explicit
+    // registry (bot.ts calls it this way).
+    expect(hasActiveMultiAsk("thread-that-has-never-asked-anything")).toBe(false);
+  });
+
+  test("false once a multi-question batch is FULLY answered, even though its entries stay in the registry (PR #444 review, must)", async () => {
+    // A completed group's members end up `"answered"`, which register()'s
+    // supersede loop deliberately never touches — they just sit there. A
+    // naive count-only check would still see 2+ entries for that groupId and
+    // report "active", wrongly blocking a LATER solo ask's plain-text reply.
+    const registry = new AskPromptRegistry();
+    const prompt = buildMultiAskPrompt(
+      {
+        threadId: "thread-1",
+        questions: [
+          { question: "Q1", options: ["A"] },
+          { question: "Q2", options: ["B"] },
+        ],
+      },
+      registry
+    );
+    const { handler } = makeHandler({ registry });
+    await handler(
+      makeInteraction({ customId: `${ASK_COMPONENT_PREFIX}${prompt.tokens![0]}:0` })
+        .interaction as never
+    );
+    await handler(
+      makeInteraction({ customId: `${ASK_COMPONENT_PREFIX}${prompt.tokens![1]}:0` })
+        .interaction as never
+    );
+
+    expect(hasActiveMultiAsk("thread-1", registry)).toBe(false);
+
+    // A subsequent solo ask on the same thread must not be treated as multi.
+    buildAskPrompt({ threadId: "thread-1", question: "Q3", options: ["C"] }, registry);
+    expect(hasActiveMultiAsk("thread-1", registry)).toBe(false);
   });
 });

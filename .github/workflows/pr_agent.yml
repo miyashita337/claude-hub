@@ -1,0 +1,64 @@
+# Qodo Merge (pr-agent) — CodeRabbit と独立に併設する 2 本目の PR レビュー AI
+#
+# 仕組み: PR が open / reopen / ready_for_review されると、Qodo の pr-agent が
+#         自動で PR をレビューし、レビュー結果と code suggestion を PR 上に投稿する。
+#         PR コメントから `/review` `/improve` `/ask` 等のコマンドも実行できる。
+#
+# ── 必須セットアップ（これが無いとレビューは動かない）──────────────────────
+#   Settings > Secrets and variables > Actions > New repository secret に以下を追加:
+#     Name   = GEMINI_API_KEY
+#     Secret = <Google AI Studio の API キー>
+#   ※ GITHUB_TOKEN は GitHub Actions が自動発行するため追加不要。
+#   ※ 値はこのリポジトリでは扱わない（Secret 経由のみ）。
+#
+# ── なぜ Gemini API なのか ──────────────────────────────────────────────
+#   GitHub App の "Gemini Code Assist" は consumer（無料）版が 2026-07-17 に
+#   シャットダウンされ、無料でのレビューは不可能になった。
+#     出典: https://developers.google.com/gemini-code-assist/docs/deprecations/consumer-code-review
+#   一方、Google AI Studio の Gemini "API" は別製品で、Flash 系モデルの無料枠が
+#   継続している。そこで pr-agent の LLM として Gemini API を使い、
+#   無料のまま 2 本目のレビュアーを成立させる。
+#   無料枠にはレート上限がある: https://ai.google.dev/gemini-api/docs/rate-limits
+#
+# ── モデルの差し替え方 ──────────────────────────────────────────────────
+#   config.model の値は litellm の命名（`gemini/<model-id>`）に従う。
+#   利用可能な model-id は下記で確認できる（キーの値は出力しないこと）:
+#     curl -s "https://generativelanguage.googleapis.com/v1beta/models?key=$GEMINI_API_KEY"
+#   API キーの env 名は pr-agent 公式の `GOOGLE_AI_STUDIO.GEMINI_API_KEY`。
+#     出典: https://docs.pr-agent.ai/usage-guide/changing_a_model/
+#   （env 名がドットを含むのは pr-agent の設定キー記法であり、POSIX の環境変数名
+#     制約とは別。agent-base PR #540 で実レビュー生成まで動作確認済み。）
+#
+# 注: uses の the-pr-agent/pr-agent は旧 qodo-ai/pr-agent の canonical リネーム先。
+name: PR Agent (Qodo)
+
+on:
+  pull_request:
+    types: [opened, reopened, ready_for_review]
+  issue_comment:
+
+permissions:
+  contents: read
+  pull-requests: write
+  issues: write
+
+jobs:
+  pr_agent_job:
+    # Bot 起因のイベントには反応しない（レビュー無限ループ・無駄な起動の防止）
+    if: ${{ github.event.sender.type != 'Bot' }}
+    runs-on: ubuntu-latest
+    name: Qodo pr-agent auto review
+    steps:
+      - name: PR Agent action step
+        id: pragent
+        uses: the-pr-agent/pr-agent@v0.36.0
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          # --- モデル設定（Google AI Studio の Gemini API・無料枠）---
+          config.model: "gemini/gemini-3.7-flash"
+          config.fallback_models: '["gemini/gemini-3.5-flash", "gemini/gemini-2.5-flash"]'
+          GOOGLE_AI_STUDIO.GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
+          # --- 自動実行するツール ---
+          github_action_config.auto_review: "true"     # PR レビューを自動投稿
+          github_action_config.auto_improve: "true"    # code suggestion を自動投稿
+          github_action_config.auto_describe: "false"  # PR 説明は上書きしない（日本語の自記述を保持）

@@ -431,7 +431,13 @@ jobs:
         env:
           SUPERVISOR_DB_PATH: ":memory:"
           TMUX_PATH: /usr/bin/tmux
-        run: bun test tests/e2e/ac-verification.test.ts tests/session/relay.test.ts tests/e2e/dialog-stall.test.ts
+        # tests/e2e/ask-user-selector.test.ts (Issue #436): drives the real
+        # relay-server + a real `hooks/ask-user-relay.sh` child process + real
+        # curl, so the hook->relay->Discord-post chain for the AskUserQuestion
+        # selector (buttons/select, #412/#416/#423) is exercised on every PR
+        # instead of only by a human clicking a button in Discord after each
+        # supervisor restart.
+        run: bun test tests/e2e/ac-verification.test.ts tests/session/relay.test.ts tests/e2e/dialog-stall.test.ts tests/e2e/ask-user-selector.test.ts
         working-directory: supervisor
 
       # Supervisor ↔ tmux session lifecycle E2E (Issue #144 / #273). Runs as its

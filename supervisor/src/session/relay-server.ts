@@ -10,6 +10,14 @@ export interface RelayResult {
   claudeSessionId?: string;
   error?: string;
   /**
+   * Issue #429: true when the failure is "the text never reached the pane"
+   * (`buildSendFailureResult`), as opposed to "no response came back" (a relay
+   * timeout / error turn). Both set {@link error}, but only the first means the
+   * session never saw the message — the dispatch transport must report that as
+   * a failed injection while leaving a slow-but-running job alone.
+   */
+  sendFailed?: boolean;
+  /**
    * Session's current context token count at the moment the Stop hook fired
    * (Issue #204). Forwarded by `hooks/stop-relay.sh`. Absent when the hook
    * could not compute it (no transcript / older hook). Consumers use it to warn
@@ -40,6 +48,13 @@ export interface LateResponseEvent {
 // Discord thread, and resolves the request with `resolveAskUser(threadId, ans)`
 // once the user replies. The hook then injects `answer` back into Claude's
 // `tool_input` via the `updatedInput` PreToolUse contract.
+/** One sub-question of a multi-question ask (Issue #443). */
+export interface AskSubQuestionEvent {
+  question: string;
+  options?: string[];
+  multiSelect?: boolean;
+}
+
 export interface AskUserEvent {
   threadId: string;
   question: string;
@@ -47,6 +62,48 @@ export interface AskUserEvent {
   /** Effective wait budget for this ask, so the thread notice can state the
    *  real deadline instead of a second hardcoded copy of it (Issue #416). */
   timeoutMs: number;
+  /**
+   * Issue #443: present only when the ask carries 2+ questions with their own
+   * option sets. `question`/`options` above stay the flattened, joined form
+   * (unchanged — the deny envelope and the expiry notice still quote that),
+   * this is the structured form bot.ts uses to post one tappable ActionRow
+   * per question instead of falling back to a single free-text prompt.
+   */
+  questions?: AskSubQuestionEvent[];
+}
+
+/**
+ * Validate the `questions` field of an `/ask/:threadId` POST body (Issue
+ * #443). Any shape mismatch — not an array, an entry missing a non-empty
+ * `question`, an `options` entry that is not all strings — returns
+ * `undefined` rather than throwing, so a malformed or older-hook payload
+ * degrades to the flattened `question`/`options` fields instead of 400ing the
+ * whole request.
+ */
+function parseAskSubQuestions(value: unknown): AskSubQuestionEvent[] | undefined {
+  if (!Array.isArray(value) || value.length === 0) return undefined;
+  const parsed: AskSubQuestionEvent[] = [];
+  for (const entry of value) {
+    if (typeof entry !== "object" || entry === null) return undefined;
+    const record = entry as Record<string, unknown>;
+    const question =
+      typeof record.question === "string" ? record.question.trim() : "";
+    if (!question) return undefined;
+    const options =
+      record.options === undefined
+        ? undefined
+        : Array.isArray(record.options) &&
+            record.options.every((o) => typeof o === "string")
+          ? (record.options as string[])
+          : null;
+    if (options === null) return undefined;
+    parsed.push({
+      question,
+      ...(options ? { options } : {}),
+      ...(record.multiSelect === true ? { multiSelect: true } : {}),
+    });
+  }
+  return parsed;
 }
 
 /**
@@ -651,6 +708,13 @@ export function startRelayServer(): void {
             ? (body.options as string[])
             : undefined;
 
+        // Issue #443: structured per-question data for a multi-question ask.
+        // Malformed entries degrade to `undefined` (falls back to the
+        // flattened `question` above) rather than a 400 — a hook running an
+        // older/newer build than the server must not break the whole ask over
+        // a field it does not understand.
+        const questions = parseAskSubQuestions(body.questions);
+
         const requested =
           typeof body.timeout_ms === "number" && body.timeout_ms > 0
             ? body.timeout_ms
@@ -717,7 +781,7 @@ export function startRelayServer(): void {
           // request. Wrap in try/catch so a buggy callback can't leave the
           // request hanging.
           try {
-            callback({ threadId, question, options, timeoutMs });
+            callback({ threadId, question, options, timeoutMs, questions });
           } catch (err) {
             console.error("[relay-server] askUserCallback error:", err);
             const pending = pendingAsks.get(threadId);

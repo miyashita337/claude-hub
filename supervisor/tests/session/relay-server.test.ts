@@ -602,6 +602,72 @@ describe("ask timeout (Issue #416, 5 hours)", () => {
     expect(hasRecentAsk("thread-recent", 0)).toBe(false);
     expect(hasRecentAsk("never-asked")).toBe(false);
   });
+
+  test("/ask forwards a structured questions[] to the subscriber (Issue #443)", async () => {
+    startRelayServer();
+    const port = getRelayPort();
+    const events: unknown[] = [];
+    onAskUser((event) => {
+      events.push(event);
+      resolveAskUser(event.threadId, "ok");
+    });
+
+    const res = await fetch(`http://localhost:${port}/ask/thread-multi`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        question: "Q1\nQ2",
+        questions: [
+          { question: "Q1", options: ["a", "b"], multiSelect: false },
+          { question: "Q2", options: ["c"] },
+        ],
+      }),
+    });
+
+    expect(res.status).toBe(200);
+    // `multiSelect: false` is the implicit default, so it is dropped rather
+    // than round-tripped — matches how the rest of the ask payload treats
+    // falsy optional fields (AskOption's description, etc).
+    expect(events).toEqual([
+      {
+        threadId: "thread-multi",
+        question: "Q1\nQ2",
+        options: undefined,
+        timeoutMs: DEFAULT_ASK_TIMEOUT_MS,
+        questions: [
+          { question: "Q1", options: ["a", "b"] },
+          { question: "Q2", options: ["c"] },
+        ],
+      },
+    ]);
+  });
+
+  test("/ask degrades a malformed questions[] to undefined rather than 400ing the request", async () => {
+    startRelayServer();
+    const port = getRelayPort();
+    const events: unknown[] = [];
+    onAskUser((event) => {
+      events.push(event);
+      resolveAskUser(event.threadId, "ok");
+    });
+
+    // A question entry with no `question` text is malformed — the whole
+    // structured array must be dropped, not just that one entry, so the hook
+    // (or an older server) never gets a half-built per-question mapping.
+    const res = await fetch(`http://localhost:${port}/ask/thread-malformed`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        question: "Q1\nQ2",
+        questions: [{ question: "Q1", options: ["a"] }, { options: ["b"] }],
+      }),
+    });
+
+    expect(res.status).toBe(200);
+    expect((events[0] as { questions?: unknown }).questions).toBeUndefined();
+    // The flattened fields still carried the ask through.
+    expect((events[0] as { question: string }).question).toBe("Q1\nQ2");
+  });
 });
 
 /**

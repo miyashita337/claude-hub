@@ -264,12 +264,21 @@ export const DELIVERY_VERIFY_BACKOFF_MS: readonly number[] = [
 ];
 
 /**
- * How many times the literal may be typed. 2 = one retype after a confirmed
- * non-render. Bounded on purpose: a retype is only safe because the pane was
- * re-read and the text was provably absent, and each extra attempt widens the
- * window where a late render turns into duplicated input.
+ * How many verification rounds run before the send is declared undelivered.
+ *
+ * For retypable text (natural language) a round == a type attempt, so 2 means
+ * "one retype after a confirmed non-render". Bounded on purpose: a retype is
+ * only safe because the pane was re-read and the text was provably absent, and
+ * each extra attempt widens the window where a late render turns into
+ * duplicated input.
+ *
+ * Issue #429: for text that must NOT be retyped (slash commands) the literal is
+ * typed in round 1 only and the later rounds just keep watching. The constant is
+ * therefore a PATIENCE budget first and a type limit second — that way the
+ * no-retype path waits exactly as long before crying failure (~2× the backoff
+ * schedule) as the retype path does, instead of being half as tolerant.
  */
-export const DELIVERY_MAX_TYPE_ATTEMPTS = 2;
+export const DELIVERY_MAX_VERIFY_ROUNDS = 2;
 
 /**
  * `RelayResult.error` marker for a send that tmux accepted but the pane never
@@ -287,7 +296,7 @@ export const SEND_UNVERIFIED_ERROR =
  * incident is diagnosed from exactly that line).
  */
 export type DeliveryVerdict =
-  /** The text appeared after the first type. */
+  /** The text appeared after the (only) first type. */
   | "verified"
   /** The text appeared only after a retype — the first keystrokes were lost. */
   | "verified-retyped"
@@ -296,8 +305,6 @@ export type DeliveryVerdict =
    * retype both rendered, so the pane now holds the message twice.
    */
   | "duplicate"
-  /** Slash command: verification is deliberately skipped ({@link shouldVerifyDelivery}). */
-  | "skipped-slash"
   /** Whitespace-only message: no probe to look for. */
   | "skipped-no-probe"
   /** `capture-pane` was unusable, so delivery could not be judged either way. */
@@ -372,24 +379,46 @@ export function countProbeOccurrences(pane: string, probe: string): number {
 }
 
 /**
- * Whether {@link sendToPane} verifies delivery for this text by default.
+ * Whether a literal that provably did not render may be typed a SECOND time.
  *
- * Slash commands are excluded: typing `/compact …` opens the TUI's command
- * picker, which re-renders the input row into its own widget, so "did my text
- * appear verbatim" is not a reliable signal there. Retyping a slash command on
- * a false negative would *execute it twice* — a worse failure than the silent
- * drop this guards against. Natural-language messages (the #422 loss path, and
- * the overwhelming majority of relays) are always verified.
+ * Slash commands may not: a retype that races a late first render leaves
+ * `/impl 429` in the pane twice, and the Enter that follows would run the
+ * command twice. For natural language a doubled prompt is merely noisy (#428
+ * already reports it as `"duplicate"`), so the retype recovery stays on.
  *
- * UNVERIFIED (PR #428 review, q-1): the picker-rendering claim above is a
- * hypothesis, not a measurement — the TUI was never driven to confirm whether
- * the typed slash text stays matchable in `capture-pane`. It is the conservative
- * assumption (skipping verification preserves the pre-#422 behaviour exactly and
- * cannot double-execute a command). If it turns out the text IS matchable, the
- * better shape is "verify but never retype": that removes the silent drop on
- * this path with zero double-execution risk. Measure before changing it.
+ * MEASURED 2026-08-13 (#429) — this replaces the hypothesis PR #428 flagged as
+ * unverified in its q-1 note. Driving a real Claude Code TUI (v2.1.229) over an
+ * isolated `tmux -L wt429test` socket:
+ *
+ *     send-keys -t probe -l '/impl 429'   → exit=0
+ *     capture-pane -p -t probe            → row 15 reads `❯ /impl 429`
+ *     countProbeOccurrences(pane, probe)  → 0 before, 1 after
+ *
+ * and with the command picker OPEN (a bare `/pd`) the menu overlays the rows
+ * *below* the prompt while the input row itself stays on screen and matchable.
+ * So the premise for skipping verification — "the picker re-renders the input
+ * row, so the text is not matchable" — is false: slash text IS observable.
+ *
+ * Re-measured for the TUI BUILT-IN `/compact` (PR #434 review, should-3), since
+ * a built-in need not render like a user-defined command and its callers
+ * (auto self-heal, the Pushover one-tap, `/session compact`) surface a failure
+ * to a human rather than retrying:
+ *
+ *     send-keys -t probe -l '/compact テスト用の意図'
+ *       → row 15 reads `❯ /compact テスト用の意図`, count 0 before / 1 after
+ *     send-keys -t probe -l '/compact'   (bare: the built-in's own picker state)
+ *       → row 15 reads `❯ /compact`, still matchable
+ *
+ * Same result as the user-defined command, so the no-retype path is measured on
+ * both kinds of slash command rather than extrapolated from one.
+ *
+ * Only the *retype* was ever unsafe. Hence the split this function encodes:
+ * verify everything, retype only what is safe to retype. That closes the silent
+ * drop on the dispatch injection path (`/impl` / `/pdca`, Issue #429) at zero
+ * double-execution risk, which is exactly the shape #428's q-1 note asked for
+ * once the measurement existed.
  */
-export function shouldVerifyDelivery(text: string): boolean {
+export function allowsRetype(text: string): boolean {
   return !text.trimStart().startsWith("/");
 }
 
@@ -423,11 +452,6 @@ const capturePaneText: PaneReader = async (sessionName, socketArgs) => {
 };
 
 export interface SendToPaneOptions {
-  /**
-   * Verify that the typed text actually appeared in the pane (Issue #422).
-   * Defaults to {@link shouldVerifyDelivery} for the given text.
-   */
-  verify?: boolean;
   /** Override the poll schedule (tests only; production uses the default). */
   verifyBackoffMs?: readonly number[];
   /**
@@ -471,7 +495,9 @@ export interface SendToPaneOptions {
  *   4. Issue #422: re-read the pane until the text shows up, retyping once if
  *      it provably did not. Throws {@link SEND_UNVERIFIED_ERROR} rather than
  *      returning, so the caller reports a failure instead of waiting out the
- *      relay timeout on a message the TUI never saw.
+ *      relay timeout on a message the TUI never saw. Issue #429: slash commands
+ *      go through the same check but are never retyped ({@link allowsRetype}),
+ *      so the dispatch injection (`/impl <N>`) is no longer exempt from step 4.
  *   5. A brief pause, then `C-m` (Enter) as a separate call — the Ink TUI can
  *      drop an Enter sent in the same call as a long literal (#32). Enter is
  *      sent only once the text is confirmed present, so a failed send can never
@@ -516,16 +542,18 @@ async function typeLiteral(
   socketArgs: readonly string[],
   options?: SendToPaneOptions
 ): Promise<DeliveryVerdict> {
-  const verify = options?.verify ?? shouldVerifyDelivery(literalText);
   const probe = buildDeliveryProbe(literalText);
   // A whitespace-only message has no probe to look for; typing it unverified
   // matches the old behaviour and costs nothing (there is nothing to lose).
-  if (!verify || !probe) {
+  if (!probe) {
     await tmuxSend(tmuxSessionName, ["-l", literalText], socketArgs);
     await options?.onAttemptTyped?.(1);
-    return verify ? "skipped-no-probe" : "skipped-slash";
+    return "skipped-no-probe";
   }
 
+  // Issue #429: retypability, not verifiability, is what varies per text. Slash
+  // commands are watched like everything else and simply never retyped.
+  const retypeAllowed = allowsRetype(literalText);
   const backoff = options?.verifyBackoffMs ?? DELIVERY_VERIFY_BACKOFF_MS;
   const readPane = options?.capturePane ?? capturePaneText;
   const before = await readPane(tmuxSessionName, socketArgs);
@@ -547,10 +575,17 @@ async function typeLiteral(
   // it. The residual risk is a false "delivered" (fail-open = pre-#422
   // behaviour), never a false failure.
   let floor = countProbeOccurrences(before, probe);
+  // How many times the literal actually went to the pane. Drives the verdict
+  // (and the duplicate check), which `round` no longer can: on the no-retype
+  // path a later round means "still watching", not "typed again".
+  let typed = 0;
 
-  for (let attempt = 1; attempt <= DELIVERY_MAX_TYPE_ATTEMPTS; attempt++) {
-    await tmuxSend(tmuxSessionName, ["-l", literalText], socketArgs);
-    await options?.onAttemptTyped?.(attempt);
+  for (let round = 1; round <= DELIVERY_MAX_VERIFY_ROUNDS; round++) {
+    if (round === 1 || retypeAllowed) {
+      await tmuxSend(tmuxSessionName, ["-l", literalText], socketArgs);
+      typed++;
+      await options?.onAttemptTyped?.(typed);
+    }
 
     for (const waitMs of backoff) {
       await new Promise((r) => setTimeout(r, waitMs));
@@ -558,27 +593,45 @@ async function typeLiteral(
       if (after === null) return "unverified-observer"; // broke mid-flight
       const count = countProbeOccurrences(after, probe);
       if (count > floor) {
-        // A rise of 2 on the retype means BOTH types rendered: the first one
+        // A rise of 2 after a retype means BOTH types rendered: the first one
         // was merely late, not lost, so the pane now holds the message twice.
         // Reported rather than silently submitted — the whole point of #422 is
         // that the relay must not hide what it did to the pane.
-        if (attempt > 1 && count - floor >= 2) {
+        //
+        // Gated on `typed > 1` = "this loop typed twice". That is not quite the
+        // same as "the literal was sent twice": `tmuxSend` retries the same
+        // `send-keys -l` once on a timeout / `not in a mode`, and a send that
+        // reached the pane before the execFile timed out lands twice without
+        // this counter noticing (PR #434 review, should-2 — a blind spot that
+        // predates #429; #428's `attempt > 1` had it too). So a rise of 2 with
+        // `typed === 1` is usually the user's own text already on screen, but
+        // it can also be that inner retry. It is deliberately NOT reported as
+        // `duplicate`: on this path the notice would fire on ordinary clean
+        // sends, and the inner retry is bounded and rare. Tracked separately
+        // rather than papered over here.
+        if (typed > 1 && count - floor >= 2) {
           console.warn(
             `[Relay] duplicate input in pane ${tmuxSessionName}: the delayed first ` +
               `type rendered after the retype (count ${floor}→${count})`
           );
           return "duplicate";
         }
-        return attempt > 1 ? "verified-retyped" : "verified";
+        return typed > 1 ? "verified-retyped" : "verified";
       }
       floor = Math.min(floor, count);
     }
     console.warn(
       `[Relay] typed text never rendered in pane ${tmuxSessionName} ` +
-        `(attempt ${attempt}/${DELIVERY_MAX_TYPE_ATTEMPTS}, ${literalText.length} chars)`
+        `(round ${round}/${DELIVERY_MAX_VERIFY_ROUNDS}, typed ${typed}×, ` +
+        `retype ${retypeAllowed ? "allowed" : "withheld (#429)"}, ${literalText.length} chars)`
     );
   }
 
+  // Issue #429: reached on the no-retype path too. The command was typed once
+  // and never showed up, so it is NOT delivered — throwing (rather than
+  // returning a soft verdict) is what stops the Enter below from submitting a
+  // pane we could not read, and what makes the caller report the failure
+  // instead of waiting out the relay timeout in silence.
   throw new Error(SEND_UNVERIFIED_ERROR);
 }
 
@@ -697,6 +750,11 @@ export function buildSendFailureResult(err: unknown): RelayResult {
     text: "",
     chunks: [SEND_FAILURE_USER_MESSAGE],
     error: String(err),
+    // Issue #429: `error` alone cannot tell a caller WHICH half failed — a relay
+    // timeout sets it too, and there the message *was* delivered (the job is
+    // just still running). Dispatch has to separate those: reporting a delivered
+    // `/impl` as failed would be as wrong as the silent drop it is fixing.
+    sendFailed: true,
   };
 }
 

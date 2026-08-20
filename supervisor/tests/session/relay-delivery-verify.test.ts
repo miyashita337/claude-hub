@@ -7,10 +7,10 @@ import {
   sendToPane,
   buildDeliveryProbe,
   countProbeOccurrences,
-  shouldVerifyDelivery,
+  allowsRetype,
   deliveryNoticeFor,
   DELIVERY_PROBE_MAX_CHARS,
-  DELIVERY_MAX_TYPE_ATTEMPTS,
+  DELIVERY_MAX_VERIFY_ROUNDS,
   DELIVERY_VERIFY_BACKOFF_MS,
   CAPTURE_PANE_TIMEOUT_MS,
   SEND_UNVERIFIED_ERROR,
@@ -211,12 +211,16 @@ describe("delivery probe helpers (#422)", () => {
     expect(countProbeOccurrences("abc", "a.c")).toBe(0);
   });
 
-  test("slash commands skip verification, natural language does not", () => {
+  test("slash commands are never retyped, natural language may be (#429)", () => {
     // Retyping a slash command on a false negative would EXECUTE IT TWICE.
-    expect(shouldVerifyDelivery("/compact 続きの作業")).toBe(false);
-    expect(shouldVerifyDelivery("  /session compact")).toBe(false);
-    expect(shouldVerifyDelivery("４１６実装開始")).toBe(true);
-    expect(shouldVerifyDelivery("status? / maybe")).toBe(true);
+    // #429 narrows the old carve-out from "not verified" to "not retyped":
+    // measurement showed the pane DOES render slash text (see allowsRetype).
+    expect(allowsRetype("/compact 続きの作業")).toBe(false);
+    expect(allowsRetype("  /session compact")).toBe(false);
+    expect(allowsRetype("/impl 429")).toBe(false);
+    expect(allowsRetype("４１６実装開始")).toBe(true);
+    // Only a LEADING slash makes it a command; a slash mid-sentence does not.
+    expect(allowsRetype("status? / maybe")).toBe(true);
   });
 
   test("only unclean verdicts produce a user notice", () => {
@@ -224,7 +228,6 @@ describe("delivery probe helpers (#422)", () => {
     // the user to ignore the one that matters.
     expect(deliveryNoticeFor("verified")).toBeNull();
     expect(deliveryNoticeFor("verified-retyped")).toBeNull();
-    expect(deliveryNoticeFor("skipped-slash")).toBeNull();
     expect(deliveryNoticeFor("skipped-no-probe")).toBeNull();
     expect(deliveryNoticeFor("duplicate")).toBe(DUPLICATE_INPUT_USER_MESSAGE);
     expect(deliveryNoticeFor("unverified-observer")).toBe(
@@ -258,7 +261,7 @@ describe("delivery probe helpers (#422)", () => {
     expect(DELIVERY_VERIFY_BACKOFF_MS[0]).toBeLessThanOrEqual(100);
     const total = DELIVERY_VERIFY_BACKOFF_MS.reduce((a, b) => a + b, 0);
     expect(total).toBeGreaterThanOrEqual(1000);
-    expect(DELIVERY_MAX_TYPE_ATTEMPTS).toBeGreaterThanOrEqual(2);
+    expect(DELIVERY_MAX_VERIFY_ROUNDS).toBeGreaterThanOrEqual(2);
   });
 });
 
@@ -383,20 +386,99 @@ describe("sendToPane delivery verification against a real pane (#422)", () => {
   );
 
   itmux(
-    "slash commands are sent unverified (a retype would execute them twice)",
+    "#429 AC-2: a slash command the pane never renders is reported, not silent",
     async () => {
-      const name = makeSessionName("slash");
-      const dir = mkdtempSync(join(tmpdir(), "relay422-slash-"));
-      startDropPane(name, dir); // never renders — a verified send would throw here
+      // Before #429 this exact call resolved with `skipped-slash` and the
+      // dispatch reported success — the silent stall corp kept hitting. The
+      // pane is observed now; only the retype is withheld.
+      const name = makeSessionName("slash-drop");
+      const dir = mkdtempSync(join(tmpdir(), "relay429-slash-"));
+      startDropPane(name, dir); // never renders
       try {
         await waitForOpenMarker(name);
-        const outcome = await sendToPane(name, "/compact 続きの作業", TMUX_ARGS, {
+        const typedAttempts: number[] = [];
+        await expect(
+          sendToPane(name, "/impl 429", TMUX_ARGS, {
+            verifyBackoffMs: FAST_BACKOFF,
+            onAttemptTyped: (n) => void typedAttempts.push(n),
+          })
+        ).rejects.toThrow(SEND_UNVERIFIED_ERROR);
+
+        // THE point of #429: typed exactly once. A second type here would be a
+        // second `/impl 429` execution the moment the pane recovers.
+        expect(typedAttempts).toEqual([1]);
+        expect(capturePane(name)).not.toContain("/impl 429");
+      } finally {
+        killSession(name);
+        rmSync(dir, { recursive: true, force: true });
+      }
+    },
+    30_000
+  );
+
+  itmux(
+    "#429 AC-1: a slash command a healthy pane renders is verified, typed once",
+    async () => {
+      const name = makeSessionName("slash-ok");
+      startEchoPane(name);
+      try {
+        const payload = "/impl 429";
+        const typedAttempts: number[] = [];
+        const outcome = await sendToPane(name, payload, TMUX_ARGS, {
           verifyBackoffMs: FAST_BACKOFF,
+          onAttemptTyped: (n) => void typedAttempts.push(n),
         });
-        expect(outcome.verdict).toBe("skipped-slash");
-        // Skipped is NOT verified: the log and any future consumer must not read
-        // this as "the pane was observed to hold the command".
-        expect(outcome.verified).toBe(false);
+        // Observed, so it may honestly be called verified (unlike the old
+        // `skipped-slash`, which was verified:false by construction).
+        expect(outcome.verdict).toBe("verified");
+        expect(outcome.verified).toBe(true);
+        expect(typedAttempts).toEqual([1]);
+        // AC-1's "no double input": exactly one copy in the pane.
+        expect(countProbeOccurrences(capturePane(name), buildDeliveryProbe(payload))).toBe(1);
+      } finally {
+        killSession(name);
+      }
+    },
+    30_000
+  );
+
+  itmux(
+    "#429: a pane that recovers mid-flight is still typed into exactly once",
+    async () => {
+      // PR #434 review, nit-3: this case cannot pin a verdict. Whether the
+      // recovered pane renders inside the remaining watch budget is a race with
+      // the real tty, so asserting "verified" here would be flaky. The verdict
+      // for the late-render path is pinned deterministically by the scripted
+      // reader below ("text that shows up only in a LATER round").
+      //
+      // What this case CAN pin, against a real tmux, is the invariant that
+      // matters for a slash command: no matter how the race lands, the literal
+      // is put on the wire once. A regression that reinstates the retype fails
+      // here even when the timing goes the other way.
+      const name = makeSessionName("slash-recover");
+      const dir = mkdtempSync(join(tmpdir(), "relay429-recover-"));
+      const flag = join(dir, "reopen");
+      startDropPane(name, dir, flag);
+      try {
+        await waitForOpenMarker(name);
+        const typedAttempts: number[] = [];
+        const outcome = await sendToPane(name, "/session compact", TMUX_ARGS, {
+          verifyBackoffMs: FAST_BACKOFF,
+          onAttemptTyped: (n) => {
+            typedAttempts.push(n);
+            // Reopen echo the instant the (swallowed) first type is done, so
+            // the recovery happens during the WATCH rounds, not before them.
+            if (n === 1) writeFileSync(flag, "");
+          },
+        }).catch((err) => err as Error);
+
+        expect(typedAttempts).toEqual([1]);
+        // Never a retype verdict, because no retype happened — whichever way
+        // the race resolved.
+        if (!(outcome instanceof Error)) {
+          expect(outcome.verdict).not.toBe("verified-retyped");
+          expect(outcome.verdict).not.toBe("duplicate");
+        }
       } finally {
         killSession(name);
         rmSync(dir, { recursive: true, force: true });
@@ -546,6 +628,120 @@ describe("delivery verification edge cases via an injected pane reader (#422)", 
         expect(outcome.verdict).toBe("verified-retyped");
         expect(outcome.verified).toBe(true);
         expect(deliveryNoticeFor(outcome.verdict)).toBeNull();
+      } finally {
+        killSession(name);
+      }
+    },
+    30_000
+  );
+});
+
+/**
+ * Issue #429 — the no-retype path, driven through the scripted reader so the
+ * round structure is pinned deterministically rather than raced against a real
+ * TUI. These are the cases that separate "verify but never retype" from both of
+ * its neighbours: the old skip (silent) and the retype path (double execution).
+ */
+describe("slash delivery: verified, never retyped (#429)", () => {
+  const slash = "/impl 429";
+  const slashProbe = buildDeliveryProbe(slash);
+
+  itmux(
+    "text that shows up only in a LATER round is verified, still typed once",
+    async () => {
+      const name = makeSessionName("slash-round2");
+      startEchoPane(name);
+      try {
+        const typedAttempts: number[] = [];
+        const outcome = await sendToPane(name, slash, TMUX_ARGS, {
+          verifyBackoffMs: FAST_BACKOFF,
+          onAttemptTyped: (n) => void typedAttempts.push(n),
+          capturePane: scriptedReader([
+            "", //                        baseline (0)
+            "", "", "", "", //            round 1 polls: nothing yet (0)
+            slashProbe, //                round 2: the late render lands (1)
+          ]),
+        });
+        // Round 2 ran (that is the patience this path keeps) but did NOT type.
+        expect(typedAttempts).toEqual([1]);
+        // Typed once → "verified", never "verified-retyped": the verdict has to
+        // describe what we actually did to the pane.
+        expect(outcome.verdict).toBe("verified");
+        expect(outcome.verified).toBe(true);
+      } finally {
+        killSession(name);
+      }
+    },
+    30_000
+  );
+
+  itmux(
+    "a rise of 2 without a retype is not blamed on us as 'duplicate'",
+    async () => {
+      const name = makeSessionName("slash-rise2");
+      startEchoPane(name);
+      try {
+        const outcome = await sendToPane(name, slash, TMUX_ARGS, {
+          verifyBackoffMs: FAST_BACKOFF,
+          capturePane: scriptedReader([
+            "", //                                   baseline (0)
+            `${slashProbe} ${slashProbe}`, //        two copies appear (2)
+          ]),
+        });
+        // We typed once, so a second copy is the user's own (or an echo the TUI
+        // renders twice) — calling it `duplicate` would put a "your input was
+        // doubled" warning on a send that behaved perfectly.
+        expect(outcome.verdict).toBe("verified");
+        expect(deliveryNoticeFor(outcome.verdict)).toBeNull();
+      } finally {
+        killSession(name);
+      }
+    },
+    30_000
+  );
+
+  itmux(
+    "provably absent through every round → throws, having typed exactly once",
+    async () => {
+      const name = makeSessionName("slash-never");
+      startEchoPane(name);
+      try {
+        const typedAttempts: number[] = [];
+        await expect(
+          sendToPane(name, slash, TMUX_ARGS, {
+            verifyBackoffMs: FAST_BACKOFF,
+            onAttemptTyped: (n) => void typedAttempts.push(n),
+            capturePane: scriptedReader([""]), // never renders, ever
+          })
+        ).rejects.toThrow(SEND_UNVERIFIED_ERROR);
+        expect(typedAttempts).toEqual([1]);
+      } finally {
+        killSession(name);
+      }
+    },
+    30_000
+  );
+
+  itmux(
+    "natural language keeps its retype — #429 must not disarm #422's recovery",
+    async () => {
+      const name = makeSessionName("nl-retype");
+      startEchoPane(name);
+      try {
+        const payload = "状況報告。";
+        const probe = buildDeliveryProbe(payload);
+        const typedAttempts: number[] = [];
+        const outcome = await sendToPane(name, payload, TMUX_ARGS, {
+          verifyBackoffMs: FAST_BACKOFF,
+          onAttemptTyped: (n) => void typedAttempts.push(n),
+          capturePane: scriptedReader([
+            "", //                        baseline (0)
+            "", "", "", "", //            attempt 1 polls: lost (0)
+            probe, //                     the retype lands (1)
+          ]),
+        });
+        expect(typedAttempts).toEqual([1, 2]);
+        expect(outcome.verdict).toBe("verified-retyped");
       } finally {
         killSession(name);
       }

@@ -31,9 +31,11 @@ import {
   withCompactButton,
 } from "./commands/compact-button";
 import {
-  buildAskPrompt,
   createAskComponentHandler,
+  hasActiveMultiAsk,
   isAskComponentId,
+  postAskUserPrompt,
+  postMultiAskUserPrompt,
 } from "./commands/ask-components";
 import { CHANNEL_MAP, MAX_SESSIONS } from "./config/channels";
 import { RELAY_ERROR_USER_MESSAGE, type AttachmentInfo } from "./session/relay";
@@ -85,6 +87,7 @@ import {
   parseDispatchCommand,
   runDispatch,
   resolveExecutorMode,
+  buildDispatchFailureNotice,
 } from "./session/dispatch";
 import { DispatchQueue } from "./session/dispatch-queue";
 import {
@@ -556,24 +559,36 @@ export async function startBot(token: string): Promise<void> {
           // the wait budget has exactly one owner — the old hardcoded "約 5 分"
           // outlived two changes to the actual value.
           //
-          // multiSelect is read defensively: AskUserEvent does not carry the
-          // flag (the hook flattens options to `label — description` strings and
-          // drops it). Reading it now means the select path switches on by
-          // itself once the payload grows the field.
+          // multiSelect is read defensively: single-question AskUserEvents do
+          // not carry the flag (the hook flattens options to `label —
+          // description` strings and drops it). Reading it now means the
+          // select path switches on by itself once the payload grows the
+          // field.
           const multiSelect =
             (event as { multiSelect?: unknown }).multiSelect === true;
-          const prompt = buildAskPrompt({
+          // Issue #443: 2+ questions arrive as `event.questions` (each with
+          // its own options) — post one ActionRow per question instead of the
+          // single flattened prompt below. The hook only populates this field
+          // for a genuinely multi-question ask, so a solo ask still takes the
+          // unchanged path.
+          if (event.questions && event.questions.length > 1) {
+            await postMultiAskUserPrompt(channel, {
+              threadId: event.threadId,
+              questions: event.questions,
+              timeoutMs: event.timeoutMs,
+            });
+            return;
+          }
+          // Issue #436 V-2: build + send is `postAskUserPrompt` (not inlined
+          // here) so an E2E test can drive this exact call with a fake channel
+          // and assert on what actually reaches `send()`, not just on
+          // `buildAskPrompt`'s return value.
+          await postAskUserPrompt(channel, {
             threadId: event.threadId,
             question: event.question,
             options: event.options,
             multiSelect,
             timeoutMs: event.timeoutMs,
-          });
-          await channel.send({
-            content: prompt.content,
-            ...(prompt.components.length
-              ? { components: prompt.components }
-              : {}),
           });
         } catch (err) {
           console.error(
@@ -1017,6 +1032,30 @@ export async function startBot(token: string): Promise<void> {
         console.error(
           `[Bot] Dispatch failed (stage=${result.stage}) in channel ${channelName}: ${result.error}`
         );
+        // Issue #429: the log alone left corp (and the user) with no signal at
+        // all — the ledger stays `dispatched` and the thread shows nothing, so a
+        // dispatch that never reached the pane is indistinguishable from one
+        // that is merely still working. Posting into the thread is what makes it
+        // recoverable: corp's failed-re-injection path (corp#107 / #108) only
+        // needs the failure to be visible.
+        try {
+          await postToThread(
+            dispatchThread.id,
+            buildDispatchFailureNotice(
+              result.stage,
+              config.displayName,
+              branch,
+              issueNumber,
+              command,
+              { sessionStopped: result.sessionStopped }
+            )
+          );
+        } catch (err) {
+          console.error(
+            `[Bot] Dispatch failure notice could not be posted to thread ${dispatchThread.id}:`,
+            err
+          );
+        }
       }
       return result.ok;
     };
@@ -1664,6 +1703,21 @@ export async function startBot(token: string): Promise<void> {
     // hook waiting on POST /ask — relaying the reply into tmux would type it
     // into a TUI that is not accepting input, so resolve the ask and stop.
     if (hasPendingAsk(threadId)) {
+      // Issue #443 AC-3: a multi-question ask is answered by tapping each
+      // question's own row, not by one free-text reply — resolveAskUser below
+      // would otherwise hand Claude a stray, unrelated message as "the answer
+      // to every question in the batch" (the #443 incident). The remaining
+      // questions stay live for tapping; nothing here resolves the ask.
+      if (hasActiveMultiAsk(threadId)) {
+        try {
+          await message.reply(
+            "この質問は複数あります。上のボタン/メニューからそれぞれタップして回答してください（テキストでの一括回答はできません）。"
+          );
+        } catch {
+          // Best-effort notice only; the ask itself stays pending either way.
+        }
+        return;
+      }
       resolveAskUser(threadId, messageText);
       // The session was parked for up to 5h with no activity recorded (#416), so
       // its idle age is stale by the whole wait. Answering IS activity — record
