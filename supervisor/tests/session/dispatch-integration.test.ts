@@ -9,6 +9,7 @@ import {
 import {
   parseDispatchCommand,
   runDispatch,
+  buildDispatchFailureNotice,
 } from "../../src/session/dispatch";
 import type { DispatchSessionManager } from "../../src/session/dispatch";
 
@@ -30,9 +31,12 @@ const SOURCE = "555555555555555555"; // an allowed dispatch source (corp webhook
 const OUTSIDER = "999999999999999999";
 
 interface SimResult {
-  outcome: "started" | "denied" | "rejected" | "ignored";
+  outcome: "started" | "inject_failed" | "denied" | "rejected" | "ignored";
   startCalls: Array<{ threadId: string; branch?: string }>;
   sendCalls: Array<{ threadId: string; message: string }>;
+  stopCalls: string[];
+  /** What bot.ts would have posted into the dispatch thread (#429). */
+  posts: string[];
   threadsCreated: number;
 }
 
@@ -46,9 +50,17 @@ async function simulateDispatch(opts: {
   channelId: string;
   sourceId: string;
   content: string;
+  /**
+   * What the relay reports for the injection (#429). Default is a healthy send;
+   * `{ sendFailed: true }` is the shape `buildSendFailureResult` produces when
+   * the pane never rendered the command.
+   */
+  sendResult?: { error?: string; sendFailed?: boolean };
 }): Promise<SimResult> {
   const startCalls: Array<{ threadId: string; branch?: string }> = [];
   const sendCalls: Array<{ threadId: string; message: string }> = [];
+  const stopCalls: string[] = [];
+  const posts: string[] = [];
   let threadsCreated = 0;
 
   const manager: DispatchSessionManager = {
@@ -57,13 +69,16 @@ async function simulateDispatch(opts: {
       return { id: "s" };
     },
     waitForInputReady: async () => true,
+    stop: async (threadId) => {
+      stopCalls.push(threadId);
+    },
     sendMessage: async (threadId, message) => {
       sendCalls.push({ threadId, message });
-      return {};
+      return opts.sendResult ?? {};
     },
   };
 
-  const base = { startCalls, sendCalls, get threadsCreated() {
+  const base = { startCalls, sendCalls, stopCalls, posts, get threadsCreated() {
     return threadsCreated;
   } };
 
@@ -87,8 +102,9 @@ async function simulateDispatch(opts: {
   }
 
   // Step 3: run.
-  await runDispatch({
-    config: { dir: "/x", channelName: "agent-base", displayName: "Agent Base" },
+  const config = { dir: "/x", channelName: "agent-base", displayName: "Agent Base" };
+  const result = await runDispatch({
+    config,
     branch: parsed.branch,
     issueNumber: parsed.issueNumber,
     command: parsed.command,
@@ -98,7 +114,27 @@ async function simulateDispatch(opts: {
       return { id: "thread-1" };
     },
   });
-  return { outcome: "started", ...base, threadsCreated };
+
+  // Step 4 (#429): what bot.ts does with the result. Before #429 the failure
+  // arm was a bare console.error, so a dispatch that never reached the pane
+  // looked — to the thread, and therefore to corp — exactly like a successful
+  // one. Mirrored here because it is the half of the contract that decides
+  // whether the failure is recoverable at all.
+  if (result.ok) {
+    posts.push(`🛰️ **${config.displayName}** をディスパッチで起動しました`);
+    return { outcome: "started", ...base, threadsCreated };
+  }
+  posts.push(
+    buildDispatchFailureNotice(
+      result.stage,
+      config.displayName,
+      parsed.branch,
+      parsed.issueNumber,
+      parsed.command,
+      { sessionStopped: result.sessionStopped },
+    ),
+  );
+  return { outcome: "inject_failed", ...base, threadsCreated };
 }
 
 describe("dispatch integration (auth -> parse -> run)", () => {
@@ -149,6 +185,51 @@ describe("dispatch integration (auth -> parse -> run)", () => {
     expect(r.outcome).toBe("started");
     expect(r.startCalls).toEqual([{ threadId: "thread-1", branch: "corp-dispatch-341" }]);
     expect(r.sendCalls).toEqual([{ threadId: "thread-1", message: "/pdca 341" }]);
+  });
+
+  test("injection that never reached the pane → failure notice in the thread (#429)", async () => {
+    // PR #434 review, question-1: the bot.ts half of #429 IS verifiable here.
+    // Reaching real Discord is not, but "a failed injection produces a failure
+    // notice instead of the success banner" is the part that decides whether
+    // corp can recover, and it is pure decision logic.
+    writePolicy([SOURCE]);
+    const r = await simulateDispatch({
+      accessPath,
+      channelId: CHANNEL_ID,
+      sourceId: SOURCE,
+      content: "/dispatch corp-dispatch-429 429",
+      sendResult: { error: "unverified send", sendFailed: true },
+    });
+
+    expect(r.outcome).toBe("inject_failed");
+    // The session was started and then torn down (should-4), so the queue slot
+    // the caller frees is genuinely free.
+    expect(r.startCalls).toEqual([{ threadId: "thread-1", branch: "corp-dispatch-429" }]);
+    expect(r.stopCalls).toEqual(["thread-1"]);
+
+    expect(r.posts).toHaveLength(1);
+    const notice = r.posts[0]!;
+    // NOT the success banner — the regression this pins.
+    expect(notice).not.toContain("ディスパッチで起動しました");
+    expect(notice).toContain("失敗");
+    expect(notice).toContain("/impl 429");
+    // The two facts a reader needs in order to act.
+    expect(notice).toMatch(/再入力/);
+    expect(notice).toMatch(/再ディスパッチ/);
+  });
+
+  test("a healthy dispatch still posts the success banner, and stops nothing", async () => {
+    // The counter-case: the failure arm must not fire on a good send.
+    writePolicy([SOURCE]);
+    const r = await simulateDispatch({
+      accessPath,
+      channelId: CHANNEL_ID,
+      sourceId: SOURCE,
+      content: "/dispatch corp-dispatch-42 42",
+    });
+    expect(r.outcome).toBe("started");
+    expect(r.stopCalls).toEqual([]);
+    expect(r.posts[0]).toContain("ディスパッチで起動しました");
   });
 
   test("non-allowed source → denied, no session (fail-closed)", async () => {

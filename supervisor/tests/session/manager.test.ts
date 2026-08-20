@@ -876,3 +876,40 @@ describe("watchTmuxSession async re-entry guard (#227 / #251 AC-4)", () => {
     }
   });
 });
+
+/**
+ * Issue #429 (PR #434 review, should-1). `sendMessage` has two ways to fail
+ * without the text ever reaching the pane: the relay's verification (covered in
+ * relay-delivery-verify.test.ts) and this early return, which fires when the
+ * tmux session died between `start()` and the send — reachable on the dispatch
+ * path, which does start → waitForInputReady → sendMessage.
+ *
+ * Both must carry `sendFailed`, because that flag is the ONLY thing separating
+ * "the session never saw the message" from "the answer has not come back yet"
+ * (a relay timeout also sets `error`). Without it, a dispatch whose session died
+ * on boot reported success: welcome banner in the thread, ledger left at
+ * `dispatched`, nothing running — the same silent stall #429 exists to end.
+ */
+describe("SessionManager.sendMessage — a dead pane is a send failure (#429)", () => {
+  test("the dead-session early return sets sendFailed", async () => {
+    const effects = createFakeEffects();
+    const manager = new SessionManager({ effects, gracefulKillTimeoutMs: 0 });
+    try {
+      const threadId = "thread-dead-pane";
+      await manager.start(makeChannelConfig({ channelName: "channel-dead" }), threadId);
+      // The pane dies after the session is registered — exactly the window the
+      // dispatch transport walks through.
+      await effects.tmux.killSession(SessionManager.tmuxSessionNameFor(threadId));
+
+      const result = await manager.sendMessage(threadId, "/impl 429");
+
+      expect(result.sendFailed).toBe(true);
+      expect(result.error).toBe("tmux session dead");
+      // Still user-facing: the flag is for the dispatch transport, not a
+      // replacement for telling whoever is reading the thread.
+      expect(result.chunks.join("")).toContain("セッションが終了しています");
+    } finally {
+      await manager.shutdownAll();
+    }
+  });
+});

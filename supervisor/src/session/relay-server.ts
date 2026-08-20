@@ -10,6 +10,14 @@ export interface RelayResult {
   claudeSessionId?: string;
   error?: string;
   /**
+   * Issue #429: true when the failure is "the text never reached the pane"
+   * (`buildSendFailureResult`), as opposed to "no response came back" (a relay
+   * timeout / error turn). Both set {@link error}, but only the first means the
+   * session never saw the message — the dispatch transport must report that as
+   * a failed injection while leaving a slow-but-running job alone.
+   */
+  sendFailed?: boolean;
+  /**
    * Session's current context token count at the moment the Stop hook fired
    * (Issue #204). Forwarded by `hooks/stop-relay.sh`. Absent when the hook
    * could not compute it (no transcript / older hook). Consumers use it to warn

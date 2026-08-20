@@ -86,6 +86,7 @@ import {
   parseDispatchCommand,
   runDispatch,
   resolveExecutorMode,
+  buildDispatchFailureNotice,
 } from "./session/dispatch";
 import { DispatchQueue } from "./session/dispatch-queue";
 import {
@@ -1024,6 +1025,30 @@ export async function startBot(token: string): Promise<void> {
         console.error(
           `[Bot] Dispatch failed (stage=${result.stage}) in channel ${channelName}: ${result.error}`
         );
+        // Issue #429: the log alone left corp (and the user) with no signal at
+        // all — the ledger stays `dispatched` and the thread shows nothing, so a
+        // dispatch that never reached the pane is indistinguishable from one
+        // that is merely still working. Posting into the thread is what makes it
+        // recoverable: corp's failed-re-injection path (corp#107 / #108) only
+        // needs the failure to be visible.
+        try {
+          await postToThread(
+            dispatchThread.id,
+            buildDispatchFailureNotice(
+              result.stage,
+              config.displayName,
+              branch,
+              issueNumber,
+              command,
+              { sessionStopped: result.sessionStopped }
+            )
+          );
+        } catch (err) {
+          console.error(
+            `[Bot] Dispatch failure notice could not be posted to thread ${dispatchThread.id}:`,
+            err
+          );
+        }
       }
       return result.ok;
     };

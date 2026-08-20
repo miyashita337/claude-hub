@@ -29,6 +29,8 @@ function harness(
   const manager: DispatchSessionManager = {
     start: async () => ({}),
     waitForInputReady: async () => true,
+    // #429: never reached here — these cases do not fail the injection.
+    stop: async () => {},
     sendMessage: async () => ({}),
     runHeadless: async (_c, threadId, initialCommand, branch, issueNumber) => {
       runHeadlessCalls.push({ threadId, initialCommand, branch, issueNumber });
@@ -173,6 +175,8 @@ describe("runDispatch headless", () => {
     const tmuxOnly: DispatchSessionManager = {
       start: async () => ({}),
       waitForInputReady: async () => true,
+      // #429: never reached here — these cases do not fail the injection.
+      stop: async () => {},
       sendMessage: async () => ({}),
     };
     const r = await runDispatch({
@@ -197,6 +201,8 @@ describe("runDispatch headless", () => {
     const manager: DispatchSessionManager = {
       start: async () => ({}),
       waitForInputReady: async () => true,
+      // #429: never reached here — these cases do not fail the injection.
+      stop: async () => {},
       sendMessage: async () => ({}),
       runHeadless: async () => {
         throw new Error("spawn claude ENOENT");
@@ -274,6 +280,8 @@ describe("runDispatch headless", () => {
     const manager: DispatchSessionManager = {
       start: async () => ({}),
       waitForInputReady: async () => true,
+      // #429: never reached here — these cases do not fail the injection.
+      stop: async () => {},
       sendMessage: async (_t, m) => {
         sent.push(m);
         return {};

@@ -113,10 +113,12 @@ export interface ExecuteDeps {
   /**
    * Send the keystrokes to the pane (production: relay.ts `sendToPane`).
    *
-   * The result is intentionally `unknown`: `sendToPane` now returns a delivery
-   * verdict (#422), but this path only sends slash commands, which skip
-   * verification, so there is nothing here to act on. Widening the type keeps
-   * the seam honest instead of pretending the callee returns nothing.
+   * The result is intentionally `unknown`: `sendToPane` returns a delivery
+   * verdict (#422) that this path has no branch for. Since #429 the slash
+   * command IS verified (it is simply never retyped), so a pane that never
+   * rendered it now REJECTS — and that is the signal this path acts on, in the
+   * catch below. The resolved verdict remains uninteresting here; widening the
+   * type keeps the seam honest instead of pretending the callee returns nothing.
    */
   send: (tmuxSession: string, text: string) => Promise<unknown>;
 }

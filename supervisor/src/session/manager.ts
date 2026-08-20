@@ -1787,6 +1787,14 @@ export class SessionManager {
         text: "",
         chunks: ["⚠️ Claude Code セッションが終了しています。`/session start` で再起動してください。"],
         error: "tmux session dead",
+        // Issue #429 (PR #434 review, should-1): the pane never received the
+        // text, which is exactly what `sendFailed` means — the dispatch
+        // transport reads this flag to tell a failed injection apart from a
+        // slow one. Without it a dispatch whose session died between start and
+        // inject was reported as a success: thread banner posted, ledger left
+        // at `dispatched`, nothing running. Same silent-stall class as the
+        // unverified send this PR exists to close, just a different door.
+        sendFailed: true,
       };
     }
 

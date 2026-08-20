@@ -156,6 +156,8 @@ function fakeManager(opts?: { startError?: Error }): HubWorkSessionManager & {
       return {};
     },
     waitForInputReady: async () => true,
+    // #429: never reached here — these cases do not fail the injection.
+    stop: async () => {},
     sendMessage: async (threadId, message) => {
       calls.sendMessage.push({ threadId, message });
       return {};
