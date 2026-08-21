@@ -56,6 +56,7 @@ import {
   onAskUser,
   onAskExpired,
   hasPendingAsk,
+  hasRecentAsk,
   resolveAskUser,
   askExpiredNotice,
 } from "./session/relay-server";
@@ -89,6 +90,12 @@ import {
   buildDispatchFailureNotice,
 } from "./session/dispatch";
 import { DispatchQueue } from "./session/dispatch-queue";
+import {
+  BRIEF_DISABLED_ENV,
+  evaluateBriefTrigger,
+  isBriefCommand,
+  type RecentBrief,
+} from "./session/corp-brief";
 import {
   ORCHESTRATE_PREFIX,
   parseOrchestrateCommand,
@@ -1286,6 +1293,257 @@ export async function startBot(token: string): Promise<void> {
     }
   }
 
+  // Issue #426: the last brief injected per channel, for the (channel, date)
+  // idempotency guard. In-memory on purpose: it only has to outlive corp's
+  // delivery retries (minutes), and a Supervisor restart re-arming the trigger
+  // is the safer failure direction than persisting a stale "already delivered".
+  const recentBriefByChannel = new Map<string, RecentBrief>();
+
+  // Issue #426: handle a `/brief <YYYY-MM-DD>` message from an allowed external
+  // source (corp's dispatch bot) — wake the channel's ALREADY RUNNING session so
+  // it puts the morning brief's proposals to the chairman (corp#112 AC-1).
+  // Returns true when the message was a brief attempt and was fully handled
+  // (caller must stop), false when it is not a brief and normal processing
+  // should continue.
+  //
+  // This is the second exception to the blanket `message.author.bot` drop, and
+  // it is deliberately the SAME shape and the SAME authorization as
+  // handleDispatchMessage (`isDispatchSourceAllowed`, fail-closed) — a new
+  // authorization model would be a new way to get it wrong. Two things make it
+  // strictly weaker than dispatch, by design:
+  //   - it starts no session (it only injects into one that is already running);
+  //   - it accepts no caller text. The single external input is a `YYYY-MM-DD`
+  //     token; the injected sentence is a fixed template built in corp-brief.ts.
+  //     That is what stops this path from becoming a way to hand the HQ session
+  //     arbitrary instructions and bypass the approval gate.
+  async function handleBriefMessage(message: Message): Promise<boolean> {
+    // Same entry shape as dispatch: a non-thread message in a known channel
+    // whose text starts with the trigger token.
+    if (message.channel.isThread()) return false;
+    const content = message.content ?? "";
+    if (!isBriefCommand(content)) return false;
+
+    const channelName =
+      "name" in message.channel ? (message.channel.name as string) : "";
+    const config = CHANNEL_MAP.get(channelName);
+    if (!config) {
+      // Unknown channel: not a valid brief target. Treat as "not handled" so a
+      // non-bot author still flows through normal processing; a bot author is
+      // dropped by the caller's bot guard.
+      return false;
+    }
+
+    // All of the decision logic (kill-switch → authorization → parse →
+    // idempotency → target resolution → ask guard, in that order) lives in the
+    // pure evaluator so it is testable without a gateway or a real
+    // SessionManager. Only the side effects are here.
+    const decision = evaluateBriefTrigger({
+      content,
+      channelId: message.channel.id,
+      sourceId: message.author.id,
+      policy: loadAccessPolicy(),
+      sessions: sessionManager.listRunningByChannel(channelName),
+      // `hasRecentAsk`, not `hasPendingAsk`: the TUI dialog the ask hook falls
+      // back to appears AFTER the ask settles, so `hasPendingAsk` alone is false
+      // at exactly the moment a dangerous dialog is on screen
+      // (relay-server.ts). This path types into the pane — and `sendToPane`
+      // leads with Escape — so it takes the wider of the two windows.
+      askPending: hasRecentAsk,
+      recentBrief: recentBriefByChannel.get(channelName),
+    });
+
+    const textChannel = message.channel as TextChannel;
+    const postToChannel = async (text: string): Promise<void> => {
+      try {
+        await textChannel.send(text);
+      } catch (err) {
+        console.error(
+          `[Bot] Brief notice failed in channel ${channelName}:`,
+          err
+        );
+      }
+    };
+
+    switch (decision.action) {
+      case "ignore":
+        return false;
+
+      case "disabled":
+        console.warn(
+          `[Bot] Brief disabled by kill-switch (${BRIEF_DISABLED_ENV}) in channel ${channelName}; not injected`
+        );
+        // The kill-switch is a deliberate operator action, but corp cannot see
+        // this Supervisor's env — from its side the post would just vanish.
+        // Same "never fail silently" bar as no_session / ambiguous, minus the
+        // page (nothing is broken).
+        await postToChannel(
+          `🛑 朝レポの決裁依頼は kill-switch（\`${BRIEF_DISABLED_ENV}\`）で停止中のため実行しませんでした。`
+        );
+        return true;
+
+      case "denied":
+        // Identifier-free denial log; never log the source/channel snowflake or
+        // the message body. Consume the message either way: by here it is a
+        // `/brief` in a known channel, which the normal relay path never acts on.
+        console.warn(
+          `[Bot] Brief denied (reason=${decision.reason}) in channel ${channelName}; not injected`
+        );
+        return true;
+
+      case "rejected":
+        // The source is authorized but the command is malformed. `reason` is a
+        // fixed literal from the parser (never echoed user text).
+        console.warn(
+          `[Bot] Brief rejected in channel ${channelName}: ${decision.reason}`
+        );
+        await postToChannel(`⚠️ ${decision.reason}`);
+        return true;
+
+      case "duplicate":
+        // Idempotency: corp retrying its delivery (or a manual re-post) must not
+        // interrupt the running conversation twice for the same day. Not a
+        // failure — the brief WAS delivered — so it is logged and posted but
+        // never paged.
+        console.log(
+          `[Bot] Brief already delivered in channel ${channelName} (date=${decision.date}, ${Math.round(decision.elapsedMs / 1000)}s ago); not injected again`
+        );
+        await postToChannel(
+          `ℹ️ 朝レポ（${decision.date}）の決裁依頼は既に実行済みのため、二重の割り込みを避けて見送りました。`
+        );
+        return true;
+
+      case "deferred":
+        // The one capability /dispatch and /orchestrate do not have: this types
+        // into a session that was ALREADY running, whose state we do not own.
+        // While an AskUserQuestion is outstanding the chairman may be mid-decision,
+        // and `sendToPane` leads with Escape — injecting here could discard a
+        // pending decision (or worse, answer it) with the chairman not present.
+        // The human relay path refuses the same way (#370), so this does too.
+        console.warn(
+          `[Bot] Brief deferred in channel ${channelName} (date=${decision.date}, thread=${decision.threadId}): an AskUserQuestion is outstanding; not injected`
+        );
+        await postToChannel(
+          `⏸️ 朝レポ（${decision.date}）の決裁依頼を見送りました。**${config.displayName}** が会長の回答待ち（AskUserQuestion）のため、` +
+            `割り込むと保留中の決裁を壊すおそれがあります。\n` +
+            `先に保留中の質問へ回答してください。回答後、朝レポの決裁が必要なら会長がスレッドで指示してください` +
+            `（corp は自動で再送しません）。`
+        );
+        notifyPushover(
+          "朝レポの決裁依頼を見送り",
+          `#${channelName} が回答待ちのため ${decision.date} の朝レポ決裁を投入しませんでした。保留中の質問に回答してください。`
+        ).catch((err) =>
+          console.warn("[Bot] brief deferred pushover failed:", err)
+        );
+        return true;
+
+      case "no_session":
+        // AC-3: must not fail silently. The brief arrived but there was nobody
+        // to hand it to — say so on the channel and page, so a stopped CEO
+        // session is noticed the same morning instead of days later.
+        console.warn(
+          `[Bot] Brief undeliverable in channel ${channelName} (date=${decision.date}): no running session`
+        );
+        // Addressed to the chairman, not to corp: corp posted this trigger and
+        // will not post it again on its own, so "resend it" would be an
+        // instruction with nobody to carry it out. Say what a human can do.
+        await postToChannel(
+          `⚠️ 朝レポ（${decision.date}）の着信を受けましたが、**${config.displayName}** の稼働中セッションがありません（決裁は未実行）。\n` +
+            `\`/session start <branch>\` で起動したうえで、スレッドで朝レポの決裁を指示してください。` +
+            `corp は自動で再送しません。`
+        );
+        notifyPushover(
+          "朝レポの決裁依頼が未達",
+          `#${channelName} に稼働中セッションが無いため ${decision.date} の朝レポ決裁を依頼できませんでした。`
+        ).catch((err) =>
+          console.warn("[Bot] brief no-session pushover failed:", err)
+        );
+        return true;
+
+      case "ambiguous":
+        // Two or more candidate sessions remain after the orchestrator filter:
+        // which one is "the CEO" is not decidable from here, and guessing would
+        // inject HQ instructions into the wrong session. Refuse and report
+        // (AC-3 applies equally — this must not fail silently either).
+        console.warn(
+          `[Bot] Brief ambiguous in channel ${channelName} (date=${decision.date}, candidates=${decision.count}); not injected`
+        );
+        await postToChannel(
+          `⚠️ 朝レポ（${decision.date}）の着信を受けましたが、**${config.displayName}** で投入先候補が ${decision.count} 件あるため特定できません（決裁は未実行）。\n` +
+            `不要なセッションを停止したうえで、スレッドで朝レポの決裁を指示してください。corp は自動で再送しません。`
+        );
+        notifyPushover(
+          "朝レポの決裁依頼が未達",
+          `#${channelName} で投入先候補が ${decision.count} 件あるため ${decision.date} の朝レポ決裁を投入できませんでした。`
+        ).catch((err) =>
+          console.warn("[Bot] brief ambiguous pushover failed:", err)
+        );
+        return true;
+
+      case "inject": {
+        console.log(
+          `[Bot] Brief accepted in channel ${channelName} (date=${decision.date}, thread=${decision.threadId})`
+        );
+        // Recorded at DECISION time, not after the relay resolves: the relay
+        // takes minutes, and a retry arriving in that window is exactly the
+        // double-interruption this guards against. Only the `inject` branch
+        // records, so a brief that ended as deferred / no_session stays
+        // re-triggerable.
+        recentBriefByChannel.set(channelName, {
+          date: decision.date,
+          atMs: Date.now(),
+        });
+        // Non-blocking on purpose: sendMessage waits for the session's Stop hook
+        // (minutes), so awaiting it inside the gateway handler would stall
+        // MessageCreate — the same reason dispatch hands off to its queue rather
+        // than awaiting runDispatch. enqueueForThread also keeps this ordered
+        // against a concurrent user message in that thread (one relay at a time).
+        enqueueForThread(decision.threadId, async () => {
+          // Discord I/O is best-effort here and never aborts the injection: a
+          // failed post must not cost us the wake-up itself (the whole point of
+          // the trigger). Failures are logged, never swallowed.
+          const channel = await client.channels
+            .fetch(decision.threadId)
+            .catch((err: unknown) => {
+              console.error(
+                `[Bot] Brief thread fetch failed for ${decision.threadId}:`,
+                err
+              );
+              return null;
+            });
+          const send = async (text: string): Promise<void> => {
+            if (!channel?.isThread()) return;
+            try {
+              await channel.send(text);
+            } catch (err) {
+              console.error(
+                `[Bot] Brief post failed in thread ${decision.threadId}:`,
+                err
+              );
+            }
+          };
+          // Marker first: the wake-up is observable in the thread even if the
+          // session answers slowly (or the relay later errors).
+          await send(
+            `📣 朝レポ（${decision.date}）の着信を受け、CEO セッションへ決裁の確認を依頼します。`
+          );
+          const result = await sessionManager.sendMessage(
+            decision.threadId,
+            decision.text
+          );
+          if (result.error) {
+            console.error(
+              `[Bot] Brief relay error in thread ${decision.threadId}: ${result.error}`
+            );
+          }
+          for (const chunk of result.chunks) {
+            if (chunk.trim()) await send(chunk);
+          }
+        });
+        return true;
+      }
+    }
+  }
+
   // Message relay: thread messages → Claude Code → thread reply
   const handleMessageCreate = async (message: Message): Promise<void> => {
     // Issue #32 / S7 (dispatch transport): intercept `/dispatch` from an allowed
@@ -1307,6 +1565,18 @@ export async function startBot(token: string): Promise<void> {
       if (await handleOrchestrateMessage(message)) return;
     } catch (err) {
       console.error("[Bot] Orchestrate handler error:", err);
+      return;
+    }
+
+    // Issue #426: intercept `/brief` from an allowed external source BEFORE the
+    // blanket bot/webhook drop below (same shape as the dispatch intercept).
+    // Without this, corp's morning brief can never reach the CEO session and
+    // corp#112's AC-1 (tap-to-decide) has no trigger. Fail-closed inside
+    // handleBriefMessage via isDispatchSourceAllowed (access.json `dispatchFrom`).
+    try {
+      if (await handleBriefMessage(message)) return;
+    } catch (err) {
+      console.error("[Bot] Brief handler error:", err);
       return;
     }
 

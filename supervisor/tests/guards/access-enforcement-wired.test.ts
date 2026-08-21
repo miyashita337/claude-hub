@@ -116,6 +116,74 @@ describe("dispatch transport is wired fail-closed (#32 / S7)", () => {
 });
 
 /**
+ * Issue #426: the brief trigger is the SECOND exception to the blanket
+ * bot/webhook drop, and it injects instructions into the already-running HQ
+ * session. Behavioral coverage (fail-closed authorization, closed date token,
+ * target resolution) lives in tests/session/corp-brief.test.ts; this guard fixes
+ * the wiring so a refactor cannot move the interception after the drop (making
+ * it dead) or move the authorization after the injection (making it bypassable).
+ */
+describe("brief trigger is wired fail-closed (#426)", () => {
+  test("bot.ts intercepts brief BEFORE the bot/webhook drop", async () => {
+    const src = await read("src/bot.ts");
+    const briefIdx = src.indexOf("handleBriefMessage(message)");
+    const botDropIdx = src.indexOf("if (message.author.bot) return;");
+    expect(briefIdx).toBeGreaterThan(-1);
+    expect(botDropIdx).toBeGreaterThan(-1);
+    expect(briefIdx).toBeLessThan(botDropIdx);
+  });
+
+  test("the brief evaluator authorizes with the dispatch gate, before parsing", async () => {
+    const src = await read("src/session/corp-brief.ts");
+    // Reuses the existing dispatch-source gate rather than inventing a second
+    // authorization model.
+    expect(src).toContain("isDispatchSourceAllowed");
+    // `isDispatchSourceAllowed(` (with the paren) matches only the call site —
+    // the import lists the bare identifier — so this compares real positions.
+    const authIdx = src.indexOf("isDispatchSourceAllowed(");
+    const parseIdx = src.indexOf("parseBriefCommand(input.content)");
+    expect(authIdx).toBeGreaterThan(-1);
+    expect(parseIdx).toBeGreaterThan(-1);
+    // An unauthorized source's message must not be interpreted at all.
+    expect(authIdx).toBeLessThan(parseIdx);
+    expect(src).toContain("decision.allowed");
+  });
+
+  test("bot.ts only injects on the evaluator's inject verdict", async () => {
+    const src = await read("src/bot.ts");
+    const evalIdx = src.indexOf("evaluateBriefTrigger({");
+    // `decision.text` is the injected sentence and exists only on the `inject`
+    // verdict, so its presence after the evaluator pins the order.
+    const injectIdx = src.indexOf("decision.text");
+    expect(evalIdx).toBeGreaterThan(-1);
+    expect(injectIdx).toBeGreaterThan(-1);
+    expect(evalIdx).toBeLessThan(injectIdx);
+  });
+
+  test("bot.ts feeds the real ask guard into the evaluator (#432 must-1)", async () => {
+    // The evaluator requires `askPending`, so it cannot be forgotten — but it
+    // CAN be defeated by passing a constant. This pins the live predicate:
+    // `hasRecentAsk` (pending + the post-settle grace window), not
+    // `hasPendingAsk`, because the TUI dialog the ask hook falls back to appears
+    // after the ask settles. This path types into the pane, Escape first.
+    const src = await read("src/bot.ts");
+    expect(src).toContain("askPending: hasRecentAsk");
+  });
+
+  test("brief denial logs do not interpolate raw source/channel ids or body", async () => {
+    const src = await read("src/bot.ts");
+    const denialLines = src
+      .split("\n")
+      .filter((l) => /Brief denied|Brief rejected/.test(l));
+    expect(denialLines.length).toBeGreaterThan(0);
+    for (const line of denialLines) {
+      expect(line).not.toContain("message.author.id");
+      expect(line).not.toContain("message.content");
+    }
+  });
+});
+
+/**
  * Issue #429 (PR #434 review, question-1). The behavioural half lives in
  * dispatch-integration.test.ts; this guard pins the bot.ts WIRING, because the
  * defect being fixed was precisely a wiring gap: the `!result.ok` arm existed
