@@ -233,7 +233,7 @@ access.json は毎メッセージ読み込まれるため、編集は即反映�
 
 ### `dispatchFrom`（/dispatch・/brief の外部トリガー許可）
 
-`allowFrom`（人間の relay 許可）とは別に、group ごとの `dispatchFrom` が **bot 起点のメッセージコマンド**の送信元を許可する。対象は `/dispatch <branch> <N>`（`dispatch.ts`）と `/brief <YYYY-MM-DD>`（`corp-brief.ts`、#426 の朝レポ受け口）。判定は `isDispatchSourceAllowed`（`supervisor/src/config/access-policy.ts`）で **fail-closed** — `dispatchFrom` が無い / 空の group は外部トリガーを常に拒否する。
+`allowFrom`（人間の relay 許可）とは別に、group ごとの `dispatchFrom` が **bot 起点のメッセージコマンド**の送信元を許可する。対象は `/dispatch <branch> <N>`（`dispatch.ts`）と `/brief <YYYY-MM-DD>`（`corp-brief.ts`、#426 の朝レポ受け口）。判定は `isDispatchSourceAllowed`（`supervisor/src/config/access-policy.ts`）で **fail-closed** — group 未登録のチャンネルは常に拒否、group があっても送信元が `dispatchFrom` に無ければ拒否する。例外は env `DISPATCH_ALLOWED_SOURCE_IDS`（カンマ区切りのグローバル allowlist）に載っている送信元のみで、これは per-channel の `dispatchFrom` を補完するが「group が登録済みであること」のゲートは迂回できない。
 
 必要な group（`examples/access-policy.template.json` の `dispatchFrom` 付きエントリと対応）:
 
