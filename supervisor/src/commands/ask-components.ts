@@ -744,6 +744,47 @@ export async function postMultiAskUserPrompt(
 }
 
 /**
+ * Issue #447: one-line notice posted to the thread's PARENT channel when an
+ * AskUserQuestion lands in the thread. The morning brief arrives in #corp
+ * itself, but the decision question it triggers only renders inside the CEO
+ * session's thread — unless the user happens to open that thread, a pending
+ * decision is invisible. The question itself stays in the thread (answer
+ * routing is per-thread: the #416 wait and the #423 no-auto-answer rule are
+ * untouched); the parent channel gets a link, not a second copy of the
+ * question (#447 rejected posting the question body to the channel because a
+ * channel-level reply cannot be attributed to a specific ask).
+ *
+ * `<#id>` is Discord's channel mention and resolves for threads too — one tap
+ * opens the thread holding the question. Not corp-specific: like the brief
+ * trigger (corp-brief.ts), #corp is merely the first user; the notice works
+ * for any thread whose parent channel resolves.
+ */
+export function buildAskChannelNotice(
+  threadId: string,
+  questionCount: number,
+): string {
+  return `📥 決裁待ち ${questionCount} 件 → <#${threadId}>`;
+}
+
+/**
+ * Deliver the parent-channel notice (mirrors `postAskUserPrompt`, #436 V-2's
+ * rationale: build + send in one call so a test can assert on what actually
+ * reaches `send()` with a fake channel). Callers own parent resolution and
+ * error handling — the notice is best-effort and must never fail the ask post
+ * that precedes it (bot.ts wraps this call in its own try/catch), and it must
+ * only be sent AFTER the question landed in the thread (a failed question post
+ * with a live "決裁待ち" notice would link to nothing).
+ */
+export async function postAskChannelNotice(
+  parent: AskPostChannel,
+  input: { threadId: string; questionCount: number },
+): Promise<void> {
+  await parent.send({
+    content: buildAskChannelNotice(input.threadId, input.questionCount),
+  });
+}
+
+/**
  * Closing lines of the post: how to answer, then the relay's own wait notice.
  *
  * `askWaitNotice` (relay-server.ts, #416) already says both "a text reply in

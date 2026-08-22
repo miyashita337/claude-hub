@@ -15,12 +15,14 @@ import {
   MAX_SELECT_OPTIONS,
   OPTION_SEPARATOR,
   SELECT_DESCRIPTION_LIMIT,
+  buildAskChannelNotice,
   buildAskPrompt,
   buildMultiAskPrompt,
   createAskComponentHandler,
   hasActiveMultiAsk,
   isAskComponentId,
   parseAskCustomId,
+  postAskChannelNotice,
   postAskUserPrompt,
   postMultiAskUserPrompt,
   shouldUseButtons,
@@ -825,6 +827,11 @@ describe("coupled contracts (#412)", () => {
     // earlier: the branch existing but never being taken.
     expect(bot).toMatch(/postMultiAskUserPrompt\(channel,\s*{/);
     expect(bot).toMatch(/hasActiveMultiAsk\(threadId\)/);
+    // #447: after either post branch, the parent channel gets the pending
+    // notice, and the helper delivers it via postAskChannelNotice. Same
+    // failure class again — the notice existing but never being wired.
+    expect(bot).toMatch(/notifyAskParentChannel\(\s*client,\s*channel,/);
+    expect(bot).toMatch(/postAskChannelNotice\(/);
   });
 });
 
@@ -925,6 +932,53 @@ describe("postAskUserPrompt (Issue #436 V-2)", () => {
     expect(sent).toHaveLength(1);
     expect(sent[0]!.components).toBeUndefined();
     expect(sent[0]!.content).toContain("自由記述でお願いします");
+  });
+});
+
+// --- parent-channel pending notice (Issue #447) -----------------------------
+
+describe("ask parent-channel notice (#447)", () => {
+  test("buildAskChannelNotice carries the count and a tappable thread mention", () => {
+    // Journey AC-1/AC-2: `<#id>` is Discord's channel mention — it resolves
+    // for threads too, so one tap in the parent channel opens the thread
+    // holding the question.
+    const notice = buildAskChannelNotice("123456789012345678", 3);
+    expect(notice).toBe("📥 決裁待ち 3 件 → <#123456789012345678>");
+  });
+
+  test("postAskChannelNotice sends exactly one message, content only", async () => {
+    const sent: { content: string; components?: unknown[] }[] = [];
+    const parent: AskPostChannel = {
+      send: async (options) => {
+        sent.push(options);
+        return { id: "notice-1" };
+      },
+    };
+
+    await postAskChannelNotice(parent, {
+      threadId: "thread-1",
+      questionCount: 1,
+    });
+
+    expect(sent).toHaveLength(1);
+    expect(sent[0]!.content).toBe("📥 決裁待ち 1 件 → <#thread-1>");
+    // A notice never carries components — the answerable UI lives only in the
+    // thread (answer routing is per-thread; #447 rejected 案 A for this).
+    expect(sent[0]!.components).toBeUndefined();
+  });
+
+  test("a failing parent send propagates to the caller (bot.ts owns the best-effort catch)", async () => {
+    // Journey AC-3 (isolation): the helper itself does not swallow errors —
+    // bot.ts wraps it so a notice failure never reads as an ask failure. The
+    // wiring test above pins that the call sits inside notifyAskParentChannel.
+    const parent: AskPostChannel = {
+      send: async () => {
+        throw new Error("boom");
+      },
+    };
+    await expect(
+      postAskChannelNotice(parent, { threadId: "t", questionCount: 2 }),
+    ).rejects.toThrow("boom");
   });
 });
 
