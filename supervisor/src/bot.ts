@@ -34,6 +34,7 @@ import {
   createAskComponentHandler,
   hasActiveMultiAsk,
   isAskComponentId,
+  postAskChannelNotice,
   postAskUserPrompt,
   postMultiAskUserPrompt,
 } from "./commands/ask-components";
@@ -255,6 +256,77 @@ async function runSelfHealRestart(
   } else {
     console.log(
       `[Bot] self-heal restart: thread ${threadId} → ${result.newThreadId}`
+    );
+  }
+}
+
+/**
+ * Structural surfaces for {@link notifyAskParentChannel}, kept deliberately
+ * minimal so a test can drive the function with plain fakes (review on #447,
+ * should-1) while the real discord.js `Client` / `AnyThreadChannel` remain
+ * assignable. `send` is optional because a thread's parent can be a forum /
+ * media channel, which discord.js types without `.send()` — the runtime guard
+ * below is what rules those out.
+ */
+export interface AskNoticeParentCandidate {
+  isTextBased(): boolean;
+  isDMBased(): boolean;
+  /** Content-only on purpose: a notice never carries components (#447). */
+  send?(options: { content: string }): Promise<unknown>;
+}
+
+export interface AskNoticeThreadRef {
+  id: string;
+  parentId: string | null;
+  parent: AskNoticeParentCandidate | null;
+}
+
+export interface AskNoticeClient {
+  channels: { fetch(id: string): Promise<AskNoticeParentCandidate | null> };
+}
+
+/**
+ * Issue #447: after an AskUserQuestion landed in a thread, post a one-line
+ * "📥 決裁待ち N 件 → <thread>" notice to the thread's parent channel so the
+ * pending decision is visible without opening the thread. Best-effort by
+ * design: the question is already posted and answerable, so a notice failure
+ * only costs discoverability — it is logged and swallowed, never rethrown into
+ * the ask path.
+ */
+export async function notifyAskParentChannel(
+  client: AskNoticeClient,
+  thread: AskNoticeThreadRef,
+  questionCount: number,
+): Promise<void> {
+  try {
+    // thread.parent はキャッシュ依存のゲッターで、起動直後などキャッシュ外だと
+    // 実在する親でも null を返す（PR #340 gemini high）。parentId からの明示
+    // fetch にフォールバックする（channel-post 経路と同じパターン）。
+    let parent: AskNoticeParentCandidate | null = thread.parent;
+    if (!parent && thread.parentId) {
+      parent = await client.channels.fetch(thread.parentId);
+    }
+    // isTextBased ガード: フォーラム等 send を持たない親には投稿できない。
+    // 解決できない場合も質問自体はスレッドで生きているため warn 止まり。
+    if (
+      !parent ||
+      !parent.isTextBased() ||
+      parent.isDMBased() ||
+      typeof parent.send !== "function"
+    ) {
+      console.warn(
+        `[Bot] ask notice skipped: cannot resolve a text parent channel for thread ${thread.id}`,
+      );
+      return;
+    }
+    await postAskChannelNotice({ send: parent.send.bind(parent) }, {
+      threadId: thread.id,
+      questionCount,
+    });
+  } catch (err) {
+    console.error(
+      `[Bot] Failed to post ask notice to parent channel of thread ${thread.id}:`,
+      err,
     );
   }
 }
@@ -571,12 +643,24 @@ export async function startBot(token: string): Promise<void> {
           // single flattened prompt below. The hook only populates this field
           // for a genuinely multi-question ask, so a solo ask still takes the
           // unchanged path.
+          //
+          // Issue #447: after (and only after) the question landed in the
+          // thread, surface its existence in the parent channel with one
+          // tappable link — a failed question post must never leave a dangling
+          // "決裁待ち" notice pointing at nothing. notifyAskParentChannel is
+          // best-effort inside (its own try/catch), so a notice failure never
+          // reads as an ask failure: the question is already answerable.
           if (event.questions && event.questions.length > 1) {
             await postMultiAskUserPrompt(channel, {
               threadId: event.threadId,
               questions: event.questions,
               timeoutMs: event.timeoutMs,
             });
+            await notifyAskParentChannel(
+              client,
+              channel,
+              event.questions.length,
+            );
             return;
           }
           // Issue #436 V-2: build + send is `postAskUserPrompt` (not inlined
@@ -590,6 +674,7 @@ export async function startBot(token: string): Promise<void> {
             multiSelect,
             timeoutMs: event.timeoutMs,
           });
+          await notifyAskParentChannel(client, channel, 1);
         } catch (err) {
           console.error(
             `[Bot] Failed to post AskUserQuestion to thread ${event.threadId}:`,
