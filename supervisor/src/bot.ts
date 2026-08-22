@@ -643,40 +643,38 @@ export async function startBot(token: string): Promise<void> {
           // single flattened prompt below. The hook only populates this field
           // for a genuinely multi-question ask, so a solo ask still takes the
           // unchanged path.
-          const multiQuestions =
-            event.questions && event.questions.length > 1
-              ? event.questions
-              : null;
-          if (multiQuestions) {
+          //
+          // Issue #447: after (and only after) the question landed in the
+          // thread, surface its existence in the parent channel with one
+          // tappable link — a failed question post must never leave a dangling
+          // "決裁待ち" notice pointing at nothing. notifyAskParentChannel is
+          // best-effort inside (its own try/catch), so a notice failure never
+          // reads as an ask failure: the question is already answerable.
+          if (event.questions && event.questions.length > 1) {
             await postMultiAskUserPrompt(channel, {
               threadId: event.threadId,
-              questions: multiQuestions,
+              questions: event.questions,
               timeoutMs: event.timeoutMs,
             });
-          } else {
-            // Issue #436 V-2: build + send is `postAskUserPrompt` (not inlined
-            // here) so an E2E test can drive this exact call with a fake channel
-            // and assert on what actually reaches `send()`, not just on
-            // `buildAskPrompt`'s return value.
-            await postAskUserPrompt(channel, {
-              threadId: event.threadId,
-              question: event.question,
-              options: event.options,
-              multiSelect,
-              timeoutMs: event.timeoutMs,
-            });
+            await notifyAskParentChannel(
+              client,
+              channel,
+              event.questions.length,
+            );
+            return;
           }
-          // Issue #447: the question renders only inside the thread — surface
-          // its existence in the parent channel (one tappable link). Placed
-          // AFTER the awaits above so a failed question post never leaves a
-          // dangling "決裁待ち" notice pointing at nothing; best-effort inside
-          // (its own try/catch), so a notice failure never reads as an ask
-          // failure — the question above is already posted and answerable.
-          await notifyAskParentChannel(
-            client,
-            channel,
-            multiQuestions ? multiQuestions.length : 1,
-          );
+          // Issue #436 V-2: build + send is `postAskUserPrompt` (not inlined
+          // here) so an E2E test can drive this exact call with a fake channel
+          // and assert on what actually reaches `send()`, not just on
+          // `buildAskPrompt`'s return value.
+          await postAskUserPrompt(channel, {
+            threadId: event.threadId,
+            question: event.question,
+            options: event.options,
+            multiSelect,
+            timeoutMs: event.timeoutMs,
+          });
+          await notifyAskParentChannel(client, channel, 1);
         } catch (err) {
           console.error(
             `[Bot] Failed to post AskUserQuestion to thread ${event.threadId}:`,
