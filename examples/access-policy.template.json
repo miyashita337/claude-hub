@@ -1,20 +1,21 @@
 {
   "_comment": "Issue #100. This file documents the EXPECTED set of channel entries for ~/.claude/channels/discord/access.json. Real access.json keys are Discord channel IDs and are user-local — they are NOT committed here. This template uses channel NAMES (kebab-case, matching supervisor/src/config/channels.ts CHANNEL_MAP keys) so CI can verify CHANNEL_MAP and the access policy stay in sync without leaking channel IDs. When you add a channel to CHANNEL_MAP, also: (1) add the same name as a key here, and (2) add the real Discord channel ID + policy to your local ~/.claude/channels/discord/access.json. The supervisor/scripts/check-access-policy.ts script verifies (1) automatically (CI mode) and warns if (2) is out of sync (local count check).",
+  "_commentDispatchFrom": "Issue #445. `dispatchFrom` lists the bot identities allowed to trigger the /dispatch (dispatch.ts) and /brief (corp-brief.ts) message commands in that channel. It is fail-closed: an absent or empty `dispatchFrom` denies ALL external triggers for the channel (isDispatchSourceAllowed in supervisor/src/config/access-policy.ts). Channels below marked with `dispatchFrom: [\"<corp-dispatch-bot>\"]` are the ones the corp dispatch bot must be able to reach — the department channels for /dispatch, plus corp itself for /brief (the morning-report wake-up added in #426). Omitting the corp entry here is exactly how the live access.json missed it (#445).",
   "_claudeHubExitPrimary": {
     "_note": "Reserved entry representing the claudeHubExit primary DM/maintenance channel. This channel is intentionally NOT in CHANNEL_MAP (see supervisor/src/config/channels.ts meta-dependency guard).",
     "requireMention": false,
     "allowFrom": []
   },
-  "team-salary": { "requireMention": true, "allowFrom": ["<owner>"] },
-  "convert-service": { "requireMention": true, "allowFrom": ["<owner>"] },
+  "team-salary": { "requireMention": true, "allowFrom": ["<owner>"], "dispatchFrom": ["<corp-dispatch-bot>"] },
+  "convert-service": { "requireMention": true, "allowFrom": ["<owner>"], "dispatchFrom": ["<corp-dispatch-bot>"] },
   "segment-anything": { "requireMention": true, "allowFrom": ["<owner>"] },
   "claude-context-manager": { "requireMention": true, "allowFrom": ["<owner>"] },
   "dev-tool": { "requireMention": true, "allowFrom": ["<owner>"] },
   "obsidian-img-annotator": { "requireMention": true, "allowFrom": ["<owner>"] },
   "oci-develop": { "requireMention": true, "allowFrom": ["<owner>"] },
-  "agent-base": { "requireMention": true, "allowFrom": ["<owner>"] },
+  "agent-base": { "requireMention": true, "allowFrom": ["<owner>"], "dispatchFrom": ["<corp-dispatch-bot>"] },
   "openclaw-rpi5-ops": { "requireMention": true, "allowFrom": ["<owner>"] },
   "vive-reading": { "requireMention": true, "allowFrom": ["<owner>"] },
   "video-qa": { "requireMention": true, "allowFrom": ["<owner>"] },
-  "corp": { "requireMention": false, "allowFrom": ["<owner>"] }
+  "corp": { "requireMention": false, "allowFrom": ["<owner>"], "dispatchFrom": ["<corp-dispatch-bot>"] }
 }

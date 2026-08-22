@@ -231,6 +231,19 @@ access.json は毎メッセージ読み込まれるため、編集は即反映�
 3. `jq empty access.json` で schema 検証
 4. 動作確認: 実メッセージで owner mention → 応答あり / 非 owner mention → 無応答
 
+### `dispatchFrom`（/dispatch・/brief の外部トリガー許可）
+
+`allowFrom`（人間の relay 許可）とは別に、group ごとの `dispatchFrom` が **bot 起点のメッセージコマンド**の送信元を許可する。対象は `/dispatch <branch> <N>`（`dispatch.ts`）と `/brief <YYYY-MM-DD>`（`corp-brief.ts`、#426 の朝レポ受け口）。判定は `isDispatchSourceAllowed`（`supervisor/src/config/access-policy.ts`）で **fail-closed** — `dispatchFrom` が無い / 空の group は外部トリガーを常に拒否する。
+
+必要な group（`examples/access-policy.template.json` の `dispatchFrom` 付きエントリと対応）:
+
+| group | 用途 |
+|---|---|
+| 各部署チャンネル（team-salary / convert-service / agent-base） | corp dispatch bot からの `/dispatch`（corp `registry.yaml` の `dispatchChannelId` と対応） |
+| corp | corp dispatch bot からの `/brief`（朝レポ配信を契機に CEO セッションを起こす。#426 / #445） |
+
+新しいチャンネルへ `/dispatch` / `/brief` を通すときは、その group に corp dispatch bot の user id を `dispatchFrom` として追加する。**corp の entry を忘れると `/brief` が silent に denied になり朝レポの決裁 UI が出ない**（#445 の実事故）。
+
 ## Permission Mode (claudeHubExit)
 
 Issue #53 以降、`--dangerously-skip-permissions` を env var で条件分岐している。`.claude/settings.json` が auto-load され、`permissions.allow`/`permissions.deny` が運用ポリシーの単一 source になる。
