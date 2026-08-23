@@ -149,25 +149,29 @@ describe("brief trigger is wired fail-closed (#426)", () => {
     expect(src).toContain("decision.allowed");
   });
 
-  test("bot.ts only injects on the evaluator's inject verdict", async () => {
+  test("bot.ts runs the proposals CLI only after the evaluator's decide verdict (#449)", async () => {
     const src = await read("src/bot.ts");
     const evalIdx = src.indexOf("evaluateBriefTrigger({");
-    // `decision.text` is the injected sentence and exists only on the `inject`
-    // verdict, so its presence after the evaluator pins the order.
-    const injectIdx = src.indexOf("decision.text");
+    // `config.brief.proposalsArgs` is consumed only inside the `decide` case,
+    // so its position after the evaluator pins the order: no CLI execution
+    // before the fail-closed authorization verdict.
+    const cliIdx = src.indexOf("config.brief.proposalsArgs");
     expect(evalIdx).toBeGreaterThan(-1);
-    expect(injectIdx).toBeGreaterThan(-1);
-    expect(evalIdx).toBeLessThan(injectIdx);
+    expect(cliIdx).toBeGreaterThan(-1);
+    expect(evalIdx).toBeLessThan(cliIdx);
   });
 
-  test("bot.ts feeds the real ask guard into the evaluator (#432 must-1)", async () => {
-    // The evaluator requires `askPending`, so it cannot be forgotten — but it
-    // CAN be defeated by passing a constant. This pins the live predicate:
-    // `hasRecentAsk` (pending + the post-settle grace window), not
-    // `hasPendingAsk`, because the TUI dialog the ask hook falls back to appears
-    // after the ask settles. This path types into the pane, Escape first.
+  test("the brief path no longer types into any session (#449: session-less by design)", async () => {
+    // #426's injection capability (typing into an already-running session,
+    // Escape first) was the reason the path needed the ask guard / no_session /
+    // ambiguous safety valves. #449 removed the capability itself: the brief
+    // path must build tap-to-decide buttons, never a session injection. A
+    // refactor that reintroduces an injected sentence would bring back the
+    // whole failure class — pin its absence.
+    const brief = await read("src/session/corp-brief.ts");
+    expect(brief).not.toContain("buildBriefInjection");
     const src = await read("src/bot.ts");
-    expect(src).toContain("askPending: hasRecentAsk");
+    expect(src).toContain("buildBriefDecisionMessages(");
   });
 
   test("brief denial logs do not interpolate raw source/channel ids or body", async () => {
