@@ -342,3 +342,125 @@ describe("createBriefDecisionHandler", () => {
     expect(calls.length).toBe(2);
   });
 });
+
+// ---------------------------------------------------------------------------
+// runBriefDecideFlow（bot.ts の decide case から抽出された一連）
+// ---------------------------------------------------------------------------
+
+import { runBriefDecideFlow } from "../../src/session/brief-decision";
+
+interface FlowCapture {
+  channelPosts: string[];
+  decisionPosts: number;
+  notifications: string[];
+}
+
+function flowDeps(
+  cli: CliResult,
+  over: {
+    postDecisionMessage?: () => Promise<void>;
+  } = {},
+): { capture: FlowCapture; input: Parameters<typeof runBriefDecideFlow>[0] } {
+  const capture: FlowCapture = { channelPosts: [], decisionPosts: 0, notifications: [] };
+  return {
+    capture,
+    input: {
+      date: "2026-08-23",
+      channelName: "corp",
+      cwd: "/tmp/corp",
+      proposalsArgs: ["npm", "run", "secretary", "--", "proposals", "--json"],
+      runCli: async () => cli,
+      postToChannel: async (text) => {
+        capture.channelPosts.push(text);
+      },
+      postDecisionMessage:
+        over.postDecisionMessage ??
+        (async () => {
+          capture.decisionPosts += 1;
+        }),
+      notifyFailure: async (title) => {
+        capture.notifications.push(title);
+      },
+    },
+  };
+}
+
+describe("runBriefDecideFlow", () => {
+  test("pending ありなら決裁メッセージを post して true（dedup 記録可）", async () => {
+    const { capture, input } = flowDeps({
+      code: 0,
+      stdout: proposalsJson([{ id: "a-1", title: "A", decision: null }]),
+      stderr: "",
+    });
+    await expect(runBriefDecideFlow(input)).resolves.toBe(true);
+    expect(capture.decisionPosts).toBe(1);
+    expect(capture.notifications.length).toBe(0);
+  });
+
+  test("未決 0 件は「すべて決裁済み」1 行のみで true", async () => {
+    const { capture, input } = flowDeps({
+      code: 0,
+      stdout: proposalsJson([{ id: "a-1", title: "A", decision: "approved" }]),
+      stderr: "",
+    });
+    await expect(runBriefDecideFlow(input)).resolves.toBe(true);
+    expect(capture.decisionPosts).toBe(0);
+    expect(capture.channelPosts.join("\n")).toContain("すべて決裁済み");
+  });
+
+  test("CLI 失敗はチャンネル報告 + ページで false（silent にしない・dedup 記録不可）", async () => {
+    const { capture, input } = flowDeps({
+      code: 1,
+      stdout: "",
+      stderr: "当日の snapshot がありません",
+    });
+    await expect(runBriefDecideFlow(input)).resolves.toBe(false);
+    expect(capture.channelPosts.join("\n")).toContain("取得できませんでした");
+    expect(capture.channelPosts.join("\n")).toContain("snapshot");
+    expect(capture.notifications).toEqual(["朝レポの決裁依頼が未達"]);
+  });
+
+  test("パース不能な出力も同じ失敗報告で false", async () => {
+    const { capture, input } = flowDeps({ code: 0, stdout: "not json", stderr: "" });
+    await expect(runBriefDecideFlow(input)).resolves.toBe(false);
+    expect(capture.notifications.length).toBe(1);
+  });
+
+  test("決裁メッセージの post 失敗は false（同日再送で回復できる余地を残す）", async () => {
+    const { input } = flowDeps(
+      {
+        code: 0,
+        stdout: proposalsJson([{ id: "a-1", title: "A", decision: null }]),
+        stderr: "",
+      },
+      {
+        postDecisionMessage: async () => {
+          throw new Error("50013 Missing Permissions");
+        },
+      },
+    );
+    await expect(runBriefDecideFlow(input)).resolves.toBe(false);
+  });
+
+  test("ボタン化できない id は skipped として警告される（silent truncation 禁止）", async () => {
+    const { capture, input } = flowDeps({
+      code: 0,
+      stdout: proposalsJson([
+        { id: "a-1", title: "A", decision: null },
+        { id: "bad id", title: "B", decision: null },
+      ]),
+      stderr: "",
+    });
+    await expect(runBriefDecideFlow(input)).resolves.toBe(true);
+    expect(capture.decisionPosts).toBe(1);
+    expect(capture.channelPosts.join("\n")).toContain("1 件は id をボタン化できず");
+  });
+
+  test("notify 自体の失敗で flow は落ちない", async () => {
+    const { input } = flowDeps({ code: 1, stdout: "", stderr: "boom" });
+    input.notifyFailure = async () => {
+      throw new Error("pushover down");
+    };
+    await expect(runBriefDecideFlow(input)).resolves.toBe(false);
+  });
+});

@@ -171,7 +171,7 @@ describe("brief trigger is wired fail-closed (#426)", () => {
     const brief = await read("src/session/corp-brief.ts");
     expect(brief).not.toContain("buildBriefInjection");
     const src = await read("src/bot.ts");
-    expect(src).toContain("buildBriefDecisionMessages(");
+    expect(src).toContain("runBriefDecideFlow(");
   });
 
   test("brief denial logs do not interpolate raw source/channel ids or body", async () => {

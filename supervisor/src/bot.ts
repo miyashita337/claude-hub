@@ -98,12 +98,9 @@ import {
   type RecentBrief,
 } from "./session/corp-brief";
 import {
-  buildAllDecidedMessage,
-  buildBriefDecisionMessages,
   createBriefDecisionHandler,
   isBriefDecisionComponentId,
-  parseProposalsOutput,
-  runBriefCli,
+  runBriefDecideFlow,
 } from "./session/brief-decision";
 import {
   ORCHESTRATE_PREFIX,
@@ -1541,81 +1538,31 @@ export async function startBot(token: string): Promise<void> {
         console.log(
           `[Bot] Brief accepted in channel ${channelName} (date=${decision.date}); fetching pending proposals`
         );
-        // AC-3 相当（#426 から継承）: 取得失敗を silent にしない。corp は自動で
-        // 再送しないので、チャンネルへの報告 + Pushover で同じ朝に気付けるようにする。
-        const reportFetchFailure = async (detail: string): Promise<void> => {
-          console.error(
-            `[Bot] Brief proposals fetch failed in channel ${channelName} (date=${decision.date}): ${detail}`
-          );
-          await postToChannel(
-            `⚠️ 朝レポ（${decision.date}）の未決提案を取得できませんでした（決裁は未実行）。\n` +
-              `\`\`\`\n${detail.slice(0, 500)}\n\`\`\``
-          );
-          notifyPushover(
-            "朝レポの決裁依頼が未達",
-            `#${channelName} で未決提案の取得に失敗し ${decision.date} の朝レポ決裁を提示できませんでした。`
-          ).catch((err) =>
-            console.warn("[Bot] brief fetch-failure pushover failed:", err)
-          );
-        };
-        const cliResult = await runBriefCli(
-          config.brief.proposalsArgs,
-          config.dir
-        );
-        if (cliResult.code !== 0) {
-          await reportFetchFailure(
-            `exit ${cliResult.code ?? "signal/timeout"}: ${cliResult.stderr.trim()}`
-          );
-          return true;
-        }
-        const proposals = parseProposalsOutput(cliResult.stdout);
-        if (proposals.kind === "error") {
-          await reportFetchFailure(proposals.reason);
-          return true;
-        }
-        if (proposals.pending.length === 0 && proposals.skipped === 0) {
-          await postToChannel(
-            buildAllDecidedMessage(decision.date, proposals.total)
-          );
-          recentBriefByChannel.set(channelName, {
-            date: decision.date,
-            atMs: Date.now(),
-          });
-          return true;
-        }
-        try {
-          for (const msg of buildBriefDecisionMessages(
-            decision.date,
-            proposals.pending
-          )) {
+        // 一連（取得 → パース → post）は runBriefDecideFlow が持ち、失敗報告の
+        // 義務ごと単体テストで固定されている。delivered のときだけ同日 dedup を
+        // 記録する（失敗時は記録せず、同じ日付の再送で回復できる余地を残す）。
+        const delivered = await runBriefDecideFlow({
+          date: decision.date,
+          channelName,
+          cwd: config.dir,
+          proposalsArgs: config.brief.proposalsArgs,
+          postToChannel,
+          postDecisionMessage: async (msg) => {
             await textChannel.send({
               content: msg.content,
               components: msg.components,
             });
-          }
-        } catch (err) {
-          // post 失敗時は dedup を記録しない（同じ日付の再送で回復できる余地を
-          // 残す — corp-brief.ts の duplicate 契約）。
-          console.error(
-            `[Bot] Brief decision post failed in channel ${channelName}:`,
-            err
-          );
-          return true;
-        }
-        if (proposals.skipped > 0) {
-          // id がボタン化できない提案を黙って落とさない（silent truncation 禁止）。
-          console.warn(
-            `[Bot] Brief: ${proposals.skipped} pending proposal(s) skipped (id not button-safe) in channel ${channelName}`
-          );
-          await postToChannel(
-            `⚠️ 未決提案のうち ${proposals.skipped} 件は id をボタン化できず表示していません。` +
-              `作業ディレクトリで proposals コマンドを直接確認してください。`
-          );
-        }
-        recentBriefByChannel.set(channelName, {
-          date: decision.date,
-          atMs: Date.now(),
+          },
+          notifyFailure: async (title, body) => {
+            await notifyPushover(title, body);
+          },
         });
+        if (delivered) {
+          recentBriefByChannel.set(channelName, {
+            date: decision.date,
+            atMs: Date.now(),
+          });
+        }
         return true;
       }
     }

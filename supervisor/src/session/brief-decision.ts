@@ -292,6 +292,105 @@ export const runBriefCli: BriefCliRunner = (args, cwd) =>
     );
   });
 
+/**
+ * `/brief` の decide verdict 後の一連（取得 → パース → post）。bot.ts から
+ * Discord I/O と通知を注入して呼ぶ。ここに抽出してあるのは、失敗経路
+ * （CLI 失敗 / パース失敗 / post 失敗 / skipped）の報告義務を bot.ts の
+ * 配線コード（カバレッジ対象外に近い）ではなく単体テストで固定するため。
+ */
+export interface BriefDecideFlowInput {
+  /** `/brief` が運んだ日付（表示用。CLI は常に当日の業務日を返す）。 */
+  date: string;
+  /** ログ用のチャンネル名。 */
+  channelName: string;
+  /** proposals CLI の作業ディレクトリ。 */
+  cwd: string;
+  /** 未決提案の取得コマンド（argv）。 */
+  proposalsArgs: string[];
+  runCli?: BriefCliRunner;
+  /** チャンネル直下へのテキスト post（報告・警告用）。 */
+  postToChannel: (text: string) => Promise<void>;
+  /** 決裁ボタン付きメッセージの post。失敗は throw してよい（flow が受ける）。 */
+  postDecisionMessage: (msg: BriefDecisionMessage) => Promise<void>;
+  /** 取得失敗時のページング（Pushover 等）。失敗しても flow は落ちない。 */
+  notifyFailure: (title: string, body: string) => Promise<void>;
+}
+
+/**
+ * @returns true = 決裁 UI（または「未決なし」報告）の post まで成功し、呼び出し元が
+ * 同日 dedup を記録してよい。false = 失敗（dedup を記録せず、同じ日付の再送で
+ * 回復できる余地を残す — corp-brief.ts の duplicate 契約）。
+ */
+export async function runBriefDecideFlow(
+  input: BriefDecideFlowInput,
+): Promise<boolean> {
+  const runCli = input.runCli ?? runBriefCli;
+
+  // AC-3 相当（#426 から継承）: 取得失敗を silent にしない。corp は自動で
+  // 再送しないので、チャンネルへの報告 + ページで同じ朝に気付けるようにする。
+  const reportFetchFailure = async (detail: string): Promise<void> => {
+    console.error(
+      `[brief-decision] proposals fetch failed in channel ${input.channelName} (date=${input.date}): ${detail}`,
+    );
+    await input.postToChannel(
+      `⚠️ 朝レポ（${input.date}）の未決提案を取得できませんでした（決裁は未実行）。\n` +
+        `\`\`\`\n${truncate(detail, 500)}\n\`\`\``,
+    );
+    await input
+      .notifyFailure(
+        "朝レポの決裁依頼が未達",
+        `#${input.channelName} で未決提案の取得に失敗し ${input.date} の朝レポ決裁を提示できませんでした。`,
+      )
+      .catch((err) =>
+        console.warn("[brief-decision] fetch-failure notify failed:", err),
+      );
+  };
+
+  const cliResult = await runCli(input.proposalsArgs, input.cwd);
+  if (cliResult.code !== 0) {
+    await reportFetchFailure(
+      `exit ${cliResult.code ?? "signal/timeout"}: ${cliResult.stderr.trim()}`,
+    );
+    return false;
+  }
+  const proposals = parseProposalsOutput(cliResult.stdout);
+  if (proposals.kind === "error") {
+    await reportFetchFailure(proposals.reason);
+    return false;
+  }
+
+  if (proposals.pending.length === 0 && proposals.skipped === 0) {
+    await input.postToChannel(
+      buildAllDecidedMessage(input.date, proposals.total),
+    );
+    return true;
+  }
+
+  try {
+    for (const msg of buildBriefDecisionMessages(input.date, proposals.pending)) {
+      await input.postDecisionMessage(msg);
+    }
+  } catch (err) {
+    console.error(
+      `[brief-decision] decision post failed in channel ${input.channelName}:`,
+      err,
+    );
+    return false;
+  }
+
+  if (proposals.skipped > 0) {
+    // id がボタン化できない提案を黙って落とさない（silent truncation 禁止）。
+    console.warn(
+      `[brief-decision] ${proposals.skipped} pending proposal(s) skipped (id not button-safe) in channel ${input.channelName}`,
+    );
+    await input.postToChannel(
+      `⚠️ 未決提案のうち ${proposals.skipped} 件は id をボタン化できず表示していません。` +
+        `作業ディレクトリで proposals コマンドを直接確認してください。`,
+    );
+  }
+  return true;
+}
+
 /** 決裁ボタンが押されたチャンネルに対する実行設定（config/channels.ts 由来）。 */
 export interface BriefDecisionChannelConfig {
   channelName: string;
