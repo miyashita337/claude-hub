@@ -27,6 +27,18 @@ export interface ChannelConfig {
    * enable for channels that drive a browser via `mcp__claude-in-chrome__*`.
    */
   chromeEnabled?: boolean;
+  /**
+   * Issue #449: `/brief <date>` のタップ決裁で claude-hub が実行する CLI。
+   * 未設定チャンネルでは brief 決裁経路全体が fail-closed で動かない。
+   * どちらも argv 配列（shell を通さない）で、cwd は `dir`。corp 固有の
+   * コマンドを supervisor 側へハードコードしないための注入点。
+   */
+  brief?: {
+    /** 未決提案の取得。stdout に `{ date, proposals: [...] }` の JSON を出すこと。 */
+    proposalsArgs: string[];
+    /** 決裁確定。末尾に `<proposalId> <approved|rejected|deferred>` が追加される。 */
+    decideArgs: string[];
+  };
 }
 
 const home = homedir();
@@ -42,6 +54,28 @@ export const CHANNEL_MAP = new Map<string, ChannelConfig>([
       channelName: "corp",
       dir: resolve(home, "corp"),
       displayName: "Corp CEO",
+      // #449: 朝レポのタップ決裁。コマンドの契約は corp src/cli.ts
+      // （runProposalsCmd / runDecideProposalCmd）。--silent で npm の run
+      // banner を stdout から除き、JSON だけを受け取る。
+      brief: {
+        proposalsArgs: [
+          "npm",
+          "run",
+          "--silent",
+          "secretary",
+          "--",
+          "proposals",
+          "--json",
+        ],
+        decideArgs: [
+          "npm",
+          "run",
+          "--silent",
+          "secretary",
+          "--",
+          "decide-proposal",
+        ],
+      },
     },
   ],
   [

@@ -1,14 +1,14 @@
 /**
- * 朝レポ契機の CEO セッション起こし（#426 / corp#112 の AC-1）。
+ * 朝レポ契機のタップ決裁トリガー（#426 → #449 / corp#112 の AC-1）。
  *
  * corp が朝レポ（CEO 提案 `[D1]..[Dn]`）を #corp へ配信しても、`bot.ts` の
  * `if (message.author.bot) return;` が bot / webhook のメッセージを一律 drop する
- * ため、corp スレッドで稼働中の CEO セッションは「朝レポが来た」ことを知れない。
- * その結果「朝レポ → CEO が決裁を問う → 会長がタップ → 決裁実行」というジャーニーが
- * 起点で成立しない（#412 のボタン UI / #416 の回答待ちが揃っても、質問を発生させる
- * 主体が居ない）。
+ * ため、「朝レポが来た」ことを起点に決裁ジャーニーを始める主体が居ない。
  *
- * 本モジュールはその受け口を、**既存 `/dispatch` と同じ認可・同じ入口形状**で用意する:
+ * #426 は「稼働中の CEO セッションへ注入して AskUserQuestion を出させる」設計だったが、
+ * Mac / supervisor 再起動のたびに `/session start` の手動再実行が前提になり、
+ * 2026-08-23 朝の実機観測でセッション不在（no_session）により決裁が止まった。
+ * #449（会長決裁・案 A）で **セッション非依存** に置き換える:
  *
  *   1. トリガーは既知チャンネルの**非スレッド**メッセージ `/brief <YYYY-MM-DD>`。
  *      corp の朝レポ配信 webhook ではなく、corp の **dispatch bot**（別 identity）が
@@ -18,28 +18,22 @@
  *   2. 認可は {@link isDispatchSourceAllowed} を**そのまま**再利用する。policy 不在 /
  *      channel 未登録 / `dispatchFrom` 未列挙 の 3 つの deny がそのまま効く
  *      （fail-closed）。新しい認可モデルを書かない = 新しい抜け道を作らない。
- *   3. **セッションへ注入する文字列は claude-hub が組み立て、自由文を一切受け取らない**。
- *      外部から受け取るのは `YYYY-MM-DD` という閉じたトークン 1 個だけで、
- *      `/dispatch <branch> <N>` → `/impl <N>` を claude-hub 側で構築するのと同型。
- *      これが「本社セッションへ任意の指示を注入して承認ゲートを迂回する」ことに対する
- *      主防御になる。レポート本文は CEO セッションが自分で `~/corp` から読む。
- *   4. 投入先スレッドは `listRunningByChannel(<channel>)` で**決定的に**解決する。
- *      オーケストレーター（branch が `orchestrate-` 始まり）だけは機械的な印で
- *      候補から除き（{@link selectBriefTargets}）、残りがちょうど 1 件のときだけ
- *      注入する。0 件 / 2 件以上は注入せず通知する（推測で選ばない）。
- *   5. **稼働中セッションへ打鍵する唯一の外部トリガー**なので、割り込みの安全弁を 2 つ持つ:
- *      対象スレッドが AskUserQuestion の回答待ちなら注入しない（`askPending`）、
- *      同じ日付を直近に注入済みなら二度割り込まない（{@link BRIEF_DEDUP_WINDOW_MS}）。
- *      dispatch / orchestrate は**自分が起こしたばかりのセッション**にしか打鍵しないため
- *      この論点を持たない。ここだけは brief のほうが強い能力を持つ。
+ *   3. **外部から受け取るのは `YYYY-MM-DD` という閉じたトークン 1 個だけ**。
+ *      提案の実体（id / タイトル / 未決状態）は claude-hub 自身が対象チャンネルの
+ *      作業ディレクトリで `proposals --json`（corp CLI）を実行して取得する
+ *      （brief-decision.ts）。自由文を一切受け取らない性質は #426 と同じ。
+ *   4. 決裁の実行者は**会長のボタンタップのみ**（brief-decision.ts が access.json の
+ *      `allowFrom` で検証する）。この評価器はどのセッションにも触れない —
+ *      セッションへの打鍵という能力自体を持たないため、#426 が持っていた
+ *      askPending / no_session / ambiguous / deferred の各安全弁は不要になった。
  *
  * *誰が* トリガーできるかは access policy 側の設定であり、本モジュールは corp 固有の
  * 送信元を一切ハードコードしない（`dispatch.ts` と同じ方針）。#corp が最初の利用者
- * というだけで、機構としては CHANNEL_MAP に載っている任意のチャンネルで動く。
+ * というだけで、機構としては CHANNEL_MAP + `ChannelConfig.brief` が設定された任意の
+ * チャンネルで動く。
  *
- * 判断はすべて純関数 {@link evaluateBriefTrigger} に閉じており、Discord ゲートウェイも
- * 実 SessionManager も無しで単体テストできる。副作用（注入・通知・投稿）は呼び出し元
- * （bot.ts）が持つ。
+ * 判断はすべて純関数 {@link evaluateBriefTrigger} に閉じており、Discord ゲートウェイ
+ * 無しで単体テストできる。副作用（CLI 実行・投稿）は呼び出し元（bot.ts）が持つ。
  */
 
 import {
@@ -48,7 +42,6 @@ import {
   type AccessPolicy,
   type DispatchDecisionReason,
 } from "../config/access-policy";
-import { ORCHESTRATE_BRANCH_PREFIX } from "./orchestrate";
 
 /** リテラルのトリガートークン。corp 側が同じ文字列を post する。 */
 export const BRIEF_PREFIX = "/brief";
@@ -138,62 +131,18 @@ export function parseBriefCommand(content: string): ParsedBrief {
 }
 
 /**
- * セッションへ注入する文字列を組み立てる。**外部入力は検証済みの `date` だけ**で、
- * 残りは固定リテラル。`date` は {@link BRIEF_DATE_RE} を通過した数字とハイフンのみ
- * なので、テンプレートへ埋めても指示文を注入できない。
- *
- * relay は `tmux send-keys -l` の途中送信を避けるため改行を空白へ潰す
- * （`relay.ts` flattenForSendKeys）。潰される前提に依存しないよう最初から 1 行で作る。
- */
-export function buildBriefInjection(date: string): string {
-  return (
-    `【朝レポ着信 ${date}】corp の朝レポ配信を claude-hub が検知しました。` +
-    `~/corp の ${date} 分の朝レポ（CEO 提案 [D1]..[Dn]）を読み、` +
-    `どの提案を承認するかを AskUserQuestion で会長に問うてください。` +
-    `会長の回答を得るまで、dispatch など承認を要する操作は実行しないこと。`
-  );
-}
-
-/** 投入先候補セッションの最小面（実 SessionInfo が構造的に満たす）。 */
-export interface BriefSessionRef {
-  threadId: string;
-  branch?: string;
-}
-
-/**
- * 投入先の候補から、CEO セッションでないと**決定的に**判る行を除く。
- *
- * `listRunningByChannel` は channelName と status でしか絞らないため、#corp では
- * `/orchestrate` で起動したオーケストレーター（branch が
- * {@link ORCHESTRATE_BRANCH_PREFIX} 始まり）も同じ候補集合に入る。これを残すと
- * CEO セッションとの同時稼働で毎回 `ambiguous`（＝朝レポ未達）になる。
- *
- * 除外の根拠は `orchestrateBranchName()` が付ける固定 prefix という**機械的な印**
- * だけに限る（推測でセッションを選り分けない）。それ以外の候補が複数残る場合は
- * 従来どおり `ambiguous` に倒す。hub work セッションは channelName が
- * `claude-hub-work` なので、そもそも #corp の候補に入らない。
- */
-export function selectBriefTargets(
-  sessions: readonly BriefSessionRef[],
-): BriefSessionRef[] {
-  return sessions.filter(
-    (s) => !(s.branch ?? "").startsWith(ORCHESTRATE_BRANCH_PREFIX),
-  );
-}
-
-/**
- * 同じ日付の brief を再び受けても投入しない時間窓（冪等性）。
+ * 同じ日付の brief を再び受けても決裁メッセージを出し直さない時間窓（冪等性）。
  *
  * corp 側の配信リトライや手動 re-post で同じ `(channel, date)` が二度来ると、
- * **稼働中の会話に二度割り込む**（`enqueueForThread` が直列化するので状態は壊れないが、
- * 会長との対話は二度中断される）。corp の dispatch スケジューラが 30 分周期なので、
- * その 1 サイクル分をまたいで吸収できる 60 分を既定にする。窓を無期限にしないのは、
- * 初回の注入がセッション側で活きなかったときに**同じ日付で意図的に再投入する**余地を
- * 残すため（無期限だと当日中は二度と起こせなくなる）。
+ * 同じ未決提案のボタンがチャンネルに二重に並ぶ（decide-proposal 自体は corp 側で
+ * 冪等だが、どちらのメッセージが生きているか会長には判別できない）。corp の
+ * dispatch スケジューラが 30 分周期なので、その 1 サイクル分をまたいで吸収できる
+ * 60 分を既定にする。窓を無期限にしないのは、決裁メッセージの post に失敗した
+ * とき**同じ日付で意図的に再投入する**余地を残すため。
  */
 export const BRIEF_DEDUP_WINDOW_MS = 60 * 60_000;
 
-/** 直近に注入済みの brief（冪等性判定の入力）。 */
+/** 直近に処理済みの brief（冪等性判定の入力）。 */
 export interface RecentBrief {
   date: string;
   atMs: number;
@@ -208,21 +157,9 @@ export interface BriefTriggerInput {
   sourceId: string;
   /** 読み込み済み access policy。`null` = 読めなかった（fail-closed で deny）。 */
   policy: AccessPolicy | null;
-  /** 当該チャンネルで running のセッション（`listRunningByChannel` の結果）。 */
-  sessions: BriefSessionRef[];
   /**
-   * 対象スレッドで AskUserQuestion が保留中（またはその直後の猶予窓）か。
-   *
-   * **必須**（省略可にしない）。この経路は「既に走っていて状態の分からないセッション」へ
-   * 打鍵する唯一の外部トリガーで、`sendToPane` は毎回先頭に `Escape` を送る。会長が
-   * 回答を検討している最中に打てば、保留中の決裁が本人不在で消えるか、最悪 fallback
-   * dialog の既定が選ばれる（#412 / #416 / #423 が閉じた失敗クラスそのもの）。
-   * 呼び出し側は `hasRecentAsk`（= 保留中 + settle 直後の猶予）を渡すこと。
-   */
-  askPending: (threadId: string) => boolean;
-  /**
-   * 同じチャンネルで直近に注入した brief。`undefined` = 記録なし。
-   * {@link BRIEF_DEDUP_WINDOW_MS} 以内に同じ日付が来たら投入しない。
+   * 同じチャンネルで直近に処理した brief。`undefined` = 記録なし。
+   * {@link BRIEF_DEDUP_WINDOW_MS} 以内に同じ日付が来たら再処理しない。
    */
   recentBrief?: RecentBrief;
   /** 冪等性判定の基準時刻。省略時 `Date.now()`。 */
@@ -246,32 +183,24 @@ export type BriefDecision =
   | { action: "denied"; reason: DispatchDecisionReason }
   /** 認可済みだがコマンドが不正。 */
   | { action: "rejected"; reason: string }
-  /** 注入する（対象スレッドがちょうど 1 件）。 */
-  | { action: "inject"; date: string; threadId: string; text: string }
-  /** 同じ日付を直近に注入済み → 二度割り込まない（冪等性）。 */
-  | { action: "duplicate"; date: string; elapsedMs: number }
-  /** 対象セッションが会長の回答待ち → 注入せず通知（割り込まない）。 */
-  | { action: "deferred"; date: string; threadId: string }
-  /** 稼働中セッションが無い → 注入せず通知（サイレントに落とさない）。 */
-  | { action: "no_session"; date: string }
-  /** 稼働中セッションが複数 → 曖昧なので注入せず通知（推測で選ばない）。 */
-  | { action: "ambiguous"; date: string; count: number };
+  /** 未決提案を取得して決裁メッセージをチャンネル直下へ post する（#449）。 */
+  | { action: "decide"; date: string }
+  /** 同じ日付を直近に処理済み → 決裁メッセージを二重に出さない（冪等性）。 */
+  | { action: "duplicate"; date: string; elapsedMs: number };
 
 /**
- * トリガーの可否と投入先を決める純関数。評価順は次で固定する:
+ * トリガーの可否を決める純関数。評価順は次で固定する:
  *
  *   1. `/brief` か（安価な形式判定。違えば policy を読まない）
  *   2. kill-switch
  *   3. **認可**（fail-closed。ここを通らなければパースもしない）
  *   4. コマンドのパース（自由文を拒否）
- *   5. 冪等性（同じ日付を直近に注入済みなら二度割り込まない）
- *   6. 投入先スレッドの決定（1 件のときだけ先へ進む）
- *   7. **回答待ちの割り込み回避**（保留中なら注入しない）
+ *   5. 冪等性（同じ日付を直近に処理済みなら決裁メッセージを出し直さない）
  *
  * 3 が 4 より先なのは既存 `handleDispatchMessage` と同じ順序で、認可されない送信元の
  * 入力を一切解釈しないため（`tests/guards/access-enforcement-wired.test.ts` が
- * dispatch と同様にこの順序を固定する）。7 が最後なのは、対象スレッドが確定して
- * 初めて「そのスレッドが回答待ちか」を問えるため。
+ * dispatch と同様にこの順序を固定する）。#426 にあった投入先セッションの決定
+ * （6）と回答待ちの割り込み回避（7）は、セッションへ触れない #449 では存在しない。
  */
 export function evaluateBriefTrigger(input: BriefTriggerInput): BriefDecision {
   if (!isBriefCommand(input.content)) return { action: "ignore" };
@@ -302,9 +231,9 @@ export function evaluateBriefTrigger(input: BriefTriggerInput): BriefDecision {
 
   const { date } = parsed;
 
-  // 冪等性: 同じ日付を直近に注入済みなら、稼働中の会話へ二度割り込まない。
-  // 記録は inject したときだけ残す契約なので、no_session / deferred で終わった
-  // brief の再送はここで止まらない（止めると回復手段が消える）。
+  // 冪等性: 同じ日付を直近に処理済みなら、決裁メッセージを二重に出さない。
+  // 記録は decide 側の post 成功時だけ残す契約なので、CLI 失敗 / post 失敗で
+  // 終わった brief の再送はここで止まらない（止めると回復手段が消える）。
   const now = input.nowMs ?? Date.now();
   const recent = input.recentBrief;
   if (recent && recent.date === date) {
@@ -314,29 +243,5 @@ export function evaluateBriefTrigger(input: BriefTriggerInput): BriefDecision {
     }
   }
 
-  const sessions = selectBriefTargets(input.sessions);
-  if (sessions.length === 0) {
-    return { action: "no_session", date };
-  }
-  if (sessions.length > 1) {
-    return { action: "ambiguous", date, count: sessions.length };
-  }
-
-  const threadId = (sessions[0] as BriefSessionRef).threadId;
-
-  // 会長が AskUserQuestion に回答している最中（およびその直後の猶予窓）には
-  // 打鍵しない。人間の relay 経路は同じ状況で tmux へ流さず resolveAskUser へ
-  // 回している（bot.ts / #370）。こちらは Discord の返信ではなく生の打鍵で、
-  // しかも `sendToPane` は先頭に Escape を送るため、割り込みの害はより大きい。
-  // no_session / ambiguous と同じ「推測で触らない」方針の延長。
-  if (input.askPending(threadId)) {
-    return { action: "deferred", date, threadId };
-  }
-
-  return {
-    action: "inject",
-    date,
-    threadId,
-    text: buildBriefInjection(date),
-  };
+  return { action: "decide", date };
 }

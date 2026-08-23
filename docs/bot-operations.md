@@ -240,9 +240,11 @@ access.json は毎メッセージ読み込まれるため、編集は即反映�
 | group | 用途 |
 |---|---|
 | 各部署チャンネル（team-salary / convert-service / agent-base） | corp dispatch bot からの `/dispatch`（corp `registry.yaml` の `dispatchChannelId` と対応） |
-| corp | corp dispatch bot からの `/brief`（朝レポ配信を契機に CEO セッションを起こす。#426 / #445） |
+| corp | corp dispatch bot からの `/brief`（朝レポ配信を契機に #corp 直下へタップ決裁ボタンを post する。#426 / #445 / #449） |
 
 新しいチャンネルへ `/dispatch` / `/brief` を通すときは、その group に corp dispatch bot の user id を `dispatchFrom` として追加する。**corp の entry を忘れると `/brief` が silent に denied になり朝レポの決裁 UI が出ない**（#445 の実事故）。
+
+`/brief` は #449 以降セッションを介さない: supervisor が `ChannelConfig.brief`（`config/channels.ts`）の proposals CLI を実行して未決提案を取得し、チャンネル直下に承認/却下/保留ボタンを post する。**ボタンを押せる（= 決裁を確定できる）のは group の `allowFrom` に列挙されたユーザーのみ**（`brief-decision.ts`、ask-components と同じゲート）。`brief` 設定の無いチャンネルでは `/brief` は「実行設定がありません」で fail-closed になる。
 
 ## Permission Mode (claudeHubExit)
 
