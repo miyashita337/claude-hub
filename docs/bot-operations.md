@@ -55,6 +55,21 @@ claude-hub プロジェクトで運用している Discord Bot の役割分担�
 
 > 制約: セッション付与は人間の `/session start` が起点であることは変わらない。bot 作成スレッドへの**自動**起動（人間の最初の発言でセッションを立てる）は Issue #454 で別途検討する。
 
+### 停止したセッションを着信メッセージで自動復帰する（Issue #456）
+
+セッションは放置で終了する（supervisor 再起動 = `supervisor_restart`、DispatchHealthReaper、idle reaper）。**セッション履歴が残るスレッドに次のメッセージが着信したら、supervisor がそのセッションを同じスレッドへ自動 resume して応答する**（message-triggered wake）。数時間〜数日単位で断続するラリー（corp の決裁フィードバックスレッド等）で、毎回手動 `/session resume <id>` を打つ必要がなくなる。
+
+- 対象: `sessions.db` に thread → session の行があり、`claude_session_id` が記録されていて、権威的 liveness 判定（#168）が `dead` のスレッド
+- 復帰先は**そのスレッド自身**（新スレッドを作らない）。復帰後、wake の契機になったメッセージはそのままセッションへ中継される
+- 復帰時はスレッドに `♻️ セッションが停止していたため自動で復帰しました` を post する（supervisor ログには `[AutoResume]` 行が残る）
+- **履歴のないスレッドでは何もしない**: 従来どおり案内のみで、セッションを勝手に新規起動しない
+- **失敗は fail-loud**: MAX_SESSIONS 満杯 / worktree 消失 / チャンネル未登録などで復帰できない場合、`⚠️ 自動復帰できませんでした` + 手動 resume コマンドをスレッドへ返す（黙って落とさない）
+- **プロセス生存中で Supervisor が追跡を見失っただけ**のセッションは resume しない（同一 cwd での二重 `claude --resume` は transcript を壊す。RW-046）。従来どおり salvage 案内を返す
+- 何度でも発動する（1 回きりではない）。復帰したセッションが再び終了すれば、次の着信でまた復帰する
+- アクセス制御は不変: `evaluateAccess` を通過したメッセージだけが wake の契機になるため、`requireMention=true` のチャンネルではメンション時のみ発動する
+
+実装: `supervisor/src/session/auto-resume.ts`（判定 + 実行）、`supervisor/src/bot.ts` の `messageCreate`（`sessionManager.has(threadId)` が false の分岐）。
+
 ### claude-hub 自体の修正
 1. Discord DM の `claudeHubExit` Bot を使用
 2. `--channels plugin:discord` 直結モードで Claude Code が動作

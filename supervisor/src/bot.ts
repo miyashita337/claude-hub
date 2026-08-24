@@ -48,6 +48,7 @@ import {
   buildSalvageReply,
   buildStatusReply,
 } from "./session/status-reply";
+import { autoResumeThread } from "./session/auto-resume";
 import {
   onProgress,
   onLateResponse,
@@ -1653,27 +1654,72 @@ export async function startBot(token: string): Promise<void> {
     // claude_session_id and resume command so the session can be salvaged
     // (Issue #169). Non-mention messages keep the quiet debug log to avoid
     // spamming a dead thread on every line.
+    //
+    // Issue #456: before falling back to that guidance, treat the message
+    // itself as a wake trigger. A thread whose session was stopped (supervisor
+    // restart, dispatch-health reap, idle reap) still owns its history in
+    // sessions.db, so resume it INTO THIS THREAD and relay the message that
+    // woke it. Only threads with history do this — an unknown thread must never
+    // auto-start a session (AC-2) — and a failed resume is reported, not
+    // swallowed (AC-3). Access was already enforced above, so a channel whose
+    // policy sets requireMention still only wakes on a mention.
     if (!sessionManager.has(threadId)) {
-      const botUserId = client.user?.id;
-      const mentioned = botUserId
-        ? message.mentions.users.has(botUserId)
-        : false;
-      if (!mentioned) {
-        console.debug(
-          `[Bot] Ignoring message in thread ${threadId} (no active session)`
-        );
+      const wake = await autoResumeThread(sessionManager, threadId);
+
+      if (wake.kind === "resumed") {
+        // notice === null when this message merely joined a resume another
+        // message in the same thread already started and announced.
+        if (wake.notice) {
+          try {
+            await (message.channel as ThreadChannel).send(wake.notice);
+          } catch (err) {
+            // The session IS live; losing the courtesy notice must not cost the
+            // user their message, so fall through to the relay either way.
+            console.warn(
+              `[Bot] Failed to post auto-resume notice in thread ${threadId}:`,
+              err
+            );
+          }
+        }
+        // Fall through: the relay below now finds the resumed session.
+      } else {
+        const botUserId = client.user?.id;
+        const mentioned = botUserId
+          ? message.mentions.users.has(botUserId)
+          : false;
+        // A failure is loud regardless of mention (#456 AC-3): the thread has a
+        // session the user is trying to reach, and silence here is exactly the
+        // dead-thread experience #456 exists to remove.
+        let reply: string | null = null;
+        if (wake.kind === "failed") {
+          reply = wake.notice;
+        } else if (mentioned) {
+          // The verdict is already resolved: "no-history" means unknown, and
+          // "not-resumable" carries the verdict it decided on. Passing it keeps
+          // this path to ONE liveness evaluation instead of a second tmux call
+          // that costs up to 2s on timeout (#238, same reason as #364).
+          reply = await buildSalvageReply(
+            sessionManager,
+            threadId,
+            wake.kind === "not-resumable" ? wake.verdict : "unknown"
+          );
+        }
+        if (!reply) {
+          console.debug(
+            `[Bot] Ignoring message in thread ${threadId} (no active session, kind=${wake.kind})`
+          );
+          return;
+        }
+        try {
+          await (message.channel as ThreadChannel).send(reply);
+        } catch (err) {
+          console.error(
+            `[Bot] Failed to send salvage reply in thread ${threadId}:`,
+            err
+          );
+        }
         return;
       }
-      const salvage = await buildSalvageReply(sessionManager, threadId);
-      try {
-        await (message.channel as ThreadChannel).send(salvage);
-      } catch (err) {
-        console.error(
-          `[Bot] Failed to send salvage reply in thread ${threadId}:`,
-          err
-        );
-      }
-      return;
     }
 
     const thread = message.channel as ThreadChannel;
