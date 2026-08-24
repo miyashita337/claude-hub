@@ -166,6 +166,7 @@ jobs:
                    tests/session/manager-compact-concurrency.test.ts \
                    tests/commands/session-start-access.test.ts \
                    tests/commands/session-start-branch.test.ts \
+                   tests/commands/session-start-in-thread.test.ts \
                    tests/commands/session-thread-title.test.ts \
                    tests/commands/session-stop.test.ts \
                    tests/commands/session-list.test.ts \

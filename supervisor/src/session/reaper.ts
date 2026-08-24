@@ -166,8 +166,10 @@ export class Reaper {
         await thread.send(Reaper.buildIdleNotice(idleMs, info));
         // Rename and archive. markTitleStopped also handles ♻️ resume threads,
         // which the old `.replace("🟢", ...)` skipped (Issue #175).
+        // #453: skip a no-op rename on a bound (Supervisor-not-created) thread,
+        // whose title carries no status emoji — see handleStop for the rationale.
         const stoppedName = markTitleStopped(thread.name);
-        await thread.setName(stoppedName);
+        if (stoppedName !== thread.name) await thread.setName(stoppedName);
         await thread.setArchived(true);
       }
     } catch (err) {

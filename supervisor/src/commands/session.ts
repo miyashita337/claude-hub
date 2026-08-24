@@ -413,40 +413,64 @@ async function handleStart(
   let createdThread: ThreadChannel | null = null;
 
   try {
-    // Issue #175: title by branch, with a sequence suffix only when another
-    // session is already live on the *same* branch (RW-046: same-branch
-    // multi-session is allowed). Counting same-branch (not channel-wide) keeps
-    // distinct branches at "(1)" so they read cleanly.
-    const sameBranchCount = sessionManager
-      .listRunningByChannel(channelName)
-      .filter((s) => s.branch === branch).length;
-    const sessionNum = sameBranchCount + 1;
-    const threadName = buildThreadTitle(
-      "running",
-      branch,
-      config.displayName,
-      sessionNum
-    );
+    // Issue #453: `/session start` invoked INSIDE a thread that has no live
+    // session binds the session to *that* thread instead of creating a sibling
+    // one. This is exactly what the dead-thread guidance already tells the user
+    // to do (status-reply.ts), and it is the only way a thread the Supervisor
+    // did not create — e.g. a decision thread opened by the corp bot (#449 /
+    // corp#127) — can get a resident session. A thread that already has a live
+    // session keeps the previous behaviour (create a sibling thread), so
+    // starting a second session from inside a working thread still works.
+    const bindTarget =
+      channel.isThread() && !sessionManager.has(channel.id)
+        ? (channel as ThreadChannel)
+        : null;
 
-    // Create a thread in the channel
-    // Get the text channel to create thread in
-    const parentChannel = channel.isThread() && channel.parent
-      ? channel.parent
-      : channel;
+    let thread: ThreadChannel;
+    if (bindTarget) {
+      // `createdThread` deliberately stays null here: the catch below deletes
+      // the thread it created, and deleting a thread we merely bound to would
+      // destroy a conversation the Supervisor does not own.
+      thread = bindTarget;
+      // An archived thread rejects sends, so unarchive before the session's
+      // first message. A locked thread throws here and the catch reports it.
+      if (thread.archived) await thread.setArchived(false);
+    } else {
+      // Issue #175: title by branch, with a sequence suffix only when another
+      // session is already live on the *same* branch (RW-046: same-branch
+      // multi-session is allowed). Counting same-branch (not channel-wide) keeps
+      // distinct branches at "(1)" so they read cleanly.
+      const sameBranchCount = sessionManager
+        .listRunningByChannel(channelName)
+        .filter((s) => s.branch === branch).length;
+      const sessionNum = sameBranchCount + 1;
+      const threadName = buildThreadTitle(
+        "running",
+        branch,
+        config.displayName,
+        sessionNum
+      );
 
-    if (!parentChannel.isTextBased() || parentChannel.isDMBased() || !("threads" in parentChannel)) {
-      await interaction.editReply({
-        content: "❌ このチャンネルではスレッドを作成できません。",
+      // Create a thread in the channel
+      // Get the text channel to create thread in
+      const parentChannel = channel.isThread() && channel.parent
+        ? channel.parent
+        : channel;
+
+      if (!parentChannel.isTextBased() || parentChannel.isDMBased() || !("threads" in parentChannel)) {
+        await interaction.editReply({
+          content: "❌ このチャンネルではスレッドを作成できません。",
+        });
+        return;
+      }
+
+      const textChannel = parentChannel as import("discord.js").TextChannel;
+      thread = await textChannel.threads.create({
+        name: threadName,
+        autoArchiveDuration: 10080, // 7 days
       });
-      return;
+      createdThread = thread;
     }
-
-    const textChannel = parentChannel as import("discord.js").TextChannel;
-    const thread = await textChannel.threads.create({
-      name: threadName,
-      autoArchiveDuration: 10080, // 7 days
-    });
-    createdThread = thread;
 
     // Start the session with the thread ID — runs claude in a per-branch
     // worktree (Issue #154).
@@ -459,8 +483,13 @@ async function handleStart(
     // #303: surface the model override so the user can confirm what was pinned
     // (omitted → recommended/environment default, so no line is shown).
     const modelLine = model ? `\n🤖 モデル: \`${model}\`` : "";
+    // #453: say which of the two things happened — a new thread was opened, or
+    // this existing thread just gained a session.
+    const header = bindTarget
+      ? `✅ **${config.displayName}** のセッションをこのスレッドに接続しました`
+      : `✅ **${config.displayName}** のセッションを開始しました`;
     await thread.send(
-      `✅ **${config.displayName}** のセッションを開始しました\n\n` +
+      `${header}\n\n` +
         `${locationLine}${modelLine}\n` +
         `📊 稼働中セッション: ${sessionManager.count()}/${MAX_SESSIONS}\n\n` +
         `このスレッドにメッセージを送信すると、Claude Code に中継されます。\n` +
@@ -468,7 +497,9 @@ async function handleStart(
     );
 
     await interaction.editReply({
-      content: `✅ セッションをスレッドで起動しました → ${thread}`,
+      content: bindTarget
+        ? "✅ このスレッドにセッションを接続しました。以降このスレッドの発言が中継されます。"
+        : `✅ セッションをスレッドで起動しました → ${thread}`,
     });
   } catch (err) {
     // Best-effort: drop the orphan thread so a failed start doesn't leave a
@@ -696,9 +727,13 @@ async function handleStop(
     // Update thread name to show stopped. markTitleStopped swaps a leading 🟢
     // (start) or ♻️ (resume) to 🔴 — shared with the reaper so both paths stay
     // consistent (Issue #175).
+    // #453: a thread the Supervisor merely bound to (not created) has no
+    // status emoji, so markTitleStopped returns the name unchanged. Renaming to
+    // the identical value would still spend one of Discord's scarce thread-
+    // rename slots and can stall the stop behind a rate limit — skip it.
     const thread = channel as ThreadChannel;
     const stoppedName = markTitleStopped(thread.name);
-    await thread.setName(stoppedName);
+    if (stoppedName !== thread.name) await thread.setName(stoppedName);
 
     // Archive and lock the thread
     await thread.setArchived(true);

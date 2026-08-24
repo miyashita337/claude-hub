@@ -42,6 +42,19 @@ claude-hub プロジェクトで運用している Discord Bot の役割分担�
 2. 作成されたスレッドにメッセージを送信 → Channel-Supervisor が Claude Code に中継
 3. 終了時は `/session stop`（worktree は削除されるが branch は repo に保持される）
 
+### 既存スレッドにセッションを常駐させる（Issue #453）
+
+`/session start <branch>` を**スレッド内**で実行すると、新しいスレッドを作らず**そのスレッドに**セッションを bind する。
+
+- 対象: 稼働中セッションを持たないスレッド（bot が API で作ったスレッドを含む。例: corp の決裁フィードバックスレッド #449 / corp#127）
+- bind 後は通常のセッションスレッドと同じ挙動（発言が中継され、`/session status` `/session stop` `/session compact` が効く）
+- アーカイブ済みスレッドは bind 時に自動でアーカイブ解除する（ロック済みスレッドは失敗を返す）
+- **既に稼働中セッションを持つスレッド**で実行した場合は従来どおり親チャンネルに新スレッドを作る（同一スレッドから 2 本目のセッションを開始する動線は不変）
+- チャンネル直下での実行も従来どおり新スレッド作成（挙動不変）
+- アクセス制御は不変: 親チャンネル id に対する `allowFrom` で判定するため、親チャンネルが未許可のスレッドには bind できない
+
+> 制約: セッション付与は人間の `/session start` が起点であることは変わらない。bot 作成スレッドへの**自動**起動（人間の最初の発言でセッションを立てる）は Issue #454 で別途検討する。
+
 ### claude-hub 自体の修正
 1. Discord DM の `claudeHubExit` Bot を使用
 2. `--channels plugin:discord` 直結モードで Claude Code が動作
