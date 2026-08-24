@@ -10,7 +10,9 @@ process.env.SUPERVISOR_DB_PATH = ":memory:";
 
 const { insertSession, updateSessionStatus, getDb, getSessionByThreadId } =
   await import("../../src/infra/db");
-const { autoResumeThread } = await import("../../src/session/auto-resume");
+const { autoResumeThread, resolveWakeReply } = await import(
+  "../../src/session/auto-resume"
+);
 const { SessionManager } = await import("../../src/session/manager");
 const { createFakeEffects } = await import("../../src/session/adapters-fake");
 const { MAX_SESSIONS } = await import("../../src/config/channels");
@@ -256,6 +258,34 @@ describe("autoResumeThread (#456)", () => {
     expect(b.notice).toBeNull();
   });
 
+  test("a joined attempt on a non-resumable thread sees the same verdict", async () => {
+    // The joiner path strips the notice from resumed/failed outcomes; verdict
+    // outcomes carry no notice, so they must pass through untouched.
+    const threadId = "thread-joined-alive";
+    seedStoppedSession(threadId);
+    let release: (() => void) | undefined;
+    const gate = new Promise<void>((resolve) => {
+      release = resolve;
+    });
+    const slow = {
+      livenessOf: async () => {
+        await gate;
+        return "alive" as const;
+      },
+      resumeSession: async () => {
+        throw new Error("must not be reached");
+      },
+    };
+
+    const first = autoResumeThread(slow, threadId, { channelMap });
+    const joined = autoResumeThread(slow, threadId, { channelMap });
+    release!();
+    const [a, b] = await Promise.all([first, joined]);
+
+    expect(a).toEqual({ kind: "not-resumable", reason: "alive", verdict: "alive" });
+    expect(b).toEqual(a);
+  });
+
   test("a DB read failure is reported, never mistaken for 'no history'", async () => {
     const outcome = await autoResumeThread(manager, "thread-db-broken", {
       channelMap,
@@ -291,5 +321,104 @@ describe("autoResumeThread (#456)", () => {
     if (outcome.kind !== "failed") throw new Error("unreachable");
     expect(outcome.reason).toContain("tmux control channel exploded");
     expect(outcome.notice).toContain("自動復帰できませんでした");
+  });
+});
+
+/**
+ * The caller-side half of the decision: given an outcome, what does bot.ts post
+ * and does the triggering message still get relayed? bot.ts's messageCreate
+ * handler is unreachable from a unit test, so this mapping lives here (same
+ * split as access-policy / slash-prefix / status-reply).
+ */
+describe("resolveWakeReply (#456)", () => {
+  const SALVAGE = "salvage-text";
+  /** Records what verdict, if any, the salvage builder was asked for. */
+  function salvageSpy() {
+    const asked: string[] = [];
+    return {
+      asked,
+      buildSalvage: async (verdict: string) => {
+        asked.push(verdict);
+        return SALVAGE;
+      },
+    };
+  }
+
+  test("resumed → relays the message and posts the wake notice", async () => {
+    const spy = salvageSpy();
+    expect(
+      await resolveWakeReply(
+        { kind: "resumed", claudeSessionId: "id", notice: "♻️ notice" },
+        { mentioned: false, buildSalvage: spy.buildSalvage }
+      )
+    ).toEqual({ relay: true, reply: "♻️ notice" });
+    expect(spy.asked).toEqual([]);
+  });
+
+  test("resumed by a joined attempt → relays without repeating the notice", async () => {
+    const spy = salvageSpy();
+    expect(
+      await resolveWakeReply(
+        { kind: "resumed", claudeSessionId: "id", notice: null },
+        { mentioned: true, buildSalvage: spy.buildSalvage }
+      )
+    ).toEqual({ relay: true, reply: null });
+  });
+
+  test("AC-3: failed → posts the reason even without a mention, and stops", async () => {
+    const spy = salvageSpy();
+    expect(
+      await resolveWakeReply(
+        { kind: "failed", reason: "満杯", notice: "⚠️ notice" },
+        { mentioned: false, buildSalvage: spy.buildSalvage }
+      )
+    ).toEqual({ relay: false, reply: "⚠️ notice" });
+    // The failure wording is authoritative here — no salvage second-guessing.
+    expect(spy.asked).toEqual([]);
+  });
+
+  test("not-resumable → salvage on a mention, reusing the resolved verdict", async () => {
+    const spy = salvageSpy();
+    expect(
+      await resolveWakeReply(
+        { kind: "not-resumable", reason: "alive", verdict: "alive" },
+        { mentioned: true, buildSalvage: spy.buildSalvage }
+      )
+    ).toEqual({ relay: false, reply: SALVAGE });
+    // Reused, not re-derived: livenessOf waits the full 2s on timeout (#238).
+    expect(spy.asked).toEqual(["alive"]);
+  });
+
+  test("not-resumable without a mention → stays quiet", async () => {
+    const spy = salvageSpy();
+    expect(
+      await resolveWakeReply(
+        { kind: "not-resumable", reason: "no-claude-session-id", verdict: "dead" },
+        { mentioned: false, buildSalvage: spy.buildSalvage }
+      )
+    ).toEqual({ relay: false, reply: null });
+    expect(spy.asked).toEqual([]);
+  });
+
+  test("AC-2: no-history → guidance on a mention, never a relay", async () => {
+    const spy = salvageSpy();
+    expect(
+      await resolveWakeReply(
+        { kind: "no-history" },
+        { mentioned: true, buildSalvage: spy.buildSalvage }
+      )
+    ).toEqual({ relay: false, reply: SALVAGE });
+    expect(spy.asked).toEqual(["unknown"]);
+  });
+
+  test("AC-2: no-history without a mention → silence, no session started", async () => {
+    const spy = salvageSpy();
+    expect(
+      await resolveWakeReply(
+        { kind: "no-history" },
+        { mentioned: false, buildSalvage: spy.buildSalvage }
+      )
+    ).toEqual({ relay: false, reply: null });
+    expect(spy.asked).toEqual([]);
   });
 });

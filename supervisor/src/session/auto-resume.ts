@@ -210,6 +210,66 @@ async function decide(
   };
 }
 
+/**
+ * What the caller should do with a wake outcome: what (if anything) to post in
+ * the thread, and whether the triggering message should still be relayed.
+ */
+export interface WakeReply {
+  /** True only after a successful resume — the session can receive the message. */
+  relay: boolean;
+  /** Text to post in the thread, or null to stay quiet. */
+  reply: string | null;
+}
+
+/**
+ * Map an {@link AutoResumeOutcome} onto the caller's two decisions.
+ *
+ * Split out of bot.ts (rather than inlined at the call site) for the same
+ * reason access-policy / slash-prefix / status-reply were: the branching is
+ * real logic with a spec attached (#456 AC-2 and AC-3 both live here), and
+ * inside bot.ts's messageCreate handler it is unreachable from a unit test.
+ *
+ * `buildSalvage` is injected because the salvage wording belongs to
+ * status-reply.ts and needs a live SessionManager; it is only awaited on the
+ * paths that actually use it.
+ */
+export async function resolveWakeReply(
+  outcome: AutoResumeOutcome,
+  opts: {
+    /** Whether the triggering message @-mentioned the bot. */
+    mentioned: boolean;
+    buildSalvage: (verdict: Liveness) => Promise<string>;
+  },
+): Promise<WakeReply> {
+  switch (outcome.kind) {
+    case "resumed":
+      // notice is null when this message joined a resume another message in the
+      // same thread already announced — relay it, but do not repeat the banner.
+      return { relay: true, reply: outcome.notice };
+    case "failed":
+      // Loud regardless of mention (#456 AC-3): the thread has a session the
+      // user is trying to reach, and silence here is the dead-thread experience
+      // #456 exists to remove. null only for a joined attempt, already reported.
+      return { relay: false, reply: outcome.notice };
+    case "not-resumable":
+      // Pass the verdict the decision was made on so the salvage path does not
+      // re-run livenessOf — a tmux call that waits the full 2s on timeout
+      // (#238, same reason as #364).
+      return {
+        relay: false,
+        reply: opts.mentioned ? await opts.buildSalvage(outcome.verdict) : null,
+      };
+    case "no-history":
+      // #456 AC-2: never auto-start here. Pre-#456 behaviour is preserved —
+      // guidance on a mention, silence otherwise so an unrelated thread is not
+      // spammed on every line.
+      return {
+        relay: false,
+        reply: opts.mentioned ? await opts.buildSalvage("unknown") : null,
+      };
+  }
+}
+
 /** Strip the announcement from an outcome handed to a joined-in-flight caller. */
 function withoutNotice(outcome: AutoResumeOutcome): AutoResumeOutcome {
   if (outcome.kind === "resumed" || outcome.kind === "failed") {

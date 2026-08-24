@@ -48,7 +48,10 @@ import {
   buildSalvageReply,
   buildStatusReply,
 } from "./session/status-reply";
-import { autoResumeThread } from "./session/auto-resume";
+import {
+  autoResumeThread,
+  resolveWakeReply,
+} from "./session/auto-resume";
 import {
   onProgress,
   onLateResponse,
@@ -1665,61 +1668,36 @@ export async function startBot(token: string): Promise<void> {
     // policy sets requireMention still only wakes on a mention.
     if (!sessionManager.has(threadId)) {
       const wake = await autoResumeThread(sessionManager, threadId);
+      const botUserId = client.user?.id;
+      const { relay, reply } = await resolveWakeReply(wake, {
+        mentioned: botUserId ? message.mentions.users.has(botUserId) : false,
+        buildSalvage: (verdict) =>
+          buildSalvageReply(sessionManager, threadId, verdict),
+      });
 
-      if (wake.kind === "resumed") {
-        // notice === null when this message merely joined a resume another
-        // message in the same thread already started and announced.
-        if (wake.notice) {
-          try {
-            await (message.channel as ThreadChannel).send(wake.notice);
-          } catch (err) {
-            // The session IS live; losing the courtesy notice must not cost the
-            // user their message, so fall through to the relay either way.
-            console.warn(
-              `[Bot] Failed to post auto-resume notice in thread ${threadId}:`,
-              err
-            );
-          }
-        }
-        // Fall through: the relay below now finds the resumed session.
-      } else {
-        const botUserId = client.user?.id;
-        const mentioned = botUserId
-          ? message.mentions.users.has(botUserId)
-          : false;
-        // A failure is loud regardless of mention (#456 AC-3): the thread has a
-        // session the user is trying to reach, and silence here is exactly the
-        // dead-thread experience #456 exists to remove.
-        let reply: string | null = null;
-        if (wake.kind === "failed") {
-          reply = wake.notice;
-        } else if (mentioned) {
-          // The verdict is already resolved: "no-history" means unknown, and
-          // "not-resumable" carries the verdict it decided on. Passing it keeps
-          // this path to ONE liveness evaluation instead of a second tmux call
-          // that costs up to 2s on timeout (#238, same reason as #364).
-          reply = await buildSalvageReply(
-            sessionManager,
-            threadId,
-            wake.kind === "not-resumable" ? wake.verdict : "unknown"
-          );
-        }
-        if (!reply) {
-          console.debug(
-            `[Bot] Ignoring message in thread ${threadId} (no active session, kind=${wake.kind})`
-          );
-          return;
-        }
+      if (reply) {
         try {
           await (message.channel as ThreadChannel).send(reply);
         } catch (err) {
+          // On the resume path the session IS live, so losing the courtesy
+          // notice must not cost the user their message — fall through to the
+          // relay either way.
           console.error(
-            `[Bot] Failed to send salvage reply in thread ${threadId}:`,
+            `[Bot] Failed to reply in thread ${threadId}:`,
             err
+          );
+        }
+      }
+
+      if (!relay) {
+        if (!reply) {
+          console.debug(
+            `[Bot] Ignoring message in thread ${threadId} (no active session, wake=${wake.kind})`
           );
         }
         return;
       }
+      // Fall through: the relay below now finds the resumed session.
     }
 
     const thread = message.channel as ThreadChannel;
