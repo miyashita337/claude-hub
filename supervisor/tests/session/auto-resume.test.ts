@@ -269,4 +269,27 @@ describe("autoResumeThread (#456)", () => {
     expect(outcome.reason).toContain("database is locked");
     expect(outcome.notice).not.toContain("セッション履歴がありません");
   });
+
+  test("a liveness probe that throws is reported, not left as a rejection", async () => {
+    // bot.ts awaits this straight from the messageCreate handler, so a
+    // rejection would be an unhandled rejection AND leave the user with no
+    // reply at all (PR #457 review, CodeRabbit major).
+    const threadId = "thread-liveness-broken";
+    seedStoppedSession(threadId);
+    const exploding = {
+      livenessOf: async () => {
+        throw new Error("tmux control channel exploded");
+      },
+      resumeSession: async () => {
+        throw new Error("must not be reached");
+      },
+    };
+
+    const outcome = await autoResumeThread(exploding, threadId, { channelMap });
+
+    expect(outcome.kind).toBe("failed");
+    if (outcome.kind !== "failed") throw new Error("unreachable");
+    expect(outcome.reason).toContain("tmux control channel exploded");
+    expect(outcome.notice).toContain("自動復帰できませんでした");
+  });
 });

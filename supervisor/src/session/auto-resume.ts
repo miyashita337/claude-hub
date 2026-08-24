@@ -126,26 +126,37 @@ async function attempt(
   threadId: string,
   deps: AutoResumeDeps,
 ): Promise<AutoResumeOutcome> {
-  const lookupSession = deps.lookupSession ?? getSessionByThreadId;
-  const channelMap = deps.channelMap ?? CHANNEL_MAP;
-
-  let row: SessionRow | undefined;
   try {
-    row = lookupSession(threadId);
+    return await decide(sessions, threadId, deps);
   } catch (err) {
-    // A DB read failure must not be reported as "no history" — that would let
-    // the caller answer "このスレッドにはセッション履歴がありません" for a thread
-    // that has one.
+    // The "never throws" contract, enforced in one place. bot.ts awaits this
+    // straight from the messageCreate handler, so a rejection escaping here is
+    // an unhandled rejection AND leaves the user with nothing back — exactly
+    // the silence #456 exists to remove. Anything unexpected (a locked DB in
+    // the history lookup, a liveness probe that blew up) becomes a loud outcome
+    // instead. Note this must NOT swallow it into "no-history": that would let
+    // the caller answer "セッション履歴がありません" for a thread that has one.
     const reason = err instanceof Error ? err.message : String(err);
-    console.error(`${LOG} DB lookup failed for thread ${threadId}: ${reason}`);
+    console.error(`${LOG} thread ${threadId} failed unexpectedly: ${reason}`);
     return {
       kind: "failed",
       reason,
       notice:
-        `⚠️ このスレッドのセッション履歴を読み出せませんでした: ${reason}\n` +
+        `⚠️ このスレッドのセッションを自動復帰できませんでした: ${reason}\n` +
         "supervisor のログを確認してください。",
     };
   }
+}
+
+async function decide(
+  sessions: AutoResumeSessions,
+  threadId: string,
+  deps: AutoResumeDeps,
+): Promise<AutoResumeOutcome> {
+  const lookupSession = deps.lookupSession ?? getSessionByThreadId;
+  const channelMap = deps.channelMap ?? CHANNEL_MAP;
+
+  const row: SessionRow | undefined = lookupSession(threadId);
   if (!row) return { kind: "no-history" };
 
   // Authoritative liveness (#168), not the DB status column: a supervisor that
