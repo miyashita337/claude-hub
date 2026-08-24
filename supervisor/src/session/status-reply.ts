@@ -12,6 +12,17 @@ import { getSessionByThreadId } from "../infra/db";
  */
 
 /**
+ * Reply for a thread with no session history.
+ *
+ * Issue #453: `/session start <branch>` run inside a thread now binds the
+ * session to THAT thread (commands/session.ts handleStart) instead of opening a
+ * sibling one, so this guidance is literally actionable where it is read — the
+ * previous wording sent the user to a command that used to move them elsewhere.
+ */
+const UNKNOWN_THREAD_REPLY =
+  "ℹ️ このスレッドにはセッション履歴がありません。`/session start <branch>` でこのスレッドにセッションを開始できます。";
+
+/**
  * Salvage reply for a thread whose Supervisor session is no longer active in
  * memory (Issue #169). Gives the claude_session_id and a ready-to-paste resume
  * command instead of silence.
@@ -33,13 +44,13 @@ export async function buildSalvageReply(
 ): Promise<string> {
   const verdict = knownVerdict ?? (await sessionManager.livenessOf(threadId));
   if (verdict === "unknown") {
-    return "ℹ️ このスレッドにはセッション履歴がありません。`/session start` で開始してください。";
+    return UNKNOWN_THREAD_REPLY;
   }
 
   const row = getSessionByThreadId(threadId);
   // verdict !== "unknown" guarantees a row exists, but guard defensively.
   if (!row) {
-    return "ℹ️ このスレッドにはセッション履歴がありません。`/session start` で開始してください。";
+    return UNKNOWN_THREAD_REPLY;
   }
 
   if (verdict === "alive") {
@@ -70,7 +81,7 @@ export async function buildSalvageReply(
   }
   return (
     `💀 このスレッドのセッションは停止しています${reason}。\n` +
-    "🔑 claude_session_id は未記録です（#167 導入前に開始されたセッション）。`/session start` で新規起動してください。"
+    "🔑 claude_session_id は未記録です（#167 導入前に開始されたセッション）。`/session start <branch>` でこのスレッドに新規セッションを開始してください。"
   );
 }
 

@@ -24,6 +24,8 @@ function makeInteraction(opts: {
   isThread?: boolean;
   hasSession?: boolean;
   stopImpl?: (...args: unknown[]) => unknown;
+  /** Thread title; defaults to a Supervisor-created one (status emoji). */
+  threadName?: string;
 }) {
   const replies: ReplyRecord[] = [];
   const stopCalls: unknown[][] = [];
@@ -32,7 +34,7 @@ function makeInteraction(opts: {
 
   const channel = {
     id: "thread-stop-1",
-    name: "🟢 feature-foo | agent-base",
+    name: opts.threadName ?? "🟢 feature-foo | agent-base",
     isThread: () => opts.isThread ?? true,
     setName: async (name: string) => {
       setNameCalls.push(name);
@@ -113,6 +115,21 @@ describe("/session stop dispatch (#349)", () => {
     const editReplies = h.replies.filter((r) => r.kind === "editReply");
     expect(editReplies).toHaveLength(1);
     expect(editReplies[0]!.content).toContain("停止しました");
+  });
+
+  test("#453: a bound thread with no status emoji is archived but not renamed", async () => {
+    // A thread the Supervisor bound to (rather than created) keeps its own
+    // title, so markTitleStopped has nothing to swap. Renaming it to the same
+    // value would burn one of Discord's scarce thread-rename slots for nothing.
+    const h = makeInteraction({
+      isThread: true,
+      hasSession: true,
+      threadName: "決裁: 朝レポ 2026-08-24",
+    });
+    await h.run();
+
+    expect(h.setNameCalls).toHaveLength(0);
+    expect(h.setArchivedCalls).toEqual([true]);
   });
 
   test("stop() failure → error surfaced, thread not renamed/archived", async () => {
