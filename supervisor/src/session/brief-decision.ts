@@ -53,6 +53,14 @@ export const BRIEF_DECISION_PREFIX = "briefdec:";
 export const PROPOSAL_DECISIONS = ["approved", "rejected", "deferred"] as const;
 export type ProposalDecision = (typeof PROPOSAL_DECISIONS)[number];
 
+/** 未知の値を決裁として通さないための型ガード（CLI 出力は外部入力として扱う）。 */
+export function isProposalDecision(v: unknown): v is ProposalDecision {
+  return (
+    typeof v === "string" &&
+    (PROPOSAL_DECISIONS as readonly string[]).includes(v)
+  );
+}
+
 /**
  * ボタンに載せてよい提案 id の形。corp の提案 id（`dispatch-<dept>-<slug>`）を
  * 十分に覆いつつ、`:`（customId の区切り）や空白・shell メタ文字を含む id を
@@ -74,13 +82,22 @@ export const DECISION_LABELS: Record<ProposalDecision, string> = {
   deferred: "保留",
 };
 
-/** proposals CLI 出力のうち、この UI が必要とする最小面。 */
-export interface PendingProposal {
+/**
+ * proposals CLI 出力のうち、この UI が必要とする最小面。
+ *
+ * Issue #132: 未決だけでなく**決裁済みも運ぶ**。決裁は corp 側で後勝ちの追記であり
+ * （`src/cli.ts` は同一決裁の再実行だけを no-op にする）、却下→承認のような押し直しは
+ * 元から CLI 側でサポートされている。ここで決裁済みを落としていたため、朝レポに 4 件並んでも
+ * 押せるのは未決 1 件だけ、という状態になっていた。
+ */
+export interface BriefProposal {
   id: string;
   title: string;
   priority: number | null;
   targetDept: string | null;
   pendingDays: number | null;
+  /** 現在の決裁。未決は null。決裁済みはそのボタンだけ disabled にする。 */
+  decision: ProposalDecision | null;
 }
 
 export type ParsedProposals =
@@ -90,9 +107,11 @@ export type ParsedProposals =
       date: string;
       /** 提案の総数（決裁済み含む）。 */
       total: number;
-      /** 未決（decision === null）のうちボタン化できたもの。 */
-      pending: PendingProposal[];
-      /** id が {@link PROPOSAL_ID_RE} を通らず除外した未決の件数。 */
+      /** ボタン化できた提案（未決・決裁済みの両方・#132）。 */
+      proposals: BriefProposal[];
+      /** うち未決（decision === null）の件数。見出しの「未決 N 件」に使う。 */
+      pendingCount: number;
+      /** id が {@link PROPOSAL_ID_RE} を通らず除外した件数。 */
       skipped: number;
     }
   | { kind: "error"; reason: string };
@@ -129,26 +148,38 @@ export function parseProposalsOutput(stdout: string): ParsedProposals {
     };
   }
 
-  const pending: PendingProposal[] = [];
+  const proposals: BriefProposal[] = [];
   let skipped = 0;
   for (const row of rows) {
     if (row === null || typeof row !== "object") continue;
     const r = row as Record<string, unknown>;
-    if (r.decision !== null) continue; // 決裁済みはボタン対象外
     const id = typeof r.id === "string" ? r.id : "";
     if (!PROPOSAL_ID_RE.test(id)) {
       skipped += 1;
       continue;
     }
-    pending.push({
+    // 未知の決裁値（CLI 側に 4 値目が増えた等）は null に倒さず除外する。null に倒すと
+    // 「決裁済みなのに未決として表示」という嘘になり、承認ゲートの見え方を誤らせる。
+    const raw = r.decision;
+    let decision: ProposalDecision | null = null;
+    if (raw !== null && raw !== undefined) {
+      if (!isProposalDecision(raw)) {
+        skipped += 1;
+        continue;
+      }
+      decision = raw;
+    }
+    proposals.push({
       id,
       title: typeof r.title === "string" ? r.title : id,
       priority: typeof r.priority === "number" ? r.priority : null,
       targetDept: typeof r.targetDept === "string" ? r.targetDept : null,
       pendingDays: typeof r.pendingDays === "number" ? r.pendingDays : null,
+      decision,
     });
   }
-  return { kind: "ok", date, total: rows.length, pending, skipped };
+  const pendingCount = proposals.filter((p) => p.decision === null).length;
+  return { kind: "ok", date, total: rows.length, proposals, pendingCount, skipped };
 }
 
 export function buildBriefDecisionCustomId(
@@ -186,23 +217,37 @@ function truncate(text: string, limit: number): string {
   return text.length <= limit ? text : `${text.slice(0, limit - 1)}…`;
 }
 
+/** 決裁ごとのボタン見た目（ラベル絵文字と style）。行の組み立てを 1 か所に寄せる。 */
+const DECISION_BUTTON: Record<
+  ProposalDecision,
+  { emoji: string; style: ButtonStyle }
+> = {
+  approved: { emoji: "✅", style: ButtonStyle.Success },
+  rejected: { emoji: "⛔", style: ButtonStyle.Danger },
+  deferred: { emoji: "⏸", style: ButtonStyle.Secondary },
+};
+
+/**
+ * 1 提案の決裁ボタン行を作る。
+ *
+ * Issue #132: `current` に現在の決裁を渡すと、**その決裁のボタンだけ disabled** になる。
+ * corp CLI が同一決裁の再実行を no-op にするため押しても何も起きず、押せると誤解させないため。
+ * 残る 2 つは押せる = 却下→承認のような押し直しがそのまま通る。未決（current=null）では 3 つとも押せる。
+ */
 function buildProposalRow(
-  proposal: PendingProposal,
+  proposal: BriefProposal,
   ordinal: number,
 ): BriefDecisionRow {
   return new ActionRowBuilder<ButtonBuilder>().addComponents(
-    new ButtonBuilder()
-      .setCustomId(buildBriefDecisionCustomId(proposal.id, "approved"))
-      .setLabel(`✅ 承認 ${ordinal}`)
-      .setStyle(ButtonStyle.Success),
-    new ButtonBuilder()
-      .setCustomId(buildBriefDecisionCustomId(proposal.id, "rejected"))
-      .setLabel(`⛔ 却下 ${ordinal}`)
-      .setStyle(ButtonStyle.Danger),
-    new ButtonBuilder()
-      .setCustomId(buildBriefDecisionCustomId(proposal.id, "deferred"))
-      .setLabel(`⏸ 保留 ${ordinal}`)
-      .setStyle(ButtonStyle.Secondary),
+    ...PROPOSAL_DECISIONS.map((decision) =>
+      new ButtonBuilder()
+        .setCustomId(buildBriefDecisionCustomId(proposal.id, decision))
+        .setLabel(
+          `${DECISION_BUTTON[decision].emoji} ${DECISION_LABELS[decision]} ${ordinal}`,
+        )
+        .setStyle(DECISION_BUTTON[decision].style)
+        .setDisabled(proposal.decision === decision),
+    ),
   );
 }
 
@@ -215,24 +260,28 @@ function buildProposalRow(
  */
 export function buildBriefDecisionMessages(
   date: string,
-  pending: PendingProposal[],
+  proposals: BriefProposal[],
 ): BriefDecisionMessage[] {
   const messages: BriefDecisionMessage[] = [];
-  for (let i = 0; i < pending.length; i += MAX_PROPOSALS_PER_MESSAGE) {
-    const chunk = pending.slice(i, i + MAX_PROPOSALS_PER_MESSAGE);
+  const pendingCount = proposals.filter((p) => p.decision === null).length;
+  for (let i = 0; i < proposals.length; i += MAX_PROPOSALS_PER_MESSAGE) {
+    const chunk = proposals.slice(i, i + MAX_PROPOSALS_PER_MESSAGE);
     const head =
       i === 0
-        ? `📋 **朝レポ（${date}）の未決提案 ${pending.length} 件** — ボタンで決裁してください（承認は次の dispatch 周期で部署へ投入されます）`
-        : `📋 朝レポ（${date}）未決提案のつづき`;
+        ? `📋 **朝レポ（${date}）の提案 ${proposals.length} 件（未決 ${pendingCount} 件）** — ボタンで決裁してください（承認は次の dispatch 周期で部署へ投入されます。決裁済みも押し直せます）`
+        : `📋 朝レポ（${date}）提案のつづき`;
     const lines = chunk.map((p, j) => {
       const ordinal = i + j + 1;
       const pri = p.priority !== null ? `[D${p.priority}] ` : "";
       const dept = p.targetDept ? `**${p.targetDept}** ` : "";
-      const days =
-        p.pendingDays !== null && p.pendingDays > 1
-          ? `（未決 ${p.pendingDays} 日目)`
-          : "";
-      return `${ordinal}. ${pri}${dept}${truncate(p.title, 160)}${days}\n   id: \`${p.id}\``;
+      // 決裁済みは現在の決裁を、未決は滞留日数を出す（どちらか一方しか意味を持たない）。
+      const state =
+        p.decision !== null
+          ? `（現在: ${DECISION_LABELS[p.decision]}）`
+          : p.pendingDays !== null && p.pendingDays > 1
+            ? `（未決 ${p.pendingDays} 日目)`
+            : "";
+      return `${ordinal}. ${pri}${dept}${truncate(p.title, 160)}${state}\n   id: \`${p.id}\``;
     });
     messages.push({
       content: truncate([head, ...lines].join("\n"), CONTENT_LIMIT),
@@ -359,7 +408,9 @@ export async function runBriefDecideFlow(
     return false;
   }
 
-  if (proposals.pending.length === 0 && proposals.skipped === 0) {
+  // #132: 決裁済みも押し直せるようボタン化するため、「ボタンを出さない」のは
+  // ボタン化できる提案が 1 件も無いときだけ（提案 0 件 / 全件 id 不正）。
+  if (proposals.proposals.length === 0 && proposals.skipped === 0) {
     await input.postToChannel(
       buildAllDecidedMessage(input.date, proposals.total),
     );
@@ -367,7 +418,7 @@ export async function runBriefDecideFlow(
   }
 
   try {
-    for (const msg of buildBriefDecisionMessages(input.date, proposals.pending)) {
+    for (const msg of buildBriefDecisionMessages(input.date, proposals.proposals)) {
       await input.postDecisionMessage(msg);
     }
   } catch (err) {
@@ -381,10 +432,10 @@ export async function runBriefDecideFlow(
   if (proposals.skipped > 0) {
     // id がボタン化できない提案を黙って落とさない（silent truncation 禁止）。
     console.warn(
-      `[brief-decision] ${proposals.skipped} pending proposal(s) skipped (id not button-safe) in channel ${input.channelName}`,
+      `[brief-decision] ${proposals.skipped} proposal(s) skipped (id or decision not button-safe) in channel ${input.channelName}`,
     );
     await input.postToChannel(
-      `⚠️ 未決提案のうち ${proposals.skipped} 件は id をボタン化できず表示していません。` +
+      `⚠️ 提案のうち ${proposals.skipped} 件は id または決裁値をボタン化できず表示していません。` +
         `作業ディレクトリで proposals コマンドを直接確認してください。`,
     );
   }
@@ -538,7 +589,7 @@ export function createBriefDecisionHandler(deps: BriefDecisionHandlerDeps) {
 }
 
 /**
- * 決裁済みの提案の行（ボタン 3 つ）を disable し、本文に決裁結果を追記する。
+ * 決裁した提案の行を「新しい決裁のボタンだけ disabled」に組み替え、本文に決裁結果を追記する。
  * best-effort: 決裁自体は既に確定しているので、メッセージ更新の失敗は log のみ
  * （ask-components の disableStaleMessage と同じ扱い）。
  *
@@ -563,7 +614,14 @@ async function markRowDecided(
         return parseBriefDecisionCustomId(id)?.proposalId === proposalId;
       });
       if (belongs) {
-        for (const c of builder.components) c.setDisabled(true);
+        // #132: 行全体を disable すると押し直しができなくなる。押した決裁のボタンだけを
+        // disable し（CLI が no-op にするため）、他の 2 つは押せるまま残す。
+        for (const c of builder.components) {
+          const id = (c.data as { custom_id?: string }).custom_id ?? "";
+          c.setDisabled(
+            parseBriefDecisionCustomId(id)?.decision === decision,
+          );
+        }
       }
       return builder;
     });
