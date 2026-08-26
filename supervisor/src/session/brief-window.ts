@@ -398,3 +398,181 @@ async function startWindowSession(
 
   return { ok: true, threadId, reused };
 }
+
+/* --------------------------------------------------------------------------
+ * bot.ts を薄く保つためのアダプタ層。
+ *
+ * discord.js / SessionManager の型は構造的に受け取り、ここでは import しない。
+ * bot.ts 側に残すのは「実物をこの形に束ねる」数行だけにして、判断もログも
+ * 通知文もこのファイル（= テストのあるファイル）に置く。
+ * ------------------------------------------------------------------------ */
+
+/** 親チャンネル（スレッドを作れるテキストチャンネル）に必要な最小形。 */
+export interface BriefWindowChannelLike {
+  threads: {
+    fetchActive: () => Promise<{
+      threads: {
+        find: (
+          predicate: (t: { name: string; id: string }) => boolean,
+        ) => { id: string } | undefined;
+      };
+    }>;
+    create: (options: {
+      name: string;
+      autoArchiveDuration: number;
+    }) => Promise<{ id: string }>;
+  };
+  send: (content: string) => Promise<unknown>;
+}
+
+/** SessionManager に必要な最小形（config は呼び出し元で bind 済み）。 */
+export interface BriefWindowSessionsLike {
+  has: (threadId: string) => boolean;
+  start: (threadId: string, branch: string) => Promise<void>;
+  waitForInputReady: (threadId: string) => Promise<boolean>;
+  sendMessage: (threadId: string, text: string) => Promise<void>;
+}
+
+/** dispatch スレッドと同じ 7 日。窓口は idle reaper 側で先に閉じる。 */
+export const BRIEF_WINDOW_AUTO_ARCHIVE_MINUTES = 10080;
+
+/** Discord / SessionManager から {@link BriefWindowDeps} を組み立てる。 */
+export function createBriefWindowDeps(args: {
+  channel: BriefWindowChannelLike;
+  sessions: BriefWindowSessionsLike;
+  /** スレッド id から送信口を引く（見つからなければ null）。 */
+  fetchThread: (
+    threadId: string,
+  ) => Promise<{ send: (content: string) => Promise<unknown> } | null>;
+  notifyFailure: (title: string, body: string) => Promise<void>;
+}): BriefWindowDeps {
+  return {
+    findThreadByName: async (name) => {
+      const active = await args.channel.threads.fetchActive();
+      const hit = active.threads.find((t) => t.name === name);
+      return hit ? { id: hit.id } : null;
+    },
+    hasSession: (threadId) => args.sessions.has(threadId),
+    createThread: async (name) =>
+      args.channel.threads.create({
+        name,
+        autoArchiveDuration: BRIEF_WINDOW_AUTO_ARCHIVE_MINUTES,
+      }),
+    start: (threadId, branch) => args.sessions.start(threadId, branch),
+    waitForInputReady: (threadId) => args.sessions.waitForInputReady(threadId),
+    sendMessage: (threadId, text) => args.sessions.sendMessage(threadId, text),
+    postToThread: async (threadId, content) => {
+      const thread = await args.fetchThread(threadId);
+      if (thread) await thread.send(content);
+    },
+    postToChannel: async (content) => {
+      await args.channel.send(content);
+    },
+    notifyFailure: args.notifyFailure,
+  };
+}
+
+/**
+ * eager 経路のエントリ。`/brief` 受理後に呼ぶ。
+ *
+ * 窓口は決裁の付随機能なので、ここで throw して決裁経路を巻き添えにしない
+ * （失敗は結果型 + ログで返す）。
+ */
+export async function openBriefWindowForBrief(args: {
+  date: string;
+  channelName: string;
+  sessionCount: number;
+  maxSessions: number;
+  deps: BriefWindowDeps;
+  env?: Record<string, string | undefined>;
+}): Promise<BriefWindowResult> {
+  try {
+    const result = await openBriefWindow(
+      {
+        date: args.date,
+        hasBriefConfig: true,
+        sessionCount: args.sessionCount,
+        maxSessions: args.maxSessions,
+        env: args.env,
+      },
+      args.deps,
+    );
+    if (result.ok) {
+      console.log(
+        `[brief-window] ${result.reused ? "reused" : "opened"} in channel ${args.channelName} (thread=${result.threadId}, date=${args.date})`,
+      );
+    } else {
+      console.warn(
+        `[brief-window] not opened in channel ${args.channelName} (stage=${result.stage}, reason=${result.reason})`,
+      );
+    }
+    return result;
+  } catch (err) {
+    const reason = errMsg(err);
+    console.error(`[brief-window] unexpected error in ${args.channelName}: ${reason}`);
+    return { ok: false, stage: "skipped", reason };
+  }
+}
+
+/** 再起動時にスレッドへ出す案内。引き金になった発言は中継しないことを明示する。 */
+export const BRIEF_WINDOW_RESTART_NOTICE =
+  "🔓 窓口セッションを再起動しました（前回は無操作で自動クローズされていました）。\n" +
+  "起動処理中のため、いまの発言はまだ届いていません。**もう一度送ってください**。";
+
+/**
+ * lazy 経路のエントリ。セッション不在スレッドへの発言で呼ぶ。
+ *
+ * 戻り値 `true` = このメッセージを消費した（呼び出し元は以降の salvage 処理を
+ * 止める）。`false` = 窓口ではない等で、従来の salvage 返信に委ねる。
+ */
+export async function handleBriefWindowThreadMessage(args: {
+  threadId: string;
+  threadName: string;
+  hasBriefConfig: boolean;
+  sessionCount: number;
+  maxSessions: number;
+  deps: BriefWindowDeps;
+  env?: Record<string, string | undefined>;
+}): Promise<boolean> {
+  const result = await restartBriefWindow(
+    {
+      threadName: args.threadName,
+      hasBriefConfig: args.hasBriefConfig,
+      // ここに来ている時点でそのスレッドに稼働セッションは無い。
+      hasSession: false,
+      sessionCount: args.sessionCount,
+      maxSessions: args.maxSessions,
+      env: args.env,
+    },
+    args.threadId,
+    args.deps,
+  );
+
+  if (result.ok) {
+    console.log(`[brief-window] restarted (thread=${args.threadId})`);
+    // 引き金の発言は中継しない: 起動直後の TUI に `/brief-window` と会長の発言を
+    // 同時に打つと RW-025 / RW-047 と同じ入力取りこぼしを起こす。黙って捨てず、
+    // 「もう一度送って」と明示する。
+    await args.deps
+      .postToThread(args.threadId, BRIEF_WINDOW_RESTART_NOTICE)
+      .catch((err) =>
+        console.error(
+          `[brief-window] restart notice failed (thread=${args.threadId}):`,
+          err,
+        ),
+      );
+    return true;
+  }
+
+  if (result.stage === "skipped") {
+    // capacity は restartBriefWindow がスレッドへ通知済み。それ以外
+    // （kill-switch / brief 未設定 / 窓口でない）は従来の salvage に委ねる。
+    return result.reason === "capacity";
+  }
+
+  // start / inject の失敗は既に post + notify 済み。二重に salvage を出さない。
+  console.warn(
+    `[brief-window] restart failed (thread=${args.threadId}, stage=${result.stage})`,
+  );
+  return true;
+}

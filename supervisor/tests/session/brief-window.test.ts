@@ -4,10 +4,14 @@ import {
   briefWindowBranch,
   briefWindowInitialCommand,
   briefWindowThreadName,
+  BRIEF_WINDOW_RESTART_NOTICE,
+  createBriefWindowDeps,
   evaluateBriefWindowOpen,
   evaluateBriefWindowRestart,
   isBriefWindowDisabled,
+  handleBriefWindowThreadMessage,
   openBriefWindow,
+  openBriefWindowForBrief,
   parseBriefWindowThreadName,
   type BriefWindowDeps,
 } from "../../src/session/brief-window";
@@ -325,6 +329,211 @@ describe("openBriefWindow", () => {
     if (res.ok) return;
     expect(res.stage).toBe("inject");
     expect(calls.thread.length + calls.channel.length).toBeGreaterThan(0);
+    expect(calls.failures.length).toBe(1);
+  });
+});
+
+describe("createBriefWindowDeps (adapter binding)", () => {
+  function fakeChannel() {
+    const state = {
+      created: [] as Array<{ name: string; autoArchiveDuration: number }>,
+      sent: [] as string[],
+      active: [] as Array<{ id: string; name: string }>,
+    };
+    const channel = {
+      threads: {
+        fetchActive: async () => ({
+          threads: {
+            find: (p: (t: { name: string; id: string }) => boolean) =>
+              state.active.find(p),
+          },
+        }),
+        create: async (o: { name: string; autoArchiveDuration: number }) => {
+          state.created.push(o);
+          return { id: "created-1" };
+        },
+      },
+      send: async (c: string) => {
+        state.sent.push(c);
+        return {};
+      },
+    };
+    return { channel, state };
+  }
+
+  function build(over: { activeThreads?: Array<{ id: string; name: string }> } = {}) {
+    const { channel, state } = fakeChannel();
+    state.active = over.activeThreads ?? [];
+    const sessions = {
+      has: (id: string) => id === "live",
+      started: [] as Array<{ threadId: string; branch: string }>,
+      sent: [] as Array<{ threadId: string; text: string }>,
+      start: async function (threadId: string, branch: string) {
+        this.started.push({ threadId, branch });
+      },
+      waitForInputReady: async () => true,
+      sendMessage: async function (threadId: string, text: string) {
+        this.sent.push({ threadId, text });
+      },
+    };
+    const threadSends: Array<{ threadId: string; content: string }> = [];
+    const pages: Array<{ title: string; body: string }> = [];
+    const deps = createBriefWindowDeps({
+      channel,
+      sessions,
+      fetchThread: async (threadId) =>
+        threadId === "missing"
+          ? null
+          : {
+              send: async (content: string) => {
+                threadSends.push({ threadId, content });
+                return {};
+              },
+            },
+      notifyFailure: async (title, body) => {
+        pages.push({ title, body });
+      },
+    });
+    return { deps, state, sessions, threadSends, pages };
+  }
+
+  test("findThreadByName matches the window thread by exact name", async () => {
+    const { deps } = build({
+      activeThreads: [
+        { id: "other", name: "corp-dispatch-12" },
+        { id: "win", name: `朝レポ窓口 ${DATE}` },
+      ],
+    });
+    expect(await deps.findThreadByName(`朝レポ窓口 ${DATE}`)).toEqual({ id: "win" });
+    expect(await deps.findThreadByName("朝レポ窓口 2026-01-01")).toBeNull();
+  });
+
+  test("createThread uses the dispatch-equivalent auto-archive window", async () => {
+    const { deps, state } = build();
+    expect(await deps.createThread("t")).toEqual({ id: "created-1" });
+    expect(state.created).toEqual([{ name: "t", autoArchiveDuration: 10080 }]);
+  });
+
+  test("postToThread is a no-op when the thread can no longer be fetched", async () => {
+    const { deps, threadSends } = build();
+    await deps.postToThread("missing", "hi");
+    expect(threadSends).toEqual([]);
+    await deps.postToThread("t1", "hi");
+    expect(threadSends).toEqual([{ threadId: "t1", content: "hi" }]);
+  });
+
+  test("postToChannel and hasSession delegate to the bound objects", async () => {
+    const { deps, state } = build();
+    await deps.postToChannel("notice");
+    expect(state.sent).toEqual(["notice"]);
+    expect(deps.hasSession("live")).toBe(true);
+    expect(deps.hasSession("dead")).toBe(false);
+  });
+});
+
+describe("openBriefWindowForBrief (eager entry)", () => {
+  test("returns the window result on the happy path", async () => {
+    const { deps: d, calls } = deps();
+    const res = await openBriefWindowForBrief({
+      date: DATE,
+      channelName: "corp",
+      sessionCount: 1,
+      maxSessions: 10,
+      deps: d,
+    });
+    expect(res).toEqual({ ok: true, threadId: "thread-new", reused: false });
+    expect(calls.created).toEqual([`朝レポ窓口 ${DATE}`]);
+  });
+
+  test("never throws into the decision path — an unexpected error becomes a result", async () => {
+    const { deps: d } = deps({
+      findThreadByName: async () => {
+        throw new Error("discord exploded");
+      },
+      postToChannel: async () => {
+        throw new Error("channel gone too");
+      },
+      notifyFailure: async () => {
+        throw new Error("pushover down");
+      },
+    });
+    const res = await openBriefWindowForBrief({
+      date: DATE,
+      channelName: "corp",
+      sessionCount: 1,
+      maxSessions: 10,
+      deps: d,
+    });
+    expect(res.ok).toBe(false);
+  });
+});
+
+describe("handleBriefWindowThreadMessage (lazy entry)", () => {
+  const base = {
+    threadId: "win-1",
+    threadName: `朝レポ窓口 ${DATE}`,
+    hasBriefConfig: true,
+    sessionCount: 2,
+    maxSessions: 10,
+  };
+
+  test("AC-5: restarts the window and tells the chairman to resend", async () => {
+    const { deps: d, calls } = deps();
+    const consumed = await handleBriefWindowThreadMessage({ ...base, deps: d });
+
+    expect(consumed).toBe(true);
+    expect(calls.started).toEqual([
+      { threadId: "win-1", branch: `corp-brief-window-${DATE}` },
+    ]);
+    expect(calls.sent).toEqual([
+      { threadId: "win-1", text: `/brief-window ${DATE}` },
+    ]);
+    // The message that woke the window is not relayed, so it must be said out loud.
+    expect(calls.thread.length).toBe(1);
+    expect(calls.thread[0]!.content).toBe(BRIEF_WINDOW_RESTART_NOTICE);
+  });
+
+  test("hands non-window threads back to the existing salvage path", async () => {
+    const { deps: d, calls } = deps();
+    const consumed = await handleBriefWindowThreadMessage({
+      ...base,
+      threadName: "corp-dispatch-12 Corp CEO 1",
+      deps: d,
+    });
+    expect(consumed).toBe(false);
+    expect(calls.started).toEqual([]);
+  });
+
+  test("falls through to salvage when the kill-switch is off rather than going quiet", async () => {
+    const { deps: d } = deps();
+    const consumed = await handleBriefWindowThreadMessage({
+      ...base,
+      deps: d,
+      env: { CORP_BRIEF_WINDOW_DISABLED: "1" },
+    });
+    expect(consumed).toBe(false);
+  });
+
+  test("consumes the message at the session cap (the reason was posted in-thread)", async () => {
+    const { deps: d, calls } = deps();
+    const consumed = await handleBriefWindowThreadMessage({
+      ...base,
+      sessionCount: 10,
+      deps: d,
+    });
+    expect(consumed).toBe(true);
+    expect(calls.thread.length).toBe(1);
+    expect(calls.started).toEqual([]);
+  });
+
+  test("consumes the message when the restart itself fails (already reported)", async () => {
+    const { deps: d, calls } = deps({
+      start: async () => {
+        throw new Error("tmux refused");
+      },
+    });
+    const consumed = await handleBriefWindowThreadMessage({ ...base, deps: d });
+    expect(consumed).toBe(true);
     expect(calls.failures.length).toBe(1);
   });
 });
