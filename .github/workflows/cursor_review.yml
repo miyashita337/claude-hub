@@ -29,14 +29,17 @@ jobs:
     runs-on: ubuntu-latest
     # cursor-agent -p にはハング報告（forum 既知バグ）があるため上限は必須
     timeout-minutes: 15
+    # GH_TOKEN は job env に置かず、gh を使う各ステップに限定して渡す
+    # （agent 実行ステップの環境から GitHub トークンを見えなくする: 信頼境界）
     env:
       PR_NUMBER: ${{ github.event.issue.number }}
-      GH_TOKEN: ${{ github.token }}
       MODEL: auto            # 例: claude-sonnet-5-thinking-high 等に変更可（agent models で一覧）
       MARKER: "<!-- cursor-review-summary -->"
     steps:
       # 受付の可視化（eyes リアクション）。失敗しても本処理は続行
       - name: Ack comment
+        env:
+          GH_TOKEN: ${{ github.token }}
         run: |
           gh api -X POST \
             "repos/${{ github.repository }}/issues/comments/${{ github.event.comment.id }}/reactions" \
@@ -45,6 +48,8 @@ jobs:
       # issue_comment は base ブランチのコンテキストで走るため、PR head SHA を明示取得して checkout する
       - name: Resolve PR head SHA
         id: pr
+        env:
+          GH_TOKEN: ${{ github.token }}
         run: |
           echo "sha=$(gh api "repos/${{ github.repository }}/pulls/${PR_NUMBER}" --jq .head.sha)" >> "$GITHUB_OUTPUT"
 
@@ -52,6 +57,27 @@ jobs:
         uses: actions/checkout@v4
         with:
           ref: ${{ steps.pr.outputs.sha }}
+          # トークンを .git/config に残さない（agent がワークスペース経由で読める場所に置かない）
+          persist-credentials: false
+
+      # 信頼境界: PR head の .cursor/（cli.json の permissions と BUGBOT.md のレビュー指示）は
+      # PR 作成者が書き換えられるため信用しない。default branch 版で上書き固定してから agent を実行する
+      # （悪意ある PR が Shell 許可の追加やプロンプト注入で秘密情報を持ち出す経路を塞ぐ）
+      - name: Pin .cursor config to default branch
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          mkdir -p .cursor
+          for f in cli.json BUGBOT.md; do
+            if gh api "repos/${{ github.repository }}/contents/.cursor/$f?ref=${{ github.event.repository.default_branch }}" \
+                 --jq .content 2>/dev/null | base64 -d > ".cursor/$f.pinned"; then
+              mv ".cursor/$f.pinned" ".cursor/$f"
+              echo "pinned .cursor/$f to default branch"
+            else
+              rm -f ".cursor/$f" ".cursor/$f.pinned"
+              echo "removed .cursor/$f (not on default branch)"
+            fi
+          done
 
       # 公式ワンライナー。配置先は docs 記載の ~/.cursor/bin と実測の ~/.local/bin の両方を PATH に足す
       # （2026-08 実測ではインストーラは ~/.local/bin/agent に symlink を作る）
@@ -65,6 +91,8 @@ jobs:
       # .cursor/cli.json の Read(**) はワークスペース相対のため、diff は必ずワークスペース内に置く
       # （/tmp だと agent が読めない可能性がある）。400KB（約 100k tokens）で頭打ちにしてコスト暴走を防ぐ
       - name: Export PR diff
+        env:
+          GH_TOKEN: ${{ github.token }}
         run: |
           mkdir -p .cursor-review-tmp
           gh pr diff "$PR_NUMBER" --repo "${{ github.repository }}" > .cursor-review-tmp/pr.diff
@@ -113,8 +141,11 @@ jobs:
               > /tmp/review.json
             exit 0
           fi
-          # JSON エンベロープ（実機確認済み形: {"type":"result","is_error":false,"result":"..."}）から本文を抽出
-          jq -r '.result' /tmp/agent.json > /tmp/review.raw
+          # JSON エンベロープ（実機確認済み形: {"type":"result","is_error":false,"result":"..."}）から本文を抽出。
+          # exit 0 でもエンベロープが不正 JSON の場合に step を落とさない（落とすと失敗サマリ投稿まで止まる）
+          if ! jq -r '.result' /tmp/agent.json > /tmp/review.raw 2>/dev/null; then
+            cp /tmp/agent.json /tmp/review.raw
+          fi
           # モデルは指示しても前置き文やコードフェンスを付けることがある（スモークテストで実測）。
           # 最初の '{' 〜 最後の '}' を抽出してパースし、型検証（summary: string / comments: array）まで
           # 通らなければ全文をサマリ扱いにフォールバック（サイレント失敗させない）
@@ -140,6 +171,8 @@ jobs:
       # diff 外の行指定で 422 になったら全指摘をサマリコメントに退避（一括 API は部分成功しないため）
       - name: Post inline review
         id: inline
+        env:
+          GH_TOKEN: ${{ github.token }}
         run: |
           COUNT=$(jq '.comments | length' /tmp/review.json)
           echo "inline comments: $COUNT"
@@ -160,6 +193,8 @@ jobs:
 
       # サマリコメント: hidden marker で「既存コメントがあれば更新、なければ新規」（重複抑制）
       - name: Post / update summary comment
+        env:
+          GH_TOKEN: ${{ github.token }}
         run: |
           {
             echo "$MARKER"
