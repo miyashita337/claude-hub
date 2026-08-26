@@ -60,22 +60,26 @@ jobs:
           # トークンを .git/config に残さない（agent がワークスペース経由で読める場所に置かない）
           persist-credentials: false
 
-      # 信頼境界: PR head の .cursor/（cli.json の permissions と BUGBOT.md のレビュー指示）は
-      # PR 作成者が書き換えられるため信用しない。default branch 版で上書き固定してから agent を実行する
-      # （悪意ある PR が Shell 許可の追加やプロンプト注入で秘密情報を持ち出す経路を塞ぐ）
-      - name: Pin .cursor config to default branch
+      # 信頼境界: Cursor CLI が「指示・設定」として自動読込するファイル群（.cursor/** の permissions・
+      # rules・mcp.json、および AGENTS.md / CLAUDE.md）は PR 作成者が書き換えられるため信用しない。
+      # .cursor は丸ごと作り直し（PR head で通常ファイル/symlink 化されても壊れない）、
+      # 指示系ファイルは default branch 版のみを配置してから agent を実行する
+      # （悪意ある PR が Shell 許可の追加・MCP 追加・プロンプト注入で秘密情報を持ち出す経路を塞ぐ）
+      - name: Pin agent instruction files to default branch
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
+          rm -rf .cursor
+          rm -f AGENTS.md CLAUDE.md
           mkdir -p .cursor
-          for f in cli.json BUGBOT.md; do
-            if gh api "repos/${{ github.repository }}/contents/.cursor/$f?ref=${{ github.event.repository.default_branch }}" \
-                 --jq .content 2>/dev/null | base64 -d > ".cursor/$f.pinned"; then
-              mv ".cursor/$f.pinned" ".cursor/$f"
-              echo "pinned .cursor/$f to default branch"
+          for f in .cursor/cli.json .cursor/BUGBOT.md AGENTS.md CLAUDE.md; do
+            if gh api "repos/${{ github.repository }}/contents/$f?ref=${{ github.event.repository.default_branch }}" \
+                 --jq .content 2>/dev/null | base64 -d > "$f.pinned"; then
+              mv "$f.pinned" "$f"
+              echo "pinned $f to default branch"
             else
-              rm -f ".cursor/$f" ".cursor/$f.pinned"
-              echo "removed .cursor/$f (not on default branch)"
+              rm -f "$f.pinned"
+              echo "absent on default branch: $f"
             fi
           done
 
@@ -142,8 +146,11 @@ jobs:
             exit 0
           fi
           # JSON エンベロープ（実機確認済み形: {"type":"result","is_error":false,"result":"..."}）から本文を抽出。
-          # exit 0 でもエンベロープが不正 JSON の場合に step を落とさない（落とすと失敗サマリ投稿まで止まる）
-          if ! jq -r '.result' /tmp/agent.json > /tmp/review.raw 2>/dev/null; then
+          # .result が欠落/非文字列（"null" が summary になる）や不正 JSON でも step を落とさず
+          # 生出力フォールバックに回す（落とすと失敗サマリ投稿まで止まる）
+          if jq -e '(.result | type) == "string"' /tmp/agent.json > /dev/null 2>&1; then
+            jq -r '.result' /tmp/agent.json > /tmp/review.raw
+          else
             cp /tmp/agent.json /tmp/review.raw
           fi
           # モデルは指示しても前置き文やコードフェンスを付けることがある（スモークテストで実測）。
