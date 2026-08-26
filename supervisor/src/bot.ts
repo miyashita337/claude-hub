@@ -38,7 +38,11 @@ import {
   postAskUserPrompt,
   postMultiAskUserPrompt,
 } from "./commands/ask-components";
-import { CHANNEL_MAP, MAX_SESSIONS } from "./config/channels";
+import {
+  CHANNEL_MAP,
+  MAX_SESSIONS,
+  type ChannelConfig,
+} from "./config/channels";
 import { RELAY_ERROR_USER_MESSAGE, type AttachmentInfo } from "./session/relay";
 import { buildDialogStuckHandler } from "./session/dialog-stuck-handler";
 import { notifyPushover, warnIfPushoverUnconfigured } from "./session/notify-pushover";
@@ -102,6 +106,13 @@ import {
   isBriefDecisionComponentId,
   runBriefDecideFlow,
 } from "./session/brief-decision";
+import {
+  createBriefWindowDeps,
+  handleBriefWindowThreadMessage,
+  openBriefWindowForBrief,
+  parseBriefWindowThreadName,
+  type BriefWindowDeps,
+} from "./session/brief-window";
 import {
   ORCHESTRATE_PREFIX,
   parseOrchestrateCommand,
@@ -1412,6 +1423,74 @@ export async function startBot(token: string): Promise<void> {
   // is the safer failure direction than persisting a stale "already delivered".
   const recentBriefByChannel = new Map<string, RecentBrief>();
 
+  // Issue #454: bind the real Discord channel / SessionManager into the window
+  // adapters. Everything else — decisions, notices, logging — lives in
+  // session/brief-window.ts so it stays under test; this is only the binding.
+  const briefWindowDeps = (
+    config: ChannelConfig,
+    textChannel: TextChannel,
+  ): BriefWindowDeps =>
+    createBriefWindowDeps({
+      channel: textChannel,
+      sessions: {
+        has: (threadId) => sessionManager.has(threadId),
+        start: async (threadId, branch) => {
+          await sessionManager.start(config, threadId, branch);
+        },
+        waitForInputReady: (threadId) =>
+          sessionManager.waitForInputReady(threadId),
+        sendMessage: async (threadId, text) => {
+          await sessionManager.sendMessage(threadId, text);
+        },
+      },
+      fetchThread: async (threadId) => {
+        const ch = await client.channels.fetch(threadId);
+        return ch?.isThread() ? ch : null;
+      },
+      notifyFailure: async (title, body) => {
+        await notifyPushover(title, body);
+      },
+    });
+
+  // Issue #454 (lazy path): a message in a window thread whose session the idle
+  // reaper already stopped restarts it instead of answering with the salvage
+  // notice. Returns true when the message was consumed and the caller must stop.
+  // Only the Discord-specific parent resolution lives here.
+  async function tryRestartBriefWindow(
+    message: Message,
+    threadId: string,
+  ): Promise<boolean> {
+    const thread = message.channel as ThreadChannel;
+    // Cheap early-out so an ordinary dead thread never fetches config or channels.
+    if (parseBriefWindowThreadName(thread.name) === null) return false;
+
+    // thread.parent はキャッシュ依存のゲッターで、起動直後などキャッシュ外だと
+    // 実在する親でも null を返す（PR #340 gemini high）。parentId からの明示
+    // fetch にフォールバックしないと、supervisor 再起動直後の窓口だけ復帰しない。
+    let parent = thread.parent as TextChannel | null;
+    if (!parent && thread.parentId) {
+      const fetched = await client.channels.fetch(thread.parentId);
+      parent =
+        fetched && !fetched.isThread() && fetched.isTextBased()
+          ? (fetched as TextChannel)
+          : null;
+    }
+    if (!parent) return false;
+
+    const parentName = "name" in parent ? (parent.name as string) : "";
+    const config = CHANNEL_MAP.get(parentName);
+    if (!config) return false;
+
+    return handleBriefWindowThreadMessage({
+      threadId,
+      threadName: thread.name,
+      hasBriefConfig: Boolean(config.brief),
+      sessionCount: sessionManager.count(),
+      maxSessions: MAX_SESSIONS,
+      deps: briefWindowDeps(config, parent),
+    });
+  }
+
   // Issue #426 → #449: handle a `/brief <YYYY-MM-DD>` message from an allowed
   // external source (corp's dispatch bot) — fetch the day's pending proposals
   // via the channel's configured CLI and post tap-to-decide buttons DIRECTLY in
@@ -1563,6 +1642,23 @@ export async function startBot(token: string): Promise<void> {
             atMs: Date.now(),
           });
         }
+
+        // Issue #454: open the day's conversation window ALONGSIDE the buttons.
+        // A channel-level message reaches no session (see the isThread guard in
+        // handleMessageCreate), so a thread is the only place the chairman can
+        // answer with anything other than approve / reject / hold. Deliberately
+        // not gated on `delivered`: the morning the decision post fails is
+        // exactly when a way to talk matters most. openBriefWindowForBrief
+        // reports and swallows its own failures so the buttons never go down
+        // with the window.
+        await openBriefWindowForBrief({
+          date: decision.date,
+          channelName,
+          sessionCount: sessionManager.count(),
+          maxSessions: MAX_SESSIONS,
+          deps: briefWindowDeps(config, textChannel),
+        });
+
         return true;
       }
     }
@@ -1654,6 +1750,18 @@ export async function startBot(token: string): Promise<void> {
     // (Issue #169). Non-mention messages keep the quiet debug log to avoid
     // spamming a dead thread on every line.
     if (!sessionManager.has(threadId)) {
+      // Issue #454: the morning window is meant to stay usable all day, but the
+      // interactive idle reaper (6h) legitimately stops it. Restart it on the
+      // chairman's next message instead of answering with a salvage notice —
+      // access was already enforced above, so this is the same privilege a
+      // `/session start` in this thread would take. Non-window threads fall
+      // through unchanged.
+      try {
+        if (await tryRestartBriefWindow(message, threadId)) return;
+      } catch (err) {
+        console.error("[Bot] Brief window restart error:", err);
+      }
+
       const botUserId = client.user?.id;
       const mentioned = botUserId
         ? message.mentions.users.has(botUserId)
