@@ -14,9 +14,10 @@ Claude に注入される**といった事故になる。以下を最優先で�
 ## must として扱う観点
 
 ### 1. 注入経路に caller text を通さない
-Discord 発の文字列を、そのまま Claude セッションへ注入するコマンドに載せてはならない。
-注入してよいのは supervisor 側が組み立てた**固定リテラル**（例: `/brief <検証済み日付>`）だけ。
-ユーザー入力を検証なしに連結・テンプレート展開する変更は must。
+Discord 発の caller text は、**検証済みであっても** Claude セッションへ連結・テンプレート展開して
+はならない。注入してよいのは supervisor 側が組み立てた固定リテラルと、supervisor 側で
+**再生成**して固定形式の allowlist（例: `YYYY-MM-DD`）を通した値だけ。
+caller text をサニタイズして通す、という設計に変える PR は must。
 
 ### 2. 認可の迂回
 `evaluateAccess`（access.json の `allowFrom`）が唯一の門。新しい入口（新コマンド・新イベント・
