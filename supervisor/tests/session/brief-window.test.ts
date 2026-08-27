@@ -10,6 +10,7 @@ import {
   BRIEF_WINDOW_REPLY_ERROR_NOTICE,
   BRIEF_WINDOW_UNRESOLVED_NOTICE,
   briefWindowResolutionFailure,
+  reportBriefWindowResolutionFailure,
   BRIEF_WINDOW_RESTART_NOTICE,
   createBriefWindowDeps,
   evaluateBriefWindowOpen,
@@ -576,6 +577,36 @@ describe("briefWindowResolutionFailure (#463 / CodeRabbit)", () => {
   });
 });
 
+describe("reportBriefWindowResolutionFailure (#463 / CodeRabbit)", () => {
+  test("posts the matching notice and blocks the generic wake", async () => {
+    const sent: string[] = [];
+    const outcome = await reportBriefWindowResolutionFailure(
+      "parent",
+      "win-1",
+      async (c) => {
+        sent.push(c);
+        return {};
+      },
+    );
+
+    expect(outcome).toBe("blocked");
+    expect(sent).toEqual([BRIEF_WINDOW_UNRESOLVED_NOTICE]);
+  });
+
+  test("still blocks when the notice cannot be posted", async () => {
+    // 通知は目的ではない。汎用 wake へ落とさないことが目的。
+    const outcome = await reportBriefWindowResolutionFailure(
+      "config",
+      "win-1",
+      async () => {
+        throw new Error("discord 500");
+      },
+    );
+
+    expect(outcome).toBe("blocked");
+  });
+});
+
 describe("handleBriefWindowThreadMessage (lazy entry)", () => {
   const base = {
     threadId: "win-1",
@@ -627,6 +658,20 @@ describe("handleBriefWindowThreadMessage (lazy entry)", () => {
     expect(calls.thread.map((c) => c.content)).toEqual([
       BRIEF_WINDOW_DISABLED_NOTICE,
     ]);
+  });
+
+  test("#463: a failed skip notice still blocks the generic wake", async () => {
+    const { deps: d } = deps({
+      postToThread: async () => {
+        throw new Error("discord 500");
+      },
+    });
+    const consumed = await handleBriefWindowThreadMessage({
+      ...base,
+      deps: d,
+      env: { CORP_BRIEF_WINDOW_DISABLED: "1" },
+    });
+    expect(consumed).toBe("blocked");
   });
 
   test("#463: same for a window thread whose channel has no brief config", async () => {

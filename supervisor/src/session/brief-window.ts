@@ -636,6 +636,29 @@ export function briefWindowResolutionFailure(stage: "parent" | "config"): {
   };
 }
 
+/**
+ * 解決失敗を通知まで含めて処理する（#463）。bot.ts 側は分岐 1 行で済ませる。
+ *
+ * 通知に失敗しても判定（`"blocked"`）は変えない。汎用 wake へ落とさないことが
+ * 目的であって、通知はそのついでだから。
+ */
+export async function reportBriefWindowResolutionFailure(
+  stage: "parent" | "config",
+  threadId: string,
+  send: (content: string) => Promise<unknown>,
+): Promise<BriefWindowMessageOutcome> {
+  const { outcome, notice } = briefWindowResolutionFailure(stage);
+  console.warn(
+    `[brief-window] ${stage} unresolved for window thread ${threadId}`,
+  );
+  try {
+    await send(notice);
+  } catch (err) {
+    console.error(`[brief-window] resolution notice failed (${threadId}):`, err);
+  }
+  return outcome;
+}
+
 export const BRIEF_WINDOW_RESTART_NOTICE =
   "🔓 窓口セッションを再起動しました（前回は無操作で自動クローズされていました）。\n" +
   "起動処理中のため、いまの発言はまだ届いていません。**もう一度送ってください**。";

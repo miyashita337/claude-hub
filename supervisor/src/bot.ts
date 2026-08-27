@@ -115,7 +115,7 @@ import {
   handleBriefWindowThreadMessage,
   openBriefWindowForBrief,
   parseBriefWindowThreadName,
-  briefWindowResolutionFailure,
+  reportBriefWindowResolutionFailure,
   type BriefWindowDeps,
   type BriefWindowMessageOutcome,
 } from "./session/brief-window";
@@ -1465,18 +1465,6 @@ export async function startBot(token: string): Promise<void> {
   // reaper already stopped restarts it instead of answering with the salvage
   // notice. Returns true when the message was consumed and the caller must stop.
   // Only the Discord-specific parent resolution lives here.
-  /** 窓口スレッドへの通知。失敗しても呼び出し元の判定は変えない。 */
-  async function notifyWindowThread(
-    thread: ThreadChannel,
-    content: string,
-  ): Promise<void> {
-    try {
-      await thread.send(content);
-    } catch (err) {
-      console.error(`[brief-window] notice failed (${thread.id}):`, err);
-    }
-  }
-
   async function tryRestartBriefWindow(
     message: Message,
     threadId: string,
@@ -1501,23 +1489,17 @@ export async function startBot(token: string): Promise<void> {
     // #454 の契約を黙って上書きし、supervisor 再起動直後のキャッシュミスや設定
     // 欠落が「窓口ではない」として扱われる。
     if (!parent) {
-      console.warn(
-        `[brief-window] parent channel unresolved for window thread ${threadId}`,
+      return reportBriefWindowResolutionFailure("parent", threadId, (c) =>
+        thread.send(c),
       );
-      const { outcome, notice } = briefWindowResolutionFailure("parent");
-      await notifyWindowThread(thread, notice);
-      return outcome;
     }
 
     const parentName = "name" in parent ? (parent.name as string) : "";
     const config = CHANNEL_MAP.get(parentName);
     if (!config) {
-      console.warn(
-        `[brief-window] no channel config for window thread ${threadId} (parent=${parentName})`,
+      return reportBriefWindowResolutionFailure("config", threadId, (c) =>
+        thread.send(c),
       );
-      const { outcome, notice } = briefWindowResolutionFailure("config");
-      await notifyWindowThread(thread, notice);
-      return outcome;
     }
 
     return handleBriefWindowThreadMessage({
