@@ -11,7 +11,7 @@ import {
   parseBriefDecisionCustomId,
   parseProposalsOutput,
   type CliResult,
-  type PendingProposal,
+  type BriefProposal,
 } from "../../src/session/brief-decision";
 
 /**
@@ -25,13 +25,14 @@ import {
  *   4. CLI 失敗は会長へ報告される（silent fallback 禁止）
  */
 
-function proposal(over: Partial<PendingProposal> = {}): PendingProposal {
+function proposal(over: Partial<BriefProposal> = {}): BriefProposal {
   return {
     id: "dispatch-social-436",
     title: "[social] 着手検討: #436",
     priority: 3,
     targetDept: "social",
     pendingDays: 1,
+    decision: null,
     ...over,
   };
 }
@@ -42,7 +43,7 @@ function proposalsJson(rows: unknown[]): string {
 }
 
 describe("parseProposalsOutput", () => {
-  test("parses pending proposals and drops decided ones", () => {
+  test("keeps decided proposals too, and counts the pending ones (#132)", () => {
     const out = parseProposalsOutput(
       proposalsJson([
         { id: "a-1", title: "A", priority: 1, targetDept: "x", decision: null, pendingDays: 2 },
@@ -53,7 +54,9 @@ describe("parseProposalsOutput", () => {
     if (out.kind === "ok") {
       expect(out.date).toBe("2026-08-23");
       expect(out.total).toBe(2);
-      expect(out.pending.map((p) => p.id)).toEqual(["a-1"]);
+      expect(out.proposals.map((p: BriefProposal) => p.id)).toEqual(["a-1", "b-2"]);
+      expect(out.proposals.map((p: BriefProposal) => p.decision)).toEqual([null, "approved"]);
+      expect(out.pendingCount).toBe(1);
       expect(out.skipped).toBe(0);
     }
   });
@@ -63,7 +66,7 @@ describe("parseProposalsOutput", () => {
     expect(out.kind).toBe("ok");
   });
 
-  test("skips (and counts) a pending proposal whose id cannot ride a customId", () => {
+  test("skips (and counts) a proposal whose id cannot ride a customId", () => {
     const out = parseProposalsOutput(
       proposalsJson([
         { id: "ok-id", title: "OK", decision: null },
@@ -73,7 +76,7 @@ describe("parseProposalsOutput", () => {
     );
     expect(out.kind).toBe("ok");
     if (out.kind === "ok") {
-      expect(out.pending.map((p) => p.id)).toEqual(["ok-id"]);
+      expect(out.proposals.map((p: BriefProposal) => p.id)).toEqual(["ok-id"]);
       expect(out.skipped).toBe(2);
     }
   });
@@ -397,15 +400,26 @@ describe("runBriefDecideFlow", () => {
     expect(capture.notifications.length).toBe(0);
   });
 
-  test("未決 0 件は「すべて決裁済み」1 行のみで true", async () => {
+  test("未決 0 件でも決裁済みがあればボタンを出す（押し直せる・#132）", async () => {
     const { capture, input } = flowDeps({
       code: 0,
       stdout: proposalsJson([{ id: "a-1", title: "A", decision: "approved" }]),
       stderr: "",
     });
     await expect(runBriefDecideFlow(input)).resolves.toBe(true);
+    expect(capture.decisionPosts).toBe(1);
+    expect(capture.channelPosts.join("\n")).not.toContain("すべて決裁済み");
+  });
+
+  test("提案が 1 件も無ければ「すべて決裁済み」1 行のみで true", async () => {
+    const { capture, input } = flowDeps({
+      code: 0,
+      stdout: proposalsJson([]),
+      stderr: "",
+    });
+    await expect(runBriefDecideFlow(input)).resolves.toBe(true);
     expect(capture.decisionPosts).toBe(0);
-    expect(capture.channelPosts.join("\n")).toContain("すべて決裁済み");
+    expect(capture.channelPosts.join("\n")).toContain("提案はありません");
   });
 
   test("CLI 失敗はチャンネル報告 + ページで false（silent にしない・dedup 記録不可）", async () => {
@@ -453,7 +467,7 @@ describe("runBriefDecideFlow", () => {
     });
     await expect(runBriefDecideFlow(input)).resolves.toBe(true);
     expect(capture.decisionPosts).toBe(1);
-    expect(capture.channelPosts.join("\n")).toContain("1 件は id をボタン化できず");
+    expect(capture.channelPosts.join("\n")).toContain("1 件は id または決裁値をボタン化できず");
   });
 
   test("notify 自体の失敗で flow は落ちない", async () => {
@@ -462,5 +476,90 @@ describe("runBriefDecideFlow", () => {
       throw new Error("pushover down");
     };
     await expect(runBriefDecideFlow(input)).resolves.toBe(false);
+  });
+});
+
+/**
+ * Issue #132: 朝レポに提案が 4 件並んでも押せるのは未決 1 件だけ、という状態の修正。
+ * 決裁済みもボタン化し、現在の決裁ボタンだけ disabled にして押し直しを通す。
+ */
+describe("決裁済み提案の押し直し（#132）", () => {
+  test("未知の決裁値は null に倒さず skipped に数える（嘘の未決を作らない）", () => {
+    const out = parseProposalsOutput(
+      proposalsJson([
+        { id: "ok-1", title: "OK", decision: null },
+        { id: "weird-1", title: "NG", decision: "escalated" },
+      ]),
+    );
+    expect(out.kind).toBe("ok");
+    if (out.kind === "ok") {
+      expect(out.proposals.map((p: BriefProposal) => p.id)).toEqual(["ok-1"]);
+      expect(out.skipped).toBe(1);
+    }
+  });
+
+  test("未決の行は 3 ボタンとも押せる", () => {
+    const [msg] = buildBriefDecisionMessages("2026-08-25", [proposal()]);
+    const row = msg!.components[0]!.toJSON();
+    expect(row.components.map((c) => (c as { disabled?: boolean }).disabled ?? false)).toEqual([
+      false,
+      false,
+      false,
+    ]);
+  });
+
+  test("決裁済みの行は現在の決裁だけ disabled、他の 2 つは押せる", () => {
+    const [msg] = buildBriefDecisionMessages("2026-08-25", [
+      proposal({ decision: "rejected" }),
+    ]);
+    const row = msg!.components[0]!.toJSON();
+    const byId = row.components.map((c) => {
+      const b = c as { custom_id?: string; disabled?: boolean };
+      return [parseBriefDecisionCustomId(b.custom_id ?? "")?.decision, b.disabled ?? false];
+    });
+    expect(byId).toEqual([
+      ["approved", false],
+      ["rejected", true],
+      ["deferred", false],
+    ]);
+  });
+
+  test("決裁済みを含む全提案が行として並ぶ（未決だけに絞らない）", () => {
+    const msgs = buildBriefDecisionMessages("2026-08-25", [
+      proposal({ id: "p-1", decision: "approved" }),
+      proposal({ id: "p-2", decision: "rejected" }),
+      proposal({ id: "p-3", decision: null }),
+      proposal({ id: "p-4", decision: "approved" }),
+    ]);
+    expect(msgs).toHaveLength(1);
+    expect(msgs[0]!.components).toHaveLength(4);
+  });
+
+  test("見出しは総数と未決数の両方を出す", () => {
+    const [msg] = buildBriefDecisionMessages("2026-08-25", [
+      proposal({ id: "p-1", decision: "approved" }),
+      proposal({ id: "p-2", decision: null }),
+    ]);
+    expect(msg!.content).toContain("提案 2 件");
+    expect(msg!.content).toContain("未決 1 件");
+  });
+
+  test("決裁済みの行には現在の決裁が本文に出る", () => {
+    const [msg] = buildBriefDecisionMessages("2026-08-25", [
+      proposal({ decision: "rejected" }),
+    ]);
+    expect(msg!.content).toContain("現在: 却下");
+  });
+
+  test("5 件超は複数メッセージに分かれ、通し番号が連番になる（決裁済み込み）", () => {
+    const rows = Array.from({ length: 7 }, (_, i) =>
+      proposal({ id: `p-${i + 1}`, decision: i % 2 === 0 ? "approved" : null }),
+    );
+    const msgs = buildBriefDecisionMessages("2026-08-25", rows);
+    expect(msgs).toHaveLength(2);
+    expect(msgs[0]!.components).toHaveLength(MAX_PROPOSALS_PER_MESSAGE);
+    expect(msgs[1]!.components).toHaveLength(7 - MAX_PROPOSALS_PER_MESSAGE);
+    expect(msgs[1]!.content).toContain("6. ");
+    expect(msgs[1]!.content).toContain("7. ");
   });
 });

@@ -1,0 +1,17 @@
+{
+  "permissions": {
+    "allow": [
+      "Read(**)",
+      "Shell(grep)",
+      "Shell(find)",
+      "Shell(ls)"
+    ],
+    "deny": [
+      "Shell(git)",
+      "Shell(gh)",
+      "Shell(curl)",
+      "Shell(rm)",
+      "Write(**)"
+    ]
+  }
+}

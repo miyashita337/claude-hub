@@ -1,0 +1,237 @@
+name: Cursor PR Review
+
+# PR に「/cursor-review」コメントが付いたときだけ動く手動トリガー（コスト最小の既定）。
+# issue_comment はデフォルトブランチ上の workflow ファイルのみ発火する仕様のため、
+# この YAML は main にマージされて初めて有効になる。
+on:
+  issue_comment:
+    types: [created]
+
+# permissions を明示すると未指定スコープは全て none になる（最小権限）
+permissions:
+  contents: read        # PR head の checkout
+  pull-requests: write  # インラインレビュー投稿 / PR 情報・diff 取得
+  issues: write         # サマリコメント（会話欄）と eyes リアクション
+
+# 同一 PR での多重起動を防止（連打対策）
+concurrency:
+  group: cursor-review-${{ github.event.issue.number }}
+  cancel-in-progress: false
+
+jobs:
+  review:
+    # PR のコメントのみ（issue.pull_request が truthy）+ トリガー語 + 本人/コラボレータ限定
+    # （public リポのため author_association ガードは必須: 第三者コメントでは発火しない）
+    if: >
+      github.event.issue.pull_request &&
+      startsWith(github.event.comment.body, '/cursor-review') &&
+      contains(fromJSON('["OWNER","MEMBER","COLLABORATOR"]'), github.event.comment.author_association)
+    runs-on: ubuntu-latest
+    # cursor-agent -p にはハング報告（forum 既知バグ）があるため上限は必須
+    timeout-minutes: 15
+    # GH_TOKEN は job env に置かず、gh を使う各ステップに限定して渡す
+    # （agent 実行ステップの環境から GitHub トークンを見えなくする: 信頼境界）
+    env:
+      PR_NUMBER: ${{ github.event.issue.number }}
+      MODEL: auto            # 例: claude-sonnet-5-thinking-high 等に変更可（agent models で一覧）
+      MARKER: "<!-- cursor-review-summary -->"
+    steps:
+      # 受付の可視化（eyes リアクション）。失敗しても本処理は続行
+      - name: Ack comment
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh api -X POST \
+            "repos/${{ github.repository }}/issues/comments/${{ github.event.comment.id }}/reactions" \
+            -f content=eyes || true
+
+      # issue_comment は base ブランチのコンテキストで走るため、PR head SHA を明示取得して checkout する
+      - name: Resolve PR head SHA
+        id: pr
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          echo "sha=$(gh api "repos/${{ github.repository }}/pulls/${PR_NUMBER}" --jq .head.sha)" >> "$GITHUB_OUTPUT"
+
+      - name: Checkout PR head
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ steps.pr.outputs.sha }}
+          # トークンを .git/config に残さない（agent がワークスペース経由で読める場所に置かない）
+          persist-credentials: false
+
+      # 信頼境界: Cursor CLI が「指示・設定」として自動読込するファイル群（.cursor/** の permissions・
+      # rules・mcp.json、および AGENTS.md / CLAUDE.md）は PR 作成者が書き換えられるため信用しない。
+      # .cursor は丸ごと作り直し（PR head で通常ファイル/symlink 化されても壊れない）、
+      # 指示系ファイルは default branch 版のみを配置してから agent を実行する
+      # （悪意ある PR が Shell 許可の追加・MCP 追加・プロンプト注入で秘密情報を持ち出す経路を塞ぐ）
+      - name: Pin agent instruction files to default branch
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          rm -rf .cursor
+          rm -f AGENTS.md CLAUDE.md
+          mkdir -p .cursor
+          for f in .cursor/cli.json .cursor/BUGBOT.md AGENTS.md CLAUDE.md; do
+            if gh api "repos/${{ github.repository }}/contents/$f?ref=${{ github.event.repository.default_branch }}" \
+                 --jq .content 2>/dev/null | base64 -d > "$f.pinned"; then
+              mv "$f.pinned" "$f"
+              echo "pinned $f to default branch"
+            else
+              rm -f "$f.pinned"
+              echo "absent on default branch: $f"
+            fi
+          done
+
+      # 公式ワンライナー。配置先は docs 記載の ~/.cursor/bin と実測の ~/.local/bin の両方を PATH に足す
+      # （2026-08 実測ではインストーラは ~/.local/bin/agent に symlink を作る）
+      - name: Install Cursor CLI
+        run: |
+          curl -fsS https://cursor.com/install | bash
+          echo "$HOME/.local/bin" >> "$GITHUB_PATH"
+          echo "$HOME/.cursor/bin" >> "$GITHUB_PATH"
+
+      # diff はファイル経由で渡す（引数直書きの ARG_MAX 回避）。
+      # .cursor/cli.json の Read(**) はワークスペース相対のため、diff は必ずワークスペース内に置く
+      # （/tmp だと agent が読めない可能性がある）。400KB（約 100k tokens）で頭打ちにしてコスト暴走を防ぐ
+      - name: Export PR diff
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          mkdir -p .cursor-review-tmp
+          gh pr diff "$PR_NUMBER" --repo "${{ github.repository }}" > .cursor-review-tmp/pr.diff
+          size=$(wc -c < .cursor-review-tmp/pr.diff)
+          echo "diff size: ${size} bytes"
+          if [ "$size" -gt 400000 ]; then
+            head -c 400000 .cursor-review-tmp/pr.diff > .cursor-review-tmp/pr.diff.trunc
+            mv .cursor-review-tmp/pr.diff.trunc .cursor-review-tmp/pr.diff
+            echo "DIFF_TRUNCATED=true" >> "$GITHUB_ENV"
+          fi
+
+      # レビュー本体。--mode ask = read-only（編集・shell 実行をさせない restricted autonomy）
+      # --trust は CI 必須（無いと Workspace Trust プロンプトで停止する: 実機確認済み）
+      # 出力は JSON 契約（summary + comments[]）。PR への投稿はエージェントにやらせない
+      - name: Run Cursor review (read-only)
+        id: review
+        env:
+          CURSOR_API_KEY: ${{ secrets.CURSOR_API_KEY }}
+        run: |
+          BUGBOT_NOTE=""
+          if [ -f .cursor/BUGBOT.md ]; then
+            BUGBOT_NOTE="レビュー観点はワークスペースの .cursor/BUGBOT.md を読んで従うこと。"
+          fi
+          PROMPT="あなたは PR レビュアーです。ワークスペース直下の .cursor-review-tmp/pr.diff にこの PR の unified diff があります（このファイル自体はレビュー対象外の入力データ）。
+          ${BUGBOT_NOTE}
+          必要ならワークスペース内の関連ファイルを読んで文脈を確認してください。
+          出力は次のスキーマの JSON のみとする。出力の最初の文字は { 、最後の文字は } であること。
+          前置き・後置き・作業経過の文章・コードフェンスは一切出力しない:
+          {\"summary\": \"日本語の総評 markdown（重要度順の指摘一覧を含む）\",
+           \"comments\": [{\"path\": \"diff 内のファイルパス\", \"line\": 123, \"side\": \"RIGHT\", \"body\": \"日本語の指摘\"}]}
+          制約: comments は最大 10 件。line は diff に含まれる行のみ（追加行・文脈行は side=RIGHT、削除行は LEFT）。
+          確信のない指摘は summary のみに書き comments に入れない。指摘ゼロなら comments は空配列。"
+          # agent の失敗は握りつぶさず、失敗サマリを PR に届けた上で最終ステップで run を赤にする
+          # （後続ステップスキップによる「PR に何も出ない」と、|| true による「緑のまま silent failure」の両方を回避）
+          set +e
+          agent -p --mode ask --trust --model "$MODEL" --output-format json \
+            "$PROMPT" > /tmp/agent.json 2> /tmp/agent.err
+          AGENT_EXIT=$?
+          set -e
+          echo "agent_exit=$AGENT_EXIT" >> "$GITHUB_OUTPUT"
+          if [ "$AGENT_EXIT" -ne 0 ]; then
+            echo "::error::cursor agent failed (exit $AGENT_EXIT)"
+            cat /tmp/agent.err
+            jq -n --arg e "$AGENT_EXIT" --rawfile err /tmp/agent.err \
+              '{summary: ("⚠️ Cursor CLI がエラー終了しました (exit " + $e + ")。stderr:\n\n```\n" + $err + "\n```"), comments: []}' \
+              > /tmp/review.json
+            exit 0
+          fi
+          # JSON エンベロープ（実機確認済み形: {"type":"result","is_error":false,"result":"..."}）から本文を抽出。
+          # .result が欠落/非文字列（"null" が summary になる）や不正 JSON でも step を落とさず
+          # 生出力フォールバックに回す（落とすと失敗サマリ投稿まで止まる）
+          if jq -e '(.result | type) == "string"' /tmp/agent.json > /dev/null 2>&1; then
+            jq -r '.result' /tmp/agent.json > /tmp/review.raw
+          else
+            cp /tmp/agent.json /tmp/review.raw
+          fi
+          # モデルは指示しても前置き文やコードフェンスを付けることがある（スモークテストで実測）。
+          # 最初の '{' 〜 最後の '}' を抽出してパースし、型検証（summary: string / comments: array）まで
+          # 通らなければ全文をサマリ扱いにフォールバック（サイレント失敗させない）
+          python3 - <<'PY'
+          import json
+
+          raw = open('/tmp/review.raw', encoding='utf-8').read()
+          obj = None
+          start, end = raw.find('{'), raw.rfind('}')
+          if start != -1 and end > start:
+              try:
+                  obj = json.loads(raw[start:end + 1])
+              except ValueError:
+                  obj = None
+          if not (isinstance(obj, dict)
+                  and isinstance(obj.get('summary'), str)
+                  and isinstance(obj.get('comments'), list)):
+              obj = {'summary': raw, 'comments': []}
+          json.dump(obj, open('/tmp/review.json', 'w', encoding='utf-8'), ensure_ascii=False)
+          PY
+
+      # インライン投稿: reviews API の comments[] 一括（API 1 回、content 生成制限 80req/min に強い）。
+      # diff 外の行指定で 422 になったら全指摘をサマリコメントに退避（一括 API は部分成功しないため）
+      - name: Post inline review
+        id: inline
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          COUNT=$(jq '.comments | length' /tmp/review.json)
+          echo "inline comments: $COUNT"
+          if [ "$COUNT" -gt 0 ]; then
+            jq --arg sha "${{ steps.pr.outputs.sha }}" \
+               '{commit_id: $sha, event: "COMMENT", body: "Cursor CLI 自動レビュー（インライン指摘は各行参照）",
+                 comments: [.comments[] | {path, line, side: (.side // "RIGHT"), body}]}' \
+               /tmp/review.json > /tmp/review-req.json
+            if gh api -X POST "repos/${{ github.repository }}/pulls/${PR_NUMBER}/reviews" \
+                 --input /tmp/review-req.json; then
+              echo "posted=true" >> "$GITHUB_OUTPUT"
+            else
+              echo "posted=false" >> "$GITHUB_OUTPUT"
+            fi
+          else
+            echo "posted=true" >> "$GITHUB_OUTPUT"
+          fi
+
+      # サマリコメント: hidden marker で「既存コメントがあれば更新、なければ新規」（重複抑制）
+      - name: Post / update summary comment
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          {
+            echo "$MARKER"
+            echo "## 🤖 Cursor CLI レビュー"
+            echo ""
+            jq -r '.summary' /tmp/review.json
+            if [ "${{ steps.inline.outputs.posted }}" = "false" ]; then
+              echo ""
+              echo "> ⚠️ インライン投稿が API に拒否されたため（行番号が diff 外の可能性）、指摘を本文に含めます:"
+              jq -r '.comments[] | "- **\(.path):\(.line)** — \(.body)"' /tmp/review.json
+            fi
+            if [ "${DIFF_TRUNCATED:-}" = "true" ]; then
+              echo ""
+              echo "> ⚠️ diff が 400KB を超えたため先頭のみレビュー"
+            fi
+            echo ""
+            echo "_model: ${MODEL} / usage: $(jq -c '.usage // empty' /tmp/agent.json)_"
+          } > /tmp/summary.md
+          CID=$(gh api "repos/${{ github.repository }}/issues/${PR_NUMBER}/comments" --paginate \
+                --jq ".[] | select(.body | startswith(\"$MARKER\")) | .id" | head -1)
+          jq -n --rawfile b /tmp/summary.md '{body: $b}' > /tmp/summary-req.json
+          if [ -n "$CID" ]; then
+            gh api -X PATCH "repos/${{ github.repository }}/issues/comments/$CID" --input /tmp/summary-req.json
+          else
+            gh api -X POST "repos/${{ github.repository }}/issues/${PR_NUMBER}/comments" --input /tmp/summary-req.json
+          fi
+
+      # agent が失敗していた場合、PR への失敗サマリ投稿後に run 自体を赤にする（silent green 防止）
+      - name: Fail run if agent errored
+        if: steps.review.outputs.agent_exit != '0'
+        run: |
+          echo "::error::cursor agent exited with ${{ steps.review.outputs.agent_exit }} (failure summary was posted to the PR)"
+          exit 1
