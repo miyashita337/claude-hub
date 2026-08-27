@@ -600,9 +600,41 @@ export const BRIEF_WINDOW_DISABLED_NOTICE =
   "⏸️ 窓口の自動再起動は停止中です（kill-switch 有効）。\n" +
   "会話を続けるには、このスレッドで `/session resume` を実行してください。";
 
+/**
+ * 窓口スレッドと判定できたが、親チャンネル / その設定を解決できないとき（#463）。
+ *
+ * ここで `not_window` を返して汎用 wake に落とすと、素の `--resume` が #454 の
+ * 契約を黙って上書きする。解決失敗は「窓口ではない」ではなく「今は起こせない」。
+ */
+export const BRIEF_WINDOW_UNRESOLVED_NOTICE =
+  "⚠️ 窓口スレッドの親チャンネルを解決できず、窓口を再開できませんでした。\n" +
+  "しばらく待って再度発言するか、このスレッドで `/session resume` を実行してください。";
+
 /** 親チャンネルに朝レポ設定が無いとき（#463）。設定ミスなので黙らせない。 */
 export const BRIEF_WINDOW_NO_CONFIG_NOTICE =
   "⚠️ このチャンネルは朝レポ窓口として設定されていないため、窓口を再開できません。";
+
+/**
+ * スレッド名で窓口と確定した「あと」に、親チャンネル（`parent`）またはその
+ * チャンネル設定（`CHANNEL_MAP`）を解決できなかったときの応答（#463）。
+ *
+ * 要点は **"not_window" を返さないこと**。解決失敗は「窓口ではない」ではなく
+ * 「今は起こせない」であり、汎用 wake（#456）に落とすと素の `--resume` が
+ * #454 の契約を黙って上書きする（supervisor 再起動直後のキャッシュミスで実際に
+ * 起こる）。bot.ts に分岐を書くとテストが届かないため判断はここに置く。
+ */
+export function briefWindowResolutionFailure(stage: "parent" | "config"): {
+  outcome: BriefWindowMessageOutcome;
+  notice: string;
+} {
+  return {
+    outcome: "blocked",
+    notice:
+      stage === "parent"
+        ? BRIEF_WINDOW_UNRESOLVED_NOTICE
+        : BRIEF_WINDOW_NO_CONFIG_NOTICE,
+  };
+}
 
 export const BRIEF_WINDOW_RESTART_NOTICE =
   "🔓 窓口セッションを再起動しました（前回は無操作で自動クローズされていました）。\n" +

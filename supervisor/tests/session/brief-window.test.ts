@@ -8,6 +8,8 @@ import {
   BRIEF_WINDOW_EMPTY_REPLY_NOTICE,
   BRIEF_WINDOW_NO_CONFIG_NOTICE,
   BRIEF_WINDOW_REPLY_ERROR_NOTICE,
+  BRIEF_WINDOW_UNRESOLVED_NOTICE,
+  briefWindowResolutionFailure,
   BRIEF_WINDOW_RESTART_NOTICE,
   createBriefWindowDeps,
   evaluateBriefWindowOpen,
@@ -552,6 +554,25 @@ describe("standby report delivery (#464)", () => {
     expect(calls.thread.length).toBe(1);
     expect(calls.thread[0]!.content).toContain("pane gone");
     expect(calls.failures.length).toBe(1);
+  });
+});
+
+describe("briefWindowResolutionFailure (#463 / CodeRabbit)", () => {
+  // スレッド名で窓口と確定した「あと」の解決失敗は、窓口でないことを意味しない。
+  // "not_window" を返すと汎用 wake (#456) が素の --resume で起こしてしまう。
+  test("never reports a resolution failure as a non-window thread", () => {
+    for (const stage of ["parent", "config"] as const) {
+      expect(briefWindowResolutionFailure(stage).outcome).toBe("blocked");
+    }
+  });
+
+  test("explains which resolution failed", () => {
+    expect(briefWindowResolutionFailure("parent").notice).toBe(
+      BRIEF_WINDOW_UNRESOLVED_NOTICE,
+    );
+    expect(briefWindowResolutionFailure("config").notice).toBe(
+      BRIEF_WINDOW_NO_CONFIG_NOTICE,
+    );
   });
 });
 
