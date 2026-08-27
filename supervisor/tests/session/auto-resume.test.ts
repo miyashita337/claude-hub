@@ -10,9 +10,13 @@ process.env.SUPERVISOR_DB_PATH = ":memory:";
 
 const { insertSession, updateSessionStatus, getDb, getSessionByThreadId } =
   await import("../../src/infra/db");
-const { autoResumeThread, resolveWakeReply } = await import(
-  "../../src/session/auto-resume"
-);
+const {
+  autoResumeThread,
+  resolveWakeReply,
+  classifyResumeFailure,
+  isAutoResumeDisabled,
+  AUTO_RESUME_DISABLED_ENV,
+} = await import("../../src/session/auto-resume");
 const { SessionManager } = await import("../../src/session/manager");
 const { createFakeEffects } = await import("../../src/session/adapters-fake");
 const { MAX_SESSIONS } = await import("../../src/config/channels");
@@ -321,6 +325,92 @@ describe("autoResumeThread (#456)", () => {
     if (outcome.kind !== "failed") throw new Error("unreachable");
     expect(outcome.reason).toContain("tmux control channel exploded");
     expect(outcome.notice).toContain("自動復帰できませんでした");
+  });
+
+  // PR #457 review (must ×3, and CodeRabbit CLI minor): `resumeSession`'s
+  // worktree recovery interpolates `projectDir` into its error, so posting
+  // `err.message` puts an absolute home path in a thread that may have
+  // non-owner readers. Same contract as RELAY_ERROR_USER_MESSAGE (#236): raw
+  // cause to the log, canned actionable text to the user.
+  test("a resume failure carrying an absolute path never posts it to the thread", async () => {
+    const threadId = "thread-path-leak";
+    const claudeSessionId = seedStoppedSession(threadId)!;
+    const leaky = {
+      livenessOf: async () => "dead" as const,
+      resumeSession: async () => {
+        throw new Error(
+          `プロジェクトディレクトリが見つかりません: ${projectDir}（worktree が削除された可能性があります）`,
+        );
+      },
+    };
+
+    const outcome = await autoResumeThread(leaky, threadId, { channelMap });
+
+    expect(outcome.kind).toBe("failed");
+    if (outcome.kind !== "failed") throw new Error("unreachable");
+    // The raw cause survives for the log and for callers.
+    expect(outcome.reason).toContain(projectDir);
+    // …but never reaches Discord. Assert on the path itself, not on a wording,
+    // so the test keeps meaning if the canned text is reworded.
+    expect(outcome.notice).not.toContain(projectDir);
+    // The `/session resume` hint is the only slash that belongs here; anything
+    // rooted at a real filesystem prefix is the leak this test exists to catch.
+    expect(outcome.notice).not.toMatch(/\/(Users|home|var|tmp|private)\//);
+    // Still fail-loud and actionable (AC-3).
+    expect(outcome.notice).toContain("自動復帰できませんでした");
+    expect(outcome.notice).toContain("Supervisor のログ");
+  });
+
+  test("an unexpected exception carrying an absolute path is logged, not posted", async () => {
+    const threadId = "thread-unexpected-path";
+    const outcome = await autoResumeThread(manager, threadId, {
+      channelMap,
+      lookupSession: () => {
+        throw new Error(`ENOENT: no such file or directory, open '${projectDir}/sessions.db'`);
+      },
+    });
+
+    expect(outcome.kind).toBe("failed");
+    if (outcome.kind !== "failed") throw new Error("unreachable");
+    expect(outcome.reason).toContain(projectDir);
+    expect(outcome.notice).not.toContain(projectDir);
+    expect(outcome.notice).toContain("自動復帰できませんでした");
+  });
+
+  // PR #457 review (should ×2): a route that fires on every inbound message and
+  // consumes a session slot needs an escape hatch short of stopping the bot.
+  test("the kill-switch disables the route without auto-starting anything", async () => {
+    const threadId = "thread-killswitch";
+    seedStoppedSession(threadId);
+
+    const outcome = await autoResumeThread(manager, threadId, {
+      channelMap,
+      env: { [AUTO_RESUME_DISABLED_ENV]: "1" },
+    });
+
+    // `no-history`, so bot.ts falls back to the pre-#456 salvage guidance
+    // rather than announcing the feature's absence on every message.
+    expect(outcome).toEqual({ kind: "no-history" });
+    expect(manager.has(threadId)).toBe(false);
+    expect(manager.count()).toBe(0);
+  });
+
+  test("the kill-switch is off for an unset or '0' value", async () => {
+    expect(isAutoResumeDisabled({})).toBe(false);
+    expect(isAutoResumeDisabled({ [AUTO_RESUME_DISABLED_ENV]: "" })).toBe(false);
+    expect(isAutoResumeDisabled({ [AUTO_RESUME_DISABLED_ENV]: "0" })).toBe(false);
+    expect(isAutoResumeDisabled({ [AUTO_RESUME_DISABLED_ENV]: "1" })).toBe(true);
+    expect(isAutoResumeDisabled({ [AUTO_RESUME_DISABLED_ENV]: "true" })).toBe(true);
+  });
+
+  test("classifyResumeFailure keeps known causes and buries unknown ones", () => {
+    expect(classifyResumeFailure("最大セッション数 (10) に達しています")).toContain(
+      "最大セッション数",
+    );
+    // Unknown → generic, and specifically NOT an echo of the input.
+    const leaked = classifyResumeFailure(`ENOENT ... open '${projectDir}'`);
+    expect(leaked).not.toContain(projectDir);
+    expect(leaked).toContain("Supervisor のログ");
   });
 });
 

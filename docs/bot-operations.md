@@ -67,8 +67,15 @@ claude-hub プロジェクトで運用している Discord Bot の役割分担�
 - **プロセス生存中で Supervisor が追跡を見失っただけ**のセッションは resume しない（同一 cwd での二重 `claude --resume` は transcript を壊す。RW-046）。従来どおり salvage 案内を返す
 - 何度でも発動する（1 回きりではない）。復帰したセッションが再び終了すれば、次の着信でまた復帰する
 - アクセス制御は不変: `evaluateAccess` を通過したメッセージだけが wake の契機になるため、`requireMention=true` のチャンネルではメンション時のみ発動する
+- 失敗理由のうち **Discord に出るのは定型文だけ**。`resumeSession` の生エラーは worktree 再生成失敗時に `projectDir` の絶対パスを含むため、生原因は supervisor ログにのみ残す（#236 / `RELAY_ERROR_USER_MESSAGE` と同じ契約）
+
+**kill-switch**: `AUTO_RESUME_DISABLED` を `0` 以外の値で設定するとこの経路だけを止められる（`CORP_BRIEF_WINDOW_DISABLED` と対称）。止めると #456 以前の挙動（salvage 案内のみ）に戻り、セッションは起動しない。誤 wake や連続失敗を bot 全体の停止なしに退避するための手段。
+
+> **運用上の制約（同一 `projectDir` の同時 wake）**: supervisor 再起動直後は多数のスレッドが同時に dead になるため、着信のたびにこの経路へ来る。同一チャンネルの**非 worktree**セッションは `projectDir` を共有するので、短時間に複数スレッドが復帰すると既知の relay-url 衝突（応答が別スレッドへ出る）を手動 resume より起こしやすい。多数の dead スレッドが一斉に動きそうな場面では、`AUTO_RESUME_DISABLED=1` で止めて順に手動 resume するか、worktree 運用のチャンネルを使うこと。
 
 実装: `supervisor/src/session/auto-resume.ts`（判定 + 実行）、`supervisor/src/bot.ts` の `messageCreate`（`sessionManager.has(threadId)` が false の分岐）。
+
+> 同じ分岐にある **#454 の朝レポ窓口の遅延再起動が先に走る**。窓口スレッド（`朝レポ窓口 <日付>`）は `/brief-window` を再注入して起動し直す専用経路を持ち、引き金の発言は中継せず「もう一度送ってください」と案内する（起動直後の TUI への入力取りこぼし対策。RW-025 / RW-047）。窓口以外のスレッドはスレッド名判定で素通りし、本節の自動 resume に落ちる。
 
 ### claude-hub 自体の修正
 1. Discord DM の `claudeHubExit` Bot を使用

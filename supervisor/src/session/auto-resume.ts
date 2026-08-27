@@ -31,6 +31,27 @@ import type { Liveness } from "./manager";
 const LOG = "[AutoResume]";
 
 /**
+ * kill-switch の env 名。`CORP_BRIEF_WINDOW_DISABLED` と対称で、この経路だけを止める。
+ */
+export const AUTO_RESUME_DISABLED_ENV = "AUTO_RESUME_DISABLED";
+
+/**
+ * この経路を止める kill-switch。空文字 / `0` 以外なら停止。
+ *
+ * 着信メッセージのたびに走り、成功すればセッション枠を 1 つ埋める経路なので、
+ * 誤 wake や連発失敗を bot 全体の停止なしに退避できる手段を用意しておく
+ * （`isBriefDisabled` / `CORP_DISPATCH_DISABLED` と同じ形）。止まると `no-history`
+ * を返すため、呼び出し側は #456 以前の salvage 案内に戻るだけで、勝手にセッションを
+ * 起動することはない。
+ */
+export function isAutoResumeDisabled(
+  env: Record<string, string | undefined> = process.env,
+): boolean {
+  const raw = (env[AUTO_RESUME_DISABLED_ENV] ?? "").trim();
+  return raw.length > 0 && raw !== "0";
+}
+
+/**
  * The slice of {@link import("./manager").SessionManager} this module needs.
  * Structural, so the real manager satisfies it without a cast while tests can
  * drive the decision path with a stub.
@@ -87,6 +108,8 @@ export type AutoResumeOutcome =
 export interface AutoResumeDeps {
   channelMap?: ReadonlyMap<string, ChannelConfig>;
   lookupSession?: (threadId: string) => SessionRow | undefined;
+  /** Overridable for tests; defaults to `process.env` at the point of use. */
+  env?: Record<string, string | undefined>;
 }
 
 /**
@@ -136,14 +159,20 @@ async function attempt(
     // the history lookup, a liveness probe that blew up) becomes a loud outcome
     // instead. Note this must NOT swallow it into "no-history": that would let
     // the caller answer "セッション履歴がありません" for a thread that has one.
+    //
+    // The raw cause goes to the log ONLY (#236). `err` here is whatever the DB
+    // or the liveness probe threw, so `err.message` can be
+    // `ENOENT ... open '/Users/<name>/...'` and `String(err)` can be anything
+    // at all — posting it would put a home path in a thread that may have
+    // non-owner readers. `reason` stays raw for the log and for callers/tests.
     const reason = err instanceof Error ? err.message : String(err);
     console.error(`${LOG} thread ${threadId} failed unexpectedly: ${reason}`);
     return {
       kind: "failed",
       reason,
       notice:
-        `⚠️ このスレッドのセッションを自動復帰できませんでした: ${reason}\n` +
-        "supervisor のログを確認してください。",
+        "⚠️ このスレッドのセッションを自動復帰できませんでした（内部エラー）。\n" +
+        "詳細は Supervisor のログに記録されています。",
     };
   }
 }
@@ -153,6 +182,15 @@ async function decide(
   threadId: string,
   deps: AutoResumeDeps,
 ): Promise<AutoResumeOutcome> {
+  // kill-switch first: the cheapest possible early-out, and it must land before
+  // the DB read so a disabled route touches nothing. `no-history` (rather than a
+  // `failed` notice) is deliberate — disabling this feature should restore the
+  // pre-#456 experience exactly, not announce its own absence on every message.
+  if (isAutoResumeDisabled(deps.env)) {
+    console.debug(`${LOG} thread ${threadId}: disabled by ${AUTO_RESUME_DISABLED_ENV}`);
+    return { kind: "no-history" };
+  }
+
   const lookupSession = deps.lookupSession ?? getSessionByThreadId;
   const channelMap = deps.channelMap ?? CHANNEL_MAP;
 
@@ -178,7 +216,18 @@ async function decide(
     // ran. Resume needs its dir / flags, so there is nothing to launch.
     const reason = `チャンネル ${row.channel_name} は CHANNEL_MAP に未登録です`;
     console.warn(`${LOG} thread ${threadId}: ${reason}`);
-    return { kind: "failed", reason, notice: failureNotice(reason, claudeSessionId) };
+    // Authored here from a Discord channel name, so it carries no filesystem
+    // path and can be shown as-is — but it is passed explicitly rather than
+    // reusing `reason`, keeping "the notice never interpolates a raw reason"
+    // true by inspection at every call site.
+    return {
+      kind: "failed",
+      reason,
+      notice: failureNotice(
+        `チャンネル ${row.channel_name} は現在の設定に存在しません`,
+        claudeSessionId,
+      ),
+    };
   }
 
   console.log(
@@ -193,9 +242,15 @@ async function decide(
       row.branch,
     );
   } catch (err) {
+    // `resumeSession`'s worktree recovery interpolates `projectDir` into its
+    // error, so the notice gets the classified cause, never `reason` (#236).
     const reason = err instanceof Error ? err.message : String(err);
     console.warn(`${LOG} thread ${threadId} failed: ${reason}`);
-    return { kind: "failed", reason, notice: failureNotice(reason, claudeSessionId) };
+    return {
+      kind: "failed",
+      reason,
+      notice: failureNotice(classifyResumeFailure(reason), claudeSessionId),
+    };
   }
 
   console.log(
@@ -278,9 +333,55 @@ function withoutNotice(outcome: AutoResumeOutcome): AutoResumeOutcome {
   return outcome;
 }
 
-function failureNotice(reason: string, claudeSessionId: string): string {
+/**
+ * Build the AC-3 failure notice.
+ *
+ * `cause` MUST already be safe to show: either authored at the call site, or
+ * put through {@link classifyResumeFailure}. Never pass a raw `err.message` —
+ * that is the #236 vulnerability, and the parameter is named `cause` rather
+ * than `reason` so the outcome's raw `reason` field cannot be handed over by
+ * habit.
+ */
+function failureNotice(cause: string, claudeSessionId: string): string {
   return (
-    `⚠️ このスレッドのセッションを自動復帰できませんでした: ${reason}\n` +
+    `⚠️ このスレッドのセッションを自動復帰できませんでした: ${cause}\n` +
     `▶️ 手動で復帰する場合: \`/session resume ${claudeSessionId}\``
+  );
+}
+
+/**
+ * Known, path-free failure causes that may be shown in a thread.
+ *
+ * `resumeSession` throws two very different kinds of message. Its own guards
+ * are curated Japanese strings with no filesystem in them, but the worktree
+ * recovery path interpolates `projectDir`
+ * (`プロジェクトディレクトリが見つかりません: /Users/<name>/...`), and anything
+ * fs/child-process throws underneath carries `ENOENT ... open '/Users/<name>/…'`.
+ * Posting `err.message` verbatim is therefore the exact shape #236 removed from
+ * the relay path (see `RELAY_ERROR_USER_MESSAGE`): raw cause to the log, canned
+ * actionable text to the user.
+ *
+ * Matching is on a stable fragment of the manager's own wording, and it
+ * fails SAFE: a marker that stops matching falls through to
+ * {@link GENERIC_RESUME_FAILURE}, so drift costs diagnostic detail — never a
+ * leak. The returned text is written here rather than echoed from the match,
+ * so the thread never shows a string this module did not author.
+ */
+const KNOWN_RESUME_FAILURES: ReadonlyArray<{ marker: string; cause: string }> = [
+  // AC-3's motivating case; `manager.ts` throws `最大セッション数 (N) に達しています`.
+  { marker: "最大セッション数", cause: "最大セッション数に達しています" },
+  { marker: "resume 処理中", cause: "この session は現在 resume 処理中です" },
+  { marker: "既に稼働中", cause: "この session は既に稼働中です" },
+];
+
+/** Shown when the cause is not on the allowlist — assume it can carry a path. */
+const GENERIC_RESUME_FAILURE =
+  "内部エラー（詳細は Supervisor のログに記録されています）";
+
+/** Map a raw resume failure onto text that is safe to post in a thread. */
+export function classifyResumeFailure(reason: string): string {
+  return (
+    KNOWN_RESUME_FAILURES.find((known) => reason.includes(known.marker))?.cause ??
+    GENERIC_RESUME_FAILURE
   );
 }
