@@ -4,6 +4,10 @@ import {
   briefWindowBranch,
   briefWindowInitialCommand,
   briefWindowThreadName,
+  BRIEF_WINDOW_DISABLED_NOTICE,
+  BRIEF_WINDOW_EMPTY_REPLY_NOTICE,
+  BRIEF_WINDOW_NO_CONFIG_NOTICE,
+  BRIEF_WINDOW_REPLY_ERROR_NOTICE,
   BRIEF_WINDOW_RESTART_NOTICE,
   createBriefWindowDeps,
   evaluateBriefWindowOpen,
@@ -35,6 +39,10 @@ import {
 
 const DATE = "2026-08-26";
 
+/** CEO が起動直後に返す待機報告の代表（corp#136 の 1 行）。 */
+const STANDBY =
+  "窓口開いてます — 未決提案 1 件 / 会長判断待ち 10 件。決裁はボタン、それ以外はここへどうぞ。";
+
 function deps(over: Partial<BriefWindowDeps> = {}) {
   const calls = {
     created: [] as string[],
@@ -57,6 +65,7 @@ function deps(over: Partial<BriefWindowDeps> = {}) {
     waitForInputReady: async () => true,
     sendMessage: async (threadId, text) => {
       calls.sent.push({ threadId, text });
+      return { chunks: [STANDBY] };
     },
     postToThread: async (threadId, content) => {
       calls.thread.push({ threadId, content });
@@ -374,6 +383,7 @@ describe("createBriefWindowDeps (adapter binding)", () => {
       waitForInputReady: async () => true,
       sendMessage: async function (threadId: string, text: string) {
         this.sent.push({ threadId, text });
+        return { chunks: [STANDBY] };
       },
     };
     const threadSends: Array<{ threadId: string; content: string }> = [];
@@ -468,6 +478,83 @@ describe("openBriefWindowForBrief (eager entry)", () => {
   });
 });
 
+describe("standby report delivery (#464)", () => {
+  const open = (d: BriefWindowDeps) =>
+    openBriefWindow(
+      { date: DATE, hasBriefConfig: true, sessionCount: 1, maxSessions: 10 },
+      d,
+    );
+
+  test("posts the CEO standby report into the window thread", async () => {
+    // 本番初回 (2026-08-27) の回帰: ペインには報告が出ているのにスレッドは空だった。
+    const { deps: d, calls } = deps();
+    const res = await open(d);
+
+    expect(res.ok).toBe(true);
+    expect(calls.thread).toEqual([{ threadId: "thread-new", content: STANDBY }]);
+  });
+
+  test("posts every non-empty chunk and drops blank ones", async () => {
+    const { deps: d, calls } = deps({
+      sendMessage: async () => ({ chunks: ["one", "   ", "two"] }),
+    });
+    await open(d);
+
+    expect(calls.thread.map((c) => c.content)).toEqual(["one", "two"]);
+  });
+
+  test("says so instead of going quiet when no chunk comes back", async () => {
+    const { deps: d, calls } = deps({
+      sendMessage: async () => ({ chunks: [] }),
+    });
+    const res = await open(d);
+
+    expect(res.ok).toBe(true);
+    expect(calls.thread.map((c) => c.content)).toEqual([
+      BRIEF_WINDOW_EMPTY_REPLY_NOTICE,
+    ]);
+  });
+
+  test("surfaces a relay error in the thread", async () => {
+    const { deps: d, calls } = deps({
+      sendMessage: async () => ({ chunks: [], error: "relay timeout" }),
+    });
+    const res = await open(d);
+
+    expect(res.ok).toBe(true);
+    expect(calls.thread.length).toBe(1);
+    expect(calls.thread[0]!.content).toContain(BRIEF_WINDOW_REPLY_ERROR_NOTICE);
+    expect(calls.thread[0]!.content).toContain("relay timeout");
+  });
+
+  test("a failed post does not undo the window itself", async () => {
+    // 窓口は既に使える。挨拶が出ないことと窓口が無いことは別物。
+    const { deps: d } = deps({
+      postToThread: async () => {
+        throw new Error("discord 500");
+      },
+    });
+    const res = await open(d);
+
+    expect(res.ok).toBe(true);
+    if (res.ok) expect(res.threadId).toBe("thread-new");
+  });
+
+  test("an inject failure reports the failure and never a standby report", async () => {
+    const { deps: d, calls } = deps({
+      sendMessage: async () => {
+        throw new Error("pane gone");
+      },
+    });
+    const res = await open(d);
+
+    expect(res.ok).toBe(false);
+    expect(calls.thread.length).toBe(1);
+    expect(calls.thread[0]!.content).toContain("pane gone");
+    expect(calls.failures.length).toBe(1);
+  });
+});
+
 describe("handleBriefWindowThreadMessage (lazy entry)", () => {
   const base = {
     threadId: "win-1",
@@ -481,16 +568,18 @@ describe("handleBriefWindowThreadMessage (lazy entry)", () => {
     const { deps: d, calls } = deps();
     const consumed = await handleBriefWindowThreadMessage({ ...base, deps: d });
 
-    expect(consumed).toBe(true);
+    expect(consumed).toBe("restarted");
     expect(calls.started).toEqual([
       { threadId: "win-1", branch: `corp-brief-window-${DATE}` },
     ]);
     expect(calls.sent).toEqual([
       { threadId: "win-1", text: `/brief-window ${DATE}` },
     ]);
-    // The message that woke the window is not relayed, so it must be said out loud.
-    expect(calls.thread.length).toBe(1);
-    expect(calls.thread[0]!.content).toBe(BRIEF_WINDOW_RESTART_NOTICE);
+    // 待機報告 → 再送依頼の順で出る（#464 で前者が加わった）。
+    expect(calls.thread.map((c) => c.content)).toEqual([
+      STANDBY,
+      BRIEF_WINDOW_RESTART_NOTICE,
+    ]);
   });
 
   test("hands non-window threads back to the existing salvage path", async () => {
@@ -500,18 +589,37 @@ describe("handleBriefWindowThreadMessage (lazy entry)", () => {
       threadName: "corp-dispatch-12 Corp CEO 1",
       deps: d,
     });
-    expect(consumed).toBe(false);
+    expect(consumed).toBe("not_window");
     expect(calls.started).toEqual([]);
   });
 
-  test("falls through to salvage when the kill-switch is off rather than going quiet", async () => {
-    const { deps: d } = deps();
+  test("#463: keeps a disabled window away from the generic wake and says why", async () => {
+    const { deps: d, calls } = deps();
     const consumed = await handleBriefWindowThreadMessage({
       ...base,
       deps: d,
       env: { CORP_BRIEF_WINDOW_DISABLED: "1" },
     });
-    expect(consumed).toBe(false);
+    // "not_window" ではないので bot.ts は汎用 auto-resume に落とさない。
+    expect(consumed).toBe("blocked");
+    expect(calls.started).toEqual([]);
+    expect(calls.thread.map((c) => c.content)).toEqual([
+      BRIEF_WINDOW_DISABLED_NOTICE,
+    ]);
+  });
+
+  test("#463: same for a window thread whose channel has no brief config", async () => {
+    const { deps: d, calls } = deps();
+    const consumed = await handleBriefWindowThreadMessage({
+      ...base,
+      hasBriefConfig: false,
+      deps: d,
+    });
+    expect(consumed).toBe("blocked");
+    expect(calls.started).toEqual([]);
+    expect(calls.thread.map((c) => c.content)).toEqual([
+      BRIEF_WINDOW_NO_CONFIG_NOTICE,
+    ]);
   });
 
   test("consumes the message at the session cap (the reason was posted in-thread)", async () => {
@@ -521,7 +629,7 @@ describe("handleBriefWindowThreadMessage (lazy entry)", () => {
       sessionCount: 10,
       deps: d,
     });
-    expect(consumed).toBe(true);
+    expect(consumed).toBe("blocked");
     expect(calls.thread.length).toBe(1);
     expect(calls.started).toEqual([]);
   });
@@ -533,7 +641,7 @@ describe("handleBriefWindowThreadMessage (lazy entry)", () => {
       },
     });
     const consumed = await handleBriefWindowThreadMessage({ ...base, deps: d });
-    expect(consumed).toBe(true);
+    expect(consumed).toBe("blocked");
     expect(calls.failures.length).toBe(1);
   });
 });

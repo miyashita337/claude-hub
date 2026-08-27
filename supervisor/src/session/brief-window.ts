@@ -204,6 +204,17 @@ export function evaluateBriefWindowRestart(
   };
 }
 
+/**
+ * 初期コマンド注入に対して relay が返した応答（#464）。
+ *
+ * `chunks` を捨てると CEO の待機報告がどこにも出ない。通常の会話経路は同じ値を
+ * スレッドへ投稿しており、窓口だけがそれを持っていなかった。
+ */
+export interface BriefWindowRelayReply {
+  chunks: string[];
+  error?: string;
+}
+
 /** 窓口を開くために必要な副作用。Discord / SessionManager を直接触らないための注入点。 */
 export interface BriefWindowDeps {
   /** 同名の生存スレッドを探す（冪等キー）。見つからなければ null。 */
@@ -213,11 +224,23 @@ export interface BriefWindowDeps {
   createThread: (name: string) => Promise<{ id: string }>;
   start: (threadId: string, branch: string) => Promise<void>;
   waitForInputReady: (threadId: string) => Promise<boolean>;
-  sendMessage: (threadId: string, text: string) => Promise<void>;
+  sendMessage: (
+    threadId: string,
+    text: string,
+  ) => Promise<BriefWindowRelayReply>;
   postToThread: (threadId: string, content: string) => Promise<void>;
   postToChannel: (content: string) => Promise<void>;
   notifyFailure: (title: string, body: string) => Promise<void>;
 }
+
+/**
+ * 窓口スレッドへの着信メッセージをどう処理したか（#463）。
+ *
+ * `not_window` 以外を返した時点で、呼び出し元は汎用 auto-resume（#456）へ
+ * 落としてはならない。窓口スレッドにも履歴があるため、素の `--resume` が先に
+ * 噛むと「窓口を止めたのに窓口が起き上がる」ようになる。
+ */
+export type BriefWindowMessageOutcome = "restarted" | "blocked" | "not_window";
 
 export type BriefWindowResult =
   | { ok: true; threadId: string; reused: boolean }
@@ -375,8 +398,9 @@ async function startWindowSession(
     );
   }
 
+  let reply: BriefWindowRelayReply;
   try {
-    await deps.sendMessage(threadId, command);
+    reply = await deps.sendMessage(threadId, command);
   } catch (err) {
     const reason = errMsg(err);
     console.error(`[brief-window] inject failed (${threadId}): ${reason}`);
@@ -396,7 +420,50 @@ async function startWindowSession(
     return { ok: false, stage: "inject", reason };
   }
 
+  await deliverStandbyReport(threadId, reply, deps);
+
   return { ok: true, threadId, reused };
+}
+
+/**
+ * 初期コマンドへの応答（＝CEO の待機報告）をスレッドへ出す（#464）。
+ *
+ * 投稿の失敗で窓口の起動そのものを巻き戻さない。窓口は既に使える状態であり、
+ * 挨拶が出ないことと窓口が無いことは別物だから。ただし黙って捨てもしない。
+ */
+async function deliverStandbyReport(
+  threadId: string,
+  reply: BriefWindowRelayReply,
+  deps: BriefWindowDeps,
+): Promise<void> {
+  const chunks = reply.chunks.filter((c) => c.trim().length > 0);
+
+  for (const chunk of chunks) {
+    try {
+      await deps.postToThread(threadId, chunk);
+    } catch (err) {
+      console.error(
+        `[brief-window] standby report post failed (${threadId}): ${errMsg(err)}`,
+      );
+    }
+  }
+
+  if (reply.error) {
+    await deps
+      .postToThread(
+        threadId,
+        `${BRIEF_WINDOW_REPLY_ERROR_NOTICE}\n\`\`\`\n${reply.error}\n\`\`\``,
+      )
+      .catch(() => {});
+    return;
+  }
+
+  if (chunks.length === 0) {
+    // 応答ゼロを「成功」として黙らせない（agent-output-quality #1）。
+    await deps
+      .postToThread(threadId, BRIEF_WINDOW_EMPTY_REPLY_NOTICE)
+      .catch(() => {});
+  }
 }
 
 /* --------------------------------------------------------------------------
@@ -430,7 +497,10 @@ export interface BriefWindowSessionsLike {
   has: (threadId: string) => boolean;
   start: (threadId: string, branch: string) => Promise<void>;
   waitForInputReady: (threadId: string) => Promise<boolean>;
-  sendMessage: (threadId: string, text: string) => Promise<void>;
+  sendMessage: (
+    threadId: string,
+    text: string,
+  ) => Promise<BriefWindowRelayReply>;
 }
 
 /** dispatch スレッドと同じ 7 日。窓口は idle reaper 側で先に閉じる。 */
@@ -515,6 +585,25 @@ export async function openBriefWindowForBrief(args: {
 }
 
 /** 再起動時にスレッドへ出す案内。引き金になった発言は中継しないことを明示する。 */
+/** 応答が 1 つも返らなかったとき（#464）。無言で成功扱いにしない。 */
+export const BRIEF_WINDOW_EMPTY_REPLY_NOTICE =
+  "⚠️ 窓口セッションは起動しましたが、待機報告が返りませんでした。" +
+  "このスレッドで話しかければ通常どおり応答します。";
+
+/** 応答が error で返ったとき（#464）。 */
+export const BRIEF_WINDOW_REPLY_ERROR_NOTICE =
+  "⚠️ 窓口セッションは起動しましたが、待機報告の取得に失敗しました。" +
+  "このスレッドで話しかければ通常どおり応答します。";
+
+/** kill-switch で窓口を止めているとき（#463）。汎用 auto-resume に落とさない。 */
+export const BRIEF_WINDOW_DISABLED_NOTICE =
+  "⏸️ 窓口の自動再起動は停止中です（kill-switch 有効）。\n" +
+  "会話を続けるには、このスレッドで `/session resume` を実行してください。";
+
+/** 親チャンネルに朝レポ設定が無いとき（#463）。設定ミスなので黙らせない。 */
+export const BRIEF_WINDOW_NO_CONFIG_NOTICE =
+  "⚠️ このチャンネルは朝レポ窓口として設定されていないため、窓口を再開できません。";
+
 export const BRIEF_WINDOW_RESTART_NOTICE =
   "🔓 窓口セッションを再起動しました（前回は無操作で自動クローズされていました）。\n" +
   "起動処理中のため、いまの発言はまだ届いていません。**もう一度送ってください**。";
@@ -533,7 +622,7 @@ export async function handleBriefWindowThreadMessage(args: {
   maxSessions: number;
   deps: BriefWindowDeps;
   env?: Record<string, string | undefined>;
-}): Promise<boolean> {
+}): Promise<BriefWindowMessageOutcome> {
   const result = await restartBriefWindow(
     {
       threadName: args.threadName,
@@ -561,18 +650,38 @@ export async function handleBriefWindowThreadMessage(args: {
           err,
         ),
       );
-    return true;
+    return "restarted";
   }
 
   if (result.stage === "skipped") {
-    // capacity は restartBriefWindow がスレッドへ通知済み。それ以外
-    // （kill-switch / brief 未設定 / 窓口でない）は従来の salvage に委ねる。
-    return result.reason === "capacity";
+    // 窓口でないスレッドだけが従来経路（#456 の汎用 wake → salvage）へ戻る。
+    if (result.reason === "not_window_thread") return "not_window";
+
+    // ここから下は「窓口だが今は起こさない」。汎用 wake に落とすと素の
+    // --resume が噛んで #454 の契約（/brief-window 再注入 + 再送依頼）を
+    // 黙って上書きするため、理由を出したうえで消費する（#463）。
+    const notice =
+      result.reason === "disabled"
+        ? BRIEF_WINDOW_DISABLED_NOTICE
+        : result.reason === "no_brief_config"
+          ? BRIEF_WINDOW_NO_CONFIG_NOTICE
+          : null; // capacity は restartBriefWindow がスレッドへ通知済み
+    if (notice) {
+      await args.deps
+        .postToThread(args.threadId, notice)
+        .catch((err) =>
+          console.error(
+            `[brief-window] skip notice failed (thread=${args.threadId}):`,
+            err,
+          ),
+        );
+    }
+    return "blocked";
   }
 
   // start / inject の失敗は既に post + notify 済み。二重に salvage を出さない。
   console.warn(
     `[brief-window] restart failed (thread=${args.threadId}, stage=${result.stage})`,
   );
-  return true;
+  return "blocked";
 }

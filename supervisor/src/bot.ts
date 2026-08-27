@@ -116,6 +116,7 @@ import {
   openBriefWindowForBrief,
   parseBriefWindowThreadName,
   type BriefWindowDeps,
+  type BriefWindowMessageOutcome,
 } from "./session/brief-window";
 import {
   ORCHESTRATE_PREFIX,
@@ -1443,8 +1444,11 @@ export async function startBot(token: string): Promise<void> {
         },
         waitForInputReady: (threadId) =>
           sessionManager.waitForInputReady(threadId),
+        // #464: 通常の会話経路と同じく chunks を持ち帰る。捨てると起動直後の
+        // 待機報告がどこにも出ない（投稿するのは brief-window.ts 側）。
         sendMessage: async (threadId, text) => {
-          await sessionManager.sendMessage(threadId, text);
+          const result = await sessionManager.sendMessage(threadId, text);
+          return { chunks: result.chunks, error: result.error };
         },
       },
       fetchThread: async (threadId) => {
@@ -1463,10 +1467,10 @@ export async function startBot(token: string): Promise<void> {
   async function tryRestartBriefWindow(
     message: Message,
     threadId: string,
-  ): Promise<boolean> {
+  ): Promise<BriefWindowMessageOutcome> {
     const thread = message.channel as ThreadChannel;
     // Cheap early-out so an ordinary dead thread never fetches config or channels.
-    if (parseBriefWindowThreadName(thread.name) === null) return false;
+    if (parseBriefWindowThreadName(thread.name) === null) return "not_window";
 
     // thread.parent はキャッシュ依存のゲッターで、起動直後などキャッシュ外だと
     // 実在する親でも null を返す（PR #340 gemini high）。parentId からの明示
@@ -1479,11 +1483,11 @@ export async function startBot(token: string): Promise<void> {
           ? (fetched as TextChannel)
           : null;
     }
-    if (!parent) return false;
+    if (!parent) return "not_window";
 
     const parentName = "name" in parent ? (parent.name as string) : "";
     const config = CHANNEL_MAP.get(parentName);
-    if (!config) return false;
+    if (!config) return "not_window";
 
     return handleBriefWindowThreadMessage({
       threadId,
@@ -1777,7 +1781,12 @@ export async function startBot(token: string): Promise<void> {
       // is still booting (RW-025 / RW-047). The name check inside is a cheap
       // early-out, so ordinary threads reach the wake path unchanged.
       try {
-        if (await tryRestartBriefWindow(message, threadId)) return;
+        // #463: "not_window" 以外＝窓口スレッドと判定できた場合は、起動できた
+        // かどうかに関わらずここで終える。下の汎用 wake（#456）に落とすと素の
+        // --resume が先に噛み、kill-switch で止めたはずの窓口が起き上がる。
+        if ((await tryRestartBriefWindow(message, threadId)) !== "not_window") {
+          return;
+        }
       } catch (err) {
         console.error("[Bot] Brief window restart error:", err);
       }
