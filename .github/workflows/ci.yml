@@ -207,6 +207,7 @@ jobs:
                    tests/session/manager-input-ready.test.ts \
                    tests/session/progress-buffer.test.ts \
                    tests/session/salvage-reply.test.ts \
+                   tests/session/auto-resume.test.ts \
                    tests/session/slash-prefix.test.ts \
                    tests/session/thread-title.test.ts \
                    tests/session/worktree.test.ts \

@@ -53,6 +53,10 @@ import {
   buildStatusReply,
 } from "./session/status-reply";
 import {
+  autoResumeThread,
+  resolveWakeReply,
+} from "./session/auto-resume";
+import {
   onProgress,
   onLateResponse,
   onSessionsQuery,
@@ -1749,6 +1753,15 @@ export async function startBot(token: string): Promise<void> {
     // claude_session_id and resume command so the session can be salvaged
     // (Issue #169). Non-mention messages keep the quiet debug log to avoid
     // spamming a dead thread on every line.
+    //
+    // Issue #456: before falling back to that guidance, treat the message
+    // itself as a wake trigger. A thread whose session was stopped (supervisor
+    // restart, dispatch-health reap, idle reap) still owns its history in
+    // sessions.db, so resume it INTO THIS THREAD and relay the message that
+    // woke it. Only threads with history do this — an unknown thread must never
+    // auto-start a session (AC-2) — and a failed resume is reported, not
+    // swallowed (AC-3). Access was already enforced above, so a channel whose
+    // policy sets requireMention still only wakes on a mention.
     if (!sessionManager.has(threadId)) {
       // Issue #454: the morning window is meant to stay usable all day, but the
       // interactive idle reaper (6h) legitimately stops it. Restart it on the
@@ -1756,32 +1769,50 @@ export async function startBot(token: string): Promise<void> {
       // access was already enforced above, so this is the same privilege a
       // `/session start` in this thread would take. Non-window threads fall
       // through unchanged.
+      //
+      // This stays AHEAD of the #456 generic wake below on purpose. A window
+      // thread has history too, so a plain `--resume` would match it first and
+      // silently retire #454's contract: re-injecting `/brief-window <date>`
+      // and telling the chairman to resend instead of relaying into a TUI that
+      // is still booting (RW-025 / RW-047). The name check inside is a cheap
+      // early-out, so ordinary threads reach the wake path unchanged.
       try {
         if (await tryRestartBriefWindow(message, threadId)) return;
       } catch (err) {
         console.error("[Bot] Brief window restart error:", err);
       }
 
+      const wake = await autoResumeThread(sessionManager, threadId);
       const botUserId = client.user?.id;
-      const mentioned = botUserId
-        ? message.mentions.users.has(botUserId)
-        : false;
-      if (!mentioned) {
-        console.debug(
-          `[Bot] Ignoring message in thread ${threadId} (no active session)`
-        );
+      const { relay, reply } = await resolveWakeReply(wake, {
+        mentioned: botUserId ? message.mentions.users.has(botUserId) : false,
+        buildSalvage: (verdict) =>
+          buildSalvageReply(sessionManager, threadId, verdict),
+      });
+
+      if (reply) {
+        try {
+          await (message.channel as ThreadChannel).send(reply);
+        } catch (err) {
+          // On the resume path the session IS live, so losing the courtesy
+          // notice must not cost the user their message — fall through to the
+          // relay either way.
+          console.error(
+            `[Bot] Failed to reply in thread ${threadId}:`,
+            err
+          );
+        }
+      }
+
+      if (!relay) {
+        if (!reply) {
+          console.debug(
+            `[Bot] Ignoring message in thread ${threadId} (no active session, wake=${wake.kind})`
+          );
+        }
         return;
       }
-      const salvage = await buildSalvageReply(sessionManager, threadId);
-      try {
-        await (message.channel as ThreadChannel).send(salvage);
-      } catch (err) {
-        console.error(
-          `[Bot] Failed to send salvage reply in thread ${threadId}:`,
-          err
-        );
-      }
-      return;
+      // Fall through: the relay below now finds the resumed session.
     }
 
     const thread = message.channel as ThreadChannel;

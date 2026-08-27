@@ -1,0 +1,387 @@
+import { CHANNEL_MAP, type ChannelConfig } from "../config/channels";
+import { getSessionByThreadId } from "../infra/db";
+import type { SessionRow } from "../infra/db";
+import type { Liveness } from "./manager";
+
+/**
+ * Message-triggered wake (Issue #456).
+ *
+ * A thread keeps its session history in sessions.db forever, but the session
+ * itself does not survive: a supervisor restart stops every session with
+ * `supervisor_restart`, the DispatchHealthReaper reaps quiet dispatch sessions,
+ * and the idle reaper eventually takes the rest. Before this module the next
+ * message in such a thread only ever produced resume *guidance*
+ * (session/status-reply.ts), so a conversation that rallies over hours or days
+ * — corp's decision-feedback threads are the motivating case — needed a manual
+ * `/session resume <id>` every single time.
+ *
+ * This turns an inbound message into the wake trigger: if the thread has
+ * history we resume THAT session INTO THAT SAME thread and let the caller relay
+ * the triggering message into it. Threads with no history are deliberately left
+ * alone — an unknown thread must never auto-start a session (#456 AC-2).
+ *
+ * Failures are loud (#456 AC-3): a full MAX_SESSIONS table or a deleted
+ * worktree returns a notice for the caller to post, never silence.
+ *
+ * The logic lives here rather than in bot.ts so it is unit-testable against the
+ * fake adapters, and so bot.ts's messageCreate path stays a thin dispatcher.
+ */
+
+/** Log prefix — AC-1 asserts the supervisor log records the auto-resume. */
+const LOG = "[AutoResume]";
+
+/**
+ * kill-switch の env 名。`CORP_BRIEF_WINDOW_DISABLED` と対称で、この経路だけを止める。
+ */
+export const AUTO_RESUME_DISABLED_ENV = "AUTO_RESUME_DISABLED";
+
+/**
+ * この経路を止める kill-switch。空文字 / `0` 以外なら停止。
+ *
+ * 着信メッセージのたびに走り、成功すればセッション枠を 1 つ埋める経路なので、
+ * 誤 wake や連発失敗を bot 全体の停止なしに退避できる手段を用意しておく
+ * （`isBriefDisabled` / `CORP_DISPATCH_DISABLED` と同じ形）。止まると `no-history`
+ * を返すため、呼び出し側は #456 以前の salvage 案内に戻るだけで、勝手にセッションを
+ * 起動することはない。
+ */
+export function isAutoResumeDisabled(
+  env: Record<string, string | undefined> = process.env,
+): boolean {
+  const raw = (env[AUTO_RESUME_DISABLED_ENV] ?? "").trim();
+  return raw.length > 0 && raw !== "0";
+}
+
+/**
+ * The slice of {@link import("./manager").SessionManager} this module needs.
+ * Structural, so the real manager satisfies it without a cast while tests can
+ * drive the decision path with a stub.
+ */
+export interface AutoResumeSessions {
+  livenessOf(threadId: string): Promise<Liveness>;
+  resumeSession(
+    config: ChannelConfig,
+    threadId: string,
+    claudeSessionId: string,
+    projectDir: string,
+    branch?: string | null,
+  ): Promise<unknown>;
+}
+
+export type AutoResumeOutcome =
+  /**
+   * Resumed into this thread; the caller relays the triggering message.
+   *
+   * `notice` is null for a caller that merely JOINED an in-flight attempt (see
+   * {@link inFlight}) — the resume was already announced for the message that
+   * started it, and repeating it would post the same banner once per line the
+   * user typed.
+   */
+  | { kind: "resumed"; claudeSessionId: string; notice: string | null }
+  /** Never-seen thread (#456 AC-2): the caller keeps its pre-#456 behaviour. */
+  | { kind: "no-history" }
+  /**
+   * History exists but resume must not be attempted. `alive` means the process
+   * is up while the Supervisor lost tracking — resuming a live claude session
+   * in the same cwd corrupts its transcript (RW-046) — and
+   * `no-claude-session-id` is a pre-#167 row with nothing to resume from. Both
+   * are exactly what the salvage reply already explains, so the caller falls
+   * back to it instead of inventing a second wording.
+   */
+  | {
+      kind: "not-resumable";
+      reason: "alive" | "no-claude-session-id";
+      /**
+       * The verdict this decision was made on. Handed to the caller so
+       * `buildSalvageReply` reuses it instead of re-deriving it — `livenessOf`
+       * runs a tmux call with a 2s timeout, and on timeout waits the full 2s
+       * (#238), so re-deriving costs the user real latency on every message in
+       * a dead thread (same reason #364 resolves it once).
+       */
+      verdict: Liveness;
+    }
+  /**
+   * Resume was attempted (or blocked) and failed: post `notice` (#456 AC-3).
+   * `notice` is null for a joined in-flight attempt, as for `resumed`.
+   */
+  | { kind: "failed"; reason: string; notice: string | null };
+
+export interface AutoResumeDeps {
+  channelMap?: ReadonlyMap<string, ChannelConfig>;
+  lookupSession?: (threadId: string) => SessionRow | undefined;
+  /** Overridable for tests; defaults to `process.env` at the point of use. */
+  env?: Record<string, string | undefined>;
+}
+
+/**
+ * In-flight attempts, keyed by thread. A resume takes seconds (tmux spawn plus
+ * the "Resume from summary" confirm), and a user typing two lines in a row
+ * would otherwise start a second resume that `resumeSession` rejects — turning
+ * a normal double-post into a spurious failure notice. Sharing the promise
+ * makes the second message wait for the first attempt and observe its outcome.
+ */
+const inFlight = new Map<string, Promise<AutoResumeOutcome>>();
+
+/**
+ * Resume the thread's last session into the thread itself, if it has one.
+ *
+ * Never throws: every failure is reported as a `failed` outcome carrying the
+ * notice to post, so a caller in Discord's messageCreate path cannot be taken
+ * down by this (agent-output-quality #1 — no silent fallback, and no crash).
+ */
+export function autoResumeThread(
+  sessions: AutoResumeSessions,
+  threadId: string,
+  deps: AutoResumeDeps = {},
+): Promise<AutoResumeOutcome> {
+  const existing = inFlight.get(threadId);
+  // A joiner observes the initiator's outcome but must not repeat its notice.
+  if (existing) return existing.then(withoutNotice);
+
+  const run = attempt(sessions, threadId, deps).finally(() => {
+    inFlight.delete(threadId);
+  });
+  inFlight.set(threadId, run);
+  return run;
+}
+
+async function attempt(
+  sessions: AutoResumeSessions,
+  threadId: string,
+  deps: AutoResumeDeps,
+): Promise<AutoResumeOutcome> {
+  try {
+    return await decide(sessions, threadId, deps);
+  } catch (err) {
+    // The "never throws" contract, enforced in one place. bot.ts awaits this
+    // straight from the messageCreate handler, so a rejection escaping here is
+    // an unhandled rejection AND leaves the user with nothing back — exactly
+    // the silence #456 exists to remove. Anything unexpected (a locked DB in
+    // the history lookup, a liveness probe that blew up) becomes a loud outcome
+    // instead. Note this must NOT swallow it into "no-history": that would let
+    // the caller answer "セッション履歴がありません" for a thread that has one.
+    //
+    // The raw cause goes to the log ONLY (#236). `err` here is whatever the DB
+    // or the liveness probe threw, so `err.message` can be
+    // `ENOENT ... open '/Users/<name>/...'` and `String(err)` can be anything
+    // at all — posting it would put a home path in a thread that may have
+    // non-owner readers. `reason` stays raw for the log and for callers/tests.
+    const reason = err instanceof Error ? err.message : String(err);
+    console.error(`${LOG} thread ${threadId} failed unexpectedly: ${reason}`);
+    return {
+      kind: "failed",
+      reason,
+      notice:
+        "⚠️ このスレッドのセッションを自動復帰できませんでした（内部エラー）。\n" +
+        "詳細は Supervisor のログに記録されています。",
+    };
+  }
+}
+
+async function decide(
+  sessions: AutoResumeSessions,
+  threadId: string,
+  deps: AutoResumeDeps,
+): Promise<AutoResumeOutcome> {
+  // kill-switch first: the cheapest possible early-out, and it must land before
+  // the DB read so a disabled route touches nothing. `no-history` (rather than a
+  // `failed` notice) is deliberate — disabling this feature should restore the
+  // pre-#456 experience exactly, not announce its own absence on every message.
+  if (isAutoResumeDisabled(deps.env)) {
+    console.debug(`${LOG} thread ${threadId}: disabled by ${AUTO_RESUME_DISABLED_ENV}`);
+    return { kind: "no-history" };
+  }
+
+  const lookupSession = deps.lookupSession ?? getSessionByThreadId;
+  const channelMap = deps.channelMap ?? CHANNEL_MAP;
+
+  const row: SessionRow | undefined = lookupSession(threadId);
+  if (!row) return { kind: "no-history" };
+
+  // Authoritative liveness (#168), not the DB status column: a supervisor that
+  // was SIGKILLed leaves `status='running'` behind on a process that is gone.
+  const verdict = await sessions.livenessOf(threadId);
+  if (verdict === "unknown") return { kind: "no-history" };
+  if (verdict === "alive") {
+    return { kind: "not-resumable", reason: "alive", verdict };
+  }
+
+  const claudeSessionId = row.claude_session_id;
+  if (!claudeSessionId) {
+    return { kind: "not-resumable", reason: "no-claude-session-id", verdict };
+  }
+
+  const config = channelMap.get(row.channel_name);
+  if (!config) {
+    // The channel was renamed or removed from CHANNEL_MAP since the session
+    // ran. Resume needs its dir / flags, so there is nothing to launch.
+    const reason = `チャンネル ${row.channel_name} は CHANNEL_MAP に未登録です`;
+    console.warn(`${LOG} thread ${threadId}: ${reason}`);
+    // Authored here from a Discord channel name, so it carries no filesystem
+    // path and can be shown as-is — but it is passed explicitly rather than
+    // reusing `reason`, keeping "the notice never interpolates a raw reason"
+    // true by inspection at every call site.
+    return {
+      kind: "failed",
+      reason,
+      notice: failureNotice(
+        `チャンネル ${row.channel_name} は現在の設定に存在しません`,
+        claudeSessionId,
+      ),
+    };
+  }
+
+  console.log(
+    `${LOG} resuming thread ${threadId} (channel ${config.channelName}, claude session ${claudeSessionId})`,
+  );
+  try {
+    await sessions.resumeSession(
+      config,
+      threadId,
+      claudeSessionId,
+      row.project_dir,
+      row.branch,
+    );
+  } catch (err) {
+    // `resumeSession`'s worktree recovery interpolates `projectDir` into its
+    // error, so the notice gets the classified cause, never `reason` (#236).
+    const reason = err instanceof Error ? err.message : String(err);
+    console.warn(`${LOG} thread ${threadId} failed: ${reason}`);
+    return {
+      kind: "failed",
+      reason,
+      notice: failureNotice(classifyResumeFailure(reason), claudeSessionId),
+    };
+  }
+
+  console.log(
+    `${LOG} resumed thread ${threadId} (claude session ${claudeSessionId})`,
+  );
+  return {
+    kind: "resumed",
+    claudeSessionId,
+    notice:
+      "♻️ セッションが停止していたため自動で復帰しました。前回の会話を引き継いで応答します。\n" +
+      `🔑 claude_session_id: \`${claudeSessionId}\``,
+  };
+}
+
+/**
+ * What the caller should do with a wake outcome: what (if anything) to post in
+ * the thread, and whether the triggering message should still be relayed.
+ */
+export interface WakeReply {
+  /** True only after a successful resume — the session can receive the message. */
+  relay: boolean;
+  /** Text to post in the thread, or null to stay quiet. */
+  reply: string | null;
+}
+
+/**
+ * Map an {@link AutoResumeOutcome} onto the caller's two decisions.
+ *
+ * Split out of bot.ts (rather than inlined at the call site) for the same
+ * reason access-policy / slash-prefix / status-reply were: the branching is
+ * real logic with a spec attached (#456 AC-2 and AC-3 both live here), and
+ * inside bot.ts's messageCreate handler it is unreachable from a unit test.
+ *
+ * `buildSalvage` is injected because the salvage wording belongs to
+ * status-reply.ts and needs a live SessionManager; it is only awaited on the
+ * paths that actually use it.
+ */
+export async function resolveWakeReply(
+  outcome: AutoResumeOutcome,
+  opts: {
+    /** Whether the triggering message @-mentioned the bot. */
+    mentioned: boolean;
+    buildSalvage: (verdict: Liveness) => Promise<string>;
+  },
+): Promise<WakeReply> {
+  switch (outcome.kind) {
+    case "resumed":
+      // notice is null when this message joined a resume another message in the
+      // same thread already announced — relay it, but do not repeat the banner.
+      return { relay: true, reply: outcome.notice };
+    case "failed":
+      // Loud regardless of mention (#456 AC-3): the thread has a session the
+      // user is trying to reach, and silence here is the dead-thread experience
+      // #456 exists to remove. null only for a joined attempt, already reported.
+      return { relay: false, reply: outcome.notice };
+    case "not-resumable":
+      // Pass the verdict the decision was made on so the salvage path does not
+      // re-run livenessOf — a tmux call that waits the full 2s on timeout
+      // (#238, same reason as #364).
+      return {
+        relay: false,
+        reply: opts.mentioned ? await opts.buildSalvage(outcome.verdict) : null,
+      };
+    case "no-history":
+      // #456 AC-2: never auto-start here. Pre-#456 behaviour is preserved —
+      // guidance on a mention, silence otherwise so an unrelated thread is not
+      // spammed on every line.
+      return {
+        relay: false,
+        reply: opts.mentioned ? await opts.buildSalvage("unknown") : null,
+      };
+  }
+}
+
+/** Strip the announcement from an outcome handed to a joined-in-flight caller. */
+function withoutNotice(outcome: AutoResumeOutcome): AutoResumeOutcome {
+  if (outcome.kind === "resumed" || outcome.kind === "failed") {
+    return { ...outcome, notice: null };
+  }
+  return outcome;
+}
+
+/**
+ * Build the AC-3 failure notice.
+ *
+ * `cause` MUST already be safe to show: either authored at the call site, or
+ * put through {@link classifyResumeFailure}. Never pass a raw `err.message` —
+ * that is the #236 vulnerability, and the parameter is named `cause` rather
+ * than `reason` so the outcome's raw `reason` field cannot be handed over by
+ * habit.
+ */
+function failureNotice(cause: string, claudeSessionId: string): string {
+  return (
+    `⚠️ このスレッドのセッションを自動復帰できませんでした: ${cause}\n` +
+    `▶️ 手動で復帰する場合: \`/session resume ${claudeSessionId}\``
+  );
+}
+
+/**
+ * Known, path-free failure causes that may be shown in a thread.
+ *
+ * `resumeSession` throws two very different kinds of message. Its own guards
+ * are curated Japanese strings with no filesystem in them, but the worktree
+ * recovery path interpolates `projectDir`
+ * (`プロジェクトディレクトリが見つかりません: /Users/<name>/...`), and anything
+ * fs/child-process throws underneath carries `ENOENT ... open '/Users/<name>/…'`.
+ * Posting `err.message` verbatim is therefore the exact shape #236 removed from
+ * the relay path (see `RELAY_ERROR_USER_MESSAGE`): raw cause to the log, canned
+ * actionable text to the user.
+ *
+ * Matching is on a stable fragment of the manager's own wording, and it
+ * fails SAFE: a marker that stops matching falls through to
+ * {@link GENERIC_RESUME_FAILURE}, so drift costs diagnostic detail — never a
+ * leak. The returned text is written here rather than echoed from the match,
+ * so the thread never shows a string this module did not author.
+ */
+const KNOWN_RESUME_FAILURES: ReadonlyArray<{ marker: string; cause: string }> = [
+  // AC-3's motivating case; `manager.ts` throws `最大セッション数 (N) に達しています`.
+  { marker: "最大セッション数", cause: "最大セッション数に達しています" },
+  { marker: "resume 処理中", cause: "この session は現在 resume 処理中です" },
+  { marker: "既に稼働中", cause: "この session は既に稼働中です" },
+];
+
+/** Shown when the cause is not on the allowlist — assume it can carry a path. */
+const GENERIC_RESUME_FAILURE =
+  "内部エラー（詳細は Supervisor のログに記録されています）";
+
+/** Map a raw resume failure onto text that is safe to post in a thread. */
+export function classifyResumeFailure(reason: string): string {
+  return (
+    KNOWN_RESUME_FAILURES.find((known) => reason.includes(known.marker))?.cause ??
+    GENERIC_RESUME_FAILURE
+  );
+}
