@@ -299,6 +299,75 @@ describe("detectDialog — AskUserQuestion is never auto-accepted (Issue #423)",
   });
 });
 
+/**
+ * Issue #452 / corp#105: a session hitting its model usage limit ends the
+ * turn with a plain error line and NO assistant response, so the Stop hook
+ * that drives every other relay path never fires (`stop-relay.sh` sees an
+ * empty `last_assistant_message` and exits without POSTing). Before this
+ * kind existed, none of the 6 dialog families recognized the text, so the
+ * user only ever saw generic stall/timeout heartbeats that never mention the
+ * limit (corp#105 reproduction).
+ */
+describe("detectDialog — model usage-limit is detected, never auto-accepted (Issue #452)", () => {
+  test("detects the verbatim corp#105 pane capture", () => {
+    const pane = [
+      "  ⎿  Running…",
+      "",
+      "You've reached your Fable 5 limit. Run /usage-credits to continue or switch models with /model.",
+    ].join("\n");
+    const result = detectDialog(pane);
+    expect(result).not.toBeNull();
+    expect(result!.kind).toBe("usage-limit");
+    expect(result!.autoAcceptable).toBe(false);
+  });
+
+  test("is generic across model names (not hardcoded to 'Fable 5')", () => {
+    const pane =
+      "You've reached your Sonnet 5 limit. Run /usage-credits to continue or switch models with /model.";
+    expect(detectDialog(pane)!.kind).toBe("usage-limit");
+  });
+
+  test("AUTO_ACCEPT_KEYS sends nothing for usage-limit — no key clears an exhausted quota", () => {
+    expect(AUTO_ACCEPT_KEYS["usage-limit"]).toEqual([]);
+  });
+
+  test("reports the matched line for [Dialog] log observability", () => {
+    const pane =
+      "You've reached your Fable 5 limit. Run /usage-credits to continue or switch models with /model.";
+    const result = detectDialog(pane);
+    expect(result!.line).toContain("reached your Fable 5 limit");
+  });
+
+  test("does NOT false-positive on prose that merely mentions 'limit'", () => {
+    expect(
+      detectDialog("There is no rate limit configured for this endpoint.")
+    ).toBeNull();
+    expect(
+      detectDialog("Let's check the character limit of the function.")
+    ).toBeNull();
+  });
+
+  test("does NOT false-positive on prose mentioning usage-credits without the limit phrase", () => {
+    expect(
+      detectDialog("Run /usage-credits any time to check your remaining balance.")
+    ).toBeNull();
+  });
+
+  test("wins over numbered-choice / ink-confirm framing that might coincidentally follow", () => {
+    // A limit message followed by unrelated dialog-shaped noise must still be
+    // classified as usage-limit (manual-only, no key sent) — mirrors the
+    // ask-user-question ordering guard (Issue #423).
+    const pane = [
+      "You've reached your Fable 5 limit. Run /usage-credits to continue or switch models with /model.",
+      "  1. Yes",
+      "  2. No",
+    ].join("\n");
+    const result = detectDialog(pane);
+    expect(result!.kind).toBe("usage-limit");
+    expect(result!.autoAcceptable).toBe(false);
+  });
+});
+
 describe("detectDialog — last-N-lines window", () => {
   test("only inspects the bottom ~30 lines (avoid stale dialog text in scrollback)", () => {
     // Old dialog text 100 lines up should not trigger detection; otherwise

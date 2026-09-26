@@ -50,6 +50,23 @@ function buildMessage(info: DialogStuckInfo): string {
       .filter(Boolean)
       .join("\n");
   }
+  // Issue #452 / corp#105: a usage-limit hit is not a dialog a key press can
+  // resolve — the generic "手動操作要求" framing would tell the user to
+  // tmux attach and do *something*, without saying what. Say plainly that the
+  // account's usage limit was reached and what actually recovers it.
+  if (info.kind === "usage-limit") {
+    return [
+      "🛑 Claude Code が**モデル利用上限**に到達し、応答を生成できませんでした。",
+      "`/model` で別モデルに切替するか、上限がリセットされるまで待つ必要があります。",
+      "tmux attach して状況を確認・対応してください:",
+      "```",
+      `tmux -L ${TMUX_SOCKET} attach -t ${info.tmuxSessionName}`,
+      "```",
+      info.line ? `検出行: \`${info.line.replace(/`/g, "'")}\`` : "",
+    ]
+      .filter(Boolean)
+      .join("\n");
+  }
   const label =
     info.kind === "stall"
       ? "応答待ちでブロック中"
@@ -114,21 +131,49 @@ export function buildDialogStuckHandler(
 }
 
 /**
- * Wrap an `onDialogStuck` handler so it pages at most once per relay turn.
+ * Wrap an `onDialogStuck` handler so it pages at most once per relay turn —
+ * with one deliberate exception (Issue #452, devils-advocate review M1).
  *
  * Two independent triggers feed the handler — the dialog watchdog (known
- * dialog) and the stall timer (unknown dialog). For a persistent known dialog
- * both would otherwise fire, double-posting to Discord and risking a Pushover
- * rate-limit. The first call wins; later calls are dropped. Returns a no-op
- * when `handler` is absent (the relay still logs to stderr via the watchdog).
+ * dialog, e.g. `ink-confirm` or `usage-limit`) and the stall timer (unknown
+ * dialog, `kind: "stall"`, fires after 3 min of no response). For a
+ * persistent known dialog both would otherwise fire, double-posting to
+ * Discord and risking a Pushover rate-limit, so by default the first call
+ * wins and later calls are dropped.
+ *
+ * BUT: the stall timer fires whenever a turn simply takes longer than 3
+ * minutes — that is not the same as being stuck, and it is common for
+ * ordinary long-running turns (e.g. dispatched `/impl` work). If a model
+ * usage-limit error then appears at minute 8, the watchdog's specific,
+ * actionable "usage-limit" page must still reach Discord — silently dropping
+ * it in favour of the generic "応答待ちでブロック中" message that already
+ * went out would reproduce the exact corp#105 symptom (a stuck-looking
+ * session with no visible cause) that this Issue exists to fix. So exactly
+ * ONE upgrade is allowed: a specific (non-`stall`) kind arriving after a
+ * `stall` page still pages. Two stalls, or a specific kind after another
+ * specific kind (or after the upgrade already happened), never double-page —
+ * the watchdog's own `heartbeatFired` latch already prevents repeat pages for
+ * one persistent dialog, so this only ever fires once more per turn.
+ *
+ * Returns a no-op when `handler` is absent (the relay still logs to stderr
+ * via the watchdog).
  */
 export function createPageOnce(
   handler?: (info: DialogStuckInfo) => void | Promise<void>
 ): (info: DialogStuckInfo) => void | Promise<void> {
   let paged = false;
+  let pagedKind: string | null = null;
   return (info: DialogStuckInfo) => {
-    if (paged || !handler) return;
+    if (!handler) return;
+    if (paged) {
+      if (pagedKind === "stall" && info.kind !== "stall") {
+        pagedKind = info.kind;
+        return handler(info);
+      }
+      return;
+    }
     paged = true;
+    pagedKind = info.kind;
     return handler(info);
   };
 }

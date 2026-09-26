@@ -286,15 +286,15 @@ export function startDialogWatchdog(
         );
       }
 
-      // Issue #423: two independent reasons to keep hands off — the detected
-      // family is a question for the user (`autoAcceptable: false`), or the
-      // caller knows an AskUserQuestion was just relayed for this session. Both
-      // latch, so the decision survives a re-render that changes which pattern
-      // matches.
+      // Two independent reasons to keep hands off — the detected family has
+      // no safe key (`autoAcceptable: false`, e.g. ask-user-question #423 or
+      // usage-limit #452), or the caller knows an AskUserQuestion was just
+      // relayed for this session. Both latch, so the decision survives a
+      // re-render that changes which pattern matches.
       if (!manualOnly && (!match.autoAcceptable || suppressAutoAccept?.() === true)) {
         manualOnly = true;
         console.warn(
-          `[Dialog] manual-only on ${tmuxSessionName}: kind=${match.kind} — auto-accept withheld (Issue #423); only a human may answer this`
+          `[Dialog] manual-only on ${tmuxSessionName}: kind=${match.kind} — auto-accept withheld; only a human may answer this`
         );
       }
 
