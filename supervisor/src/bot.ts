@@ -101,6 +101,7 @@ import {
 import { DispatchQueue } from "./session/dispatch-queue";
 import {
   BRIEF_DISABLED_ENV,
+  briefDenialNotice,
   evaluateBriefTrigger,
   isBriefCommand,
   type RecentBrief,
@@ -1551,11 +1552,12 @@ export async function startBot(token: string): Promise<void> {
     // idempotency → target resolution → ask guard, in that order) lives in the
     // pure evaluator so it is testable without a gateway or a real
     // SessionManager. Only the side effects are here.
+    const policy = loadAccessPolicy();
     const decision = evaluateBriefTrigger({
       content,
       channelId: message.channel.id,
       sourceId: message.author.id,
-      policy: loadAccessPolicy(),
+      policy,
       recentBrief: recentBriefByChannel.get(channelName),
     });
 
@@ -1595,6 +1597,20 @@ export async function startBot(token: string): Promise<void> {
         console.warn(
           `[Bot] Brief denied (reason=${decision.reason}) in channel ${channelName}; not injected`
         );
+        // #466: a silent denial looked exactly like "the Supervisor is down"
+        // (2026-09-26: the chairman's manual /brief was dropped with no trace
+        // in Discord). Tell the sender why — but only a sender already in the
+        // channel's human allowFrom, so strangers learn nothing and bots never
+        // get a reply to loop on. The text carries no snowflakes.
+        {
+          const notice = briefDenialNotice({
+            reason: decision.reason,
+            policy,
+            channelId: message.channel.id,
+            sourceId: message.author.id,
+          });
+          if (notice) await postToChannel(notice);
+        }
         return true;
 
       case "rejected":

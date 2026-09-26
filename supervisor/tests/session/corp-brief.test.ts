@@ -3,6 +3,7 @@ import {
   BRIEF_DEDUP_WINDOW_MS,
   BRIEF_DISABLED_ENV,
   BRIEF_PREFIX,
+  briefDenialNotice,
   evaluateBriefTrigger,
   isBriefCommand,
   isBriefDisabled,
@@ -307,5 +308,83 @@ describe("evaluateBriefTrigger — same-day idempotency", () => {
     // evaluator side of that contract.
     const d = evaluateBriefTrigger(input({ nowMs: NOW, recentBrief: undefined }));
     expect(d.action).toBe("decide");
+  });
+});
+
+/**
+ * #466: a denied `/brief` used to vanish without a trace in Discord, which looked
+ * exactly like "the Supervisor is down". The reply is limited to senders already
+ * in the channel's human `allowFrom`, and never carries a snowflake.
+ */
+describe("briefDenialNotice — why a /brief was refused (#466)", () => {
+  const HUMAN_ID = "444444444444444444";
+
+  /** The 2026-09-26 setup: the chairman may relay but is not in dispatchFrom. */
+  function humanRelayPolicy(): AccessPolicy {
+    return {
+      groups: {
+        [CHANNEL_ID]: {
+          requireMention: false,
+          allowFrom: [HUMAN_ID],
+          dispatchFrom: [CORP_BOT_ID],
+        },
+      },
+    };
+  }
+
+  test("journey 1: allowFrom human outside dispatchFrom gets the reason, with no snowflakes", () => {
+    const policy = humanRelayPolicy();
+    const decision = evaluateBriefTrigger(input({ policy, sourceId: HUMAN_ID }));
+    expect(decision).toEqual({ action: "denied", reason: "source_not_allowlisted" });
+    if (decision.action !== "denied") throw new Error("unreachable");
+
+    const notice = briefDenialNotice({
+      reason: decision.reason,
+      policy,
+      channelId: CHANNEL_ID,
+      sourceId: HUMAN_ID,
+    });
+    expect(notice).not.toBeNull();
+    expect(notice).toContain("許可リストにありません");
+    expect(notice).toContain("dispatchFrom");
+    expect(notice).not.toMatch(/\d{17,20}/);
+  });
+
+  test("journey 2: a sender outside allowFrom (stranger or bot) gets silence", () => {
+    const policy = humanRelayPolicy();
+    expect(
+      briefDenialNotice({ reason: "source_not_allowlisted", policy, channelId: CHANNEL_ID, sourceId: OTHER_ID }),
+    ).toBeNull();
+  });
+
+  test("an empty allowFrom never replies (it is not 'everyone' on this path)", () => {
+    expect(
+      briefDenialNotice({
+        reason: "source_not_allowlisted",
+        policy: allowingPolicy(),
+        channelId: CHANNEL_ID,
+        sourceId: OTHER_ID,
+      }),
+    ).toBeNull();
+  });
+
+  test("policy_unavailable / channel_not_configured stay silent: allowFrom cannot be checked", () => {
+    expect(
+      briefDenialNotice({ reason: "policy_unavailable", policy: null, channelId: CHANNEL_ID, sourceId: HUMAN_ID }),
+    ).toBeNull();
+    expect(
+      briefDenialNotice({
+        reason: "channel_not_configured",
+        policy: humanRelayPolicy(),
+        channelId: "999999999999999999",
+        sourceId: HUMAN_ID,
+      }),
+    ).toBeNull();
+  });
+
+  test("journey 3: an allowed decision never produces a notice", () => {
+    expect(
+      briefDenialNotice({ reason: "allowed", policy: humanRelayPolicy(), channelId: CHANNEL_ID, sourceId: HUMAN_ID }),
+    ).toBeNull();
   });
 });

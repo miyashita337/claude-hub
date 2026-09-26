@@ -245,3 +245,41 @@ export function evaluateBriefTrigger(input: BriefTriggerInput): BriefDecision {
 
   return { action: "decide", date };
 }
+
+/**
+ * 拒否理由の日本語訳（#466）。粗い enum の訳だけで、送信者・チャンネルの snowflake や
+ * 本文は含めない（ログ方針と同じ）。`allowed` は拒否ではないので持たない。
+ */
+const BRIEF_DENIAL_TEXT: Record<Exclude<DispatchDecisionReason, "allowed">, string> = {
+  policy_unavailable: "access.json を読み込めませんでした",
+  channel_not_configured: "このチャンネルは access.json に登録されていません",
+  source_not_allowlisted: "送信者がこのチャンネルの /brief 許可リストにありません",
+};
+
+export interface BriefDenialNoticeInput {
+  reason: DispatchDecisionReason;
+  /** `evaluateBriefTrigger` に渡したものと同じ policy。 */
+  policy: AccessPolicy | null;
+  channelId: string;
+  sourceId: string;
+}
+
+/**
+ * `/brief` を拒否したときにチャンネルへ返す 1 行を決める純関数（#466）。
+ * `null` = 何も返さない（ログだけ残す）。
+ *
+ * 返すのは、送信者がそのチャンネルの group `allowFrom`（人間の relay 許可）に
+ * **明示的に**含まれるときだけ。理由:
+ *   - 許可されていない第三者に許可リストの有無を教えない
+ *   - bot / webhook 同士の応答ループを作らない（bot は allowFrom に載らない）
+ *
+ * `policy_unavailable` / `channel_not_configured` は group が引けず allowFrom を
+ * 確かめられないため、同じ規則で結果的に無言になる（fail-closed）。
+ * 空の `allowFrom` は「全員許可」の意味を持つ relay 側とは異なり、ここでは返信しない。
+ */
+export function briefDenialNotice(input: BriefDenialNoticeInput): string | null {
+  if (input.reason === "allowed") return null;
+  const allowFrom = input.policy?.groups?.[input.channelId]?.allowFrom ?? [];
+  if (!allowFrom.includes(input.sourceId)) return null;
+  return `🚫 ${BRIEF_PREFIX} を受け付けませんでした（${BRIEF_DENIAL_TEXT[input.reason]}）。access.json の dispatchFrom を確認してください。`;
+}
