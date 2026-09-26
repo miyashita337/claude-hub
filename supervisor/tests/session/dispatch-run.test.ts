@@ -442,3 +442,157 @@ describe("runDispatch — a dialog needing a human reaches the thread (#423 / #4
     expect(warnings.some((w) => w.includes("no postToThread"))).toBe(true);
   });
 });
+
+/**
+ * Issue #438: an inject failure must reach corp in a machine-readable form, not
+ * only as a Discord notice a human has to notice. runDispatch hands a
+ * Dispatch 実行レポート body (with `- dispatch_failure: inject`) to the injected
+ * `reportFailure`, which bot.ts binds to `gh issue comment` on the target Issue
+ * — the comment corp's `latestDispatchReport` already reads.
+ */
+describe("runDispatch — inject failure is reported machine-readably (#438)", () => {
+  function recorder(): {
+    reportFailure: (r: { issueNumber: number; body: string }) => Promise<void>;
+    calls: Array<{ issueNumber: number; body: string }>;
+  } {
+    const calls: Array<{ issueNumber: number; body: string }> = [];
+    return {
+      calls,
+      reportFailure: async (r) => {
+        calls.push(r);
+      },
+    };
+  }
+
+  test("sendFailed → one report for the target Issue with the failure schema", async () => {
+    const { manager } = fakeManager({
+      sendMessage: async () => ({ error: "unverified", sendFailed: true }),
+    });
+    const rec = recorder();
+    const r = await runDispatch({
+      config,
+      branch: "corp-dispatch-438",
+      issueNumber: 438,
+      command: "impl",
+      sessionManager: manager,
+      createThread: async () => ({ id: "t" }),
+      reportFailure: rec.reportFailure,
+    });
+    expect(r.ok).toBe(false);
+    expect(rec.calls).toHaveLength(1);
+    expect(rec.calls[0]!.issueNumber).toBe(438);
+    const body = rec.calls[0]!.body;
+    expect(body).toContain("## Dispatch 実行レポート");
+    expect(body).toContain("- dispatch_failure: inject");
+    expect(body).toContain("- executor: tmux");
+    expect(body).toContain("- branch: corp-dispatch-438");
+    expect(body).toContain("- initial_command: /impl 438");
+    expect(body).toContain("- session_stopped: true");
+    // The raw cause stays in the log, never in the public comment.
+    expect(body).not.toContain("unverified");
+  });
+
+  test("a thrown sendMessage is reported the same way, with the teardown outcome", async () => {
+    const { manager } = fakeManager({
+      sendMessage: async () => {
+        throw new Error("tmux gone at /Users/secret/path");
+      },
+      stop: async () => {
+        throw new Error("kill-session failed");
+      },
+    });
+    const rec = recorder();
+    await runDispatch({
+      config,
+      branch: "b",
+      issueNumber: 7,
+      command: "pdca",
+      sessionManager: manager,
+      createThread: async () => ({ id: "t" }),
+      reportFailure: rec.reportFailure,
+    });
+    expect(rec.calls).toHaveLength(1);
+    expect(rec.calls[0]!.body).toContain("- initial_command: /pdca 7");
+    expect(rec.calls[0]!.body).toContain("- session_stopped: false");
+    expect(rec.calls[0]!.body).not.toContain("/Users/secret");
+  });
+
+  test("a successful injection produces no failure report", async () => {
+    const { manager } = fakeManager();
+    const rec = recorder();
+    const r = await runDispatch({
+      config,
+      branch: "corp-dispatch-438",
+      issueNumber: 438,
+      command: "impl",
+      sessionManager: manager,
+      createThread: async () => ({ id: "t" }),
+      reportFailure: rec.reportFailure,
+    });
+    expect(r.ok).toBe(true);
+    expect(rec.calls).toHaveLength(0);
+  });
+
+  test("a relay timeout (command landed) produces no failure report", async () => {
+    const { manager } = fakeManager({
+      sendMessage: async () => ({ error: "relay timeout after 900000ms" }),
+    });
+    const rec = recorder();
+    const r = await runDispatch({
+      config,
+      branch: "corp-dispatch-438",
+      issueNumber: 438,
+      command: "pdca",
+      sessionManager: manager,
+      createThread: async () => ({ id: "t" }),
+      reportFailure: rec.reportFailure,
+    });
+    expect(r.ok).toBe(true);
+    expect(rec.calls).toHaveLength(0);
+  });
+
+  test("a slow reporter does not delay the dispatch result (notice / slot release)", async () => {
+    const { manager } = fakeManager({
+      sendMessage: async () => ({ error: "unverified", sendFailed: true }),
+    });
+    let called = false;
+    const r = await runDispatch({
+      config,
+      branch: "corp-dispatch-438",
+      issueNumber: 438,
+      command: "impl",
+      sessionManager: manager,
+      createThread: async () => ({ id: "t" }),
+      // Never settles — stands in for a wedged `gh` (up to its 15s timeout).
+      reportFailure: () => {
+        called = true;
+        return new Promise<void>(() => {});
+      },
+    });
+    expect(called).toBe(true);
+    expect(r.ok).toBe(false);
+  });
+
+  test("a failing reporter is fail-soft: the dispatch result is unchanged", async () => {
+    const { manager } = fakeManager({
+      sendMessage: async () => ({ error: "unverified", sendFailed: true }),
+    });
+    const r = await runDispatch({
+      config,
+      branch: "corp-dispatch-438",
+      issueNumber: 438,
+      command: "impl",
+      sessionManager: manager,
+      createThread: async () => ({ id: "t" }),
+      reportFailure: async () => {
+        throw new Error("gh: network down");
+      },
+    });
+    expect(r.ok).toBe(false);
+    if (!r.ok) {
+      expect(r.stage).toBe("inject");
+      expect(r.error).toContain("unverified");
+      expect(r.sessionStopped).toBe(true);
+    }
+  });
+});

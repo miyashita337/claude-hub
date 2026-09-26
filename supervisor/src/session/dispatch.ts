@@ -34,6 +34,7 @@
 
 import { resolveWorktreePath } from "./worktree";
 import { formatForDiscord } from "./output-formatter";
+import { formatDispatchFailureReport } from "./dispatch-report";
 import {
   buildDialogStuckHandler,
   type DialogStuckInfo,
@@ -339,7 +340,23 @@ export interface RunDispatchArgs {
    * own welcome there).
    */
   postToThread?: DispatchThreadPoster;
+  /**
+   * Records an inject failure where corp can read it (Issue #438). Receives a
+   * Dispatch 実行レポート body carrying `- dispatch_failure: inject`; bot.ts
+   * binds it to `gh issue comment` on the target Issue — the comment corp's
+   * `latestDispatchReport` already reads. Called only on stage=inject, never on
+   * success. Fail-soft: a rejection is logged and never changes the result.
+   * Optional so callers that have no Issue to write to (tests, hub paths) are
+   * unaffected.
+   */
+  reportFailure?: DispatchFailureReporter;
 }
+
+/** Sink for the machine-readable inject-failure record (Issue #438). */
+export type DispatchFailureReporter = (report: {
+  issueNumber: number;
+  body: string;
+}) => Promise<void>;
 
 export type RunDispatchResult =
   | {
@@ -506,7 +523,11 @@ export async function runDispatch(
       onDialogStuck ? { onDialogStuck } : undefined,
     );
   } catch (err) {
-    return injectFailure(sessionManager, threadId, errMsg(err));
+    return reportInjectFailure(
+      args,
+      initialCommand,
+      await injectFailure(sessionManager, threadId, errMsg(err)),
+    );
   }
 
   // Issue #429: this is the silent-stall site. `sendMessage` resolves with a
@@ -521,7 +542,11 @@ export async function runDispatch(
   // job is simply still running past RELAY_TIMEOUT_MS — reporting that as a
   // failed dispatch would trade a silent drop for a false alarm.
   if (relay.sendFailed) {
-    return injectFailure(sessionManager, threadId, relay.error ?? "send failed");
+    return reportInjectFailure(
+      args,
+      initialCommand,
+      await injectFailure(sessionManager, threadId, relay.error ?? "send failed"),
+    );
   }
 
   return { ok: true, mode: "tmux", threadId, injected: initialCommand };
@@ -559,6 +584,48 @@ async function injectFailure(
     );
   }
   return { ok: false, stage: "inject", error, sessionStopped };
+}
+
+/**
+ * Hand the inject failure to {@link RunDispatchArgs.reportFailure} as a
+ * machine-readable Dispatch 実行レポート (Issue #438), then return the failure
+ * unchanged. Before #438 the only trace was the Discord notice, so corp's ledger
+ * stayed `dispatched` and re-injection waited on a human noticing.
+ *
+ * Fail-soft: the dispatch failure is what the caller must act on, so a reporter
+ * error is logged (not swallowed silently) and never replaces the result.
+ */
+async function reportInjectFailure(
+  args: RunDispatchArgs,
+  initialCommand: string,
+  failure: RunDispatchResult,
+): Promise<RunDispatchResult> {
+  const report = args.reportFailure;
+  if (!report || failure.ok) return failure;
+  const body = formatDispatchFailureReport({
+    stage: "inject",
+    executor: "tmux",
+    branch: args.branch,
+    initialCommand,
+    sessionStopped: failure.sessionStopped !== false,
+  });
+  const logReportError = (err: unknown): void => {
+    console.error(
+      `[Dispatch] inject failure for issue #${args.issueNumber} could not be recorded for corp (#438):`,
+      errMsg(err),
+    );
+  };
+  // Fire-and-forget: the `gh issue comment` call can take up to its 15s
+  // timeout, and awaiting it here would delay both the thread's failure notice
+  // and the queue slot release (PR review, devils-advocate should-1). The
+  // session is already stopped, so nothing depends on the comment landing
+  // first; its failure is still logged.
+  try {
+    report({ issueNumber: args.issueNumber, body }).catch(logReportError);
+  } catch (err) {
+    logReportError(err);
+  }
+  return failure;
 }
 
 /**
