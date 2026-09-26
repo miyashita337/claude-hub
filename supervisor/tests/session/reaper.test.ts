@@ -262,3 +262,50 @@ describe("Reaper.check — sessions awaiting an AskUserQuestion answer", () => {
     expect(stopCalls).toEqual([{ threadId: "answered", reason: "idle_timeout" }]);
   });
 });
+
+/**
+ * Issue #435: the reaper tick also drives the unregistered-tmux watch (detect +
+ * notify only). It must run even when nothing registered is due, and a failing
+ * watch must not break the idle reap.
+ */
+describe("Reaper.check — unregistered tmux watch (#435)", () => {
+  const idleClient = {
+    channels: { cache: { get: () => undefined }, fetch: async () => undefined },
+  } as unknown as Client;
+
+  test("scans the unregistered-tmux watch on every tick", async () => {
+    const { manager } = makeManager(new Map());
+    let scans = 0;
+    const reaper = new Reaper(manager, idleClient, {
+      idleTimeoutMs: 6 * HOUR,
+      unregisteredTmuxWatch: {
+        scan: async () => {
+          scans += 1;
+          return [];
+        },
+      },
+    });
+    await reaper.check();
+    await reaper.check();
+    expect(scans).toBe(2);
+  });
+
+  test("a throwing watch does not stop the idle reap", async () => {
+    const NOW = 1000 * HOUR;
+    const sessions = new Map<string, SessionInfo>([
+      ["idle", makeSession({ threadId: "idle", lastActivityAt: new Date(NOW - 7 * HOUR) })],
+    ]);
+    const { manager, stopCalls } = makeManager(sessions);
+    const reaper = new Reaper(manager, idleClient, {
+      idleTimeoutMs: 6 * HOUR,
+      now: () => NOW,
+      unregisteredTmuxWatch: {
+        scan: async () => {
+          throw new Error("tmux wedged");
+        },
+      },
+    });
+    await reaper.check();
+    expect(stopCalls).toEqual([{ threadId: "idle", reason: "idle_timeout" }]);
+  });
+});

@@ -236,3 +236,60 @@ describe("SessionManager orphan tmux GC (#246)", () => {
     );
   });
 });
+
+/**
+ * Issue #435: the supervisor-side view of "which tmux sessions on our socket do
+ * we NOT own right now" — the input of the unregistered-tmux watch. Uses the
+ * in-memory FakeTmuxAdapter only: never touches the real `-L claude-hub` socket.
+ */
+describe("SessionManager.listUnregisteredTmuxSessions (#435)", () => {
+  let manager: SessionManager | undefined;
+  let effects: FakeSessionEffects;
+
+  beforeEach(() => {
+    getDb().exec("DELETE FROM sessions");
+    effects = createFakeEffects();
+    manager = undefined;
+  });
+
+  afterEach(async () => {
+    await manager?.shutdownAll();
+  });
+
+  test("lists tmux sessions that no in-memory session owns, and kills none of them", async () => {
+    manager = new SessionManager({ effects, gracefulKillTimeoutMs: 0 });
+    await manager.recovery;
+    await effects.tmux.newSession("claude-x", "claude");
+    await effects.tmux.newSession("claude-tricky", "claude");
+    await effects.tmux.newSession("scratch", "bash");
+    expect((await manager.listUnregisteredTmuxSessions()).sort()).toEqual([
+      "claude-tricky",
+      "claude-x",
+      "scratch",
+    ]);
+    // Detect-only: nothing was killed.
+    expect(effects.tmux.list().sort()).toEqual([
+      "claude-tricky",
+      "claude-x",
+      "scratch",
+    ]);
+  });
+
+  test("excludes a session the manager is running (AC-2: active sessions are not flagged)", async () => {
+    const dir = resolve(tmpdir(), `unregistered-tmux-435-${process.pid}`);
+    mkdirSync(dir, { recursive: true });
+    const config: ChannelConfig = {
+      channelName: "test-channel",
+      dir,
+      displayName: "Test Channel",
+    };
+    manager = new SessionManager({ effects, gracefulKillTimeoutMs: 0 });
+    await manager.recovery;
+    const threadId = "933300000000333";
+    await manager.start(config, threadId);
+    await effects.tmux.newSession("claude-x", "claude");
+    const names = await manager.listUnregisteredTmuxSessions();
+    expect(names).toEqual(["claude-x"]);
+    expect(names).not.toContain(SessionManager.tmuxSessionNameFor(threadId));
+  });
+});

@@ -209,6 +209,7 @@ jobs:
                    tests/session/headless-liveness.test.ts \
                    tests/session/pending-work.test.ts \
                    tests/session/reaper.test.ts \
+                   tests/session/unregistered-tmux-watch.test.ts \
                    tests/session/dispatch-queue.test.ts \
                    tests/session/admission.test.ts \
                    tests/session/latency-logger.test.ts \

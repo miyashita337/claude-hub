@@ -842,6 +842,23 @@ export class SessionManager {
     }));
   }
 
+  /**
+   * Issue #435: live tmux sessions on the supervisor socket that no in-memory
+   * session owns — neither running nor mid-start (same ownership set as
+   * {@link reapOrphanTmuxSessions}' protectedNames). Read-only: the caller only
+   * reports them; nothing here kills. Any name counts, prefixed or not, because
+   * the socket is supervisor-dedicated. `[]` when tmux cannot be listed.
+   */
+  async listUnregisteredTmuxSessions(): Promise<string[]> {
+    const liveNames = await this.effects.tmux.listSessions();
+    const owned = new Set(
+      [...this.sessions.keys(), ...this.pendingStarts].map((threadId) =>
+        this.tmuxSessionName(threadId)
+      )
+    );
+    return liveNames.filter((name) => !owned.has(name));
+  }
+
   private tmuxSessionName(threadId: string): string {
     return SessionManager.tmuxSessionNameFor(threadId);
   }
