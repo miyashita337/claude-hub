@@ -44,6 +44,13 @@ export interface ReaperDeps {
    * the wait exists for. Defaults to the relay server's live pending map.
    */
   isAwaitingAsk?: (threadId: string) => boolean;
+  /**
+   * Issue #435: the registered-session loop below cannot see tmux sessions the
+   * supervisor never registered. This watch rides the same tick to surface them
+   * (detect + notify once — it never kills; see unregistered-tmux-watch.ts).
+   * Omitted → no unregistered scan (tests / callers that don't wire it).
+   */
+  unregisteredTmuxWatch?: { scan(): Promise<unknown> };
 }
 
 /** Minimal snapshot captured before stop() removes the session, for the resume導線. */
@@ -58,6 +65,7 @@ export class Reaper {
   private readonly checkIntervalMs: number;
   private readonly now: () => number;
   private readonly isAwaitingAsk: (threadId: string) => boolean;
+  private readonly unregisteredTmuxWatch?: { scan(): Promise<unknown> };
 
   constructor(
     private sessionManager: SessionManager,
@@ -68,6 +76,7 @@ export class Reaper {
     this.checkIntervalMs = deps.checkIntervalMs ?? IDLE_CHECK_INTERVAL_MS;
     this.now = deps.now ?? Date.now;
     this.isAwaitingAsk = deps.isAwaitingAsk ?? hasPendingAsk;
+    this.unregisteredTmuxWatch = deps.unregisteredTmuxWatch;
   }
 
   start(): void {
@@ -118,6 +127,15 @@ export class Reaper {
         );
         await this.sessionManager.stop(threadId, "idle_timeout");
         await this.notifyThread(threadId, idleMs, snapshot);
+      }
+    }
+    // After the idle reap, so a session reaped just now has already left tmux
+    // and a failure here cannot hold up the reap.
+    if (this.unregisteredTmuxWatch) {
+      try {
+        await this.unregisteredTmuxWatch.scan();
+      } catch (err) {
+        console.error("[Reaper] unregistered tmux scan failed (#435):", err);
       }
     }
   }

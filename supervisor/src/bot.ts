@@ -16,6 +16,10 @@ import {
   manualRestartGuidance,
 } from "./session/self-heal-restart";
 import { Reaper } from "./session/reaper";
+import {
+  UnregisteredTmuxWatch,
+  formatUnregisteredTmuxAlert,
+} from "./session/unregistered-tmux-watch";
 import { GoalWatcher } from "./session/goal-watcher";
 import { OrphanDispatchReaper } from "./session/orphan-dispatch-reaper";
 import { DispatchHealthReaper } from "./session/dispatch-health-reaper";
@@ -430,7 +434,30 @@ export async function startBot(token: string): Promise<void> {
       }
     });
   }
-  const reaper = new Reaper(sessionManager, client);
+  // Issue #435: tmux sessions on our socket that the supervisor never
+  // registered are invisible to the idle reaper. Surface them once in the
+  // 非常口 channel after 6h of observation — detect + notify only, never kill
+  // (kill policy is the follow-up #477).
+  const unregisteredTmuxWatch = new UnregisteredTmuxWatch({
+    listUnregistered: () => sessionManager.listUnregisteredTmuxSessions(),
+    notify: async (sightings) => {
+      const alert = formatUnregisteredTmuxAlert(sightings);
+      console.warn(`[UnregisteredTmuxWatch] ${alert}`);
+      const hijoguchiId = claudeHubExitPrimaryChannelId();
+      if (!hijoguchiId) {
+        console.error(
+          "[UnregisteredTmuxWatch] HIJOGUCHI_CHANNEL_ID が未設定のため、上記の通知はログにしか出せません。",
+        );
+        return;
+      }
+      const channel = await client.channels.fetch(hijoguchiId);
+      if (!channel?.isTextBased() || !("send" in channel)) {
+        throw new Error(`hijoguchi channel ${hijoguchiId} is not sendable`);
+      }
+      await channel.send(alert);
+    },
+  });
+  const reaper = new Reaper(sessionManager, client, { unregisteredTmuxWatch });
   // corp #52 M3 (spec §7): auto-stop dispatch-origin sessions (branch
   // `corp-dispatch-<N>`) once their Issue carries the `done` label, after a
   // grace window the chairman can cancel by speaking. Frees the shared session
