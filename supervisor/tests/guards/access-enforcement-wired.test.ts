@@ -180,8 +180,8 @@ describe("brief trigger is wired fail-closed (#426)", () => {
     const rejectedIdx = src.indexOf('case "rejected":', deniedIdx);
     expect(deniedIdx).toBeGreaterThan(-1);
     const arm = src.slice(deniedIdx, rejectedIdx);
-    expect(arm).toContain("briefDenialNotice(");
-    expect(arm).toContain("postToChannel(notice)");
+    expect(arm).toContain("notifyBriefDenial(");
+    expect(arm).toContain("postToChannel);");
   });
 
   test("brief denial logs do not interpolate raw source/channel ids or body", async () => {

@@ -101,9 +101,9 @@ import {
 import { DispatchQueue } from "./session/dispatch-queue";
 import {
   BRIEF_DISABLED_ENV,
-  briefDenialNotice,
   evaluateBriefTrigger,
   isBriefCommand,
+  notifyBriefDenial,
   type RecentBrief,
 } from "./session/corp-brief";
 import {
@@ -1602,15 +1602,7 @@ export async function startBot(token: string): Promise<void> {
         // in Discord). Tell the sender why — but only a sender already in the
         // channel's human allowFrom, so strangers learn nothing and bots never
         // get a reply to loop on. The text carries no snowflakes.
-        {
-          const notice = briefDenialNotice({
-            reason: decision.reason,
-            policy,
-            channelId: message.channel.id,
-            sourceId: message.author.id,
-          });
-          if (notice) await postToChannel(notice);
-        }
+        await notifyBriefDenial({ reason: decision.reason, policy, channelId: message.channel.id, sourceId: message.author.id, senderIsBot: message.author.bot || Boolean(message.webhookId) }, postToChannel);
         return true;
 
       case "rejected":

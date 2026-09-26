@@ -262,6 +262,11 @@ export interface BriefDenialNoticeInput {
   policy: AccessPolicy | null;
   channelId: string;
   sourceId: string;
+  /**
+   * 送信者が bot / webhook か（discord.js の `author.bot` / `webhookId`）。
+   * `/brief` は bot ガードより前で処理されるため、ここで除外する。
+   */
+  senderIsBot: boolean;
 }
 
 /**
@@ -271,7 +276,7 @@ export interface BriefDenialNoticeInput {
  * 返すのは、送信者がそのチャンネルの group `allowFrom`（人間の relay 許可）に
  * **明示的に**含まれるときだけ。理由:
  *   - 許可されていない第三者に許可リストの有無を教えない
- *   - bot / webhook 同士の応答ループを作らない（bot は allowFrom に載らない）
+ *   - bot / webhook 同士の応答ループを作らない（allowFrom に載っていても bot には返さない）
  *
  * `policy_unavailable` / `channel_not_configured` は group が引けず allowFrom を
  * 確かめられないため、同じ規則で結果的に無言になる（fail-closed）。
@@ -279,7 +284,22 @@ export interface BriefDenialNoticeInput {
  */
 export function briefDenialNotice(input: BriefDenialNoticeInput): string | null {
   if (input.reason === "allowed") return null;
+  if (input.senderIsBot) return null;
   const allowFrom = input.policy?.groups?.[input.channelId]?.allowFrom ?? [];
   if (!allowFrom.includes(input.sourceId)) return null;
   return `🚫 ${BRIEF_PREFIX} を受け付けませんでした（${BRIEF_DENIAL_TEXT[input.reason]}）。access.json の dispatchFrom を確認してください。`;
+}
+
+/**
+ * {@link briefDenialNotice} が返す 1 行を `post` で投稿する（#466）。投稿したら `true`。
+ * bot.ts の denied 分岐をこの 1 呼び出しに保ち、判定と投稿の配線をテストで押さえる。
+ */
+export async function notifyBriefDenial(
+  input: BriefDenialNoticeInput,
+  post: (text: string) => Promise<void>,
+): Promise<boolean> {
+  const notice = briefDenialNotice(input);
+  if (notice === null) return false;
+  await post(notice);
+  return true;
 }

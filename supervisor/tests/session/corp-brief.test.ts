@@ -7,6 +7,7 @@ import {
   evaluateBriefTrigger,
   isBriefCommand,
   isBriefDisabled,
+  notifyBriefDenial,
   parseBriefCommand,
   type BriefTriggerInput,
 } from "../../src/session/corp-brief";
@@ -343,6 +344,7 @@ describe("briefDenialNotice — why a /brief was refused (#466)", () => {
       policy,
       channelId: CHANNEL_ID,
       sourceId: HUMAN_ID,
+      senderIsBot: false,
     });
     expect(notice).not.toBeNull();
     expect(notice).toContain("許可リストにありません");
@@ -353,7 +355,19 @@ describe("briefDenialNotice — why a /brief was refused (#466)", () => {
   test("journey 2: a sender outside allowFrom (stranger or bot) gets silence", () => {
     const policy = humanRelayPolicy();
     expect(
-      briefDenialNotice({ reason: "source_not_allowlisted", policy, channelId: CHANNEL_ID, sourceId: OTHER_ID }),
+      briefDenialNotice({ reason: "source_not_allowlisted", policy, channelId: CHANNEL_ID, sourceId: OTHER_ID , senderIsBot: false }),
+    ).toBeNull();
+  });
+
+  test("a bot or webhook gets silence even when listed in allowFrom (no reply loops)", () => {
+    expect(
+      briefDenialNotice({
+        reason: "source_not_allowlisted",
+        policy: humanRelayPolicy(),
+        channelId: CHANNEL_ID,
+        sourceId: HUMAN_ID,
+        senderIsBot: true,
+      }),
     ).toBeNull();
   });
 
@@ -364,13 +378,14 @@ describe("briefDenialNotice — why a /brief was refused (#466)", () => {
         policy: allowingPolicy(),
         channelId: CHANNEL_ID,
         sourceId: OTHER_ID,
+        senderIsBot: false,
       }),
     ).toBeNull();
   });
 
   test("policy_unavailable / channel_not_configured stay silent: allowFrom cannot be checked", () => {
     expect(
-      briefDenialNotice({ reason: "policy_unavailable", policy: null, channelId: CHANNEL_ID, sourceId: HUMAN_ID }),
+      briefDenialNotice({ reason: "policy_unavailable", policy: null, channelId: CHANNEL_ID, sourceId: HUMAN_ID , senderIsBot: false }),
     ).toBeNull();
     expect(
       briefDenialNotice({
@@ -378,13 +393,35 @@ describe("briefDenialNotice — why a /brief was refused (#466)", () => {
         policy: humanRelayPolicy(),
         channelId: "999999999999999999",
         sourceId: HUMAN_ID,
+        senderIsBot: false,
       }),
     ).toBeNull();
   });
 
   test("journey 3: an allowed decision never produces a notice", () => {
     expect(
-      briefDenialNotice({ reason: "allowed", policy: humanRelayPolicy(), channelId: CHANNEL_ID, sourceId: HUMAN_ID }),
+      briefDenialNotice({ reason: "allowed", policy: humanRelayPolicy(), channelId: CHANNEL_ID, sourceId: HUMAN_ID , senderIsBot: false }),
     ).toBeNull();
+  });
+
+  test("notifyBriefDenial posts the notice once, and posts nothing when silent", async () => {
+    const posted: string[] = [];
+    const post = async (text: string) => {
+      posted.push(text);
+    };
+    const base = {
+      reason: "source_not_allowlisted" as const,
+      policy: humanRelayPolicy(),
+      channelId: CHANNEL_ID,
+      sourceId: HUMAN_ID,
+      senderIsBot: false,
+    };
+    expect(await notifyBriefDenial(base, post)).toBe(true);
+    expect(posted).toHaveLength(1);
+    expect(posted[0]).toContain("🚫");
+
+    expect(await notifyBriefDenial({ ...base, senderIsBot: true }, post)).toBe(false);
+    expect(await notifyBriefDenial({ ...base, sourceId: OTHER_ID }, post)).toBe(false);
+    expect(posted).toHaveLength(1);
   });
 });
