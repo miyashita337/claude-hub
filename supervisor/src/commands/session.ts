@@ -223,7 +223,9 @@ async function handleEnter(
       content: "⏎ Enter を送信しました。送信が確定すれば、応答はこのスレッドに返ります。",
     });
   } catch (err) {
-    const msg = `❌ Enter の送信に失敗: ${err instanceof Error ? err.message : String(err)}`;
+    // Issue #360 (rebase onto #357's /session enter, merged after this PR's
+    // branch point): same leak shape as the other 7 session.ts catches.
+    const msg = sanitizedFailureNotice("session enter", "❌ Enter の送信に失敗しました", err);
     await safeRespond(interaction, { content: msg, ephemeral: true });
   }
 }

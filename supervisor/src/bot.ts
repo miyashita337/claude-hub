@@ -45,7 +45,11 @@ import {
   type ChannelConfig,
 } from "./config/channels";
 import { RELAY_ERROR_USER_MESSAGE, type AttachmentInfo } from "./session/relay";
-import { logRawError, sanitizedFailureNotice } from "./session/user-error-notice";
+import {
+  channelPostFetchThreadFailure,
+  channelPostSendFailure,
+  sanitizedFailureNotice,
+} from "./session/user-error-notice";
 import { buildDialogStuckHandler } from "./session/dialog-stuck-handler";
 import { relayInteractive } from "./session/interactive-relay";
 import { notifyPushover, warnIfPushoverUnconfigured } from "./session/notify-pushover";
@@ -877,15 +881,8 @@ export async function startBot(token: string): Promise<void> {
         thread = await client.channels.fetch(threadId);
       } catch (err) {
         // Unknown Channel 等の Discord API エラーは呼び出し側の指定ミス扱い。
-        // Issue #360: the raw cause used to be interpolated into this
-        // relay-server response body (same shape as #236); it goes to
-        // console.error only now.
-        logRawError("channel-post fetch thread", err);
-        return {
-          ok: false,
-          status: 404,
-          error: `スレッドを取得できません: ${threadId}`,
-        };
+        // Issue #360: sanitized in channelPostFetchThreadFailure.
+        return channelPostFetchThreadFailure(threadId, err);
       }
       if (!thread?.isThread()) {
         return {
@@ -924,16 +921,8 @@ export async function startBot(token: string): Promise<void> {
           sentCount++;
         }
       } catch (err) {
-        // Issue #360: same leak shape as the fetch-thread catch above — the
-        // raw cause now goes to console.error only.
-        logRawError("channel-post send", err);
-        return {
-          ok: false,
-          status: 502,
-          error:
-            `送信中にエラー（${sentCount}/${chunks.length} chunks 送信済み。` +
-            `再試行すると重複投稿の可能性があります）`,
-        };
+        // Issue #360: sanitized in channelPostSendFailure.
+        return channelPostSendFailure(sentCount, chunks.length, err);
       }
       console.log(
         `[Bot] channel-post: thread ${threadId} → #${parent.name} (${chunks.length} chunks, ${text.length} chars)`,
@@ -963,17 +952,8 @@ export async function startBot(token: string): Promise<void> {
     // Repliable (not just chat-input): button interactions share this path since
     // #364, and narrowing to slash commands would silently swallow their errors.
     if (!interaction.isRepliable()) return;
-    // Issue #360 (follow-up of #236): this is the widest of the audited leak
-    // sites — every uncaught error from any slash command or component
-    // handler lands here. `sanitizedFailureNotice` logs `err` here too, even
-    // though all four current callers already `console.error` it before
-    // invoking this helper: this is the last line of defense before a
-    // Discord reply, so a future caller that forgets to log first still
-    // gets the raw cause captured (observability.md — never silently drop
-    // the cause) instead of silently losing it. The duplicate log line at
-    // today's call sites is the accepted, cheap cost (devils-advocate
-    // review of #360 flagged the duplication; kept intentionally for this
-    // reason rather than switching to the log-free `buildFailureNotice`).
+    // Issue #360: widest audited leak site, sanitized via sanitizedFailureNotice
+    // (see its doc comment for why it logs `err` again here on purpose).
     const content = sanitizedFailureNotice("Bot safeReplyError", "❌ エラーが発生しました", err);
     try {
       if (interaction.deferred || interaction.replied) {

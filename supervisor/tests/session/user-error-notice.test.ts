@@ -1,6 +1,8 @@
 import { test, expect, describe, spyOn } from "bun:test";
 import {
   buildFailureNotice,
+  channelPostFetchThreadFailure,
+  channelPostSendFailure,
   logRawError,
   sanitizedFailureNotice,
 } from "../../src/session/user-error-notice";
@@ -97,6 +99,43 @@ describe("logRawError (#360)", () => {
       logRawError("channel-post fetch thread", LEAKY_ERROR);
       expect(spy).toHaveBeenCalledTimes(1);
       expect(spy.mock.calls[0]![0]).toContain("channel-post fetch thread");
+      expect(spy.mock.calls[0]).toContain(LEAKY_ERROR);
+    } finally {
+      spy.mockRestore();
+    }
+  });
+});
+
+describe("channelPostFetchThreadFailure (#360, devils-advocate review)", () => {
+  test("never embeds the raw error, but keeps the (non-sensitive) threadId", () => {
+    const spy = spyOn(console, "error").mockImplementation(() => {});
+    try {
+      const result = channelPostFetchThreadFailure("thread-abc123", LEAKY_ERROR);
+      expect(result.ok).toBe(false);
+      expect(result.status).toBe(404);
+      expect(result.error).toContain("thread-abc123");
+      expect(result.error).not.toContain("/Users/");
+      expect(result.error).not.toContain("ENOENT");
+      expect(spy).toHaveBeenCalledTimes(1);
+      expect(spy.mock.calls[0]).toContain(LEAKY_ERROR);
+    } finally {
+      spy.mockRestore();
+    }
+  });
+});
+
+describe("channelPostSendFailure (#360, devils-advocate review)", () => {
+  test("never embeds the raw error, but keeps the (non-sensitive) chunk progress", () => {
+    const spy = spyOn(console, "error").mockImplementation(() => {});
+    try {
+      const result = channelPostSendFailure(2, 5, LEAKY_ERROR);
+      expect(result.ok).toBe(false);
+      expect(result.status).toBe(502);
+      expect(result.error).toContain("2/5");
+      expect(result.error).toContain("chunks 送信済み");
+      expect(result.error).not.toContain("/Users/");
+      expect(result.error).not.toContain("ENOENT");
+      expect(spy).toHaveBeenCalledTimes(1);
       expect(spy.mock.calls[0]).toContain(LEAKY_ERROR);
     } finally {
       spy.mockRestore();

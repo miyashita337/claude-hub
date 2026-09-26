@@ -45,6 +45,16 @@ export function buildFailureNotice(message: string): string {
  * via {@link logRawError} in one call — for the common case where the catch
  * site has not logged `err` yet (every `/session <sub>` handler, the
  * compact button, the context-budget self-heal notice).
+ *
+ * bot.ts's `safeReplyError` also uses this — even though all four of its
+ * current callers already `console.error` the raw `err` before invoking it —
+ * because it is the last line of defense before a Discord reply: a future
+ * caller that forgets to log first still gets the raw cause captured
+ * (observability.md — never silently drop the cause) instead of losing it.
+ * The resulting duplicate log line at today's call sites is the accepted,
+ * cheap cost (devils-advocate review of #360 flagged the duplication; kept
+ * intentionally rather than switching that call site to the log-free
+ * {@link buildFailureNotice}).
  */
 export function sanitizedFailureNotice(
   logLabel: string,
@@ -53,4 +63,55 @@ export function sanitizedFailureNotice(
 ): string {
   logRawError(logLabel, err);
   return buildFailureNotice(message);
+}
+
+/** Shape shared by every `handleChannelPost` failure response (bot.ts). */
+export interface ChannelPostFailure {
+  ok: false;
+  status: number;
+  error: string;
+}
+
+/**
+ * `handleChannelPost`'s thread-fetch catch, extracted to a pure/testable
+ * function (coverage note below). `threadId` is caller-supplied, already
+ * public in the request, and safe to echo back; the raw `err` is not.
+ */
+export function channelPostFetchThreadFailure(
+  threadId: string,
+  err: unknown
+): ChannelPostFailure {
+  logRawError("channel-post fetch thread", err);
+  return { ok: false, status: 404, error: `スレッドを取得できません: ${threadId}` };
+}
+
+/**
+ * `handleChannelPost`'s chunk-send-loop catch, extracted to a pure/testable
+ * function. `sentCount`/`totalChunks` are non-sensitive progress data the
+ * caller needs to judge whether a retry would double-post; the raw `err` is
+ * not.
+ *
+ * Both `handleChannelPost` catches are extracted here (not left inline in
+ * bot.ts) because they live inside a closure defined in `startBot()`, which
+ * no test can invoke — Codecov's patch-coverage gate (`codecov.yml`, blocking
+ * since #300) would otherwise flag every line touched inside that closure as
+ * uncovered. Pulling the logic out into these plain functions makes it
+ * directly unit-testable (see `tests/session/user-error-notice.test.ts`),
+ * leaving bot.ts as a one-line delegator — the same pattern already used for
+ * `buildSendFailureResult` (relay.ts) and `buildDispatchFailureNotice`
+ * (dispatch.ts).
+ */
+export function channelPostSendFailure(
+  sentCount: number,
+  totalChunks: number,
+  err: unknown
+): ChannelPostFailure {
+  logRawError("channel-post send", err);
+  return {
+    ok: false,
+    status: 502,
+    error:
+      `送信中にエラー（${sentCount}/${totalChunks} chunks 送信済み。` +
+      `再試行すると重複投稿の可能性があります）`,
+  };
 }

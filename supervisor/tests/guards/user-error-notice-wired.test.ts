@@ -74,27 +74,33 @@ describe("bot.ts safeReplyError stays sanitized (#360)", () => {
 });
 
 describe("bot.ts handleChannelPost stays sanitized (#360)", () => {
-  test("both catch blocks log the raw cause via logRawError and never interpolate it", async () => {
+  test("both catch blocks delegate to the extracted, unit-tested failure builders", async () => {
     const src = await readSrc("src/bot.ts");
     const fn = extractBetween(
       src,
       'const handleChannelPost: ReadyWiringHandlers["relay:channelPost"] = async (',
       "console.log("
     );
-    // Two catch blocks (fetch-thread, send-loop); both must log raw err.
-    expect([...fn.matchAll(/logRawError\(/g)].length).toBe(2);
+    // Issue #360 (devils-advocate review): the sanitization logic itself now
+    // lives in channelPostFetchThreadFailure / channelPostSendFailure
+    // (session/user-error-notice.ts), which ARE plain functions a unit test
+    // can call directly -- see tests/session/user-error-notice.test.ts for
+    // the leak-free / info-preserved behavioral assertions. This closure
+    // (never invoked by any test -- it only runs inside a live startBot())
+    // just delegates to them, so Codecov's patch-coverage gate does not
+    // require covering untestable closure lines to pass.
+    expect(fn).toContain("return channelPostFetchThreadFailure(threadId, err)");
+    expect(fn).toContain("return channelPostSendFailure(sentCount, chunks.length, err)");
     expectNoRawErrLeak(fn);
-    // The response body still carries useful, non-sensitive detail (Issue
-    // #360: "情報量をむやみに落とさない") — the thread id and the partial
-    // chunk-count progress survive, just not the raw error.
-    expect(fn).toContain("スレッドを取得できません: ${threadId}");
-    expect(fn).toContain("chunks 送信済み");
   });
 
-  test("imports logRawError from the shared user-error-notice module", async () => {
+  test("imports channelPostFetchThreadFailure and channelPostSendFailure from the shared module", async () => {
     const src = await readSrc("src/bot.ts");
     expect(src).toMatch(
-      /import\s*\{[^}]*logRawError[^}]*\}\s*from\s*"\.\/session\/user-error-notice"/
+      /import\s*\{[^}]*channelPostFetchThreadFailure[^}]*\}\s*from\s*"\.\/session\/user-error-notice"/
+    );
+    expect(src).toMatch(
+      /import\s*\{[^}]*channelPostSendFailure[^}]*\}\s*from\s*"\.\/session\/user-error-notice"/
     );
   });
 });
