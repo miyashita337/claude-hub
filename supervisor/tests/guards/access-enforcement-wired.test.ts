@@ -174,6 +174,16 @@ describe("brief trigger is wired fail-closed (#426)", () => {
     expect(src).toContain("runBriefDecideFlow(");
   });
 
+  test("a denied brief replies through briefDenialNotice, not log-only (#466)", async () => {
+    const src = await read("src/bot.ts");
+    const deniedIdx = src.indexOf('case "denied":');
+    const rejectedIdx = src.indexOf('case "rejected":', deniedIdx);
+    expect(deniedIdx).toBeGreaterThan(-1);
+    const arm = src.slice(deniedIdx, rejectedIdx);
+    expect(arm).toContain("notifyBriefDenial(");
+    expect(arm).toContain("postToChannel);");
+  });
+
   test("brief denial logs do not interpolate raw source/channel ids or body", async () => {
     const src = await read("src/bot.ts");
     const denialLines = src
