@@ -6,6 +6,28 @@ import { promisify } from "util";
 const execFileAsync = promisify(execFile);
 
 /**
+ * PR #484 review (Discord E2E FAIL): a hub-work `/session resume` hung the
+ * Discord interaction at "考え中" indefinitely — no tmux session, no
+ * sessions.db row, no console output at all. Root cause: every git/gh call
+ * below ran through the async `execFile` (Issue #227) but — unlike
+ * `realTmuxAdapter` (adapters.ts, `TMUX_CALL_TIMEOUT_MS` /
+ * `TMUX_NEW_SESSION_TIMEOUT_MS`, Issue #222/#227) — with no `timeout` at all.
+ * Async only keeps the event loop free while a call is in flight; it does not
+ * bound how long the call can take. A stuck/contended git process (a held
+ * `.git` lock from a concurrent worktree operation on the SAME repo — exactly
+ * this multi-worktree Supervisor's own architecture) or a stalled network
+ * fetch/`gh api` call therefore hung `resumeSession()` forever with none of
+ * this module's own `console.log`/`console.warn` calls ever firing (the
+ * `await` never returned), so the caller's catch block — which would
+ * otherwise turn a rejection into a sanitized Discord reply — never ran
+ * either. Every call below now passes a positive timeout so a wedged
+ * subprocess rejects (loudly, catchable) instead of hanging forever.
+ */
+const GIT_CALL_TIMEOUT_MS = 15_000;
+/** Slightly more generous for network-bound calls (git fetch / gh api). */
+const GIT_NETWORK_TIMEOUT_MS = 20_000;
+
+/**
  * Per-branch git worktree management for supervisor sessions (Issue #154).
  *
  * `/session start <branch>` runs claude in a dedicated worktree under
@@ -283,14 +305,18 @@ export const realGitGhRunner: GitGhRunner = {
       // Restrict to local *branch* refs so revision expressions like `HEAD~1`
       // or `@{-1}` are not mistaken for an existing branch (which would create
       // a detached-HEAD worktree). exit 0 iff refs/heads/<branch> resolves.
-      await execFileAsync("git", [
-        "-C",
-        mainRepoDir,
-        "show-ref",
-        "--verify",
-        "--quiet",
-        `refs/heads/${branch}`,
-      ]);
+      await execFileAsync(
+        "git",
+        [
+          "-C",
+          mainRepoDir,
+          "show-ref",
+          "--verify",
+          "--quiet",
+          `refs/heads/${branch}`,
+        ],
+        { timeout: GIT_CALL_TIMEOUT_MS },
+      );
       return true;
     } catch {
       return false;
@@ -303,7 +329,7 @@ export const realGitGhRunner: GitGhRunner = {
       const { stdout } = await execFileAsync(
         "gh",
         ["api", "repos/:owner/:repo", "--jq", ".default_branch"],
-        { cwd: mainRepoDir, encoding: "utf8" },
+        { cwd: mainRepoDir, encoding: "utf8", timeout: GIT_NETWORK_TIMEOUT_MS },
       );
       const out = stdout.trim();
       if (out) return out;
@@ -318,6 +344,7 @@ export const realGitGhRunner: GitGhRunner = {
     try {
       const { stdout } = await execFileAsync("git", ["-C", mainRepoDir, "remote"], {
         encoding: "utf8",
+        timeout: GIT_CALL_TIMEOUT_MS,
       });
       const remotes = stdout
         .split("\n")
@@ -328,7 +355,7 @@ export const realGitGhRunner: GitGhRunner = {
         const { stdout: refOut } = await execFileAsync(
           "git",
           ["-C", mainRepoDir, "symbolic-ref", "--short", `refs/remotes/${remote}/HEAD`],
-          { encoding: "utf8" },
+          { encoding: "utf8", timeout: GIT_CALL_TIMEOUT_MS },
         );
         const ref = refOut.trim();
         const prefix = `${remote}/`;
@@ -345,47 +372,43 @@ export const realGitGhRunner: GitGhRunner = {
     // and cannot inject metacharacters. A failure rejects with git's message via
     // the error's `.stderr`; ensureWorktree's Q2 catch turns that into a loud
     // warning instead of silently continuing on a stale base.
-    await execFileAsync("git", [
-      "-C",
-      mainRepoDir,
-      "fetch",
-      remote,
-      branch,
-    ]);
+    await execFileAsync(
+      "git",
+      ["-C", mainRepoDir, "fetch", remote, branch],
+      { timeout: GIT_NETWORK_TIMEOUT_MS },
+    );
   },
   async addWorktreeFromBranch(mainRepoDir, worktreePath, branch) {
     // A failure surfaces git's message via the rejected error's `.stderr`.
-    await execFileAsync("git", [
-      "-C",
-      mainRepoDir,
-      "worktree",
-      "add",
-      worktreePath,
-      branch,
-    ]);
+    await execFileAsync(
+      "git",
+      ["-C", mainRepoDir, "worktree", "add", worktreePath, branch],
+      { timeout: GIT_CALL_TIMEOUT_MS },
+    );
   },
   async addWorktreeNewBranch(mainRepoDir, worktreePath, branch, base) {
-    await execFileAsync("git", [
-      "-C",
-      mainRepoDir,
-      "worktree",
-      "add",
-      "-b",
-      branch,
-      "--no-track",
-      worktreePath,
-      base,
-    ]);
+    await execFileAsync(
+      "git",
+      [
+        "-C",
+        mainRepoDir,
+        "worktree",
+        "add",
+        "-b",
+        branch,
+        "--no-track",
+        worktreePath,
+        base,
+      ],
+      { timeout: GIT_CALL_TIMEOUT_MS },
+    );
   },
   async removeWorktree(mainRepoDir, worktreePath) {
-    await execFileAsync("git", [
-      "-C",
-      mainRepoDir,
-      "worktree",
-      "remove",
-      worktreePath,
-      "--force",
-    ]);
+    await execFileAsync(
+      "git",
+      ["-C", mainRepoDir, "worktree", "remove", worktreePath, "--force"],
+      { timeout: GIT_CALL_TIMEOUT_MS },
+    );
   },
   pathExists(path) {
     return existsSync(path);
@@ -405,7 +428,7 @@ export const realGitGhRunner: GitGhRunner = {
       const { stdout } = await execFileAsync(
         "git",
         ["-C", mainRepoDir, "worktree", "list", "--porcelain"],
-        { encoding: "utf8" },
+        { encoding: "utf8", timeout: GIT_CALL_TIMEOUT_MS },
       );
       out = stdout.toString();
     } catch {

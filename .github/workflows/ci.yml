@@ -292,6 +292,20 @@ jobs:
                    --coverage-dir=coverage-tmux \
                    tests/session/tmux.test.ts
 
+      # worktree-git-timeouts.test.ts (PR #484 review, Discord E2E hang) mocks
+      # child_process.execFile the same way adapters.test.ts / tmux.test.ts do,
+      # so it needs the same process isolation (mock.module is process-global
+      # in Bun and would otherwise leak into tests/integration/worktree-real-git.test.ts,
+      # which runs REAL git against a throwaway repo in the curated list above).
+      - name: Run mock-isolated worktree git-timeout tests (#484)
+        env:
+          SUPERVISOR_DB_PATH: ":memory:"
+          TMUX_PATH: /usr/bin/tmux
+        run: |
+          bun test --coverage --coverage-reporter=lcov \
+                   --coverage-dir=coverage-worktree-git \
+                   tests/session/worktree-git-timeouts.test.ts
+
       # #227 (PR-1 / #249) AC-3: relay.ts's tmux send hot path must stay
       # non-blocking after the execFileSync→execFile migration. This file mocks
       # child_process.execFile via mock.module (process-global in Bun), so it
@@ -326,7 +340,7 @@ jobs:
       # even if that default flips back.
       - name: Keep only executed lines from the mock-isolated reports (#300)
         run: |
-          for name in hassession adapters tmux relay-nonblocking; do
+          for name in hassession adapters tmux relay-nonblocking worktree-git; do
             bun scripts/lcov-hits-only.ts \
               "coverage-$name/lcov.info" "coverage-$name/hits-only.info"
             rm "coverage-$name/lcov.info"
@@ -378,6 +392,15 @@ jobs:
         uses: codecov/codecov-action@v5
         with:
           files: supervisor/coverage-relay-nonblocking/hits-only.info
+          flags: unit-tests
+          fail_ci_if_error: false
+          disable_search: true
+
+      - name: Upload mock-isolated worktree git-timeout coverage to Codecov
+        if: always()
+        uses: codecov/codecov-action@v5
+        with:
+          files: supervisor/coverage-worktree-git/hits-only.info
           flags: unit-tests
           fail_ci_if_error: false
           disable_search: true
