@@ -17,6 +17,7 @@ import {
   DUPLICATE_INPUT_USER_MESSAGE,
   UNVERIFIED_DELIVERY_USER_MESSAGE,
   type PaneReader,
+  type TmuxSendResult,
 } from "../../src/session/relay";
 import { TMUX_ARGS, ensureSocketConfigured } from "../../src/session/tmux";
 
@@ -627,6 +628,81 @@ describe("delivery verification edge cases via an injected pane reader (#422)", 
         });
         expect(outcome.verdict).toBe("verified-retyped");
         expect(outcome.verified).toBe(true);
+        expect(deliveryNoticeFor(outcome.verdict)).toBeNull();
+      } finally {
+        killSession(name);
+      }
+    },
+    30_000
+  );
+
+  /**
+   * Issue #437 (blind spot documented in `typeLiteral`, PR #434 review
+   * should-2): `tmuxSend`'s own transient-retry (Issue #73) can land the
+   * literal on the pane TWICE from a SINGLE call in round 1 — the first
+   * `send-keys` timed out to us but still reached tmux, and the retry landed
+   * a second time. Before the fix, `typed` only counted the number of times
+   * `typeLiteral`'s loop CALLED `tmuxSend`, so this case had `typed === 1`
+   * and a rise of 2 fell into the "usually the user's own text" branch and
+   * was reported as `verified` — the duplicate went undetected.
+   *
+   * Driven via the injected `sendLiteral` seam so the internal retry is
+   * pinned deterministically instead of racing a real transient tmux error.
+   */
+  function retriedOnceSendLiteral(): (
+    sessionName: string,
+    literalText: string,
+    socketArgs: readonly string[]
+  ) => Promise<TmuxSendResult> {
+    let calls = 0;
+    return async () => {
+      calls++;
+      // Only round 1 runs (retype would be a second call); report that the
+      // single call already retried internally.
+      return { retried: calls === 1 };
+    };
+  }
+
+  itmux(
+    "tmuxSend's own internal retry is counted: a rise of 2 after ONE typeLiteral call is 'duplicate' (#437)",
+    async () => {
+      const name = makeSessionName("inner-retry-dup");
+      startEchoPane(name);
+      try {
+        const outcome = await sendToPane(name, payload, TMUX_ARGS, {
+          verifyBackoffMs: FAST_BACKOFF,
+          sendLiteral: retriedOnceSendLiteral(),
+          capturePane: scriptedReader([
+            "", //                        baseline: nothing on screen (0)
+            `${probe} ${probe}`, //       both the delayed first send and the
+            //                            internal retry rendered (2)
+          ]),
+        });
+        expect(outcome.verdict).toBe("duplicate");
+        expect(outcome.verified).toBe(true);
+        expect(deliveryNoticeFor(outcome.verdict)).toBe(DUPLICATE_INPUT_USER_MESSAGE);
+      } finally {
+        killSession(name);
+      }
+    },
+    30_000
+  );
+
+  itmux(
+    "a clean (non-retried) typeLiteral call with a single render stays 'verified' (#437 regression guard)",
+    async () => {
+      const name = makeSessionName("inner-retry-clean");
+      startEchoPane(name);
+      try {
+        const outcome = await sendToPane(name, payload, TMUX_ARGS, {
+          verifyBackoffMs: FAST_BACKOFF,
+          sendLiteral: async () => ({ retried: false }),
+          capturePane: scriptedReader([
+            "", //     baseline (0)
+            probe, //  single render (1)
+          ]),
+        });
+        expect(outcome.verdict).toBe("verified");
         expect(deliveryNoticeFor(outcome.verdict)).toBeNull();
       } finally {
         killSession(name);

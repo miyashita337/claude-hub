@@ -184,18 +184,40 @@ export async function ensurePaneNotInMode(
   }
 }
 
+/**
+ * Issue #437: whether {@link tmuxSend}'s own transient-retry path (Issue #73)
+ * may have delivered its literal to the pane TWICE. A caller that counts how
+ * many times a literal reached the pane (e.g. `typeLiteral`'s duplicate
+ * check) must count a `true` here as TWO deliveries, not one.
+ *
+ * Only set for the TIMEOUT retry, not the `not in a mode` retry — the two
+ * transient causes are not symmetric:
+ *   - **timeout**: our `execFile` call gave up waiting, but that race is
+ *     against OUR deadline, not tmux's — the server can have already
+ *     processed the first `send-keys` before we timed out on it. The retry
+ *     can therefore land a second copy.
+ *   - **not in a mode**: the pane was in copy-mode, which consumes `-l`
+ *     input as a mode command instead of passing it to the application (see
+ *     {@link ensurePaneNotInMode}) — the first attempt's literal never
+ *     reached the app at all, so only the retry (after exiting the mode)
+ *     delivers it, exactly once.
+ */
+export interface TmuxSendResult {
+  retried: boolean;
+}
+
 export async function tmuxSend(
   sessionName: string,
   extraArgs: string[],
   // Issue #199 AC1: socket selector (see ensurePaneNotInMode). Defaults to the
   // claude-hub socket; `[]` targets the default socket (claudeHubExit).
   socketArgs: readonly string[] = TMUX_ARGS
-): Promise<void> {
+): Promise<TmuxSendResult> {
   const args = [...socketArgs, "send-keys", "-t", sessionName, ...extraArgs];
   const PER_CALL_TIMEOUT = 7000;
   try {
     await execFileAsync(TMUX_PATH, args, { timeout: PER_CALL_TIMEOUT });
-    return;
+    return { retried: false };
   } catch (err) {
     const summary = summarizeExecError(err);
     const stderr = getExecStderr(err);
@@ -214,6 +236,9 @@ export async function tmuxSend(
     await new Promise((r) => setTimeout(r, 250));
     try {
       await execFileAsync(TMUX_PATH, args, { timeout: PER_CALL_TIMEOUT });
+      // Issue #437: only the timeout path may have double-delivered — see the
+      // TmuxSendResult doc comment above.
+      return { retried: isTimeout };
     } catch (retryErr) {
       console.error(
         `[Relay] tmux send-keys retry also failed for ${sessionName}:`,
@@ -549,6 +574,22 @@ export interface SendToPaneOptions {
    */
   capturePaneState?: PaneReader;
   /**
+   * Test seam, never set in production: replaces the `tmux send-keys -l
+   * <literal>` call that {@link typeLiteral} makes each round.
+   *
+   * Issue #437: production always uses the real {@link tmuxSend}, whose own
+   * transient-retry path (Issue #73) can land the literal on the pane TWICE
+   * from a single round. Reproducing that race against a real tmux server
+   * would depend on timing tmux itself does not expose deterministically;
+   * injecting the sender lets a test report `{ retried: true }` on demand so
+   * the resulting duplicate-detection is pinned with a pane fixture instead.
+   */
+  sendLiteral?: (
+    sessionName: string,
+    literalText: string,
+    socketArgs: readonly string[]
+  ) => Promise<TmuxSendResult>;
+  /**
    * Called once, synchronously, right before the FIRST Enter. Issue #357: the
    * Enter confirmation polls for a while after `C-m`, and a fast Stop-hook POST
    * can land inside that window — so {@link relayMessage} registers its
@@ -717,10 +758,14 @@ async function typeLiteral(
   options?: SendToPaneOptions
 ): Promise<DeliveryVerdict> {
   const probe = buildDeliveryProbe(literalText);
+  const sendLiteral =
+    options?.sendLiteral ??
+    ((session: string, literal: string, args: readonly string[]) =>
+      tmuxSend(session, ["-l", literal], args));
   // A whitespace-only message has no probe to look for; typing it unverified
   // matches the old behaviour and costs nothing (there is nothing to lose).
   if (!probe) {
-    await tmuxSend(tmuxSessionName, ["-l", literalText], socketArgs);
+    await sendLiteral(tmuxSessionName, literalText, socketArgs);
     await options?.onAttemptTyped?.(1);
     return "skipped-no-probe";
   }
@@ -734,7 +779,7 @@ async function typeLiteral(
   if (before === null) {
     // Observer broken before we even typed → judge nothing, but still type so
     // the message has its normal chance of landing.
-    await tmuxSend(tmuxSessionName, ["-l", literalText], socketArgs);
+    await sendLiteral(tmuxSessionName, literalText, socketArgs);
     await options?.onAttemptTyped?.(1);
     return "unverified-observer";
   }
@@ -756,8 +801,16 @@ async function typeLiteral(
 
   for (let round = 1; round <= DELIVERY_MAX_VERIFY_ROUNDS; round++) {
     if (round === 1 || retypeAllowed) {
-      await tmuxSend(tmuxSessionName, ["-l", literalText], socketArgs);
-      typed++;
+      const { retried } = await sendLiteral(tmuxSessionName, literalText, socketArgs);
+      // Issue #437: `tmuxSend`'s own transient-retry (Issue #73) sends the
+      // SAME `send-keys -l` twice from this one call — and the first attempt
+      // can have already reached the pane before erroring to us — so it counts
+      // as two deliveries here, not one. This closes the blind spot PR #434's
+      // review (should-2) flagged: previously `typed` only counted how many
+      // times THIS loop called `tmuxSend`, so an inner retry left `typed === 1`
+      // and a resulting rise of 2 fell through to "usually the user's own
+      // text" and was reported as `verified` instead of `duplicate`.
+      typed += retried ? 2 : 1;
       await options?.onAttemptTyped?.(typed);
     }
 
@@ -767,22 +820,11 @@ async function typeLiteral(
       if (after === null) return "unverified-observer"; // broke mid-flight
       const count = countProbeOccurrences(after, probe);
       if (count > floor) {
-        // A rise of 2 after a retype means BOTH types rendered: the first one
-        // was merely late, not lost, so the pane now holds the message twice.
-        // Reported rather than silently submitted — the whole point of #422 is
-        // that the relay must not hide what it did to the pane.
-        //
-        // Gated on `typed > 1` = "this loop typed twice". That is not quite the
-        // same as "the literal was sent twice": `tmuxSend` retries the same
-        // `send-keys -l` once on a timeout / `not in a mode`, and a send that
-        // reached the pane before the execFile timed out lands twice without
-        // this counter noticing (PR #434 review, should-2 — a blind spot that
-        // predates #429; #428's `attempt > 1` had it too). So a rise of 2 with
-        // `typed === 1` is usually the user's own text already on screen, but
-        // it can also be that inner retry. It is deliberately NOT reported as
-        // `duplicate`: on this path the notice would fire on ordinary clean
-        // sends, and the inner retry is bounded and rare. Tracked separately
-        // rather than papered over here.
+        // A rise of 2 after a retype (or after an inner tmuxSend retry, #437)
+        // means BOTH types rendered: the first one was merely late, not lost,
+        // so the pane now holds the message twice. Reported rather than
+        // silently submitted — the whole point of #422 is that the relay must
+        // not hide what it did to the pane.
         if (typed > 1 && count - floor >= 2) {
           console.warn(
             `[Relay] duplicate input in pane ${tmuxSessionName}: the delayed first ` +
