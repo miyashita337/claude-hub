@@ -2,6 +2,7 @@ import { CHANNEL_MAP, type ChannelConfig } from "../config/channels";
 import { getSessionByThreadId } from "../infra/db";
 import type { SessionRow } from "../infra/db";
 import type { Liveness } from "./manager";
+import { buildHubWorkConfig, HUB_WORK_CHANNEL_NAME } from "./hub-work";
 
 /**
  * Message-triggered wake (Issue #456).
@@ -210,7 +211,15 @@ async function decide(
     return { kind: "not-resumable", reason: "no-claude-session-id", verdict };
   }
 
-  const config = channelMap.get(row.channel_name);
+  // Issue #451: hub-work rows carry the synthetic channel_name
+  // HUB_WORK_CHANNEL_NAME, which by contract must never be registered in
+  // CHANNEL_MAP (hub-work.ts). Looking it up via channelMap.get() below would
+  // always miss and report a false "未登録" failure, so it gets its config
+  // from the same ephemeral builder `/session resume` uses instead.
+  const config =
+    row.channel_name === HUB_WORK_CHANNEL_NAME
+      ? buildHubWorkConfig()
+      : channelMap.get(row.channel_name);
   if (!config) {
     // The channel was renamed or removed from CHANNEL_MAP since the session
     // ran. Resume needs its dir / flags, so there is nothing to launch.

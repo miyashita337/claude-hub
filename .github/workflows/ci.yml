@@ -136,6 +136,7 @@ jobs:
                    tests/session/manager-orphan-gc.test.ts \
                    tests/commands/session-interaction.test.ts \
                    tests/commands/session-resume.test.ts \
+                   tests/commands/session-resume-access.test.ts \
                    tests/hooks/stop-relay.test.ts \
                    tests/infra/db.test.ts \
                    tests/infra/db-isolation.test.ts \

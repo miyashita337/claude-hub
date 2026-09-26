@@ -20,6 +20,7 @@ const {
 const { SessionManager } = await import("../../src/session/manager");
 const { createFakeEffects } = await import("../../src/session/adapters-fake");
 const { MAX_SESSIONS } = await import("../../src/config/channels");
+const { HUB_WORK_CHANNEL_NAME } = await import("../../src/session/hub-work");
 
 import type { ChannelConfig } from "../../src/config/channels";
 import type { FakeSessionEffects } from "../../src/session/adapters-fake";
@@ -220,6 +221,41 @@ describe("autoResumeThread (#456)", () => {
       verdict: "dead",
     });
     expect(manager.has(threadId)).toBe(false);
+  });
+
+  test("#451: a hub-work row resumes via the ephemeral hub-work config, not a CHANNEL_MAP lookup", async () => {
+    // hub-work rows carry channel_name = HUB_WORK_CHANNEL_NAME, a synthetic
+    // label that must NEVER be registered in CHANNEL_MAP (absolute rule). The
+    // passed-in channelMap below is intentionally empty to prove decide() does
+    // not resolve the config via channelMap.get() for this row — if it did,
+    // this would produce the same "未登録" failure as the test below.
+    const threadId = "thread-hub-work";
+    const claudeSessionId = uuid(9);
+    const now = new Date().toISOString();
+    insertSession({
+      id: "row-hub-work",
+      channel_name: HUB_WORK_CHANNEL_NAME,
+      thread_id: threadId,
+      project_dir: projectDir,
+      pid: 4242,
+      claude_session_id: claudeSessionId,
+      started_at: now,
+      last_activity_at: now,
+      status: "running",
+      branch: null,
+    });
+    updateSessionStatus("row-hub-work", "stopped", "supervisor_restart");
+
+    const outcome = await autoResumeThread(manager, threadId, {
+      channelMap: new Map(),
+    });
+
+    expect(outcome.kind).toBe("resumed");
+    if (outcome.kind !== "resumed") throw new Error("unreachable");
+    expect(outcome.claudeSessionId).toBe(claudeSessionId);
+    expect(manager.has(threadId)).toBe(true);
+    const cmd = effects.tmux.getCommand(`claude-${threadId.slice(0, 12)}`) ?? "";
+    expect(cmd).toContain(`--resume ${claudeSessionId}`);
   });
 
   test("an unregistered channel fails loudly rather than silently skipping", async () => {
