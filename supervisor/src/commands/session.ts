@@ -282,6 +282,27 @@ async function handleCompact(
   // Gated on HIJOGUCHI_CHANNEL_ID so it no-ops when the Supervisor isn't wired.
   const primaryChannelId = claudeHubExitPrimaryChannelId();
   if (primaryChannelId && channel?.id === primaryChannelId) {
+    // Issue #366: compact sends keys into a running session exactly like
+    // `/session start` and `/session enter` do, so it gets the same
+    // access.json `allowFrom` gate (fail-closed) rather than staying the one
+    // ungated way to touch a live session.
+    const primaryDecision = evaluateAccess({
+      channelKey: primaryChannelId,
+      userId: interaction.user.id,
+      isMention: true,
+    });
+    if (!primaryDecision.allowed) {
+      console.warn(
+        `[Session] /session compact access denied (reason=${primaryDecision.reason}) in channel ${primaryChannelId}`
+      );
+      await interaction.reply({
+        content:
+          "❌ このチャンネルのセッションを操作する権限がありません（アクセスポリシー）。",
+        flags: 64,
+      });
+      return;
+    }
+
     const rawIntent = interaction.options.getString("intent")?.trim() ?? "";
     const intent = rawIntent || DEFAULT_COMPACT_INTENT;
     await interaction.deferReply({ flags: 64 });
@@ -309,6 +330,26 @@ async function handleCompact(
       content:
         "ℹ️ `/session compact` は稼働中セッションのスレッド内で実行してください。" +
         "スレッドが無ければ `/session start <branch>` か `/session resume <session_id>` で開始できます。",
+      flags: 64,
+    });
+    return;
+  }
+
+  // Issue #366: same gate as the primary-channel branch above, keyed on the
+  // parent channel (threads inherit their parent's opt-in, matching
+  // /session start and /session enter). Checked before the has() lookup so a
+  // denied caller learns nothing about whether a session exists here.
+  const decision = evaluateAccess({
+    channelKey: channel.parentId ?? channel.id,
+    userId: interaction.user.id,
+    isMention: true,
+  });
+  if (!decision.allowed) {
+    console.warn(
+      `[Session] /session compact access denied (reason=${decision.reason}) in thread ${channel.id}`
+    );
+    await interaction.reply({
+      content: "❌ このスレッドのセッションを操作する権限がありません（アクセスポリシー）。",
       flags: 64,
     });
     return;
@@ -786,6 +827,27 @@ async function handleStop(
   if (!channel.isThread()) {
     await interaction.reply({
       content: "ℹ️ `/session stop` はセッションスレッド内で実行してください。",
+      flags: 64,
+    });
+    return;
+  }
+
+  // Issue #366: stop terminates a running --dangerously-skip-permissions
+  // session just like compact/enter do, so it gets the same access.json
+  // `allowFrom` gate (fail-closed), keyed on the parent channel. Checked
+  // before the has() lookup so a denied caller learns nothing about whether a
+  // session exists here.
+  const decision = evaluateAccess({
+    channelKey: channel.parentId ?? channel.id,
+    userId: interaction.user.id,
+    isMention: true,
+  });
+  if (!decision.allowed) {
+    console.warn(
+      `[Session] /session stop access denied (reason=${decision.reason}) in thread ${channel.id}`
+    );
+    await interaction.reply({
+      content: "❌ このスレッドのセッションを操作する権限がありません（アクセスポリシー）。",
       flags: 64,
     });
     return;

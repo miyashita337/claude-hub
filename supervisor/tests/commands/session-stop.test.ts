@@ -1,4 +1,7 @@
-import { test, expect, describe } from "bun:test";
+import { test, expect, describe, beforeEach, afterEach } from "bun:test";
+import { mkdtempSync, writeFileSync, rmSync } from "fs";
+import { join } from "path";
+import { tmpdir } from "os";
 import { createSessionHandler } from "../../src/commands/session";
 
 /**
@@ -12,7 +15,16 @@ import { createSessionHandler } from "../../src/commands/session";
  * `/session stop` had none — this file closes that gap using the same
  * mock-`ChatInputCommandInteraction` approach (no real Discord gateway, no
  * real tmux; `SessionManager` is a hand-rolled fake so no process is spawned).
+ *
+ * Issue #366: `/session stop` terminates a running
+ * `--dangerously-skip-permissions` session, so it now runs behind the same
+ * access.json `allowFrom` gate as `/session start` / `/session enter` /
+ * `/session compact`, keyed on the parent channel (fail-closed).
  */
+
+const PARENT_CHANNEL_ID = "846209781206941736";
+const OWNER = "184695080709324800";
+const OUTSIDER = "999999999999999999";
 
 interface ReplyRecord {
   kind: "reply" | "editReply";
@@ -26,6 +38,10 @@ function makeInteraction(opts: {
   stopImpl?: (...args: unknown[]) => unknown;
   /** Thread title; defaults to a Supervisor-created one (status emoji). */
   threadName?: string;
+  /** override the thread's parent channel id (default PARENT_CHANNEL_ID). */
+  parentId?: string | null;
+  /** invoking user id (default OWNER). */
+  userId?: string;
 }) {
   const replies: ReplyRecord[] = [];
   const stopCalls: unknown[][] = [];
@@ -34,6 +50,7 @@ function makeInteraction(opts: {
 
   const channel = {
     id: "thread-stop-1",
+    parentId: opts.parentId !== undefined ? opts.parentId : PARENT_CHANNEL_ID,
     name: opts.threadName ?? "🟢 feature-foo | agent-base",
     isThread: () => opts.isThread ?? true,
     setName: async (name: string) => {
@@ -45,6 +62,7 @@ function makeInteraction(opts: {
   };
 
   const interaction = {
+    user: { id: opts.userId ?? OWNER },
     options: {
       getSubcommand: () => "stop",
       getString: () => null,
@@ -83,6 +101,30 @@ function makeInteraction(opts: {
 }
 
 describe("/session stop dispatch (#349)", () => {
+  let dir: string;
+  const prevAccess = process.env.SUPERVISOR_ACCESS_JSON_PATH;
+
+  beforeEach(() => {
+    dir = mkdtempSync(join(tmpdir(), "session-stop-access-"));
+    const path = join(dir, "access.json");
+    writeFileSync(
+      path,
+      JSON.stringify({
+        groups: {
+          [PARENT_CHANNEL_ID]: { requireMention: true, allowFrom: [OWNER] },
+        },
+      })
+    );
+    process.env.SUPERVISOR_ACCESS_JSON_PATH = path;
+  });
+
+  afterEach(() => {
+    if (prevAccess === undefined)
+      delete process.env.SUPERVISOR_ACCESS_JSON_PATH;
+    else process.env.SUPERVISOR_ACCESS_JSON_PATH = prevAccess;
+    rmSync(dir, { recursive: true, force: true });
+  });
+
   test("outside a thread → usage hint, stop() never called", async () => {
     const h = makeInteraction({ isThread: false });
     await h.run();
@@ -151,5 +193,27 @@ describe("/session stop dispatch (#349)", () => {
     expect(editReplies[editReplies.length - 1]!.content).toContain(
       "セッション停止に失敗"
     );
+  });
+
+  test("#366: a user outside allowFrom is refused, stop() never called, thread not archived", async () => {
+    const h = makeInteraction({ userId: OUTSIDER });
+    await h.run();
+
+    expect(h.stopCalls).toHaveLength(0);
+    expect(h.setNameCalls).toHaveLength(0);
+    expect(h.setArchivedCalls).toHaveLength(0);
+    const deny = h.replies.find((r) => r.kind === "reply");
+    expect(deny?.content).toContain("権限がありません");
+    expect(deny?.flags).toBe(64);
+  });
+
+  test("#366: fail-closed when access.json is missing", async () => {
+    rmSync(join(dir, "access.json"));
+    const h = makeInteraction({});
+    await h.run();
+
+    expect(h.stopCalls).toHaveLength(0);
+    const deny = h.replies.find((r) => r.kind === "reply");
+    expect(deny?.content).toContain("権限がありません");
   });
 });
