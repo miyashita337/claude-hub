@@ -147,7 +147,7 @@ describe("compact button handler (#364)", () => {
     expect(last?.content).not.toContain("失敗");
   });
 
-  test("compact failure is reported, never swallowed", async () => {
+  test("compact failure is reported, never swallowed, without leaking the raw cause (#360)", async () => {
     const fx = makeInteraction({
       compactImpl: () => {
         throw new Error("tmux send-keys failed");
@@ -158,6 +158,9 @@ describe("compact button handler (#364)", () => {
     expect(fx.compactCalls).toHaveLength(1);
     const last = fx.replies[fx.replies.length - 1];
     expect(last?.content).toContain("compact の送信に失敗");
-    expect(last?.content).toContain("tmux send-keys failed");
+    // Issue #360: the raw error message must never reach the Discord reply —
+    // only console.error (diagnostics).
+    expect(last?.content).not.toContain("tmux send-keys failed");
+    expect(last?.content).toContain("/session status");
   });
 });

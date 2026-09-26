@@ -216,19 +216,26 @@ describe("SessionManager (thread-based)", () => {
       compactSpy.mockRestore();
     });
 
-    test("auto-compact failure is folded into the message, never thrown", async () => {
+    test("auto-compact failure is folded into the message, never thrown, without leaking the raw cause (#360)", async () => {
       const t = "sh-red-fail";
       await manager.start(primaryConfig, t);
       const compactSpy = spyOn(manager, "compactSession").mockRejectedValue(
         new Error("tmux session dead")
       );
+      const errorSpy = spyOn(console, "error").mockImplementation(() => {});
 
       const outcome = await manager.contextBudgetSelfHeal(t, 410_000);
 
       expect(outcome?.action).toBe("compact");
       expect(outcome?.message).toContain("失敗");
-      expect(outcome?.message).toContain("tmux session dead");
+      // Issue #360: the raw cause must never reach this thread-facing
+      // message — only console.error (diagnostics, agent-output-quality #1:
+      // no silent fallback).
+      expect(outcome?.message).not.toContain("tmux session dead");
+      expect(outcome?.message).toContain("/session compact");
+      expect(errorSpy).toHaveBeenCalled();
       compactSpy.mockRestore();
+      errorSpy.mockRestore();
     });
 
     test("#244: critical → restart, hands back the session identity (no auto-compact)", async () => {

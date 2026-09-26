@@ -140,7 +140,7 @@ describe("/session enter (#357)", () => {
     );
   });
 
-  test("a send failure is reported, never acked as sent", async () => {
+  test("a send failure is reported, never acked as sent, without leaking the raw cause (#360)", async () => {
     const fx = makeInteraction({
       enterImpl: () => {
         throw new Error("tmux session dead");
@@ -149,6 +149,9 @@ describe("/session enter (#357)", () => {
     await fx.run();
     const err = fx.replies.find((r) => r.kind === "editReply");
     expect(err?.content).toContain("失敗");
-    expect(err?.content).toContain("tmux session dead");
+    // Issue #360: the raw error message must never reach the Discord reply —
+    // only console.error (diagnostics).
+    expect(err?.content).not.toContain("tmux session dead");
+    expect(err?.content).toContain("/session status");
   });
 });

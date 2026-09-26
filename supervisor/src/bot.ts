@@ -45,6 +45,11 @@ import {
   type ChannelConfig,
 } from "./config/channels";
 import { RELAY_ERROR_USER_MESSAGE, type AttachmentInfo } from "./session/relay";
+import {
+  channelPostFetchThreadFailure,
+  channelPostSendFailure,
+  sanitizedFailureNotice,
+} from "./session/user-error-notice";
 import { buildDialogStuckHandler } from "./session/dialog-stuck-handler";
 import { relayInteractive } from "./session/interactive-relay";
 import { notifyPushover, warnIfPushoverUnconfigured } from "./session/notify-pushover";
@@ -876,11 +881,8 @@ export async function startBot(token: string): Promise<void> {
         thread = await client.channels.fetch(threadId);
       } catch (err) {
         // Unknown Channel 等の Discord API エラーは呼び出し側の指定ミス扱い。
-        return {
-          ok: false,
-          status: 404,
-          error: `スレッドを取得できません: ${threadId} (${err instanceof Error ? err.message : String(err)})`,
-        };
+        // Issue #360: sanitized in channelPostFetchThreadFailure.
+        return channelPostFetchThreadFailure(threadId, err);
       }
       if (!thread?.isThread()) {
         return {
@@ -919,13 +921,8 @@ export async function startBot(token: string): Promise<void> {
           sentCount++;
         }
       } catch (err) {
-        return {
-          ok: false,
-          status: 502,
-          error:
-            `送信中にエラー（${sentCount}/${chunks.length} chunks 送信済み。` +
-            `再試行すると重複投稿の可能性があります）: ${err instanceof Error ? err.message : String(err)}`,
-        };
+        // Issue #360: sanitized in channelPostSendFailure.
+        return channelPostSendFailure(sentCount, chunks.length, err);
       }
       console.log(
         `[Bot] channel-post: thread ${threadId} → #${parent.name} (${chunks.length} chunks, ${text.length} chars)`,
@@ -955,7 +952,9 @@ export async function startBot(token: string): Promise<void> {
     // Repliable (not just chat-input): button interactions share this path since
     // #364, and narrowing to slash commands would silently swallow their errors.
     if (!interaction.isRepliable()) return;
-    const content = `❌ エラーが発生しました: ${err instanceof Error ? err.message : String(err)}`;
+    // Issue #360: widest audited leak site, sanitized via sanitizedFailureNotice
+    // (see its doc comment for why it logs `err` again here on purpose).
+    const content = sanitizedFailureNotice("Bot safeReplyError", "❌ エラーが発生しました", err);
     try {
       if (interaction.deferred || interaction.replied) {
         await interaction.editReply({ content });

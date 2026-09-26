@@ -6,6 +6,7 @@ import {
 } from "discord.js";
 import { CompactInFlightError, type SessionManager } from "../session/manager";
 import { safeRespond } from "./safe-respond";
+import { sanitizedFailureNotice } from "../session/user-error-notice";
 
 /**
  * One-click compact button (Issue #364).
@@ -120,7 +121,10 @@ export function createCompactButtonHandler(sessionManager: SessionManager) {
         });
         return;
       }
-      const msg = `❌ compact の送信に失敗: ${err instanceof Error ? err.message : String(err)}`;
+      // Issue #360 (devils-advocate review of #360): same leak shape as
+      // `/session compact` in session.ts — the raw cause goes to
+      // console.error only now, not this Discord reply.
+      const msg = sanitizedFailureNotice("compact button", "❌ compact の送信に失敗しました", err);
       await safeRespond(interaction, { content: msg, ephemeral: true });
     }
   };

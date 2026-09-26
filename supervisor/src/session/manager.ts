@@ -43,6 +43,7 @@ import {
   type SelfHealer,
 } from "./self-heal";
 import { compactClaudeHubExit } from "./primary-compact";
+import { logRawError } from "./user-error-notice";
 import { formatDispatchReport } from "./dispatch-report";
 import {
   deriveTranscriptPath,
@@ -1933,14 +1934,18 @@ export class SessionManager {
         };
       } catch (err) {
         // Auto-compact failed (e.g. tmux pane gone) — fall back to the manual
-        // recommendation so the user still acts.
+        // recommendation so the user still acts. Issue #360: the raw cause
+        // used to be interpolated straight into this thread-facing message
+        // (`ENOENT: ... open '/Users/<name>/...'` and friends); it goes to
+        // console.error only now, same contract as the relay notices (#236).
+        logRawError("self-heal auto-compact", err);
         return {
           level: warning.level,
           action: "compact",
           tokens: warning.tokens,
           page,
           message:
-            `⚠️ 自動 \`/compact\` を試みましたが失敗しました（${err instanceof Error ? err.message : String(err)}）。` +
+            `⚠️ 自動 \`/compact\` を試みましたが失敗しました。` +
             `手動で \`/session compact\` を実行してください (#206)。`,
         };
       }

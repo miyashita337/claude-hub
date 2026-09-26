@@ -34,6 +34,7 @@ import type { ChannelConfig } from "../config/channels";
 import { MAX_SESSIONS } from "../config/channels";
 import {
   DISPATCH_PREFIX,
+  buildDispatchFailureNotice,
   parseDispatchCommand,
   runDispatch,
   type DispatchCommand,
@@ -43,6 +44,7 @@ import {
 } from "./dispatch";
 import type { QueuedDispatch } from "./dispatch-queue";
 import { buildThreadTitle } from "./thread-title";
+import { logRawError } from "./user-error-notice";
 
 /**
  * sessions.db の `channel_name` に記録される work セッションのラベル。
@@ -235,10 +237,15 @@ export async function runHubWork(args: RunHubWorkArgs): Promise<RunHubWorkResult
     );
     thread = await args.createThread(threadName);
   } catch (err) {
+    // Issue #360: same leak shape as bot.ts's handleChannelPost fetch-thread
+    // catch — this is an HTTP response body to an internal caller
+    // (session-ctl / orchestrator), but the raw cause still goes to
+    // console.error only, not the response.
+    logRawError("hub-work create thread", err);
     return {
       ok: false,
       status: 500,
-      error: `ワーカースレッドを作成できませんでした: ${errMsg(err)}`,
+      error: `ワーカースレッドを作成できませんでした（branch: ${branch}）`,
     };
   }
 
@@ -283,10 +290,22 @@ export async function runHubWork(args: RunHubWorkArgs): Promise<RunHubWorkResult
         `[HubWork] hub work dispatch failed (stage=${result.stage}): ${result.error}`,
       );
       // 起動失敗をスレッドにも明示する（サイレント失敗にしない）。
+      // Issue #360 (devils-advocate review): `result.error` is `errMsg(err)` —
+      // the same raw-cause shape #236/#360 sanitize everywhere else — and this
+      // posts straight to a Discord thread. bot.ts's own `/dispatch` path
+      // already solved this exact case with `buildDispatchFailureNotice`
+      // (#429); reuse it here instead of interpolating `result.error`.
       try {
         await postToThread(
           thread.id,
-          `❌ work セッションの起動に失敗しました（stage=${result.stage}）: ${result.error}`,
+          buildDispatchFailureNotice(
+            result.stage,
+            config.displayName,
+            branch,
+            issueNumber,
+            command,
+            { sessionStopped: result.sessionStopped },
+          ),
         );
       } catch (postErr) {
         console.error(
