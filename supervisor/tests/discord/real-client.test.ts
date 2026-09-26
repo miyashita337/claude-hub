@@ -206,7 +206,7 @@ describe("RealDiscordClient", () => {
       const baseMessage = {
         author: { bot: false, id: "user_1" },
         channel: { isThread: () => true, id: "thread_1", parentId: "parent_1" },
-        mentions: { users: { has: () => false } },
+        mentions: { has: () => false },
         content: "hi from user",
         id: "msg_1",
         attachments: new Map(),
@@ -286,11 +286,20 @@ describe("RealDiscordClient MessageCreate access enforcement (#32 / S7)", () => 
     return { inner, events };
   }
 
-  function msg(opts: { userId: string; mentioned?: boolean; content: string }) {
+  function msg(opts: {
+    userId: string;
+    // true = direct user mention (<@bot_self>), "role" = a role mention that
+    // resolves to the bot (<@&ROLE_ID>, e.g. its integration role) — both
+    // count as "the bot is mentioned" in real discord.js MessageMentions#has.
+    mentioned?: boolean | "role";
+    content: string;
+  }) {
     return {
       author: { bot: false, id: opts.userId },
       channel: { isThread: () => true, id: "thread_1", parentId: PARENT },
-      mentions: { users: { has: (id: string) => !!opts.mentioned && id === "bot_self" } },
+      mentions: {
+        has: (data: { id: string }) => !!opts.mentioned && data.id === "bot_self",
+      },
       content: opts.content,
       id: "m",
       attachments: new Map(),
@@ -303,6 +312,20 @@ describe("RealDiscordClient MessageCreate access enforcement (#32 / S7)", () => 
     });
     inner.emit("messageCreate", msg({ userId: OWNER, mentioned: true, content: "ok" }));
     expect(events).toEqual(["ok"]);
+  });
+
+  // Issue #410: a ROLE mention (the bot's auto-created integration role) must
+  // be treated the same as a direct user mention — this was the regression
+  // (`mentions.users.has()` never saw role mentions, so this case was denied).
+  test("allowlisted + ROLE mention → dispatched (#410)", () => {
+    const { inner, events } = setup({
+      groups: { [PARENT]: { requireMention: true, allowFrom: [OWNER] } },
+    });
+    inner.emit(
+      "messageCreate",
+      msg({ userId: OWNER, mentioned: "role", content: "ok via role" }),
+    );
+    expect(events).toEqual(["ok via role"]);
   });
 
   test("non-allowlisted sender → dropped", () => {

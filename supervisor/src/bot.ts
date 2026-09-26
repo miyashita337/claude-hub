@@ -9,6 +9,7 @@ import {
   type ThreadChannel,
   type TextChannel,
 } from "discord.js";
+import { isBotMentioned, stripBotMention } from "./discord/mentions";
 import { SessionManager, type SelfHealOutcome } from "./session/manager";
 import {
   executeSelfHealRestart,
@@ -1258,10 +1259,7 @@ export async function startBot(token: string): Promise<void> {
     // missing / broken policy or an unlisted sender denies. Independent of
     // the dispatch-only `dispatchFrom` list (#318).
     {
-      const botUserId = client.user?.id;
-      const isMention = botUserId
-        ? message.mentions.users.has(botUserId)
-        : false;
+      const isMention = isBotMentioned(message, client.user);
       const decision = evaluateAccess({
         channelKey: textChannel.id,
         userId: message.author.id,
@@ -1753,10 +1751,7 @@ export async function startBot(token: string): Promise<void> {
     // keyed on the parent channel id (matching the upstream channel server gate).
     {
       const parentChannelId = message.channel.parentId ?? threadId;
-      const botUserId = client.user?.id;
-      const isMention = botUserId
-        ? message.mentions.users.has(botUserId)
-        : false;
+      const isMention = isBotMentioned(message, client.user);
       const decision = evaluateAccess({
         channelKey: parentChannelId,
         userId: message.author.id,
@@ -1814,9 +1809,8 @@ export async function startBot(token: string): Promise<void> {
       }
 
       const wake = await autoResumeThread(sessionManager, threadId);
-      const botUserId = client.user?.id;
       const { relay, reply } = await resolveWakeReply(wake, {
-        mentioned: botUserId ? message.mentions.users.has(botUserId) : false,
+        mentioned: isBotMentioned(message, client.user),
         buildSalvage: (verdict) =>
           buildSalvageReply(sessionManager, threadId, verdict),
       });
@@ -1856,9 +1850,12 @@ export async function startBot(token: string): Promise<void> {
     // command (commands/session.ts) is the equivalent deterministic trigger.
     {
       const botUserId = client.user?.id;
-      if (botUserId && message.mentions.users.has(botUserId)) {
-        const withoutMention = message.content
-          .replace(new RegExp(`<@!?${botUserId}>`, "g"), "")
+      if (isBotMentioned(message, client.user)) {
+        // #410: the trigger above now also fires on a ROLE mention (e.g. the
+        // bot's auto-created integration role), so stripBotMention removes
+        // that token too — not just the direct user mention — before
+        // comparing against the exact "status" token.
+        const withoutMention = stripBotMention(message.content, botUserId)
           .trim()
           .toLowerCase();
         if (withoutMention === "status") {
