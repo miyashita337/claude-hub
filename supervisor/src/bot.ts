@@ -45,6 +45,7 @@ import {
 } from "./config/channels";
 import { RELAY_ERROR_USER_MESSAGE, type AttachmentInfo } from "./session/relay";
 import { buildDialogStuckHandler } from "./session/dialog-stuck-handler";
+import { relayInteractive } from "./session/interactive-relay";
 import { notifyPushover, warnIfPushoverUnconfigured } from "./session/notify-pushover";
 import { startActionReceiver, stopActionReceiver } from "./action/receiver";
 import { updateSessionClaudeId } from "./infra/db";
@@ -2017,7 +2018,10 @@ export async function startBot(token: string): Promise<void> {
         `[Bot] Relay start in thread ${threadId} (${messageText.length} chars, ${attachments.length} attachments)`
       );
       try {
-        const result = await sessionManager.sendMessage(
+        // Issue #357: wait for the TUI to accept input first (best-effort),
+        // as the dispatch / orchestrate transports already do.
+        const result = await relayInteractive(
+          sessionManager,
           threadId,
           messageText,
           attachments,

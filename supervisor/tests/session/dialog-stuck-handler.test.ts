@@ -102,6 +102,44 @@ describe("buildDialogStuckHandler", () => {
     expect(pushover).toHaveBeenCalledTimes(1);
   });
 
+  // Issue #357 AC-2 (journey): the stall used to be recoverable only from a
+  // terminal. Both the stall heartbeat and the new "Enter never submitted"
+  // notice must name the Discord-only recovery command.
+  test("stall heartbeat offers the Discord-only recovery `/session enter` (#357)", async () => {
+    const thread = makeThread();
+    const handler = buildDialogStuckHandler(thread, { pushover: mock(async () => true) });
+
+    await handler({
+      kind: "stall",
+      line: "no response within stall threshold",
+      tmuxSessionName: "claude-stall2",
+    });
+
+    expect(thread.sent[0]!).toContain("/session enter");
+    // The terminal path stays available as a fallback.
+    expect(thread.sent[0]!).toContain("tmux -L claude-hub attach -t claude-stall2");
+  });
+
+  test("an unsubmitted input says the text is waiting and how to submit it from Discord (#357)", async () => {
+    const thread = makeThread();
+    const pushover = mock(async () => true);
+    const handler = buildDialogStuckHandler(thread, { pushover });
+
+    await handler({
+      kind: "unsubmitted",
+      line: "",
+      tmuxSessionName: "claude-unsub1",
+    });
+
+    const msg = thread.sent[0]!;
+    expect(msg).toContain("送信（Enter）が確定していません");
+    expect(msg).toContain("/session enter");
+    expect(msg).toContain("tmux -L claude-hub attach -t claude-unsub1");
+    // Not framed as a dialog: nothing on screen is a dialog to click through.
+    expect(msg).not.toContain("ダイアログ検出");
+    expect(pushover).toHaveBeenCalledTimes(1);
+  });
+
   test("still pages Pushover when Discord thread.send throws", async () => {
     const pushover = mock(async () => true);
     const throwingThread = {
