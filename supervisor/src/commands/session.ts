@@ -92,6 +92,15 @@ export function createSessionCommand() {
     )
     .addSubcommand((sub) =>
       sub
+        .setName("enter")
+        // Issue #357: Discord-only recovery for a message left un-submitted in
+        // the TUI input box (previously only fixable from a terminal).
+        .setDescription(
+          "入力欄に残った未送信の内容を送信（Enter）する。ダイアログ表示中は既定の選択肢で確定する点に注意"
+        )
+    )
+    .addSubcommand((sub) =>
+      sub
         .setName("keep")
         // Issue #193: persist an attachment past the 30-day GC. Namespaced under
         // /session for the same reason as compact (#200): a top-level /keep would
@@ -153,8 +162,69 @@ export function createSessionHandler(sessionManager: SessionManager) {
       case "keep":
         await handleKeep(interaction);
         break;
+      case "enter":
+        await handleEnter(interaction, sessionManager);
+        break;
     }
   };
+}
+
+/**
+ * Issue #357: send one bare Enter to the session bound to this thread, so an
+ * un-submitted input can be recovered from Discord alone. Keys go into a
+ * `--dangerously-skip-permissions` session, so — like `/session start` — the
+ * per-channel access.json `allowFrom` gate applies (fail-closed).
+ */
+async function handleEnter(
+  interaction: ChatInputCommandInteraction,
+  sessionManager: SessionManager
+): Promise<void> {
+  const channel = interaction.channel;
+  if (!channel || !channel.isThread()) {
+    await interaction.reply({
+      content: "ℹ️ `/session enter` は稼働中セッションのスレッド内で実行してください。",
+      flags: 64,
+    });
+    return;
+  }
+
+  const decision = evaluateAccess({
+    channelKey: channel.parentId ?? channel.id,
+    userId: interaction.user.id,
+    isMention: true,
+  });
+  if (!decision.allowed) {
+    console.warn(
+      `[Session] /session enter access denied (reason=${decision.reason}) in thread ${channel.id}`
+    );
+    await interaction.reply({
+      content: "❌ このスレッドのセッションを操作する権限がありません（アクセスポリシー）。",
+      flags: 64,
+    });
+    return;
+  }
+
+  const threadId = channel.id;
+  if (!sessionManager.has(threadId)) {
+    await interaction.reply({
+      content:
+        "ℹ️ このスレッドに稼働中のセッションはありません。" +
+        "`/session start <branch>` か `/session resume <session_id>` で開始してください。",
+      flags: 64,
+    });
+    return;
+  }
+
+  await interaction.deferReply({ flags: 64 });
+  try {
+    await sessionManager.sendEnter(threadId);
+    await interaction.editReply({
+      content: "⏎ Enter を送信しました。送信が確定すれば、応答はこのスレッドに返ります。",
+    });
+  } catch (err) {
+    const msg = `❌ Enter の送信に失敗: ${err instanceof Error ? err.message : String(err)}`;
+    await safeRespond(interaction, { content: msg, ephemeral: true });
+  }
 }
 
 async function handleKeep(

@@ -20,6 +20,7 @@ import {
   type SessionRow,
 } from "../infra/db";
 import {
+  ensurePaneNotInMode,
   relayMessage,
   sendToPane,
   type AttachmentInfo,
@@ -1743,9 +1744,15 @@ export class SessionManager {
    * awaited setTimeout so the single-process bot's event loop stays free for
    * other channels' relays while this session boots.
    */
-  async waitForInputReady(threadId: string): Promise<boolean> {
+  async waitForInputReady(
+    threadId: string,
+    // Issue #357: the interactive relay passes a short budget — it runs on
+    // every message, and a marker the TUI hides (e.g. while Claude is busy)
+    // must not add the full dispatch boot budget to each one.
+    maxAttempts: number = this.inputReadyPollAttempts
+  ): Promise<boolean> {
     const tmuxName = this.tmuxSessionName(threadId);
-    for (let i = 0; i < this.inputReadyPollAttempts; i++) {
+    for (let i = 0; i < maxAttempts; i++) {
       if (!(await this.effects.tmux.hasSession(tmuxName))) return false;
       const pane = await this.effects.tmux.capturePane(tmuxName);
       if (INPUT_READY_RE.test(pane)) return true;
@@ -2023,6 +2030,28 @@ export class SessionManager {
     } finally {
       this.compactInFlight.delete(threadId);
     }
+  }
+
+  /**
+   * Issue #357: send one bare Enter to this thread's pane, so a message that
+   * sits un-submitted in the TUI input box can be submitted from Discord
+   * (`/session enter`) without attaching a terminal. Throws when there is no
+   * session / pane, so the command never acks a send that did not happen.
+   */
+  async sendEnter(threadId: string): Promise<void> {
+    const session = this.sessions.get(threadId);
+    if (!session) {
+      throw new Error(`スレッド ${threadId} にセッションが見つかりません`);
+    }
+    const tmuxName = this.tmuxSessionName(threadId);
+    if (!(await this.effects.tmux.hasSession(tmuxName))) {
+      throw new Error("tmux session dead");
+    }
+    session.lastActivityAt = new Date();
+    updateSessionActivity(session.id);
+    // A pane stuck in copy-mode would eat the Enter (#73); exit it first.
+    await ensurePaneNotInMode(tmuxName);
+    await this.effects.tmux.sendKeys(tmuxName, ["C-m"]);
   }
 
   /**

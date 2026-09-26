@@ -30,7 +30,33 @@ export interface DialogStuckHandlerOptions {
   pushover?: (title: string, message: string) => Promise<boolean>;
 }
 
+/**
+ * Issue #357: the Discord-only recovery for an input that sits un-submitted in
+ * the TUI. Named in both the "Enter never submitted" notice and the stall
+ * heartbeat, so the user is never forced to a terminal to press Enter.
+ */
+const ENTER_RECOVERY_HINT =
+  "Discord からは、このスレッドで `/session enter` を実行すると入力欄の内容を送信（Enter）できます。";
+
+/**
+ * Issue #357: posted when the relay typed the message but no Enter was taken
+ * (kind `"unsubmitted"`). No tmux internals in the lead sentence; the attach
+ * command follows only as the terminal fallback.
+ */
+export const SUBMIT_UNCONFIRMED_USER_MESSAGE =
+  "⚠️ メッセージは入力欄に入りましたが、送信（Enter）が確定していません（#357）。" +
+  ENTER_RECOVERY_HINT;
+
 function buildMessage(info: DialogStuckInfo): string {
+  if (info.kind === "unsubmitted") {
+    return [
+      SUBMIT_UNCONFIRMED_USER_MESSAGE,
+      "ターミナルから対応する場合:",
+      "```",
+      `tmux -L ${TMUX_SOCKET} attach -t ${info.tmuxSessionName}`,
+      "```",
+    ].join("\n");
+  }
   // Issue #423: an AskUserQuestion dialog is not a stuck dialog — it is a
   // question that never reached Discord (the /ask relay timed out or failed, so
   // the hook fell back to the TUI). Say that plainly, and say that nothing was
@@ -65,6 +91,9 @@ function buildMessage(info: DialogStuckInfo): string {
     // Escape backticks so a captured terminal line can't break out of the
     // Discord inline code span (the line is arbitrary TUI output).
     info.line ? `検出行: \`${info.line.replace(/`/g, "'")}\`` : "",
+    // Issue #357: a stall is frequently an un-submitted input box — offer the
+    // Discord-only recovery alongside the terminal one.
+    info.kind === "stall" ? ENTER_RECOVERY_HINT : "",
   ]
     .filter(Boolean)
     .join("\n");

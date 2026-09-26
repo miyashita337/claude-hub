@@ -310,11 +310,42 @@ export type DeliveryVerdict =
   /** `capture-pane` was unusable, so delivery could not be judged either way. */
   | "unverified-observer";
 
+/**
+ * Issue #357: whether the Enter after the literal actually submitted it.
+ *
+ * #422 proved the text reached the input box, but `C-m` was sent blind: an
+ * Enter the TUI dropped left the message sitting un-submitted until the stall
+ * heartbeat told the user to `tmux attach`.
+ */
+export type SubmitVerdict =
+  /** The pane reacted to the first Enter. */
+  | "submitted"
+  /** The first Enter left the pane untouched; a re-sent Enter was taken. */
+  | "submitted-after-resend"
+  /** Every Enter (bounded) left the pane untouched — the text is still waiting. */
+  | "unconfirmed"
+  /** No observer (capture failed / nothing to compare): one blind Enter, pre-#357. */
+  | "not-checked";
+
 export interface SendOutcome {
   verdict: DeliveryVerdict;
   /** True only when the text was actually observed in the pane. */
   verified: boolean;
+  /** Issue #357: whether the Enter was observed to submit the input. */
+  submit: SubmitVerdict;
 }
+
+/**
+ * Issue #357: how many Enters are sent in total before the submit is declared
+ * unconfirmed (1 + re-sends). A re-send is only issued after the pane showed NO
+ * change at all since the previous Enter, i.e. that Enter visibly did nothing —
+ * so a re-sent Enter is equivalent to the dropped one, not an extra action.
+ * Residual risk (NOT measured on a real TUI): a first Enter that was taken but
+ * whose redraw took longer than the whole poll budget gets a second Enter; that
+ * one lands on an empty input box, which is expected to be a no-op. Bounded so
+ * a pane that never reacts does not spin.
+ */
+export const SUBMIT_MAX_ENTER_ATTEMPTS = 3;
 
 /** Verdicts that mean "the pane was observed to hold the text". */
 function isVerified(verdict: DeliveryVerdict): boolean {
@@ -451,6 +482,37 @@ const capturePaneText: PaneReader = async (sessionName, socketArgs) => {
   }
 };
 
+/**
+ * Issue #357: the pane's state for the submit check — cursor position plus the
+ * visible screen, in ONE tmux invocation (`display-message ; capture-pane`).
+ * The cursor is included because a submit that leaves the visible text looking
+ * the same (the echoed prompt scrolls identically) still moves the cursor off
+ * the end of the typed text. No TUI literal is matched (RW-027): the check is
+ * "did anything change after Enter", which holds across Claude Code redesigns.
+ */
+const capturePaneState: PaneReader = async (sessionName, socketArgs) => {
+  try {
+    const { stdout } = await execFileAsync(
+      TMUX_PATH,
+      [
+        ...socketArgs,
+        "display-message", "-p", "-t", sessionName, "#{cursor_x},#{cursor_y}",
+        ";",
+        "capture-pane", "-p", "-t", sessionName,
+      ],
+      { timeout: CAPTURE_PANE_TIMEOUT_MS }
+    );
+    return stdout.toString();
+  } catch (err) {
+    console.warn(
+      `[Relay] pane state read failed for ${sessionName} — Enter cannot be confirmed ` +
+        `(falling back to a single blind Enter):`,
+      summarizeExecError(err)
+    );
+    return null;
+  }
+};
+
 export interface SendToPaneOptions {
   /** Override the poll schedule (tests only; production uses the default). */
   verifyBackoffMs?: readonly number[];
@@ -476,6 +538,11 @@ export interface SendToPaneOptions {
    * double render) deterministically, without racing a real tmux server.
    */
   capturePane?: PaneReader;
+  /**
+   * Test seam, never set in production: replaces the cursor+screen reader used
+   * to confirm that Enter submitted the input (Issue #357).
+   */
+  capturePaneState?: PaneReader;
 }
 
 /**
@@ -502,6 +569,8 @@ export interface SendToPaneOptions {
  *      drop an Enter sent in the same call as a long literal (#32). Enter is
  *      sent only once the text is confirmed present, so a failed send can never
  *      submit a half-typed or empty prompt.
+ *   6. Issue #357: confirm the Enter was taken (the pane changed), re-sending
+ *      it (bounded) when the pane showed no reaction — see submitAndConfirm.
  *
  * Newlines are flattened to spaces because `send-keys -l` would submit at the
  * first newline.
@@ -527,8 +596,93 @@ export async function sendToPane(
     options
   );
   await new Promise((r) => setTimeout(r, 100));
-  await tmuxSend(tmuxSessionName, ["C-m"], socketArgs);
-  return { verdict, verified: isVerified(verdict) };
+  const submit = await submitAndConfirm(
+    tmuxSessionName,
+    socketArgs,
+    // An observer that already failed during typing, or a message with no
+    // probe, has nothing trustworthy to compare against: one blind Enter.
+    verdict === "unverified-observer" || verdict === "skipped-no-probe",
+    options
+  );
+  return { verdict, verified: isVerified(verdict), submit };
+}
+
+/**
+ * Issue #357: send Enter and confirm the pane reacted, re-sending (bounded) when
+ * it provably did not.
+ *
+ *   1. Settle: re-read the pane until two consecutive reads match, so the rest
+ *      of a long literal (only its first {@link DELIVERY_PROBE_MAX_CHARS} chars
+ *      were verified) has finished rendering. Otherwise that late render would
+ *      read as "the pane changed after Enter" and hide a dropped Enter — and an
+ *      Enter that arrives while the TUI is still ingesting the literal is the
+ *      leading suspect for the drop (#32 class).
+ *   2. Send `C-m`, then poll: any change to cursor/screen since the settled
+ *      snapshot means the Enter was taken.
+ *   3. No change → the Enter visibly did nothing → send it again, up to
+ *      {@link SUBMIT_MAX_ENTER_ATTEMPTS} Enters in total.
+ *
+ * Never throws for an unconfirmed submit: the text IS in the pane, so the caller
+ * reports it (with a Discord-side recovery) instead of failing the send.
+ */
+async function submitAndConfirm(
+  tmuxSessionName: string,
+  socketArgs: readonly string[],
+  blind: boolean,
+  options?: SendToPaneOptions
+): Promise<SubmitVerdict> {
+  const sendEnter = () => tmuxSend(tmuxSessionName, ["C-m"], socketArgs);
+  if (blind) {
+    await sendEnter();
+    return "not-checked";
+  }
+  const readState = options?.capturePaneState ?? capturePaneState;
+  const backoff = options?.verifyBackoffMs ?? DELIVERY_VERIFY_BACKOFF_MS;
+
+  let snapshot = await readState(tmuxSessionName, socketArgs);
+  if (snapshot === null) {
+    await sendEnter();
+    return "not-checked";
+  }
+  let settled = false;
+  for (const waitMs of backoff) {
+    await new Promise((r) => setTimeout(r, waitMs));
+    const next = await readState(tmuxSessionName, socketArgs);
+    if (next === null) {
+      await sendEnter();
+      return "not-checked";
+    }
+    if (next === snapshot) {
+      settled = true;
+      break;
+    }
+    snapshot = next;
+  }
+  // A pane that never stops changing (spinner / elapsed counter while Claude is
+  // mid-turn, a live statusline) makes "changed after Enter" meaningless: it
+  // would read every Enter as taken. Say so instead of claiming a confirmation.
+  if (!settled) {
+    await sendEnter();
+    return "not-checked";
+  }
+
+  for (let attempt = 1; attempt <= SUBMIT_MAX_ENTER_ATTEMPTS; attempt++) {
+    await sendEnter();
+    for (const waitMs of backoff) {
+      await new Promise((r) => setTimeout(r, waitMs));
+      const after = await readState(tmuxSessionName, socketArgs);
+      // The Enter is already sent; a dead observer just means we cannot judge it.
+      if (after === null) return "not-checked";
+      if (after !== snapshot) {
+        return attempt > 1 ? "submitted-after-resend" : "submitted";
+      }
+    }
+    console.warn(
+      `[Relay] Enter did not submit in pane ${tmuxSessionName} ` +
+        `(attempt ${attempt}/${SUBMIT_MAX_ENTER_ATTEMPTS}, pane unchanged)`
+    );
+  }
+  return "unconfirmed";
 }
 
 /**
@@ -840,7 +994,7 @@ export async function relayMessage(
   // exactly this line.
   console.log(
     `[Relay] send finished for ${tmuxSessionName}: ${outcome.verdict} ` +
-      `(pane observed: ${outcome.verified ? "yes" : "no"})`
+      `(pane observed: ${outcome.verified ? "yes" : "no"}, submit: ${outcome.submit})`
   );
 
   // Segment (c): tmux send 完了 → waitForRelay 開始までの隙間 (大体ゼロ、
@@ -907,6 +1061,28 @@ export async function relayMessage(
       });
     },
   });
+
+  // Issue #357: the text is in the input box but no Enter was taken. Tell the
+  // thread NOW (with the Discord-only `/session enter` recovery) instead of
+  // leaving the user to the 3-min stall page. Deliberately NOT routed through
+  // pageOnce: if the user recovers and the turn then stalls on a real dialog,
+  // that page must still fire. Scheduled as a microtask so waitForRelay below
+  // has registered the pending request before the handler runs — a recovery
+  // that completes instantly must find something to resolve.
+  if (outcome.submit === "unconfirmed" && options?.onDialogStuck) {
+    const onDialogStuck = options.onDialogStuck;
+    void Promise.resolve()
+      .then(() =>
+        onDialogStuck({
+          kind: "unsubmitted",
+          line: "",
+          tmuxSessionName,
+        })
+      )
+      .catch((err) =>
+        console.warn(`[Relay] unsubmitted notice failed for ${tmuxSessionName}:`, err)
+      );
+  }
 
   let result: RelayResult;
   try {

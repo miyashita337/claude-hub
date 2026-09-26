@@ -146,6 +146,11 @@ jobs:
                    tests/session/relay-send-failure.test.ts \
                    tests/session/relay-error-notice.test.ts \
                    tests/session/relay-delivery-verify.test.ts \
+                   tests/session/relay-submit-confirm.test.ts \
+                   tests/session/interactive-relay.test.ts \
+                   tests/session/manager-send-enter.test.ts \
+                   tests/commands/session-enter.test.ts \
+                   tests/guards/interactive-relay-wired.test.ts \
                    tests/scripts/lint-blocking-in-timers.test.ts \
                    tests/scripts/lint-no-sync-exec.test.ts \
                    tests/session/notify-pushover.test.ts \
