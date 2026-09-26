@@ -109,6 +109,7 @@ import {
   resolveExecutorMode,
   buildDispatchFailureNotice,
 } from "./session/dispatch";
+import { realIssueReporterAdapter } from "./session/adapters";
 import { DispatchQueue } from "./session/dispatch-queue";
 import {
   BRIEF_DISABLED_ENV,
@@ -1166,6 +1167,12 @@ export async function startBot(token: string): Promise<void> {
         executorMode,
         postToThread,
         createThread: async () => dispatchThread, // reuse the eagerly-created thread
+        // Issue #438: record an inject failure on the target Issue as a
+        // Dispatch 実行レポート (`- dispatch_failure: inject`) so corp can read
+        // it the same way it reads headless run reports. gh runs in the
+        // channel's repo dir so the Issue resolves from that repo's remote.
+        reportFailure: ({ issueNumber: n, body }) =>
+          realIssueReporterAdapter.postComment({ cwd: config.dir, issueNumber: n, body }),
       });
 
       if (result.ok && result.mode === "tmux") {

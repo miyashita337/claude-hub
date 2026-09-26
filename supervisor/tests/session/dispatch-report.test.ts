@@ -2,6 +2,7 @@ import { describe, test, expect } from "bun:test";
 import {
   formatDispatchReport,
   DISPATCH_REPORT_HEADING,
+  formatDispatchFailureReport,
 } from "../../src/session/dispatch-report";
 
 /**
@@ -180,5 +181,69 @@ describe("formatDispatchReport", () => {
           "worktree は復旧用に保全されています。同じブランチへの再 dispatch で作業状態を引き継げます。\n",
       );
     });
+  });
+});
+
+/**
+ * Issue #438: a dispatch whose initial command never reached the pane
+ * (`runDispatch` stage=inject, #429) must leave a MACHINE-READABLE record corp
+ * can read, not only a Discord notice. It reuses the Dispatch 実行レポート
+ * contract (heading + `- key: value`) because corp already reads it
+ * (`latestDispatchReport` / `parseDispatchReportLine`, corp#162 / #167). The
+ * failure keys are ADDITIVE: none of the keys corp's existing reconcile acts on
+ * are emitted, so `isEmptyRun` / `isUnlandedCandidate` cannot misfire.
+ */
+describe("formatDispatchFailureReport (#438)", () => {
+  // Mirror of corp src/dispatches.ts parseDispatchReportLine — the reader side
+  // of the contract. Kept verbatim so a format drift fails here.
+  const corpLine = (body: string, key: string): string | undefined => {
+    if (!body.includes(DISPATCH_REPORT_HEADING)) return undefined;
+    const m = body.match(new RegExp(`^\\s*[-*]\\s*${key}:\\s*(.+?)\\s*$`, "im"));
+    return m?.[1]?.trim();
+  };
+
+  const base = {
+    stage: "inject" as const,
+    executor: "tmux" as const,
+    branch: "corp-dispatch-438",
+    initialCommand: "/impl 438",
+    sessionStopped: true,
+  };
+
+  test("renders the exact heading + failure key/value schema", () => {
+    const body = formatDispatchFailureReport(base);
+    expect(body.startsWith(
+      [
+        "## Dispatch 実行レポート",
+        "",
+        "- dispatch_failure: inject",
+        "- executor: tmux",
+        "- branch: corp-dispatch-438",
+        "- initial_command: /impl 438",
+        "- session_stopped: true",
+        "",
+      ].join("\n"),
+    )).toBe(true);
+  });
+
+  test("corp's line parser reads every failure key", () => {
+    const body = formatDispatchFailureReport({ ...base, sessionStopped: false });
+    expect(corpLine(body, "dispatch_failure")).toBe("inject");
+    expect(corpLine(body, "executor")).toBe("tmux");
+    expect(corpLine(body, "branch")).toBe("corp-dispatch-438");
+    expect(corpLine(body, "initial_command")).toBe("/impl 438");
+    expect(corpLine(body, "session_stopped")).toBe("false");
+  });
+
+  test("emits none of the keys corp reconcile already acts on (additive, no misfire)", () => {
+    const body = formatDispatchFailureReport(base);
+    for (const key of ["tokens", "duration_ms", "exit_code", "completion", "artifacts"]) {
+      expect(corpLine(body, key)).toBeUndefined();
+    }
+  });
+
+  test("states in prose that nothing was re-sent automatically", () => {
+    const body = formatDispatchFailureReport(base);
+    expect(body).toContain("自動での再入力はしていません");
   });
 });

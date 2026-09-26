@@ -95,3 +95,57 @@ export function formatDispatchReport(fields: DispatchReportFields): string {
   }
   return lines.join("\n") + "\n";
 }
+
+/**
+ * A dispatch that failed before any work ran (Issue #438). Emitted on the tmux
+ * path when the initial command never reached the pane (`runDispatch`
+ * stage=inject, #429), so corp can see the failure where it already reads run
+ * evidence (`latestDispatchReport` / `parseDispatchReportLine`, corp#162 /
+ * #167) instead of relying on someone noticing a Discord notice.
+ */
+export interface DispatchFailureReportFields {
+  /** Stage the dispatch failed at. Only `inject` is reported (#438 scope). */
+  stage: "inject";
+  /** Executor backend the dispatch ran on. */
+  executor: "tmux";
+  branch: string;
+  /** The command that was typed but never confirmed, e.g. `/impl 438`. */
+  initialCommand: string;
+  /** Whether the started-but-idle session was torn down (#429 should-4). */
+  sessionStopped: boolean;
+}
+
+/**
+ * Render the failure report. Same heading and `- key: value` shape as
+ * {@link formatDispatchReport}; the keys are NEW so the contract stays
+ * additive: none of `tokens` / `duration_ms` / `exit_code` / `completion` /
+ * `artifacts` is emitted, which keeps corp's existing reconcile predicates
+ * (`isEmptyRun`, `isUnlandedCandidate`) from judging a run that never happened.
+ *
+ * The raw failure cause is deliberately NOT included: it can carry tmux
+ * internals or absolute paths (same rule as the Discord notice,
+ * `buildDispatchFailureNotice`). Diagnostics stay in the Supervisor log.
+ */
+export function formatDispatchFailureReport(
+  fields: DispatchFailureReportFields,
+): string {
+  const lines = [
+    DISPATCH_REPORT_HEADING,
+    "",
+    `- dispatch_failure: ${fields.stage}`,
+    `- executor: ${fields.executor}`,
+    `- branch: ${fields.branch}`,
+    `- initial_command: ${fields.initialCommand}`,
+    `- session_stopped: ${fields.sessionStopped}`,
+    "",
+    "⚠️ 初期コマンドがセッションに届いたことを確認できず、dispatch は失敗しました（claude-hub#429 / #438）。" +
+      "二重実行を避けるため自動での再入力はしていません。再投入が必要です。",
+  ];
+  if (!fields.sessionStopped) {
+    lines.push(
+      "",
+      "⚠️ セッションの停止にも失敗しています。残存セッションがないか確認してください。",
+    );
+  }
+  return lines.join("\n") + "\n";
+}
