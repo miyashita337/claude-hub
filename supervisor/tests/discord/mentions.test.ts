@@ -11,7 +11,7 @@
 
 import { describe, expect, test } from "bun:test";
 import type { Message, User } from "discord.js";
-import { isBotMentioned } from "../../src/discord/mentions";
+import { isBotMentioned, stripBotMention } from "../../src/discord/mentions";
 
 const BOT_USER = { id: "bot_1" } as User;
 
@@ -98,5 +98,35 @@ describe("isBotMentioned (#410)", () => {
   test("a mention of another user/role does not count as the bot being mentioned", () => {
     const message = fixture({ directUserId: "someone_else" });
     expect(isBotMentioned(message, BOT_USER)).toBe(false);
+  });
+});
+
+describe("stripBotMention (#410)", () => {
+  test("strips a direct user mention", () => {
+    expect(stripBotMention("<@bot_1> status", "bot_1")).toBe(" status");
+  });
+
+  test("strips a nickname-form user mention (<@!id>)", () => {
+    expect(stripBotMention("<@!bot_1> status", "bot_1")).toBe(" status");
+  });
+
+  test("strips a role mention even though it does not encode the user id (#410)", () => {
+    // This is the exact case the #410 fix needs: the message never contains
+    // the bot's user id at all, only a role mention that resolves to it.
+    expect(stripBotMention("<@&999999999999999999> status", "bot_1")).toBe(
+      " status",
+    );
+  });
+
+  test("returns content unchanged when botUserId is undefined", () => {
+    expect(stripBotMention("<@bot_1> status", undefined)).toBe(
+      "<@bot_1> status",
+    );
+  });
+
+  test("leaves an unrelated user mention untouched", () => {
+    expect(stripBotMention("<@someone_else> status", "bot_1")).toBe(
+      "<@someone_else> status",
+    );
   });
 });

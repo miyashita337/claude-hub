@@ -9,7 +9,7 @@ import {
   type ThreadChannel,
   type TextChannel,
 } from "discord.js";
-import { isBotMentioned } from "./discord/mentions";
+import { isBotMentioned, stripBotMention } from "./discord/mentions";
 import { SessionManager, type SelfHealOutcome } from "./session/manager";
 import {
   executeSelfHealRestart,
@@ -1850,8 +1850,11 @@ export async function startBot(token: string): Promise<void> {
     {
       const botUserId = client.user?.id;
       if (isBotMentioned(message, client.user)) {
-        const withoutMention = message.content
-          .replace(new RegExp(`<@!?${botUserId}>`, "g"), "")
+        // #410: the trigger above now also fires on a ROLE mention (e.g. the
+        // bot's auto-created integration role), so stripBotMention removes
+        // that token too — not just the direct user mention — before
+        // comparing against the exact "status" token.
+        const withoutMention = stripBotMention(message.content, botUserId)
           .trim()
           .toLowerCase();
         if (withoutMention === "status") {

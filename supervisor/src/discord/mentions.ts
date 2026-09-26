@@ -39,3 +39,19 @@ export function isBotMentioned(
     ignoreRepliedUser: true,
   });
 }
+
+/**
+ * Strip a mention of `botUserId` from `content` for exact-token comparisons
+ * (e.g. the `@Supervisor status` trigger). Strips both the direct user
+ * mention (`<@ID>` / `<@!ID>`) and any role mention (`<@&ROLE_ID>`), since
+ * {@link isBotMentioned} may have matched via a role the bot holds rather
+ * than a direct mention (#410) — leaving a role token behind would make an
+ * otherwise-exact "status" command never match.
+ */
+export function stripBotMention(
+  content: string,
+  botUserId: string | undefined,
+): string {
+  if (!botUserId) return content;
+  return content.replace(new RegExp(`<@!?${botUserId}>|<@&\\d+>`, "g"), "");
+}

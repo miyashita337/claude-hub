@@ -28,11 +28,20 @@ describe("bot mention detection is centralized (#410)", () => {
 
   test("bot.ts's four mention-gated call sites all use isBotMentioned", async () => {
     const src = await read("src/bot.ts");
-    expect(src).toContain('import { isBotMentioned } from "./discord/mentions"');
+    expect(src).toContain("isBotMentioned");
+    expect(src).toContain('from "./discord/mentions"');
     const count = src.split("isBotMentioned(").length - 1;
     // orchestrate access, thread access (requireMention), dead-thread salvage
     // (resolveWakeReply mentioned flag), and the `@Supervisor status` token.
     expect(count).toBe(4);
+  });
+
+  test("the `@Supervisor status` token strips role mentions too, not just the user mention", async () => {
+    const src = await read("src/bot.ts");
+    // #410: isBotMentioned now also fires on a role mention, so the token
+    // comparison must strip that token too, or an otherwise-exact "status"
+    // command silently stops matching (same failure class as the main bug).
+    expect(src).toContain("stripBotMention(message.content, botUserId)");
   });
 
   test("real-client.ts's relay access gate uses isBotMentioned", async () => {
