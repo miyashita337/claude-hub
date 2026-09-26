@@ -79,6 +79,14 @@ function makeInteraction(opts: {
    * "dead" so legacy stopped-row tests keep passing.
    */
   liveness?: "alive" | "dead" | "unknown";
+  /**
+   * Issue #451 (devils-advocate review gap): simulate running `/session
+   * resume` from INSIDE a thread (e.g. the dead hub-work thread itself) whose
+   * parent is `channelName`, instead of from the top-level channel. Exercises
+   * the `channel.isThread() && channel.parent` branch that resolves
+   * `channelName` via the parent, which the non-thread mock never reaches.
+   */
+  asThread?: boolean;
 }) {
   const replies: ReplyRecord[] = [];
   const resumeCalls: unknown[][] = [];
@@ -97,12 +105,15 @@ function makeInteraction(opts: {
     },
   };
 
-  const channel = {
+  // Reused as both the top-level channel (non-thread case) and the parent
+  // channel (thread case) — both need isTextBased/isDMBased/threads.create,
+  // and reusing FIXTURE_CHANNEL_ID as its id keeps the access.json fixture
+  // above valid for either shape.
+  const parentChannelLike = {
     id: FIXTURE_CHANNEL_ID,
-    isThread: () => false,
+    name: opts.channelName ?? "team-salary",
     isTextBased: () => true,
     isDMBased: () => false,
-    name: opts.channelName ?? "team-salary",
     threads: {
       create: async () => {
         threadCreated = true;
@@ -110,6 +121,17 @@ function makeInteraction(opts: {
       },
     },
   };
+
+  const channel = opts.asThread
+    ? {
+        id: "dead-hub-work-thread-id",
+        isThread: () => true,
+        parent: parentChannelLike,
+        parentId: parentChannelLike.id,
+        isTextBased: () => true,
+        isDMBased: () => false,
+      }
+    : { ...parentChannelLike, isThread: () => false };
 
   const interaction = {
     user: { id: FIXTURE_USER_ID },
@@ -243,6 +265,28 @@ describe("/session resume validation (#161)", () => {
     expect(passedConfig.channelName).toBe("claude-hub-work");
     const editReplies = h.replies.filter((r) => r.kind === "editReply");
     expect(editReplies[editReplies.length - 1]!.content).toContain("復帰しました");
+  });
+
+  test("hub-work row (#451) resumed from INSIDE the dead hub-work thread (parent=#corp)", async () => {
+    // devils-advocate review gap: resume is most often invoked from inside the
+    // archived hub-work thread itself, not from the top-level #corp channel.
+    // channelName must resolve via channel.parent.name in that case.
+    const h = makeInteraction({
+      sessionId: VALID_ID,
+      channelName: "corp",
+      asThread: true,
+      resumableRow: {
+        channel_name: "claude-hub-work",
+        project_dir: "/Users/x/claude-hub",
+        status: "stopped",
+      },
+    });
+    await h.run();
+
+    expect(h.threadCreated).toBe(true);
+    expect(h.resumeCalls).toHaveLength(1);
+    const passedConfig = h.resumeCalls[0]![0] as { channelName: string };
+    expect(passedConfig.channelName).toBe("claude-hub-work");
   });
 
   test("hub-work row (#451) resume attempted outside #corp → rejected, guided to #corp", async () => {
