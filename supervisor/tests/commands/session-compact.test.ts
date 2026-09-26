@@ -144,7 +144,7 @@ describe("/session compact (#200)", () => {
     expect(hint?.flags).toBe(64);
   });
 
-  test("compactSession failure: reports error via editReply after defer", async () => {
+  test("compactSession failure: reports error via editReply after defer, without leaking the raw cause (#360)", async () => {
     const fx = makeInteraction({
       compactImpl: () => {
         throw new Error("tmux session dead");
@@ -156,7 +156,11 @@ describe("/session compact (#200)", () => {
       (r) => r.kind === "editReply" && r.content?.includes("失敗")
     );
     expect(err).toBeDefined();
-    expect(err?.content).toContain("tmux session dead");
+    // Issue #360: the raw error message must never reach the Discord reply —
+    // only console.error (diagnostics). The user still gets an actionable
+    // notice with the command's recovery guidance.
+    expect(err?.content).not.toContain("tmux session dead");
+    expect(err?.content).toContain("/session status");
   });
 });
 
@@ -205,7 +209,7 @@ describe("/session compact in claudeHubExit primary channel (#199 AC1)", () => {
     expect(fx.primaryCompactCalls[0]?.intent).toBe(DEFAULT_COMPACT_INTENT);
   });
 
-  test("primary channel + dead claudeHubExit: reports error via editReply", async () => {
+  test("primary channel + dead claudeHubExit: reports error via editReply, without leaking the raw cause (#360)", async () => {
     process.env.HIJOGUCHI_CHANNEL_ID = PRIMARY;
     const fx = makeInteraction({
       inThread: false,
@@ -219,7 +223,9 @@ describe("/session compact in claudeHubExit primary channel (#199 AC1)", () => {
     const err = fx.replies.find(
       (r) => r.kind === "editReply" && r.content?.includes("失敗")
     );
-    expect(err?.content).toContain("claudeHubExit session dead");
+    // Issue #360: same contract as the thread-bound compact catch above.
+    expect(err?.content).not.toContain("claudeHubExit session dead");
+    expect(err?.content).toContain("/session status");
   });
 
   test("HIJOGUCHI_CHANNEL_ID unset: primary channel falls through to usage hint, no primary compact", async () => {

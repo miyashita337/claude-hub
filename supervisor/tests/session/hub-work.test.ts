@@ -249,7 +249,7 @@ describe("runHubWork", () => {
     expect(args.threads).toHaveLength(0);
   });
 
-  test("スレッド作成失敗 → 500", async () => {
+  test("スレッド作成失敗 → 500（生の cause は漏れない、#360）", async () => {
     const args = baseArgs({
       createThread: async () => {
         throw new Error("no corp channel");
@@ -259,11 +259,16 @@ describe("runHubWork", () => {
     expect(result.ok).toBe(false);
     if (!result.ok) {
       expect(result.status).toBe(500);
-      expect(result.error).toContain("no corp channel");
+      // Issue #360 (devils-advocate review): this HTTP error body used to
+      // interpolate the raw cause. It now carries only the branch (non-
+      // sensitive, already public in the request) — the raw cause goes to
+      // console.error only.
+      expect(result.error).not.toContain("no corp channel");
+      expect(result.error).toContain("feat-320");
     }
   });
 
-  test("start 失敗 → run() は false（スロット即時解放契約）+ スレッドへ失敗を明示", async () => {
+  test("start 失敗 → run() は false（スロット即時解放契約）+ スレッドへ失敗を明示（生の cause は漏れない、#360）", async () => {
     const manager = fakeManager({ startError: new Error("boom") });
     let runReturned: boolean | undefined;
     const queue: HubWorkQueue = {
@@ -278,7 +283,15 @@ describe("runHubWork", () => {
     // submit 自体は受理される（既存 dispatch と同じ: 失敗はスレッドで報告）。
     expect(result.ok).toBe(true);
     expect(runReturned).toBe(false);
-    expect(args.posts.some((p) => p.content.includes("起動に失敗"))).toBe(true);
+    // Issue #360 (devils-advocate review): this Discord post used to
+    // interpolate the raw dispatch error straight into the thread. It now
+    // reuses bot.ts's `buildDispatchFailureNotice` (#429) — same contract as
+    // the top-level `/dispatch` path — so the raw "boom" cause never reaches
+    // Discord.
+    const failurePost = args.posts.find((p) => p.content.includes("ディスパッチに失敗"));
+    expect(failurePost).toBeDefined();
+    expect(failurePost?.content).toContain("セッションを起動できませんでした");
+    expect(failurePost?.content).not.toContain("boom");
   });
 
   test("上限超過: queued=true で onQueued の待機通知が届く", async () => {

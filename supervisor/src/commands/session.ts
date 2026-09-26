@@ -20,6 +20,7 @@ import {
   buildCompactButtonRow,
   DEFAULT_COMPACT_INTENT,
 } from "./compact-button";
+import { sanitizedFailureNotice } from "../session/user-error-notice";
 
 export function createSessionCommand() {
   return new SlashCommandBuilder()
@@ -260,7 +261,7 @@ async function handleKeep(
       await interaction.editReply({ content: `❌ ${err.message}` });
       return;
     }
-    const msg = `❌ 退避に失敗: ${err instanceof Error ? err.message : String(err)}`;
+    const msg = sanitizedFailureNotice("session keep", "❌ 退避に失敗しました", err);
     await safeRespond(interaction, { content: msg, ephemeral: true });
   }
 }
@@ -288,7 +289,11 @@ async function handleCompact(
         content: `🗜️ claudeHubExit に compact を送信しました: \`/compact ${intent}\``,
       });
     } catch (err) {
-      const msg = `❌ compact の送信に失敗: ${err instanceof Error ? err.message : String(err)}`;
+      const msg = sanitizedFailureNotice(
+        "session compact (primary)",
+        "❌ compact の送信に失敗しました",
+        err
+      );
       await safeRespond(interaction, { content: msg, ephemeral: true });
     }
     return;
@@ -340,7 +345,11 @@ async function handleCompact(
       });
       return;
     }
-    const msg = `❌ compact の送信に失敗: ${err instanceof Error ? err.message : String(err)}`;
+    const msg = sanitizedFailureNotice(
+      "session compact",
+      "❌ compact の送信に失敗しました",
+      err
+    );
     await safeRespond(interaction, { content: msg, ephemeral: true });
   }
 }
@@ -581,7 +590,7 @@ async function handleStart(
         // Thread already gone or delete not permitted — nothing to recover.
       }
     }
-    const msg = `❌ セッション起動に失敗: ${err instanceof Error ? err.message : String(err)}`;
+    const msg = sanitizedFailureNotice("session start", "❌ セッション起動に失敗しました", err);
     await safeRespond(interaction, { content: msg, ephemeral: true });
   }
 }
@@ -753,7 +762,7 @@ async function handleResume(
         // Thread already gone or delete not permitted — nothing to recover.
       }
     }
-    const msg = `❌ セッション復帰に失敗: ${err instanceof Error ? err.message : String(err)}`;
+    const msg = sanitizedFailureNotice("session resume", "❌ セッション復帰に失敗しました", err);
     await safeRespond(interaction, { content: msg, ephemeral: true });
   }
 }
@@ -812,7 +821,7 @@ async function handleStop(
       content: "🛑 セッションを停止しました。スレッドをアーカイブします。",
     });
   } catch (err) {
-    const msg = `❌ セッション停止に失敗: ${err instanceof Error ? err.message : String(err)}`;
+    const msg = sanitizedFailureNotice("session stop", "❌ セッション停止に失敗しました", err);
     await safeRespond(interaction, { content: msg, ephemeral: true });
   }
 }
@@ -858,7 +867,11 @@ async function handleList(
 
     await interaction.reply({ embeds: [embed] });
   } catch (err) {
-    const msg = `❌ セッション一覧の取得に失敗: ${err instanceof Error ? err.message : String(err)}`;
+    const msg = sanitizedFailureNotice(
+      "session list",
+      "❌ セッション一覧の取得に失敗しました",
+      err
+    );
     await safeRespond(interaction, { content: msg, ephemeral: true });
   }
 }
