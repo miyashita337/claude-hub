@@ -175,9 +175,11 @@ jobs:
                    tests/config/check-access-policy.test.ts \
                    tests/discord/in-memory-client.test.ts \
                    tests/discord/real-client.test.ts \
+                   tests/discord/mentions.test.ts \
                    tests/bot/startup-wiring.test.ts \
                    tests/bot/notify-ask-parent-channel.test.ts \
                    tests/guards/access-enforcement-wired.test.ts \
+                   tests/guards/bot-mention-helper.test.ts \
                    tests/hooks/ask-user-relay.test.ts \
                    tests/hooks/auto-approve-permission.test.ts \
                    tests/hooks/headless-pending-guard.test.ts \

@@ -22,6 +22,7 @@ import type {
   ThreadMessageHandler,
 } from "./types";
 import { evaluateAccess } from "../config/access-policy";
+import { isBotMentioned } from "./mentions";
 
 export interface RealDiscordClientOptions {
   /** discord.js intents. Defaults match bot.ts for backwards compatibility. */
@@ -64,10 +65,7 @@ export class RealDiscordClient implements IDiscordClient {
       // threads inherit their parent's opt-in.
       {
         const parentChannelId = thread.parentId ?? thread.id;
-        const botUserId = this.client.user?.id;
-        const isMention = botUserId
-          ? message.mentions.users.has(botUserId)
-          : false;
+        const isMention = isBotMentioned(message, this.client.user);
         const decision = evaluateAccess({
           channelKey: parentChannelId,
           userId: message.author.id,
