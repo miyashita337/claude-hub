@@ -1,4 +1,4 @@
-import { test, expect, describe, beforeEach, afterEach } from "bun:test";
+import { test, expect, describe, beforeEach, afterEach, spyOn } from "bun:test";
 import { existsSync, mkdirSync, rmSync } from "fs";
 import { tmpdir } from "os";
 import { resolve } from "path";
@@ -112,6 +112,78 @@ describe("SessionManager.resumeSession (#161)", () => {
     await manager.resumeSession(makeConfig(projectDir), THREAD_ID, VALID_ID, projectDir);
 
     expect(effects.tmux.sendKeysCalls).toHaveLength(0);
+  });
+
+  // PR #484 review (2nd Discord E2E FAIL): decisively reproduced with real tmux
+  // in tests/e2e/session-resume-lifecycle.test.ts that a pane which NEVER
+  // matches either marker silently exhausts the full poll window with zero
+  // console output, then still reports success. These pin the observability
+  // fix at the unit level (fast, no real tmux needed).
+  test("PR #484: warns once when the resume prompt/ready marker never appears (full exhaustion)", async () => {
+    manager = new SessionManager({
+      effects,
+      gracefulKillTimeoutMs: 0,
+      resumePromptPollAttempts: 3,
+      resumePromptPollIntervalMs: 5,
+    });
+    const warnSpy = spyOn(console, "warn").mockImplementation(() => {});
+    try {
+      // capturePane returns "" (no marker) for the whole poll window — the
+      // exact claude-mock.sh pane shape from the real-tmux E2E repro.
+      await manager.resumeSession(makeConfig(projectDir), THREAD_ID, VALID_ID, projectDir);
+
+      expect(warnSpy).toHaveBeenCalledTimes(1);
+      expect(String(warnSpy.mock.calls[0]?.[0])).toContain("never appeared");
+      // The false-positive shape of the bug: still reports success despite the
+      // marker never appearing.
+      expect(manager.has(THREAD_ID)).toBe(true);
+    } finally {
+      warnSpy.mockRestore();
+    }
+  });
+
+  test("PR #484: does not warn when the ready marker eventually appears (no false alarm)", async () => {
+    manager = new SessionManager({
+      effects,
+      gracefulKillTimeoutMs: 0,
+      resumePromptPollAttempts: 3,
+      resumePromptPollIntervalMs: 5,
+    });
+    effects.tmux.setPaneContent(
+      tmuxName,
+      "❯ \n  ⏵⏵ bypass permissions on (shift+tab to cycle)"
+    );
+    const warnSpy = spyOn(console, "warn").mockImplementation(() => {});
+    try {
+      await manager.resumeSession(makeConfig(projectDir), THREAD_ID, VALID_ID, projectDir);
+      expect(warnSpy).not.toHaveBeenCalled();
+    } finally {
+      warnSpy.mockRestore();
+    }
+  });
+
+  test("PR #484: logs a heartbeat during a long wait instead of total silence", async () => {
+    manager = new SessionManager({
+      effects,
+      gracefulKillTimeoutMs: 0,
+      // Attempts must exceed RESUME_PROMPT_POLL_LOG_EVERY_N (15) to observe a
+      // heartbeat before exhaustion.
+      resumePromptPollAttempts: 20,
+      resumePromptPollIntervalMs: 1,
+    });
+    const logSpy = spyOn(console, "log").mockImplementation(() => {});
+    try {
+      // capturePane returns "" the whole time (no marker) — exercises the
+      // heartbeat path on the way to exhaustion.
+      await manager.resumeSession(makeConfig(projectDir), THREAD_ID, VALID_ID, projectDir);
+
+      const heartbeats = logSpy.mock.calls.filter((c) =>
+        String(c[0]).includes("Still waiting for resume prompt")
+      );
+      expect(heartbeats.length).toBeGreaterThanOrEqual(1);
+    } finally {
+      logSpy.mockRestore();
+    }
   });
 
   test("exits early without keys when the ready marker appears (no picker, #163)", async () => {

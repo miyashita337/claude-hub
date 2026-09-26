@@ -778,6 +778,25 @@ async function handleResume(
     });
     createdThread = thread;
 
+    // PR #484 review: a large/compacted session's resume prompt can take up
+    // to ~5 minutes to render (Issue #163), during which resumeSession() below
+    // produces no observable signal to Discord at all — leaving the
+    // interaction on Discord's own "考え中" placeholder with nothing to show
+    // it isn't stuck. Replace it with an accurate interim status pointing at
+    // the (already-created) thread instead of leaving that ambiguous for
+    // minutes. Best-effort: a failure here is purely cosmetic and must not
+    // abort the resume itself.
+    try {
+      await interaction.editReply({
+        content: `⏳ セッションを復帰しています → ${thread}\n（会話履歴が大きい場合、数分かかることがあります）`,
+      });
+    } catch (err) {
+      console.error(
+        `[Session] resume interim status update failed for thread ${thread.id}:`,
+        err
+      );
+    }
+
     // Resume in the directory the original session ran in (row.project_dir),
     // not a worktree — `claude --resume` keys the transcript by cwd. Awaited so
     // the resume prompt is confirmed before the welcome message is posted.

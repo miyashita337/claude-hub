@@ -483,13 +483,19 @@ jobs:
       # session tests above. The env below is what makes the suite ACTUALLY run
       # (it self-skips without both vars). Test-only socket `claude-hub-test`
       # keeps it isolated from any prod `claude-hub` server (RW-019).
+      #
+      # session-resume-lifecycle.test.ts (PR #484 review, 2nd Discord E2E FAIL)
+      # joins this same step: it uses the identical real-tmux + claude-mock.sh
+      # harness (no mock.module, so no cross-file collision with the file
+      # above) to decisively reproduce and pin the fix for the `/session
+      # resume` silent-stall bug (confirmResumePromptIfPresent, manager.ts).
       - name: Run session lifecycle E2E
         env:
           SUPERVISOR_DB_PATH: ":memory:"
           TMUX_PATH: /usr/bin/tmux
           SUPERVISOR_TMUX_SOCKET: claude-hub-test
           SUPERVISOR_CLAUDE_PATH: ${{ github.workspace }}/supervisor/tests/e2e/fixtures/claude-mock.sh
-        run: bun test tests/e2e/session-lifecycle.test.ts
+        run: bun test tests/e2e/session-lifecycle.test.ts tests/e2e/session-resume-lifecycle.test.ts
         working-directory: supervisor
 
   # Not-gated tests: see the EXCLUSIONS list in

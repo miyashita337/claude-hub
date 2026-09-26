@@ -160,6 +160,28 @@ const RESUME_READY_RE = /bypass permissions|\? for shortcuts/i;
 const RESUME_PROMPT_POLL_ATTEMPTS = 300;
 
 /**
+ * PR #484 review (2nd Discord E2E FAIL, 2026-09-27): `/session resume` on a
+ * hub-work session created its thread, then left the Discord interaction at
+ * "考え中" for 90+ seconds with ZERO console output and no sessions.db row.
+ * Decisively reproduced with real tmux + the existing `claude-mock.sh` E2E
+ * fixture (`tests/e2e/session-resume-lifecycle.test.ts`): when the pane never
+ * matches {@link RESUME_PROMPT_RE} or {@link RESUME_READY_RE} — which is
+ * exactly what an unresponsive/broken resumed claude process looks like —
+ * {@link SessionManager.confirmResumePromptIfPresent} silently consumes the
+ * ENTIRE poll window (up to 5 minutes at production defaults, Issue #163)
+ * before finally registering the session as "resumed" anyway. Not a git/tmux
+ * timeout bug (the git-recovery path, worktree.ts, isn't even reached when the
+ * recorded projectDir still exists on disk — confirmed against the real
+ * sessions.db row for this incident). This constant governs a periodic
+ * heartbeat log during that wait so a long-but-legitimate resume (the
+ * documented ~4min/239k-token case) is at least OBSERVABLE, and a full
+ * exhaustion (the picker/ready marker NEVER appearing — always anomalous,
+ * since a legitimate resume returns early via one of the two markers) is
+ * logged loudly instead of silently.
+ */
+const RESUME_PROMPT_POLL_LOG_EVERY_N = 15;
+
+/**
  * Input-ready marker for a freshly STARTED session's Ink TUI (same prompt
  * markers as {@link RESUME_READY_RE}; a `--dangerously-skip-permissions` session
  * shows the "bypass permissions" banner + "? for shortcuts" hint once it can
@@ -1749,8 +1771,32 @@ export class SessionManager {
       if (RESUME_READY_RE.test(pane)) {
         return;
       }
+      // PR #484 review: a heartbeat every N attempts so a long-but-legitimate
+      // wait (large compacted sessions, Issue #163) is visible in the logs
+      // instead of total silence for up to 5 minutes. `i > 0` skips a log on
+      // the very first (near-instant) attempt.
+      if (i > 0 && i % RESUME_PROMPT_POLL_LOG_EVERY_N === 0) {
+        console.log(
+          `[SessionManager] Still waiting for resume prompt/ready marker on ${tmuxName} ` +
+            `(attempt ${i}/${this.resumePromptPollAttempts})`
+        );
+      }
       await new Promise((resolve) =>
         setTimeout(resolve, this.resumePromptPollIntervalMs)
+      );
+    }
+    // PR #484 review: neither marker EVER appeared — always anomalous (a
+    // legitimate resume, however slow, returns early via one of the two
+    // regexes above). Previously this fell through in total silence and the
+    // session was still registered as "resumed" (a false positive). Warn
+    // loudly so a stuck/broken resume is diagnosable instead of a `/session
+    // status` reporting "稼働中" over a session that never actually became
+    // interactive.
+    if (this.resumePromptPollAttempts > 0) {
+      console.warn(
+        `[SessionManager] Resume prompt/ready marker never appeared on ${tmuxName} ` +
+          `after ${this.resumePromptPollAttempts} attempts; proceeding anyway ` +
+          `(the resumed pane may be in an unexpected state)`
       );
     }
   }
