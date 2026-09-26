@@ -14,6 +14,7 @@ import {
   buildClaudeFlags,
   isValidModelId,
   AUTO_COMPACT_INTENT,
+  relayUrlFilePath,
 } from "../../src/session/manager";
 import {
   createFakeEffects,
@@ -95,6 +96,44 @@ describe("SessionManager (thread-based)", () => {
     const cmd = effects.tmux.getCommand(tmuxName)!;
     expect(cmd).toContain(`--session-id ${session.claudeSessionId}`);
     expect(cmd).not.toContain("--resume");
+  });
+
+  test("two sessions sharing a projectDir get independent relay-url files, keyed by claudeSessionId (#149/#150)", async () => {
+    // Regression: two Discord threads pointed at the SAME projectDir (one
+    // repo, several logical threads — a very common setup) used to collide
+    // on a single relay-url file keyed by projectDir. The second session's
+    // write silently overwrote the first's, so the first thread's
+    // PostToolUse/AskUserQuestion hooks POSTed to the second thread's Discord
+    // channel (Issue #149/#150).
+    // Distinct in the first 12 chars (tmuxSessionName truncates threadId to
+    // 12 chars) so the fake tmux adapter tracks them as separate sessions.
+    const threadA = "thread-A-149";
+    const threadB = "thread-B-150";
+
+    const sessionA = await manager.start(primaryConfig, threadA);
+    const sessionB = await manager.start(primaryConfig, threadB);
+
+    // Precondition: both sessions really do share one projectDir.
+    expect(sessionA.projectDir).toBe(sessionB.projectDir);
+    expect(sessionA.claudeSessionId).not.toBe(sessionB.claudeSessionId);
+
+    const cmdA = effects.tmux.getCommand(`claude-${threadA.slice(0, 12)}`)!;
+    const cmdB = effects.tmux.getCommand(`claude-${threadB.slice(0, 12)}`)!;
+
+    const fileA = relayUrlFilePath(sessionA.claudeSessionId!);
+    const fileB = relayUrlFilePath(sessionB.claudeSessionId!);
+
+    // Each session's tmux command writes to its OWN file.
+    expect(fileA).not.toBe(fileB);
+    expect(cmdA).toContain(`> "${fileA}"`);
+    expect(cmdB).toContain(`> "${fileB}"`);
+
+    // Regression guard: the pre-fix key (projectDir) must not appear as the
+    // write target — if it did, both commands would target the same file
+    // again despite the two independent session ids.
+    const projectDirKeyedFile = relayUrlFilePath(sessionA.projectDir);
+    expect(cmdA).not.toContain(`> "${projectDirKeyedFile}"`);
+    expect(cmdB).not.toContain(`> "${projectDirKeyedFile}"`);
   });
 
   test("has() checks by threadId", async () => {

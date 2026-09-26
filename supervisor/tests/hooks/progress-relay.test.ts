@@ -7,21 +7,25 @@ import { tmpdir } from "os";
 
 const HOOK_PATH = resolve(import.meta.dir, "../../hooks/progress-relay.sh");
 
+const DEFAULT_SESSION_ID = "sess-default";
+
 /**
- * Helper: create a temp dir with .supervisor-relay-url and a mock curl script.
+ * Helper: create a temp dir with a relay-url file (fallback path, keyed by
+ * `sessionId` — Issue #149/#150, NOT cwd) and a mock curl script.
  * Returns { dir, curlArgsFile, mockBinDir } for assertions.
  */
-function setupTestEnv(relayUrl: string) {
+function setupTestEnv(relayUrl: string, sessionId: string = DEFAULT_SESSION_ID) {
   const dir = mkdtempSync(resolve(tmpdir(), "progress-relay-test-"));
 
-  // Issue #88: relay URL file lives in $XDG_RUNTIME_DIR/claude-hub-supervisor/
-  // keyed by sanitised cwd, NOT inside the project dir.
+  // Issue #88: relay URL file lives in $XDG_RUNTIME_DIR/claude-hub-supervisor/.
+  // Issue #149/#150: keyed by the session's claudeSessionId, NOT the project
+  // cwd — two sessions sharing a cwd must not collide on one file.
   const runtimeDir = mkdtempSync(resolve(tmpdir(), "progress-relay-runtime-"));
-  const sanitisedCwd = dir.replace(/^\/+/, "").replace(/\//g, "_");
+  const sanitisedSessionId = sessionId.replace(/^\/+/, "").replace(/[^A-Za-z0-9._-]/g, "_");
   const relayDir = resolve(runtimeDir, "claude-hub-supervisor");
   mkdirSync(relayDir, { recursive: true });
   writeFileSync(
-    resolve(relayDir, `${sanitisedCwd}.relay-url`),
+    resolve(relayDir, `${sanitisedSessionId}.relay-url`),
     relayUrl,
     "utf8",
   );
@@ -55,8 +59,16 @@ function cleanup(env: ReturnType<typeof setupTestEnv>) {
   rmSync(env.runtimeDir, { recursive: true, force: true });
 }
 
-function makeInput(toolName: string, toolInput: Record<string, unknown>, cwd: string): string {
-  return JSON.stringify({ tool_name: toolName, tool_input: toolInput, cwd });
+function makeInput(
+  toolName: string,
+  toolInput: Record<string, unknown>,
+  sessionId: string = DEFAULT_SESSION_ID,
+): string {
+  return JSON.stringify({
+    tool_name: toolName,
+    tool_input: toolInput,
+    session_id: sessionId,
+  });
 }
 
 // ---------------------------------------------------------------------------
@@ -74,9 +86,11 @@ describe("progress-relay.sh URL replacement", () => {
   });
 
   test("PROGRESS_URL has no backslash-escaped slashes", async () => {
-    const input = makeInput("Bash", { command: "echo test" }, env.dir);
+    const input = makeInput("Bash", { command: "echo test" });
 
-    await $`echo ${input} | PATH=${env.mockBinDir}:$PATH XDG_RUNTIME_DIR=${env.runtimeDir} bash ${HOOK_PATH}`
+    // SUPERVISOR_RELAY_URL= (empty) forces the file-fallback path so this
+    // test exercises the same file this env writes.
+    await $`echo ${input} | SUPERVISOR_RELAY_URL= PATH=${env.mockBinDir}:$PATH XDG_RUNTIME_DIR=${env.runtimeDir} bash ${HOOK_PATH}`
       .quiet()
       .nothrow();
 
@@ -120,13 +134,16 @@ describe("manager.ts relay URL write", () => {
     expect(managerSource).not.toMatch(/writeFileSync\(relayUrlFile/);
   });
 
-  test("relayUrlFilePath sanitises cwd and falls back to /tmp/claude-hub-supervisor-<USER> when XDG unset", async () => {
+  test("relayUrlFilePath sanitises the session-id key and falls back to /tmp/claude-hub-supervisor-<USER> when XDG unset", async () => {
     const originalXdg = process.env.XDG_RUNTIME_DIR;
     const originalUser = process.env.USER;
     delete process.env.XDG_RUNTIME_DIR;
     process.env.USER = "alice";
     try {
       const { relayUrlFilePath } = await import("../../src/session/manager");
+      // relayUrlFilePath is a generic sanitiser (Issue #149/#150: callers now
+      // pass claudeSessionId, but the function itself just sanitises whatever
+      // string it is given).
       expect(relayUrlFilePath("/Users/x/team_salary")).toBe(
         "/tmp/claude-hub-supervisor-alice/Users_x_team_salary.relay-url"
       );
@@ -192,9 +209,10 @@ describe("progress-relay.sh tool message extraction", () => {
     toolName: string,
     toolInput: Record<string, unknown>
   ): Promise<{ tool: string; message: string } | null> {
-    const input = makeInput(toolName, toolInput, env.dir);
+    const input = makeInput(toolName, toolInput);
 
-    await $`echo ${input} | PATH=${env.mockBinDir}:$PATH XDG_RUNTIME_DIR=${env.runtimeDir} bash ${HOOK_PATH}`
+    // SUPERVISOR_RELAY_URL= (empty) forces the file-fallback path.
+    await $`echo ${input} | SUPERVISOR_RELAY_URL= PATH=${env.mockBinDir}:$PATH XDG_RUNTIME_DIR=${env.runtimeDir} bash ${HOOK_PATH}`
       .quiet()
       .nothrow();
 
@@ -250,6 +268,125 @@ describe("progress-relay.sh tool message extraction", () => {
     expect(result).not.toBeNull();
     expect(result!.tool).toBe("Unknown");
     expect(result!.message).toBe("(実行完了)");
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Test 3b (Issue #149/#150): $SUPERVISOR_RELAY_URL env var takes priority
+// over the relay-url file, and is used even when no file exists at all.
+// ---------------------------------------------------------------------------
+describe("progress-relay.sh SUPERVISOR_RELAY_URL env priority (#149/#150)", () => {
+  test("env var is used directly when set, without touching any file", async () => {
+    const dir = mkdtempSync(resolve(tmpdir(), "progress-relay-env-test-"));
+    const runtimeDir = mkdtempSync(resolve(tmpdir(), "progress-relay-env-runtime-"));
+    const mockBinDir = resolve(dir, "mock-bin");
+    mkdirSync(mockBinDir, { recursive: true });
+    const curlArgsFile = resolve(dir, "curl-args.txt");
+    writeFileSync(
+      resolve(mockBinDir, "curl"),
+      `#!/bin/bash\necho "$@" > "${curlArgsFile}"\n`,
+      { mode: 0o755 },
+    );
+    try {
+      // No relay-url file is written anywhere under runtimeDir — env alone
+      // must be enough.
+      const input = makeInput("Bash", { command: "echo test" }, "sess-env-only");
+      await $`echo ${input} | SUPERVISOR_RELAY_URL="http://localhost:9/relay/thread-env" PATH=${mockBinDir}:$PATH XDG_RUNTIME_DIR=${runtimeDir} bash ${HOOK_PATH}`
+        .quiet()
+        .nothrow();
+
+      const curlArgs = readFileSync(curlArgsFile, "utf8");
+      expect(curlArgs).toContain("http://localhost:9/progress/thread-env");
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+      rmSync(runtimeDir, { recursive: true, force: true });
+    }
+  });
+
+  test("env var wins over a stale/conflicting relay-url file for the same session", async () => {
+    const env = setupTestEnv(
+      "http://localhost:9/relay/thread-from-file",
+      "sess-conflict",
+    );
+    try {
+      const input = makeInput("Bash", { command: "echo test" }, "sess-conflict");
+      await $`echo ${input} | SUPERVISOR_RELAY_URL="http://localhost:9/relay/thread-from-env" PATH=${env.mockBinDir}:$PATH XDG_RUNTIME_DIR=${env.runtimeDir} bash ${HOOK_PATH}`
+        .quiet()
+        .nothrow();
+
+      const curlArgs = readFileSync(env.curlArgsFile, "utf8");
+      expect(curlArgs).toContain("http://localhost:9/progress/thread-from-env");
+      expect(curlArgs).not.toContain("thread-from-file");
+    } finally {
+      cleanup(env);
+    }
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Test 3c (Issue #149/#150 regression): two concurrent sessions sharing the
+// SAME cwd must route to their own Discord thread, not the last-started
+// one's. This is the exact bug reported in #149/#150 — the file used to be
+// keyed by cwd, so the second session's write silently clobbered the first's.
+// ---------------------------------------------------------------------------
+describe("progress-relay.sh concurrent sessions with the same cwd (#149/#150)", () => {
+  test("each session's relay-url file (keyed by session_id) routes independently", async () => {
+    const dir = mkdtempSync(resolve(tmpdir(), "progress-relay-multi-test-"));
+    const runtimeDir = mkdtempSync(resolve(tmpdir(), "progress-relay-multi-runtime-"));
+    const relayDir = resolve(runtimeDir, "claude-hub-supervisor");
+    mkdirSync(relayDir, { recursive: true });
+    // Two DIFFERENT sessions, both happen to run in the same project cwd —
+    // exactly the setup described in #149/#150 (one repo, two Discord threads).
+    writeFileSync(
+      resolve(relayDir, "session-aaa.relay-url"),
+      "http://localhost:9/relay/thread-A",
+      "utf8",
+    );
+    writeFileSync(
+      resolve(relayDir, "session-bbb.relay-url"),
+      "http://localhost:9/relay/thread-B",
+      "utf8",
+    );
+
+    const mockBinDir = resolve(dir, "mock-bin");
+    mkdirSync(mockBinDir, { recursive: true });
+    const curlArgsFileA = resolve(dir, "curl-args-a.txt");
+    const curlArgsFileB = resolve(dir, "curl-args-b.txt");
+    // Route args to a different file depending on which thread was targeted,
+    // so both invocations can be asserted independently even though they
+    // share one mock curl binary.
+    writeFileSync(
+      resolve(mockBinDir, "curl"),
+      `#!/bin/bash
+for arg in "$@"; do
+  case "$arg" in
+    */progress/thread-A) echo "$@" >> "${curlArgsFileA}" ;;
+    */progress/thread-B) echo "$@" >> "${curlArgsFileB}" ;;
+  esac
+done
+`,
+      { mode: 0o755 },
+    );
+
+    try {
+      const inputA = makeInput("Bash", { command: "echo from-A" }, "session-aaa");
+      const inputB = makeInput("Bash", { command: "echo from-B" }, "session-bbb");
+
+      await $`echo ${inputA} | SUPERVISOR_RELAY_URL= PATH=${mockBinDir}:$PATH XDG_RUNTIME_DIR=${runtimeDir} bash ${HOOK_PATH}`
+        .quiet()
+        .nothrow();
+      await $`echo ${inputB} | SUPERVISOR_RELAY_URL= PATH=${mockBinDir}:$PATH XDG_RUNTIME_DIR=${runtimeDir} bash ${HOOK_PATH}`
+        .quiet()
+        .nothrow();
+
+      // Regression check: session A's progress must have gone to thread A
+      // ONLY, and session B's to thread B only — never cross-routed.
+      expect(readFileSync(curlArgsFileA, "utf8")).toContain("thread-A");
+      expect(readFileSync(curlArgsFileB, "utf8")).toContain("thread-B");
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+      rmSync(runtimeDir, { recursive: true, force: true });
+    }
   });
 });
 

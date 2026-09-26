@@ -27,20 +27,28 @@ interface TestEnv {
   curlStdinFile: string;
 }
 
+const DEFAULT_SESSION_ID = "sess-default";
+
 function setupTestEnv(opts: {
   relayUrl?: string;
   curlOutput?: string;
   curlExit?: number;
+  sessionId?: string;
 }): TestEnv {
   const dir = mkdtempSync(resolve(tmpdir(), "ask-user-relay-test-"));
   const runtimeDir = mkdtempSync(resolve(tmpdir(), "ask-user-relay-runtime-"));
 
   if (opts.relayUrl !== undefined) {
-    const sanitisedCwd = dir.replace(/^\/+/, "").replace(/\//g, "_");
+    // Issue #149/#150: keyed by session_id, NOT cwd — two sessions sharing a
+    // cwd must not collide on one file.
+    const sessionId = opts.sessionId ?? DEFAULT_SESSION_ID;
+    const sanitisedSessionId = sessionId
+      .replace(/^\/+/, "")
+      .replace(/[^A-Za-z0-9._-]/g, "_");
     const relayDir = resolve(runtimeDir, "claude-hub-supervisor");
     mkdirSync(relayDir, { recursive: true });
     writeFileSync(
-      resolve(relayDir, `${sanitisedCwd}.relay-url`),
+      resolve(relayDir, `${sanitisedSessionId}.relay-url`),
       opts.relayUrl,
       "utf8",
     );
@@ -80,11 +88,14 @@ function cleanup(env: TestEnv) {
   rmSync(env.runtimeDir, { recursive: true, force: true });
 }
 
-function makeInput(toolInput: Record<string, unknown>, cwd: string): string {
+function makeInput(
+  toolInput: Record<string, unknown>,
+  sessionId: string = DEFAULT_SESSION_ID,
+): string {
   return JSON.stringify({
     tool_name: "AskUserQuestion",
     tool_input: toolInput,
-    cwd,
+    session_id: sessionId,
   });
 }
 
@@ -115,7 +126,10 @@ async function runHook(
   env: TestEnv,
   input: string,
 ): Promise<{ stdout: string; stderr: string; exitCode: number | null }> {
-  const result = await $`echo ${input} | PATH=${env.mockBinDir}:$PATH XDG_RUNTIME_DIR=${env.runtimeDir} bash ${HOOK_PATH}`
+  // SUPERVISOR_RELAY_URL= (empty) forces the file-fallback path so these
+  // tests exercise the file this env writes (env-priority is covered by its
+  // own describe block below).
+  const result = await $`echo ${input} | SUPERVISOR_RELAY_URL= PATH=${env.mockBinDir}:$PATH XDG_RUNTIME_DIR=${env.runtimeDir} bash ${HOOK_PATH}`
     .quiet()
     .nothrow();
   return {
@@ -138,7 +152,7 @@ describe("ask-user-relay.sh — supervisor session active", () => {
   afterEach(() => cleanup(env));
 
   test("forwards question + options to /ask/ and emits deny envelope carrying the user's reply", async () => {
-    const input = makeInput(singleQuestionInput(), env.dir);
+    const input = makeInput(singleQuestionInput());
 
     const { stdout, exitCode } = await runHook(env, input);
     expect(exitCode).toBe(0);
@@ -181,7 +195,6 @@ describe("ask-user-relay.sh — supervisor session active", () => {
           { question: "Q2 はどうしますか？", header: "Q2", multiSelect: true, options: [{ label: "b", description: "d2" }] },
         ],
       },
-      env.dir,
     );
 
     const { exitCode } = await runHook(env, input);
@@ -210,7 +223,6 @@ describe("ask-user-relay.sh — supervisor session active", () => {
           { question: "Q2 は自由記述です", header: "Q2", multiSelect: false, options: [] },
         ],
       },
-      env.dir,
     );
 
     const { exitCode } = await runHook(env, input);
@@ -241,7 +253,7 @@ describe("ask-user-relay.sh — URL derivation safety", () => {
       curlOutput: '{"answer":"ok"}',
     });
     try {
-      const input = makeInput(singleQuestionInput(), env.dir);
+      const input = makeInput(singleQuestionInput());
       await runHook(env, input);
       const curlArgs = readFileSync(env.curlArgsFile, "utf8");
       expect(curlArgs).toContain(
@@ -259,7 +271,7 @@ describe("ask-user-relay.sh — URL derivation safety", () => {
       curlOutput: '{"answer":"ok"}',
     });
     try {
-      const input = makeInput(singleQuestionInput(), env.dir);
+      const input = makeInput(singleQuestionInput());
       await runHook(env, input);
       const curlArgs = readFileSync(env.curlArgsFile, "utf8");
       expect(curlArgs).toContain(
@@ -275,7 +287,7 @@ describe("ask-user-relay.sh — fallback / safety", () => {
   test("no relay-url file: hook is a no-op (empty stdout, exit 0)", async () => {
     const env = setupTestEnv({}); // no relayUrl written
     try {
-      const input = makeInput(singleQuestionInput(), env.dir);
+      const input = makeInput(singleQuestionInput());
       const { stdout, exitCode } = await runHook(env, input);
       // AC-3 / Journey-AC #3: hook must produce no stdout when not in a
       // supervisor session — Claude proceeds with original tool_input.
@@ -292,7 +304,7 @@ describe("ask-user-relay.sh — fallback / safety", () => {
       curlOutput: '{"answer":"x"}',
     });
     try {
-      const input = makeInput({}, env.dir);
+      const input = makeInput({});
       const { stdout, exitCode } = await runHook(env, input);
       expect(stdout.trim()).toBe("");
       expect(exitCode).toBe(0);
@@ -309,7 +321,7 @@ describe("ask-user-relay.sh — fallback / safety", () => {
       curlOutput: '{"answer":"x"}',
     });
     try {
-      const input = makeInput({ question: "hi" }, env.dir);
+      const input = makeInput({ question: "hi" });
       const { stdout, exitCode } = await runHook(env, input);
       expect(stdout.trim()).toBe("");
       expect(exitCode).toBe(0);
@@ -324,7 +336,7 @@ describe("ask-user-relay.sh — fallback / safety", () => {
       curlOutput: '{"error":"ask timeout"}',
     });
     try {
-      const input = makeInput(singleQuestionInput(), env.dir);
+      const input = makeInput(singleQuestionInput());
       const { stdout, exitCode } = await runHook(env, input);
       expect(stdout.trim()).toBe("");
       expect(exitCode).toBe(0);
@@ -340,7 +352,7 @@ describe("ask-user-relay.sh — fallback / safety", () => {
       curlExit: 7, // CURLE_COULDNT_CONNECT
     });
     try {
-      const input = makeInput(singleQuestionInput(), env.dir);
+      const input = makeInput(singleQuestionInput());
       const { stdout, exitCode } = await runHook(env, input);
       expect(stdout.trim()).toBe("");
       expect(exitCode).toBe(0);
@@ -349,7 +361,7 @@ describe("ask-user-relay.sh — fallback / safety", () => {
     }
   });
 
-  test("missing cwd in hook JSON: hook exits 0 silently", async () => {
+  test("no SUPERVISOR_RELAY_URL and missing session_id in hook JSON: hook exits 0 silently", async () => {
     const env = setupTestEnv({
       relayUrl: "http://localhost:12345/relay/t",
       curlOutput: '{"answer":"x"}',
@@ -358,13 +370,86 @@ describe("ask-user-relay.sh — fallback / safety", () => {
       const input = JSON.stringify({
         tool_name: "AskUserQuestion",
         tool_input: singleQuestionInput(),
-        // no `cwd`
+        // no `session_id` — with SUPERVISOR_RELAY_URL also empty (runHook
+        // forces this), the hook has no way to find a relay URL at all.
       });
       const { stdout, exitCode } = await runHook(env, input);
       expect(stdout.trim()).toBe("");
       expect(exitCode).toBe(0);
     } finally {
       cleanup(env);
+    }
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Issue #149/#150: $SUPERVISOR_RELAY_URL env var takes priority over the
+// relay-url file, and the file fallback is keyed by session_id — NOT cwd, so
+// two sessions sharing a projectDir never collide on one file.
+// ---------------------------------------------------------------------------
+describe("ask-user-relay.sh SUPERVISOR_RELAY_URL env priority / per-session keying (#149/#150)", () => {
+  test("env var is used directly when set, without touching any file", async () => {
+    const env = setupTestEnv({}); // no relay-url file written anywhere
+    try {
+      const input = makeInput(singleQuestionInput());
+      const result = await $`echo ${input} | SUPERVISOR_RELAY_URL="http://localhost:12345/relay/thread-env" PATH=${env.mockBinDir}:$PATH XDG_RUNTIME_DIR=${env.runtimeDir} bash ${HOOK_PATH}`
+        .quiet()
+        .nothrow();
+      // The mock curl in setupTestEnv({}) has no configured curlOutput, so it
+      // returns empty — the hook falls back to TUI (empty stdout) but MUST
+      // still have reached curl with the env-derived /ask/ URL.
+      expect(result.exitCode).toBe(0);
+      const curlArgs = readFileSync(env.curlArgsFile, "utf8");
+      expect(curlArgs).toContain("http://localhost:12345/ask/thread-env");
+    } finally {
+      cleanup(env);
+    }
+  });
+
+  test("two sessions sharing a cwd get independent relay files, keyed by session_id", async () => {
+    const runtimeDir = mkdtempSync(resolve(tmpdir(), "ask-user-relay-multi-runtime-"));
+    const relayDir = resolve(runtimeDir, "claude-hub-supervisor");
+    mkdirSync(relayDir, { recursive: true });
+    // Both sessions ran (or would run) in the exact same projectDir — the
+    // precondition for #149/#150 — but are keyed by their own session_id.
+    writeFileSync(
+      resolve(relayDir, "session-aaa.relay-url"),
+      "http://localhost:12345/relay/thread-A",
+      "utf8",
+    );
+    writeFileSync(
+      resolve(relayDir, "session-bbb.relay-url"),
+      "http://localhost:12345/relay/thread-B",
+      "utf8",
+    );
+
+    const dir = mkdtempSync(resolve(tmpdir(), "ask-user-relay-multi-test-"));
+    const mockBinDir = resolve(dir, "mock-bin");
+    mkdirSync(mockBinDir, { recursive: true });
+    const curlArgsFile = resolve(dir, "curl-args.txt");
+    writeFileSync(
+      resolve(mockBinDir, "curl"),
+      `#!/bin/bash\necho "$@" >> "${curlArgsFile}"\nprintf '{"answer":"ok"}'\n`,
+      { mode: 0o755 },
+    );
+
+    try {
+      const inputA = makeInput(singleQuestionInput(), "session-aaa");
+      const inputB = makeInput(singleQuestionInput(), "session-bbb");
+
+      await $`echo ${inputA} | SUPERVISOR_RELAY_URL= PATH=${mockBinDir}:$PATH XDG_RUNTIME_DIR=${runtimeDir} bash ${HOOK_PATH}`
+        .quiet()
+        .nothrow();
+      await $`echo ${inputB} | SUPERVISOR_RELAY_URL= PATH=${mockBinDir}:$PATH XDG_RUNTIME_DIR=${runtimeDir} bash ${HOOK_PATH}`
+        .quiet()
+        .nothrow();
+
+      const curlArgs = readFileSync(curlArgsFile, "utf8");
+      expect(curlArgs).toContain("http://localhost:12345/ask/thread-A");
+      expect(curlArgs).toContain("http://localhost:12345/ask/thread-B");
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+      rmSync(runtimeDir, { recursive: true, force: true });
     }
   });
 });
