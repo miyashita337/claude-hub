@@ -294,7 +294,8 @@ export function buildBriefDecisionMessages(
 /** 未決 0 件のときの 1 行報告（ボタンなし）。 */
 export function buildAllDecidedMessage(date: string, total: number): string {
   return total > 0
-    ? `✅ 朝レポ（${date}）の提案 ${total} 件はすべて決裁済みです（未決 0 件）。`
+    ? `✅ 朝レポ（${date}）の提案 ${total} 件はすべて決裁済みです（未決 0 件）。` +
+      "決裁を変える場合は `cd ~/corp && npm run secretary -- decide-proposal <提案ID> <approved|rejected|deferred>` を実行してください。"
     : `ℹ️ 朝レポ（${date}）に CEO 提案はありません。`;
 }
 
@@ -408,9 +409,11 @@ export async function runBriefDecideFlow(
     return false;
   }
 
-  // #132: 決裁済みも押し直せるようボタン化するため、「ボタンを出さない」のは
-  // ボタン化できる提案が 1 件も無いときだけ（提案 0 件 / 全件 id 不正）。
-  if (proposals.proposals.length === 0 && proposals.skipped === 0) {
+  // 未決が 1 件も無ければボタンを出さず 1 行で報告する（#468）。押せない灰色ボタン
+  // （現在の決裁と同じボタンは disabled）だけが並ぶと、押すべきものがあるように見えるため。
+  // 未決が 1 件でもあれば従来どおり決裁済みも含めてボタン化し押し直せる（#132 / #458）。
+  // id 不正で落とした提案（skipped）があるときは下の経路でその旨を出す（黙って消さない）。
+  if (proposals.pendingCount === 0 && proposals.skipped === 0) {
     await input.postToChannel(
       buildAllDecidedMessage(input.date, proposals.total),
     );

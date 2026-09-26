@@ -400,10 +400,29 @@ describe("runBriefDecideFlow", () => {
     expect(capture.notifications.length).toBe(0);
   });
 
-  test("未決 0 件でも決裁済みがあればボタンを出す（押し直せる・#132）", async () => {
+  test("未決 0 件（全件決裁済み）ならボタンを出さず「すべて決裁済み」1 行のみ（#468）", async () => {
     const { capture, input } = flowDeps({
       code: 0,
-      stdout: proposalsJson([{ id: "a-1", title: "A", decision: "approved" }]),
+      stdout: proposalsJson([
+        { id: "a-1", title: "A", decision: "approved" },
+        { id: "a-2", title: "B", decision: "rejected" },
+      ]),
+      stderr: "",
+    });
+    await expect(runBriefDecideFlow(input)).resolves.toBe(true);
+    expect(capture.decisionPosts).toBe(0);
+    const text = capture.channelPosts.join("\n");
+    expect(text).toContain("提案 2 件はすべて決裁済み");
+    expect(text).toContain("decide-proposal");
+  });
+
+  test("未決が 1 件でもあれば決裁済みも含めてボタンを出す（押し直せる・#132）", async () => {
+    const { capture, input } = flowDeps({
+      code: 0,
+      stdout: proposalsJson([
+        { id: "a-1", title: "A", decision: "approved" },
+        { id: "a-2", title: "B", decision: null },
+      ]),
       stderr: "",
     });
     await expect(runBriefDecideFlow(input)).resolves.toBe(true);
