@@ -1,4 +1,7 @@
-import { test, expect, describe } from "bun:test";
+import { test, expect, describe, beforeEach, afterEach } from "bun:test";
+import { mkdtempSync, writeFileSync, rmSync } from "fs";
+import { join } from "path";
+import { tmpdir } from "os";
 import { ButtonStyle } from "discord.js";
 import { CompactInFlightError } from "../../src/session/manager";
 import {
@@ -16,7 +19,16 @@ import {
  * the real handler without a Discord gateway. What matters here is that the
  * button reaches the *same* compact path as `/session compact` (so the two can't
  * drift) and that a stale button on a dead thread never sends keys.
+ *
+ * Issue #366 (Devin review of #365): the button is exposed on non-ephemeral
+ * replies / thread notifications, so any user who can see the thread could
+ * click it. Every fixture now runs behind the same access.json `allowFrom`
+ * gate as `/session compact`, keyed on the parent channel (fail-closed).
  */
+
+const PARENT_CHANNEL_ID = "846209781206941736";
+const OWNER = "184695080709324800";
+const OUTSIDER = "999999999999999999";
 
 interface ReplyRecord {
   kind: "reply" | "editReply";
@@ -28,15 +40,24 @@ function makeInteraction(opts: {
   inThread?: boolean;
   hasSession?: boolean;
   compactImpl?: (threadId: string, intent: string) => unknown;
+  /** override the thread's parent channel id (default PARENT_CHANNEL_ID). */
+  parentId?: string | null;
+  /** invoking user id (default OWNER). */
+  userId?: string;
 }) {
   const replies: ReplyRecord[] = [];
   const compactCalls: { threadId: string; intent: string }[] = [];
 
   const inThread = opts.inThread ?? true;
-  const channel = { id: "thread-btn-1", isThread: () => inThread };
+  const channel = {
+    id: "thread-btn-1",
+    parentId: opts.parentId !== undefined ? opts.parentId : PARENT_CHANNEL_ID,
+    isThread: () => inThread,
+  };
 
   const interaction = {
     customId: COMPACT_BUTTON_ID,
+    user: { id: opts.userId ?? OWNER },
     channel,
     deferred: false,
     replied: false,
@@ -99,6 +120,30 @@ describe("compact button component (#364)", () => {
 });
 
 describe("compact button handler (#364)", () => {
+  let dir: string;
+  const prevAccess = process.env.SUPERVISOR_ACCESS_JSON_PATH;
+
+  beforeEach(() => {
+    dir = mkdtempSync(join(tmpdir(), "compact-button-access-"));
+    const path = join(dir, "access.json");
+    writeFileSync(
+      path,
+      JSON.stringify({
+        groups: {
+          [PARENT_CHANNEL_ID]: { requireMention: true, allowFrom: [OWNER] },
+        },
+      })
+    );
+    process.env.SUPERVISOR_ACCESS_JSON_PATH = path;
+  });
+
+  afterEach(() => {
+    if (prevAccess === undefined)
+      delete process.env.SUPERVISOR_ACCESS_JSON_PATH;
+    else process.env.SUPERVISOR_ACCESS_JSON_PATH = prevAccess;
+    rmSync(dir, { recursive: true, force: true });
+  });
+
   test("running session: compacts with the default intent, ephemeral ack (RW-032)", async () => {
     const fx = makeInteraction({});
     await fx.run();
@@ -162,5 +207,25 @@ describe("compact button handler (#364)", () => {
     // only console.error (diagnostics).
     expect(last?.content).not.toContain("tmux send-keys failed");
     expect(last?.content).toContain("/session status");
+  });
+
+  test("#366: a user outside allowFrom is refused, no send-keys", async () => {
+    const fx = makeInteraction({ userId: OUTSIDER });
+    await fx.run();
+
+    expect(fx.compactCalls).toHaveLength(0);
+    const deny = fx.replies.find((r) => r.kind === "reply");
+    expect(deny?.content).toContain("権限がありません");
+    expect(deny?.flags).toBe(64);
+  });
+
+  test("#366: fail-closed when access.json is missing", async () => {
+    rmSync(join(dir, "access.json"));
+    const fx = makeInteraction({});
+    await fx.run();
+
+    expect(fx.compactCalls).toHaveLength(0);
+    const deny = fx.replies.find((r) => r.kind === "reply");
+    expect(deny?.content).toContain("権限がありません");
   });
 });

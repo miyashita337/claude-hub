@@ -7,6 +7,7 @@ import {
 import { CompactInFlightError, type SessionManager } from "../session/manager";
 import { safeRespond } from "./safe-respond";
 import { sanitizedFailureNotice } from "../session/user-error-notice";
+import { evaluateAccess } from "../config/access-policy";
 
 /**
  * One-click compact button (Issue #364).
@@ -85,6 +86,27 @@ export function createCompactButtonHandler(sessionManager: SessionManager) {
       await interaction.reply({
         content:
           "ℹ️ compact は稼働中セッションのスレッド内でのみ実行できます。",
+        flags: 64,
+      });
+      return;
+    }
+
+    // Issue #366 (Devin review of #365): the button surfaces on a non-ephemeral
+    // reply / thread notification, so anyone who can see the thread can click
+    // it. Mirror the slash command's access.json `allowFrom` gate (fail-closed),
+    // keyed on the parent channel, checked before the has() lookup so a denied
+    // clicker learns nothing about whether a session exists here.
+    const decision = evaluateAccess({
+      channelKey: channel.parentId ?? channel.id,
+      userId: interaction.user.id,
+      isMention: true,
+    });
+    if (!decision.allowed) {
+      console.warn(
+        `[Session] compact button access denied (reason=${decision.reason}) in thread ${channel.id}`
+      );
+      await interaction.reply({
+        content: "❌ このスレッドのセッションを操作する権限がありません（アクセスポリシー）。",
         flags: 64,
       });
       return;

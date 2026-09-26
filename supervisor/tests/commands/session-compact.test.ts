@@ -1,4 +1,7 @@
-import { test, expect, describe, afterEach } from "bun:test";
+import { test, expect, describe, beforeEach, afterEach } from "bun:test";
+import { mkdtempSync, writeFileSync, rmSync } from "fs";
+import { join } from "path";
+import { tmpdir } from "os";
 import {
   createSessionHandler,
   DEFAULT_COMPACT_INTENT,
@@ -12,7 +15,17 @@ import {
  * records `has` lookups and `compactSession` calls so we can assert the
  * resolution branches, the never-bare-/compact contract (RW-032), and that no
  * keys are sent when there is no session to compact.
+ *
+ * Issue #366: `/session compact` sends keys into a running
+ * `--dangerously-skip-permissions` session exactly like `/session start` and
+ * `/session enter` do, so every fixture now runs behind an access.json
+ * `allowFrom` gate keyed on the parent channel (fail-closed).
  */
+
+const PARENT_CHANNEL_ID = "846209781206941736";
+const PRIMARY_CHANNEL_ID = "primary-chan-199";
+const OWNER = "184695080709324800";
+const OUTSIDER = "999999999999999999";
 
 interface ReplyRecord {
   kind: "reply" | "editReply";
@@ -30,6 +43,10 @@ function makeInteraction(opts: {
   compactImpl?: (threadId: string, intent: string) => unknown;
   /** override the channel id (default "thread-compact-1"). */
   channelId?: string;
+  /** override the thread's parent channel id (default PARENT_CHANNEL_ID when inThread). */
+  parentId?: string | null;
+  /** invoking user id (default OWNER). */
+  userId?: string;
   /** make compactPrimarySession reject, to exercise the error branch (#199 AC1). */
   primaryCompactImpl?: (intent: string) => unknown;
 }) {
@@ -41,10 +58,17 @@ function makeInteraction(opts: {
   const inThread = opts.inThread ?? true;
   const channel = {
     id: opts.channelId ?? "thread-compact-1",
+    parentId:
+      opts.parentId !== undefined
+        ? opts.parentId
+        : inThread
+          ? PARENT_CHANNEL_ID
+          : null,
     isThread: () => inThread,
   };
 
   const interaction = {
+    user: { id: opts.userId ?? OWNER },
     options: {
       getSubcommand: () => "compact",
       getString: (name: string) =>
@@ -93,6 +117,30 @@ function makeInteraction(opts: {
 }
 
 describe("/session compact (#200)", () => {
+  let dir: string;
+  const prevAccess = process.env.SUPERVISOR_ACCESS_JSON_PATH;
+
+  beforeEach(() => {
+    dir = mkdtempSync(join(tmpdir(), "session-compact-access-"));
+    const path = join(dir, "access.json");
+    writeFileSync(
+      path,
+      JSON.stringify({
+        groups: {
+          [PARENT_CHANNEL_ID]: { requireMention: true, allowFrom: [OWNER] },
+        },
+      })
+    );
+    process.env.SUPERVISOR_ACCESS_JSON_PATH = path;
+  });
+
+  afterEach(() => {
+    if (prevAccess === undefined)
+      delete process.env.SUPERVISOR_ACCESS_JSON_PATH;
+    else process.env.SUPERVISOR_ACCESS_JSON_PATH = prevAccess;
+    rmSync(dir, { recursive: true, force: true });
+  });
+
   test("running session + explicit intent: relays /compact <intent>, ephemeral ack", async () => {
     const fx = makeInteraction({ intent: "直近のリファクタと残テストを保持" });
     await fx.run();
@@ -162,6 +210,27 @@ describe("/session compact (#200)", () => {
     expect(err?.content).not.toContain("tmux session dead");
     expect(err?.content).toContain("/session status");
   });
+
+  test("#366: a user outside allowFrom is refused, no send-keys, no has() lookup", async () => {
+    const fx = makeInteraction({ userId: OUTSIDER });
+    await fx.run();
+
+    expect(fx.compactCalls).toHaveLength(0);
+    expect(fx.hasCalls).toHaveLength(0);
+    const deny = fx.replies.find((r) => r.kind === "reply");
+    expect(deny?.content).toContain("権限がありません");
+    expect(deny?.flags).toBe(64);
+  });
+
+  test("#366: fail-closed when access.json is missing", async () => {
+    rmSync(join(dir, "access.json"));
+    const fx = makeInteraction({});
+    await fx.run();
+
+    expect(fx.compactCalls).toHaveLength(0);
+    const deny = fx.replies.find((r) => r.kind === "reply");
+    expect(deny?.content).toContain("権限がありません");
+  });
 });
 
 /**
@@ -171,12 +240,39 @@ describe("/session compact (#200)", () => {
  * compactPrimarySession (NOT the thread-bound compactSession), gated on the
  * HIJOGUCHI_CHANNEL_ID env so it fail-safes to the usage hint when the
  * Supervisor isn't told the primary channel id.
+ *
+ * Issue #366: this branch gets the same access.json gate as the thread-bound
+ * one, keyed on the primary channel id itself (it is not a thread).
  */
 describe("/session compact in claudeHubExit primary channel (#199 AC1)", () => {
-  const PRIMARY = "primary-chan-199";
+  const PRIMARY = PRIMARY_CHANNEL_ID;
+  let dir: string;
+  const prevAccess = process.env.SUPERVISOR_ACCESS_JSON_PATH;
+
+  beforeEach(() => {
+    dir = mkdtempSync(join(tmpdir(), "session-compact-primary-access-"));
+    const path = join(dir, "access.json");
+    writeFileSync(
+      path,
+      JSON.stringify({
+        groups: {
+          [PRIMARY]: { requireMention: false, allowFrom: [] },
+          // Also present so the "non-primary channel id" test below (which
+          // exercises the thread-bound branch) is unaffected by this describe's
+          // access.json.
+          [PARENT_CHANNEL_ID]: { requireMention: true, allowFrom: [OWNER] },
+        },
+      })
+    );
+    process.env.SUPERVISOR_ACCESS_JSON_PATH = path;
+  });
 
   afterEach(() => {
     delete process.env.HIJOGUCHI_CHANNEL_ID;
+    if (prevAccess === undefined)
+      delete process.env.SUPERVISOR_ACCESS_JSON_PATH;
+    else process.env.SUPERVISOR_ACCESS_JSON_PATH = prevAccess;
+    rmSync(dir, { recursive: true, force: true });
   });
 
   test("primary channel + explicit intent: routes to compactPrimarySession, never compactSession, ephemeral ack", async () => {
@@ -246,5 +342,28 @@ describe("/session compact in claudeHubExit primary channel (#199 AC1)", () => {
 
     expect(fx.primaryCompactCalls).toHaveLength(0);
     expect(fx.compactCalls).toHaveLength(1);
+  });
+
+  test("#366: primary channel user outside allowFrom is refused, no primary compact", async () => {
+    writeFileSync(
+      join(dir, "access.json"),
+      JSON.stringify({
+        groups: {
+          [PRIMARY]: { requireMention: false, allowFrom: [OWNER] },
+        },
+      })
+    );
+    process.env.HIJOGUCHI_CHANNEL_ID = PRIMARY;
+    const fx = makeInteraction({
+      inThread: false,
+      channelId: PRIMARY,
+      userId: OUTSIDER,
+    });
+    await fx.run();
+
+    expect(fx.primaryCompactCalls).toHaveLength(0);
+    const deny = fx.replies.find((r) => r.kind === "reply");
+    expect(deny?.content).toContain("権限がありません");
+    expect(deny?.flags).toBe(64);
   });
 });
