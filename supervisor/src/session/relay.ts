@@ -2,7 +2,12 @@ import { execFile } from "child_process";
 import { promisify } from "util";
 import { resolve } from "path";
 import { mkdirSync, writeFileSync } from "fs";
-import { waitForRelay, hasRecentAsk, type RelayResult } from "./relay-server";
+import {
+  waitForRelay,
+  cancelRelay,
+  hasRecentAsk,
+  type RelayResult,
+} from "./relay-server";
 import { persistAttachments } from "./attachment-store";
 import { TMUX_PATH, TMUX_ARGS } from "./tmux";
 import { createLatencyTracker } from "./latency-logger";
@@ -543,6 +548,14 @@ export interface SendToPaneOptions {
    * to confirm that Enter submitted the input (Issue #357).
    */
   capturePaneState?: PaneReader;
+  /**
+   * Called once, synchronously, right before the FIRST Enter. Issue #357: the
+   * Enter confirmation polls for a while after `C-m`, and a fast Stop-hook POST
+   * can land inside that window — so {@link relayMessage} registers its
+   * `waitForRelay` here, not after sendToPane returns, or the response would
+   * arrive with nobody waiting for it.
+   */
+  beforeSubmit?: () => void;
 }
 
 /**
@@ -631,7 +644,14 @@ async function submitAndConfirm(
   blind: boolean,
   options?: SendToPaneOptions
 ): Promise<SubmitVerdict> {
-  const sendEnter = () => tmuxSend(tmuxSessionName, ["C-m"], socketArgs);
+  let announced = false;
+  const sendEnter = () => {
+    if (!announced) {
+      announced = true;
+      options?.beforeSubmit?.();
+    }
+    return tmuxSend(tmuxSessionName, ["C-m"], socketArgs);
+  };
   if (blind) {
     await sendEnter();
     return "not-checked";
@@ -957,12 +977,23 @@ export async function relayMessage(
   // dropped Enter, argv-no-shell safety) live in sendToPane, shared with the
   // fire-and-forget compact path (Issue #200).
   let outcome: SendOutcome;
+  // Issue #357: registered right before the first Enter (see
+  // SendToPaneOptions.beforeSubmit) so a Stop-hook POST that lands while the
+  // Enter is still being confirmed is not lost.
+  let pendingRelay: Promise<RelayResult> | undefined;
   try {
     // Segment (b): tmux 経路
     tracker.markStart("b");
-    outcome = await sendToPane(tmuxSessionName, fullMessage);
+    outcome = await sendToPane(tmuxSessionName, fullMessage, TMUX_ARGS, {
+      beforeSubmit: () => {
+        pendingRelay = waitForRelay(threadId, RELAY_TIMEOUT_MS);
+      },
+    });
     tracker.markEnd("b");
   } catch (err) {
+    // The Enter itself failed after the wait was registered: release it so it
+    // neither lingers until the relay timeout nor swallows a later turn.
+    if (pendingRelay) cancelRelay(threadId);
     tracker.markEnd("b");
     tracker.setError("b");
     // Issue #223: the message never reached the pane, so this turn delivered
@@ -1066,9 +1097,9 @@ export async function relayMessage(
   // thread NOW (with the Discord-only `/session enter` recovery) instead of
   // leaving the user to the 3-min stall page. Deliberately NOT routed through
   // pageOnce: if the user recovers and the turn then stalls on a real dialog,
-  // that page must still fire. Scheduled as a microtask so waitForRelay below
-  // has registered the pending request before the handler runs — a recovery
-  // that completes instantly must find something to resolve.
+  // that page must still fire. The pending request was registered before the
+  // first Enter (beforeSubmit), so a recovery that completes instantly still
+  // finds something to resolve.
   if (outcome.submit === "unconfirmed" && options?.onDialogStuck) {
     const onDialogStuck = options.onDialogStuck;
     void Promise.resolve()
@@ -1086,7 +1117,7 @@ export async function relayMessage(
 
   let result: RelayResult;
   try {
-    result = await waitForRelay(threadId, RELAY_TIMEOUT_MS);
+    result = await (pendingRelay ?? waitForRelay(threadId, RELAY_TIMEOUT_MS));
   } finally {
     watchdog.stop();
     stall.cancel();
