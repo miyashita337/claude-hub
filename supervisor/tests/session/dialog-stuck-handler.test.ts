@@ -62,6 +62,30 @@ describe("buildDialogStuckHandler", () => {
     expect(pushover).toHaveBeenCalledTimes(1);
   });
 
+  // Issue #452 / corp#105: a usage-limit dialog is not a stuck confirmation —
+  // there is no key that clears it. The notice must say what actually
+  // happened (upstream quota exhausted) and how to recover (`/model` or wait
+  // for reset), not the generic "手動操作要求" framing used for dialogs a key
+  // press *can* resolve.
+  test("says the model usage limit was reached and how to recover (Issue #452)", async () => {
+    const thread = makeThread();
+    const pushover = mock(async () => true);
+    const handler = buildDialogStuckHandler(thread, { pushover });
+
+    await handler({
+      kind: "usage-limit",
+      line: "You've reached your Fable 5 limit. Run /usage-credits to continue or switch models with /model.",
+      tmuxSessionName: "claude-abc123",
+    });
+
+    const msg = thread.sent[0]!;
+    expect(msg).toContain("モデル利用上限");
+    expect(msg).toContain("/model");
+    expect(msg).toContain("tmux -L claude-hub attach -t claude-abc123");
+    expect(msg).toContain("reached your Fable 5 limit");
+    expect(pushover).toHaveBeenCalledTimes(1);
+  });
+
   test("uses 'ブロック中' phrasing for stall (unknown dialog)", async () => {
     const thread = makeThread();
     const pushover = mock(async () => true);
@@ -135,5 +159,54 @@ describe("createPageOnce", () => {
   test("is a safe no-op when no handler is supplied", () => {
     const pageOnce = createPageOnce(undefined);
     expect(pageOnce(info("stall"))).toBeUndefined();
+  });
+
+  // Issue #452 (devils-advocate review, M1): a usage-limit hit is often
+  // discovered LATE in a turn (Claude was legitimately working, not stuck),
+  // so the generic 3-min stall heartbeat (stall-heartbeat.ts) frequently fires
+  // FIRST — well before the watchdog's specific "usage-limit" detection. Before
+  // this fix, `pageOnce`'s naive "first call wins" rule then silently dropped
+  // the specific, actionable page, leaving the user with only the generic
+  // "応答待ちでブロック中" message and no mention of the real cause — exactly
+  // the corp#105 symptom this Issue exists to fix.
+  test("upgrades from a generic stall page to a specific dialog kind (Issue #452)", async () => {
+    const calls: string[] = [];
+    const pageOnce = createPageOnce((i) => void calls.push(i.kind));
+
+    await pageOnce(info("stall")); // stall fires first (long-running turn)
+    await pageOnce(info("usage-limit")); // watchdog catches up — must still page
+
+    expect(calls).toEqual(["stall", "usage-limit"]);
+  });
+
+  test("the upgrade happens at most once — a second specific kind after the upgrade is suppressed", async () => {
+    const calls: string[] = [];
+    const pageOnce = createPageOnce((i) => void calls.push(i.kind));
+
+    await pageOnce(info("stall"));
+    await pageOnce(info("usage-limit"));
+    await pageOnce(info("ink-confirm")); // already upgraded once — suppressed
+
+    expect(calls).toEqual(["stall", "usage-limit"]);
+  });
+
+  test("two stall triggers never both page (no upgrade from stall to stall)", async () => {
+    const calls: string[] = [];
+    const pageOnce = createPageOnce((i) => void calls.push(i.kind));
+
+    await pageOnce(info("stall"));
+    await pageOnce(info("stall"));
+
+    expect(calls).toEqual(["stall"]);
+  });
+
+  test("a specific kind first still blocks a later stall (unchanged pre-#452 behaviour)", async () => {
+    const calls: string[] = [];
+    const pageOnce = createPageOnce((i) => void calls.push(i.kind));
+
+    await pageOnce(info("ink-confirm"));
+    await pageOnce(info("stall"));
+
+    expect(calls).toEqual(["ink-confirm"]);
   });
 });

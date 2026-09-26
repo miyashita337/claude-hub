@@ -31,6 +31,15 @@
  *    a fabricated decision is not). It is matched BEFORE the auto-acceptable
  *    families so a question whose options happen to render like `1. Yes` /
  *    `2. No` cannot be classified as `numbered-choice`.
+ *  - Issue #452 / corp#105 applies the same "no safe key" principle to model
+ *    usage-limit exhaustion. When a session's account hits its Claude usage
+ *    limit mid-turn, Claude Code prints a plain error line and the turn ends
+ *    WITHOUT producing an assistant response — the Stop hook that drives
+ *    every other relay path never fires (`stop-relay.sh` sees an empty
+ *    `last_assistant_message` and exits without POSTing), so this watchdog is
+ *    the only thing that can ever notice. There is no key that clears an
+ *    exhausted quota (the remedies are `/model` or waiting for reset), so
+ *    `usage-limit` is `autoAcceptable: false` like `ask-user-question`.
  *  - The matched line is returned so log lines can include the actual text
  *    that triggered detection — required for [Dialog] log entries to be
  *    useful when diagnosing false positives.
@@ -42,7 +51,8 @@ export type DialogKind =
   | "numbered-choice"
   | "press-enter"
   | "feedback-survey"
-  | "ask-user-question";
+  | "ask-user-question"
+  | "usage-limit";
 
 export interface DialogMatch {
   /** Detected dialog family. */
@@ -75,6 +85,9 @@ export interface DialogMatch {
  *    The map stays total over DialogKind so a new family cannot be added
  *    without deciding its keys, and the empty list is a second line of defence
  *    for any caller that forgets to check `autoAcceptable`.
+ *  - usage-limit: EMPTY on purpose (Issue #452). An exhausted usage quota is
+ *    not a dialog a key press can clear — the remedies (`/model`, waiting for
+ *    reset) both require the human. Sending a key would be a no-op at best.
  *
  * Each entry is an argv list passed to `tmux send-keys -t <session> ...`.
  * Multiple entries mean multiple sequential send-keys calls (with no
@@ -87,6 +100,7 @@ export const AUTO_ACCEPT_KEYS: Record<DialogKind, string[]> = {
   "press-enter": ["C-m"],
   "feedback-survey": ["0", "C-m"],
   "ask-user-question": [],
+  "usage-limit": [],
 };
 
 /**
@@ -128,6 +142,31 @@ export const AUTO_ACCEPT_KEYS: Record<DialogKind, string[]> = {
  */
 const ASK_OPTION_MARKER =
   /^[^\p{L}\p{N}\n]*(?:\d+\s*[.)]\s*)?(?:Type something|Chat about this)\b.*$/mu;
+
+/**
+ * Model usage-limit exhaustion (Issue #452 / corp#105).
+ *
+ * Evidence (verbatim pane capture, corp#105 issue body / screenshot):
+ *   "You've reached your Fable 5 limit. Run /usage-credits to continue or
+ *    switch models with /model."
+ *
+ * The model name ("Fable 5") varies with whichever model the account was
+ * running, so it is matched with `.+` rather than hardcoded. Both the
+ * straight (`'`) and curly (`'`) apostrophe are accepted since we cannot
+ * confirm which one every terminal/font renders. The phrase is deliberately
+ * narrow (requires "reached your ... limit" together) so ordinary prose that
+ * mentions "limit" or "/usage-credits" in isolation — e.g. a session
+ * discussing rate limits or checking its own balance — does not match.
+ *
+ * Anchored to the START of the line (after optional leading whitespace), same
+ * design as {@link ASK_OPTION_MARKER}: the evidenced message is a standalone
+ * error line, never prose that merely mentions it mid-sentence. This also
+ * narrows (but does not eliminate — see the watchdog's `manualOnly` reset on
+ * a clean tick) the odds of the line still matching once it has scrolled
+ * toward the edge of the last-{@link DETECT_WINDOW_LINES}-lines window on a
+ * later, unrelated turn.
+ */
+const USAGE_LIMIT_MARKER = /^\s*You['’]ve reached your .+ limit\b/im;
 
 /** Number of trailing lines to inspect. Dialogs render at the bottom of
  *  the visible pane; older content is scrollback noise. */
@@ -184,6 +223,21 @@ export function detectDialog(paneText: string): DialogMatch | null {
       kind: "ask-user-question",
       autoAcceptable: false,
       line: askMatch[0].trim(),
+    };
+  }
+
+  // 0.6. Model usage-limit exhaustion (Issue #452 / corp#105). Checked before
+  //    the auto-acceptable families for the same reason as ask-user-question:
+  //    the limit message could in principle be followed by unrelated
+  //    dialog-shaped noise (e.g. a leftover numbered list) on the same
+  //    screen, and a wrongly-sent key here is worse than a missed detection
+  //    (there IS no key that helps — see AUTO_ACCEPT_KEYS).
+  const usageLimitMatch = windowText.match(USAGE_LIMIT_MARKER);
+  if (usageLimitMatch) {
+    return {
+      kind: "usage-limit",
+      autoAcceptable: false,
+      line: usageLimitMatch[0].trim(),
     };
   }
 

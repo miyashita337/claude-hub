@@ -630,3 +630,45 @@ describe("dialog-watchdog — AskUserQuestion is never auto-accepted (Issue #423
     expect(sentKeys).toContainEqual(["C-m"]);
   });
 });
+
+/**
+ * Issue #452 / corp#105: a model usage-limit error ends the turn without an
+ * assistant response, so the Stop hook that drives every other relay path
+ * never fires. The watchdog is the only thing polling the pane while the
+ * relay waits, so it must recognize the limit text, send no key (there is
+ * nothing to accept — the remedy is `/model` or waiting for reset), and page
+ * the user on the FIRST tick exactly like the AskUserQuestion path (#423).
+ */
+describe("dialog-watchdog — model usage-limit is never auto-accepted (Issue #452)", () => {
+  const USAGE_LIMIT_PANE =
+    "You've reached your Fable 5 limit. Run /usage-credits to continue or switch models with /model.";
+
+  test("sends no keys and pages on the FIRST tick", async () => {
+    const clock = createVirtualClock();
+    const sentKeys: string[][] = [];
+    const heartbeats: DialogMatch[] = [];
+    const watchdog = startDialogWatchdog({
+      tmuxSessionName: "test-usage-limit",
+      pollIntervalMs: SHORT_TICK_MS,
+      // Budget of 2 would normally mean two auto-accepts before any heartbeat;
+      // a manual-only dialog must skip straight to paging the user.
+      maxAutoAcceptAttempts: 2,
+      capture: () => USAGE_LIMIT_PANE,
+      sendKeys: (_, keys) => {
+        sentKeys.push(keys);
+      },
+      onHeartbeat: (m) => {
+        heartbeats.push(m);
+      },
+      setTimer: clock.setTimer,
+      clearTimer: clock.clearTimer,
+    });
+    await clock.advance(SHORT_TICK_MS * 5);
+    watchdog.stop();
+
+    expect(sentKeys).toEqual([]);
+    expect(heartbeats.length).toBe(1);
+    expect(heartbeats[0]!.kind).toBe("usage-limit");
+    expect(heartbeats[0]!.line).toContain("reached your Fable 5 limit");
+  });
+});
