@@ -101,7 +101,87 @@ describe("relay tmux I/O is non-blocking (#227 / #249 AC-3)", () => {
 
   test("tmuxSend resolves via the async path with no thrown error on success", async () => {
     // Default mock (onExec null) completes immediately with empty stdout.
-    await expect(tmuxSend("ok-sess", ["C-m"])).resolves.toBeUndefined();
+    await expect(tmuxSend("ok-sess", ["C-m"])).resolves.toEqual({ retried: false });
     expect(mockExecFile).toHaveBeenCalled();
+  });
+});
+
+/**
+ * Issue #437: `tmuxSend`'s own transient-retry path (Issue #73 — a `send-keys`
+ * that ETIMEDOUT or hit `not in a mode` is retried once after clearing any
+ * stuck mode) can land the SAME literal on the pane TWICE — the first attempt
+ * can have reached tmux before erroring to us, and the retry lands a second
+ * time. Before this fix `tmuxSend` returned nothing, so `typeLiteral`'s
+ * `typed` counter never learned about the extra send and a resulting
+ * duplicate could be reported as `verified` instead of `duplicate`.
+ *
+ * This locks the return value in isolation (no real tmux, no real timeout
+ * delay) via the same `execFile` mock used for the non-blocking proof above:
+ * the first call errors with `ETIMEDOUT`, `ensurePaneNotInMode`'s
+ * `display-message` probe succeeds, and the retried `send-keys` succeeds.
+ */
+describe("tmuxSend reports its own internal retry (#437)", () => {
+  beforeEach(() => {
+    onExec = null;
+    mockExecFile.mockClear();
+  });
+
+  test("a transient ETIMEDOUT followed by a successful retry resolves { retried: true }", async () => {
+    let callCount = 0;
+    onExec = (cb) => {
+      callCount++;
+      if (callCount === 1) {
+        // First send-keys attempt: transient timeout (Issue #73).
+        cb(Object.assign(new Error("timeout"), { code: "ETIMEDOUT" }), {
+          stdout: "",
+          stderr: "",
+        });
+        return;
+      }
+      // ensurePaneNotInMode's display-message probe (call 2, pane not in a
+      // mode) and the retried send-keys (call 3) both succeed.
+      cb(null, { stdout: "0", stderr: "" });
+    };
+
+    const result = await tmuxSend("retry-sess", ["-l", "hello"]);
+
+    expect(result).toEqual({ retried: true });
+    expect(mockExecFile).toHaveBeenCalledTimes(3);
+  });
+
+  test("a clean send-keys with no error resolves { retried: false }", async () => {
+    const result = await tmuxSend("clean-sess", ["-l", "hello"]);
+    expect(result).toEqual({ retried: false });
+    expect(mockExecFile).toHaveBeenCalledTimes(1);
+  });
+
+  // Devils-advocate review (PR for #437): a "not in a mode" retry is NOT
+  // symmetric with a timeout retry. The pane was in copy-mode, which consumes
+  // `-l` input as a mode command (see ensurePaneNotInMode) instead of passing
+  // it to the application — so the first attempt's literal never reached the
+  // app, and only the successful retry delivers it, exactly once. Counting
+  // this as `retried: true` (⇒ "two deliveries") would OVER-count and could
+  // false-positive a healthy single delivery as `duplicate`.
+  test("a 'not in a mode' error followed by a successful retry resolves { retried: false }", async () => {
+    let callCount = 0;
+    onExec = (cb) => {
+      callCount++;
+      if (callCount === 1) {
+        // First send-keys attempt: pane was in copy-mode.
+        cb(Object.assign(new Error("not in a mode"), { stderr: "not in a mode" }), {
+          stdout: "",
+          stderr: "",
+        });
+        return;
+      }
+      // ensurePaneNotInMode's display-message probe (call 2) and the retried
+      // send-keys (call 3) both succeed.
+      cb(null, { stdout: "0", stderr: "" });
+    };
+
+    const result = await tmuxSend("mode-retry-sess", ["-l", "hello"]);
+
+    expect(result).toEqual({ retried: false });
+    expect(mockExecFile).toHaveBeenCalledTimes(3);
   });
 });
