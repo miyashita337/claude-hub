@@ -62,16 +62,20 @@ function makeFakeChannel() {
 interface TestEnv {
   cwd: string;
   runtimeDir: string;
+  /** Issue #149/#150: the relay-url fallback file is keyed by this, not cwd. */
+  sessionId: string;
 }
 
-function setupEnv(relayUrl: string): TestEnv {
+function setupEnv(relayUrl: string, sessionId: string = "sess-e2e-436"): TestEnv {
   const cwd = mkdtempSync(resolve(tmpdir(), "ask-user-selector-e2e-"));
   const runtimeDir = mkdtempSync(resolve(tmpdir(), "ask-user-selector-runtime-"));
-  const sanitisedCwd = cwd.replace(/^\/+/, "").replace(/\//g, "_");
+  const sanitisedSessionId = sessionId
+    .replace(/^\/+/, "")
+    .replace(/[^A-Za-z0-9._-]/g, "_");
   const relayDir = resolve(runtimeDir, "claude-hub-supervisor");
   mkdirSync(relayDir, { recursive: true });
-  writeFileSync(resolve(relayDir, `${sanitisedCwd}.relay-url`), relayUrl, "utf8");
-  return { cwd, runtimeDir };
+  writeFileSync(resolve(relayDir, `${sanitisedSessionId}.relay-url`), relayUrl, "utf8");
+  return { cwd, runtimeDir, sessionId };
 }
 
 function cleanupEnv(env: TestEnv) {
@@ -79,7 +83,7 @@ function cleanupEnv(env: TestEnv) {
   rmSync(env.runtimeDir, { recursive: true, force: true });
 }
 
-function makeHookInput(cwd: string, question: string, options: string[]) {
+function makeHookInput(sessionId: string, question: string, options: string[]) {
   return JSON.stringify({
     tool_name: "AskUserQuestion",
     tool_input: {
@@ -92,12 +96,12 @@ function makeHookInput(cwd: string, question: string, options: string[]) {
         },
       ],
     },
-    cwd,
+    session_id: sessionId,
   });
 }
 
 function makeMultiHookInput(
-  cwd: string,
+  sessionId: string,
   questions: { question: string; options: string[] }[]
 ) {
   return JSON.stringify({
@@ -110,7 +114,7 @@ function makeMultiHookInput(
         options: q.options.map((label) => ({ label, description: "" })),
       })),
     },
-    cwd,
+    session_id: sessionId,
   });
 }
 
@@ -131,7 +135,9 @@ function makeTap(customId: string, threadId: string) {
 }
 
 async function runHook(env: TestEnv, input: string) {
-  const result = await $`echo ${input} | XDG_RUNTIME_DIR=${env.runtimeDir} bash ${HOOK_PATH}`
+  // SUPERVISOR_RELAY_URL= (empty) forces the file-fallback path so these
+  // tests exercise the relay-url file this env writes.
+  const result = await $`echo ${input} | SUPERVISOR_RELAY_URL= XDG_RUNTIME_DIR=${env.runtimeDir} bash ${HOOK_PATH}`
     .quiet()
     .nothrow();
   return {
@@ -170,7 +176,7 @@ describe("AskUserQuestion selector end-to-end (Issue #436 V-2)", () => {
       });
     });
 
-    const input = makeHookInput(env.cwd, "V-2検証テスト: AでもBでも選んでください", [
+    const input = makeHookInput(env.sessionId, "V-2検証テスト: AでもBでも選んでください", [
       "A（テストOK）",
       "B（テストOK・別選択）",
     ]);
@@ -206,9 +212,9 @@ describe("AskUserQuestion selector end-to-end (Issue #436 V-2)", () => {
     // No relay-url file written: mirrors a non-supervisor session. Nothing
     // should be posted anywhere, and the hook must exit silently (0, no
     // stdout) so Claude Code opens its native dialog.
-    env = { cwd: mkdtempSync(resolve(tmpdir(), "ask-user-selector-e2e-")), runtimeDir: mkdtempSync(resolve(tmpdir(), "ask-user-selector-runtime-")) };
+    env = { cwd: mkdtempSync(resolve(tmpdir(), "ask-user-selector-e2e-")), runtimeDir: mkdtempSync(resolve(tmpdir(), "ask-user-selector-runtime-")), sessionId: "sess-no-relay" };
 
-    const input = makeHookInput(env.cwd, "no relay configured", ["A", "B"]);
+    const input = makeHookInput(env.sessionId, "no relay configured", ["A", "B"]);
     const { stdout, exitCode } = await runHook(env, input);
 
     expect(exitCode).toBe(0);
@@ -260,7 +266,7 @@ describe("AskUserQuestion selector end-to-end (Issue #436 V-2)", () => {
       });
     });
 
-    const input = makeMultiHookInput(env.cwd, [
+    const input = makeMultiHookInput(env.sessionId, [
       { question: "Q1: 承認しますか？", options: ["承認", "却下"] },
       { question: "Q2: 優先度は？", options: ["高", "低"] },
     ]);

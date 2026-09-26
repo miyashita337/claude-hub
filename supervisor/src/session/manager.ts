@@ -507,30 +507,44 @@ export function parseHeadlessOutput(raw: string): {
 }
 
 /**
- * Compute the runtime-dir path that holds the relay URL for a given project
- * cwd. Sanitises by stripping every leading `/` and replacing any character
- * outside `[A-Za-z0-9._-]` with `_`, so each session's URL lives in its own
- * file and the path is shell-safe even if `projectDir` contains quotes:
+ * Compute the runtime-dir path that holds the relay URL for a given
+ * `claudeSessionId`. Sanitises by stripping every leading `/` and replacing
+ * any character outside `[A-Za-z0-9._-]` with `_` (a no-op for a UUID, but
+ * kept so the path is shell-safe even if the key ever contained something
+ * unexpected):
  *
- *   /Users/x/team_salary  →  ${RUNTIME_DIR}/Users_x_team_salary.relay-url
+ *   9c9f9b4e-...-000000000001  →  ${RUNTIME_DIR}/9c9f9b4e-...-000000000001.relay-url
  *
  * `XDG_RUNTIME_DIR` is per-user by spec (`/run/user/$UID`), so when present
  * we just append `claude-hub-supervisor`. When absent (typical macOS) we fall
  * back to `/tmp/claude-hub-supervisor-<USER>` to avoid multi-user mkdir
  * collisions on shared `/tmp`.
  *
- * The same scheme is mirrored in `supervisor/hooks/progress-relay.sh`. If you
- * change the layout here, update the hook and its tests as well.
+ * Issue #149/#150: this used to be keyed by `projectDir`, so two Discord
+ * threads pointed at the SAME `projectDir` (a very common setup — e.g. one
+ * repo, several logical threads) collided on one file. The last session to
+ * `start()`/`resumeSession()` overwrote the file, so every OTHER session's
+ * PostToolUse progress and PreToolUse(AskUserQuestion) hooks silently POSTed
+ * to the last-started thread's Discord channel. `claudeSessionId` is a fresh
+ * `randomUUID()` per session (manager.ts's `launchStart`/`launchResume`), so
+ * keying by it gives each session its own file regardless of `projectDir`.
+ *
+ * The same scheme is mirrored in `supervisor/hooks/progress-relay.sh` and
+ * `supervisor/hooks/ask-user-relay.sh`, which read the file only as a
+ * fallback when `$SUPERVISOR_RELAY_URL` is not present in the hook's own
+ * environment (both discover the key from the hook JSON's `session_id`
+ * field). If you change the layout here, update those hooks and their tests
+ * as well.
  *
  * Issue #88: keeps the file out of every project repo.
  */
-export function relayUrlFilePath(projectDir: string): string {
+export function relayUrlFilePath(claudeSessionId: string): string {
   const fromXdg = process.env.XDG_RUNTIME_DIR;
   const user = process.env.USER || "default";
   const runtimeDir = fromXdg
     ? `${fromXdg}/claude-hub-supervisor`
     : `/tmp/claude-hub-supervisor-${user}`;
-  const sanitised = projectDir
+  const sanitised = claudeSessionId
     .replace(/^\/+/, "")
     .replace(/[^A-Za-z0-9._-]/g, "_");
   return `${runtimeDir}/${sanitised}.relay-url`;
@@ -932,18 +946,25 @@ export class SessionManager {
     // the relay URL parser. relay-server.ts decodes symmetrically on receipt.
     const relayUrl = `http://localhost:${this.effects.relayServer.getPort()}/relay/${encodeURIComponent(threadId)}`;
 
-    // Relay URL is written to a runtime-dir file keyed by the project cwd so
-    // that progress-relay.sh (PostToolUse hook) can locate it from $CWD without
-    // dropping `.supervisor-relay-url` into every project repo (Issue #88).
-    // The hook applies the same sanitisation logic to its `$CWD` payload.
-    const relayUrlFile = relayUrlFilePath(projectDir);
+    // Relay URL is written to a runtime-dir file keyed by claudeSessionId (NOT
+    // projectDir — Issue #149/#150: two threads sharing a projectDir used to
+    // collide on one file, last-writer-wins, so every other thread's
+    // progress-relay.sh / ask-user-relay.sh POSTed to the wrong Discord
+    // thread) so those hooks can locate it as a fallback without dropping
+    // `.supervisor-relay-url` into every project repo (Issue #88). The hooks
+    // read the same `session_id` the hook JSON already carries and apply the
+    // same sanitisation logic.
+    const relayUrlFile = relayUrlFilePath(claudeSessionId);
     const relayUrlDir = dirname(relayUrlFile);
 
-    // Best-effort cleanup of any stale relay-url file from a prior session for
-    // this project. Without this, a Supervisor restart can leave a file pointing
-    // at a dead relay port; PostToolUse hooks would then POST to a stale URL
-    // and silently time out (curl --max-time 3 in progress-relay.sh).
-    this.cleanupRelayUrlFile(projectDir);
+    // Best-effort cleanup of a stale relay-url file for this SAME
+    // claudeSessionId (e.g. left behind by a crashed prior tmux launch for
+    // this id). claudeSessionId is a fresh randomUUID() here, so in practice
+    // there is nothing to clean — this only matters if a previous attempt to
+    // start this exact id got partway through. Without it, a stale file could
+    // point at a dead relay port and a PostToolUse hook would POST to it and
+    // silently time out (curl --max-time 3 in progress-relay.sh).
+    this.cleanupRelayUrlFile(claudeSessionId);
 
     const claudeCmd = [
       "unset ANTHROPIC_API_KEY",
@@ -984,7 +1005,7 @@ export class SessionManager {
       // worktree (if any) is left in place — it is valid and gets reused on the
       // next `/session start <branch>` (Q4); only an explicit /session stop
       // removes it (Q3).
-      this.cleanupRelayUrlFile(projectDir);
+      this.cleanupRelayUrlFile(claudeSessionId);
       throw new Error(
         "Claude Code の起動に失敗しました（tmuxセッションのPID取得失敗）"
       );
@@ -1574,9 +1595,13 @@ export class SessionManager {
     await this.effects.tmux.killSession(tmuxName);
 
     const relayUrl = `http://localhost:${this.effects.relayServer.getPort()}/relay/${encodeURIComponent(threadId)}`;
-    const relayUrlFile = relayUrlFilePath(projectDir);
+    // Keyed by claudeSessionId, not projectDir (Issue #149/#150) — see the
+    // relayUrlFilePath doc comment for why.
+    const relayUrlFile = relayUrlFilePath(claudeSessionId);
     const relayUrlDir = dirname(relayUrlFile);
-    this.cleanupRelayUrlFile(projectDir);
+    // Clean up a stale file for this SAME id (e.g. left by a crashed prior
+    // resume attempt) before rewriting it.
+    this.cleanupRelayUrlFile(claudeSessionId);
 
     // `--resume <id>` continues the prior conversation in-place (no
     // --fork-session, so the same claude session id keeps accumulating).
@@ -1613,7 +1638,7 @@ export class SessionManager {
     }
 
     if (!pid) {
-      this.cleanupRelayUrlFile(projectDir);
+      this.cleanupRelayUrlFile(claudeSessionId);
       throw new Error(
         "Claude Code の起動に失敗しました（tmuxセッションのPID取得失敗）"
       );
@@ -1668,7 +1693,7 @@ export class SessionManager {
     } catch (err) {
       this.sessions.delete(threadId);
       await this.effects.tmux.killSession(tmuxName);
-      this.cleanupRelayUrlFile(projectDir);
+      this.cleanupRelayUrlFile(claudeSessionId);
       throw err;
     }
 
@@ -2088,7 +2113,7 @@ export class SessionManager {
     }
     this.effects.iterm2.markTabStopped(session.channelName, tmuxName);
     updateSessionStatus(session.id, "stopped", reason);
-    this.cleanupRelayUrlFile(session.projectDir);
+    this.cleanupRelayUrlFile(session.claudeSessionId);
 
     // Issue #369 (cause A): a supervisor shutdown (SIGTERM / launchctl
     // kickstart) is NOT an explicit teardown — the user never chose to drop
@@ -2250,7 +2275,7 @@ export class SessionManager {
           this.emitSessionEnd(threadId); // Phase 5c: free a dispatch queue slot (#294)
           if (session) {
             this.effects.iterm2.markTabStopped(session.channelName, tmuxName);
-            this.cleanupRelayUrlFile(session.projectDir);
+            this.cleanupRelayUrlFile(session.claudeSessionId);
             // Issue #244: an unexpected exit ends this conversation generation —
             // drop its self-heal planner so the cap map does not leak. A later
             // manual /session resume legitimately starts a fresh planner.
@@ -2288,7 +2313,7 @@ export class SessionManager {
           await this.effects.tmux.killSession(tmuxName);
         }
       }
-      this.cleanupRelayUrlFile(row.project_dir);
+      this.cleanupRelayUrlFile(row.claude_session_id);
       // Issue #154: worktrees are intentionally left in place on restart. They
       // are reused on the next `/session start <branch>` (Q4) and force-removing
       // them here would discard uncommitted work without an explicit teardown.
@@ -2362,7 +2387,7 @@ export class SessionManager {
         `[SessionManager] Reaping orphan tmux session ${name} (DB status=${row.status}, reason=${row.stopped_reason ?? "?"}) (#246)`
       );
       await this.effects.tmux.killSession(name);
-      this.cleanupRelayUrlFile(row.project_dir);
+      this.cleanupRelayUrlFile(row.claude_session_id);
       // Re-stamp the reason so the reap is auditable in the DB; the row is
       // already `stopped`, and — as in the loop above — the worktree stays put
       // because this is not an explicit teardown (#154). The reason is distinct
@@ -2373,14 +2398,21 @@ export class SessionManager {
   }
 
   /**
-   * Best-effort removal of the relay-url file for a project. Idempotent: ENOENT
-   * is treated as success (already cleaned). Called from start (before write),
-   * stop (after sessions.delete), watchTmuxSession (on tmux_exited), and
-   * recoverFromDb (Supervisor restart) so a dead URL never lingers and gets
-   * POSTed to by progress-relay.sh.
+   * Best-effort removal of the relay-url file for a session, keyed by
+   * `claudeSessionId` (Issue #149/#150 — NOT `projectDir`; two threads can
+   * share a projectDir and must not touch each other's file). Idempotent:
+   * ENOENT is treated as success (already cleaned), and a null/undefined id
+   * (an older DB row from before claudeSessionId was always captured, or a
+   * SessionInfo that never got one) is a no-op — there is nothing to key a
+   * file by. Called from start (before write), stop (after sessions.delete),
+   * watchTmuxSession (on tmux_exited), and recoverFromDb (Supervisor restart)
+   * so a dead URL never lingers and gets POSTed to by progress-relay.sh.
    */
-  private cleanupRelayUrlFile(projectDir: string): void {
-    const relayUrlFile = relayUrlFilePath(projectDir);
+  private cleanupRelayUrlFile(
+    claudeSessionId: string | null | undefined
+  ): void {
+    if (!claudeSessionId) return;
+    const relayUrlFile = relayUrlFilePath(claudeSessionId);
     try {
       unlinkSync(relayUrlFile);
     } catch (err) {

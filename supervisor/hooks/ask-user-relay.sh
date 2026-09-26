@@ -15,43 +15,54 @@
 #
 # Skipping behaviour
 # ------------------
-# Out of a supervisor session (no relay-url file for the cwd), the hook exits
+# Out of a supervisor session (no relay URL available at all), the hook exits
 # 0 silently with no stdout — Claude sees the original tool input unchanged
 # and the regular TUI dialog flow runs (Issue #12 AC-3 / Journey-AC #3).
 # Unknown input shapes (no `questions[]`) fall through the same way.
 #
-# Relay URL discovery mirrors `progress-relay.sh`: the runtime-dir layout is
-# written by SessionManager.start (`relayUrlFilePath()` in manager.ts).
+# Relay URL discovery (Issue #149/#150), mirrors `progress-relay.sh`:
 #
-#   $XDG_RUNTIME_DIR set: ${XDG_RUNTIME_DIR}/claude-hub-supervisor/<sanitised-cwd>.relay-url
-#   $XDG_RUNTIME_DIR unset (typical macOS): /tmp/claude-hub-supervisor-<USER>/<sanitised-cwd>.relay-url
+#   1. Primary: $SUPERVISOR_RELAY_URL, exported directly into this session's
+#      environment by SessionManager.launchStart/launchResume (manager.ts).
+#      Per-process env, so it can never collide across sessions the way a
+#      shared file can.
+#   2. Fallback (older Claude Code / non-standard invocation that does not
+#      propagate the exported env into hook subprocesses): a runtime-dir file
+#      written by the SAME manager.ts call, keyed by THIS hook invocation's
+#      `session_id` — NOT the cwd. Two Discord threads commonly share a
+#      projectDir; keying by cwd made them collide on one file, so the
+#      last-started thread's URL silently overwrote every other thread's
+#      (#149/#150). `session_id` is the per-conversation `claudeSessionId`,
+#      unique per concurrently running session, so this cannot collide even
+#      across identical cwds. Layout:
+#        $XDG_RUNTIME_DIR set: ${XDG_RUNTIME_DIR}/claude-hub-supervisor/<sanitised-session-id>.relay-url
+#        $XDG_RUNTIME_DIR unset (typical macOS): /tmp/claude-hub-supervisor-<USER>/<sanitised-session-id>.relay-url
+#      <sanitised-session-id> strips all leading `/` and replaces any
+#      non-`[A-Za-z0-9._-]` character with `_` — a no-op for a UUID, but this
+#      must match `relayUrlFilePath()` in manager.ts exactly.
 
 INPUT=$(cat)
 
-# Read cwd from hook JSON. Without a cwd we have no way to find the relay URL.
-CWD=$(echo "$INPUT" | jq -r '.cwd // ""')
-if [ -z "$CWD" ]; then
-  exit 0
-fi
-
-# Sanitise the cwd to match relayUrlFilePath() in manager.ts:
-#   - strip ALL leading slashes
-#   - replace any non-[A-Za-z0-9._-] with `_`
-SANITISED=$(printf '%s' "$CWD" | sed -e 's|^/*||' -e 's|[^A-Za-z0-9._-]|_|g')
-if [ -n "$XDG_RUNTIME_DIR" ]; then
-  RUNTIME_DIR="${XDG_RUNTIME_DIR}/claude-hub-supervisor"
-else
-  RUNTIME_DIR="/tmp/claude-hub-supervisor-${USER:-default}"
-fi
-RELAY_URL_FILE="${RUNTIME_DIR}/${SANITISED}.relay-url"
-if [ ! -f "$RELAY_URL_FILE" ]; then
-  # Not running under a supervisor session — keep TUI behaviour unchanged.
-  exit 0
-fi
-
-SUPERVISOR_RELAY_URL=$(cat "$RELAY_URL_FILE")
 if [ -z "$SUPERVISOR_RELAY_URL" ]; then
-  exit 0
+  SESSION_ID=$(echo "$INPUT" | jq -r '.session_id // ""')
+  if [ -z "$SESSION_ID" ]; then
+    exit 0
+  fi
+  SANITISED=$(printf '%s' "$SESSION_ID" | sed -e 's|^/*||' -e 's|[^A-Za-z0-9._-]|_|g')
+  if [ -n "$XDG_RUNTIME_DIR" ]; then
+    RUNTIME_DIR="${XDG_RUNTIME_DIR}/claude-hub-supervisor"
+  else
+    RUNTIME_DIR="/tmp/claude-hub-supervisor-${USER:-default}"
+  fi
+  RELAY_URL_FILE="${RUNTIME_DIR}/${SANITISED}.relay-url"
+  if [ ! -f "$RELAY_URL_FILE" ]; then
+    # Not running under a supervisor session — keep TUI behaviour unchanged.
+    exit 0
+  fi
+  SUPERVISOR_RELAY_URL=$(cat "$RELAY_URL_FILE")
+  if [ -z "$SUPERVISOR_RELAY_URL" ]; then
+    exit 0
+  fi
 fi
 
 # Derive the /ask/ endpoint from the /relay/ URL the manager wrote. Use sed
