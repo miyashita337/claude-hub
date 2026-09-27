@@ -181,6 +181,27 @@ const RESUME_PROMPT_POLL_ATTEMPTS = 300;
  */
 const RESUME_PROMPT_POLL_LOG_EVERY_N = 15;
 
+/** Lines of the last captured pane logged when a resume fails (Issue #485). */
+const RESUME_FAILURE_PANE_TAIL_LINES = 20;
+
+/**
+ * Issue #485: log the tail of the last pane capture to stderr when a resume
+ * fails, so the reason claude exited (e.g. "No conversation found with
+ * session ID") is recoverable from supervisor.stderr.log. stderr only; never
+ * sent to Discord.
+ */
+function logResumePaneTail(tmuxName: string, pane: string): void {
+  const tail = pane
+    .split("\n")
+    .filter((line) => line.trim() !== "")
+    .slice(-RESUME_FAILURE_PANE_TAIL_LINES)
+    .join("\n");
+  console.error(
+    `[SessionManager] Resume failed on ${tmuxName}; last captured pane lines:\n` +
+      (tail || "(no pane output captured before the session ended)")
+  );
+}
+
 /**
  * Input-ready marker for a freshly STARTED session's Ink TUI (same prompt
  * markers as {@link RESUME_READY_RE}; a `--dangerously-skip-permissions` session
@@ -1774,8 +1795,25 @@ export class SessionManager {
    * relayed message can never race the prompt picker (#86 / RW-019 class bug).
    */
   private async confirmResumePromptIfPresent(tmuxName: string): Promise<void> {
+    // Issue #485: the last pane text seen, logged to stderr on failure so a
+    // resume that dies (e.g. "No conversation found with session ID") is
+    // diagnosable. stderr only — pane text can hold anything, so it must never
+    // reach Discord (the thrown message is sanitized by the caller, #360).
+    let lastPane = "";
     for (let i = 0; i < this.resumePromptPollAttempts; i++) {
+      // Issue #485 AC-1: a resumed claude that exits right after launch
+      // leaves no tmux session. Without this check the loop captured the
+      // missing pane for the whole ~5min window and then reported success.
+      // hasSession returns true on a tmux timeout (liveness unknown, #369),
+      // so only a definite "no such session" aborts here.
+      if (!(await this.effects.tmux.hasSession(tmuxName))) {
+        logResumePaneTail(tmuxName, lastPane);
+        throw new Error(
+          `resume した Claude Code の tmux セッション ${tmuxName} が起動直後に終了しました（attempt ${i}/${this.resumePromptPollAttempts}）`
+        );
+      }
       const pane = await this.effects.tmux.capturePane(tmuxName);
+      if (pane.trim()) lastPane = pane;
       if (RESUME_PROMPT_RE.test(pane)) {
         // Down moves from option 1 (summary, highlighted) to option 2 (full
         // session as-is); C-m confirms. See Issue #163.
@@ -1809,11 +1847,21 @@ export class SessionManager {
     // loudly so a stuck/broken resume is diagnosable instead of a `/session
     // status` reporting "稼働中" over a session that never actually became
     // interactive.
+    //
+    // Issue #485 AC-2: "proceeding anyway" registered a session that never
+    // became interactive and Discord showed "✅ 復帰しました" (false success).
+    // Exhaustion is now a failure; launchResume's catch kills the tmux
+    // session and handleResume replies with the sanitized failure notice.
+    // `attempts === 0` means polling is disabled (unit-test knob), not a
+    // failure.
     if (this.resumePromptPollAttempts > 0) {
       console.warn(
         `[SessionManager] Resume prompt/ready marker never appeared on ${tmuxName} ` +
-          `after ${this.resumePromptPollAttempts} attempts; proceeding anyway ` +
-          `(the resumed pane may be in an unexpected state)`
+          `after ${this.resumePromptPollAttempts} attempts; aborting resume as a failure`
+      );
+      logResumePaneTail(tmuxName, lastPane);
+      throw new Error(
+        `resume した Claude Code の入力プロンプトが ${this.resumePromptPollAttempts} 回のポーリングで現れませんでした（${tmuxName}）`
       );
     }
   }

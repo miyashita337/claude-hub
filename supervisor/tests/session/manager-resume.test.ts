@@ -108,37 +108,103 @@ describe("SessionManager.resumeSession (#161)", () => {
       resumePromptPollAttempts: 2,
       resumePromptPollIntervalMs: 5,
     });
-    // capturePane returns "" (no marker) for the whole poll window.
-    await manager.resumeSession(makeConfig(projectDir), THREAD_ID, VALID_ID, projectDir);
-
-    expect(effects.tmux.sendKeysCalls).toHaveLength(0);
+    const errSpy = spyOn(console, "error").mockImplementation(() => {});
+    const warnSpy = spyOn(console, "warn").mockImplementation(() => {});
+    try {
+      // capturePane returns "" (no marker) for the whole poll window. Issue
+      // #485: that exhaustion is now a failure, but it must still never send
+      // stray keystrokes into a pane that never showed the picker.
+      await expect(
+        manager.resumeSession(makeConfig(projectDir), THREAD_ID, VALID_ID, projectDir)
+      ).rejects.toThrow();
+      expect(effects.tmux.sendKeysCalls).toHaveLength(0);
+    } finally {
+      errSpy.mockRestore();
+      warnSpy.mockRestore();
+    }
   });
 
-  // PR #484 review (2nd Discord E2E FAIL): decisively reproduced with real tmux
-  // in tests/e2e/session-resume-lifecycle.test.ts that a pane which NEVER
-  // matches either marker silently exhausts the full poll window with zero
-  // console output, then still reports success. These pin the observability
-  // fix at the unit level (fast, no real tmux needed).
-  test("PR #484: warns once when the resume prompt/ready marker never appears (full exhaustion)", async () => {
+  // Issue #485 AC-1: in production the resumed `claude --resume <id>` exited
+  // ~2s after launch ("No conversation found with session ID"), yet the poll
+  // kept capturing the dead pane for the full 300×1s window and then reported
+  // success. The loop must check liveness every iteration and abort at once.
+  test("Issue #485 AC-1: aborts immediately as a failure when the tmux session vanishes mid-poll", async () => {
+    manager = new SessionManager({
+      effects,
+      gracefulKillTimeoutMs: 0,
+      // A huge budget: without the liveness check this would poll ~10s.
+      resumePromptPollAttempts: 1000,
+      resumePromptPollIntervalMs: 10,
+    });
+    // Simulate claude printing its fatal error and exiting right after the
+    // first capture: the pane shows the message once, then the session is gone.
+    const realCapture = effects.tmux.capturePane.bind(effects.tmux);
+    let captures = 0;
+    effects.tmux.capturePane = async (name: string) => {
+      captures += 1;
+      const pane = await realCapture(name);
+      await effects.tmux.killSession(name);
+      return pane;
+    };
+    effects.tmux.setPaneContent(
+      tmuxName,
+      "No conversation found with session ID: " + VALID_ID
+    );
+    const errSpy = spyOn(console, "error").mockImplementation(() => {});
+    const warnSpy = spyOn(console, "warn").mockImplementation(() => {});
+    try {
+      const t0 = Date.now();
+      await expect(
+        manager.resumeSession(makeConfig(projectDir), THREAD_ID, VALID_ID, projectDir)
+      ).rejects.toThrow(/終了/);
+      expect(Date.now() - t0).toBeLessThan(1000);
+      expect(captures).toBeLessThanOrEqual(2);
+
+      // Not registered as resumed (no false success, no DB "running" row).
+      expect(manager.has(THREAD_ID)).toBe(false);
+      expect(manager.count()).toBe(0);
+      expect(effects.tmux.list()).toHaveLength(0);
+      expect(effects.tmux.sendKeysCalls).toHaveLength(0);
+
+      // Diagnosability: the last captured pane lines go to stderr.
+      const errText = errSpy.mock.calls.map((c) => c.map(String).join(" ")).join("\n");
+      expect(errText).toContain("No conversation found with session ID");
+    } finally {
+      errSpy.mockRestore();
+      warnSpy.mockRestore();
+    }
+  });
+
+  // Issue #485 AC-2 (attempts-exhausted half): a legitimate resume, however
+  // slow, returns early via the picker or the ready marker, so a full
+  // exhaustion is always anomalous. It used to log "proceeding anyway" and
+  // report success; it is now a failure, with the tmux session rolled back.
+  test("Issue #485 AC-2: fails (not success) and rolls back when the marker never appears", async () => {
     manager = new SessionManager({
       effects,
       gracefulKillTimeoutMs: 0,
       resumePromptPollAttempts: 3,
       resumePromptPollIntervalMs: 5,
     });
+    effects.tmux.setPaneContent(tmuxName, "some unexpected pane state");
     const warnSpy = spyOn(console, "warn").mockImplementation(() => {});
+    const errSpy = spyOn(console, "error").mockImplementation(() => {});
     try {
-      // capturePane returns "" (no marker) for the whole poll window — the
+      // capturePane returns a non-marker pane for the whole window — the
       // exact claude-mock.sh pane shape from the real-tmux E2E repro.
-      await manager.resumeSession(makeConfig(projectDir), THREAD_ID, VALID_ID, projectDir);
+      await expect(
+        manager.resumeSession(makeConfig(projectDir), THREAD_ID, VALID_ID, projectDir)
+      ).rejects.toThrow(/never|現れ/);
 
       expect(warnSpy).toHaveBeenCalledTimes(1);
       expect(String(warnSpy.mock.calls[0]?.[0])).toContain("never appeared");
-      // The false-positive shape of the bug: still reports success despite the
-      // marker never appearing.
-      expect(manager.has(THREAD_ID)).toBe(true);
+      expect(manager.has(THREAD_ID)).toBe(false);
+      expect(effects.tmux.list()).toHaveLength(0);
+      const errText = errSpy.mock.calls.map((c) => c.map(String).join(" ")).join("\n");
+      expect(errText).toContain("some unexpected pane state");
     } finally {
       warnSpy.mockRestore();
+      errSpy.mockRestore();
     }
   });
 
@@ -174,8 +240,10 @@ describe("SessionManager.resumeSession (#161)", () => {
     const logSpy = spyOn(console, "log").mockImplementation(() => {});
     try {
       // capturePane returns "" the whole time (no marker) — exercises the
-      // heartbeat path on the way to exhaustion.
-      await manager.resumeSession(makeConfig(projectDir), THREAD_ID, VALID_ID, projectDir);
+      // heartbeat path on the way to exhaustion (a failure since #485).
+      await expect(
+        manager.resumeSession(makeConfig(projectDir), THREAD_ID, VALID_ID, projectDir)
+      ).rejects.toThrow();
 
       const heartbeats = logSpy.mock.calls.filter((c) =>
         String(c[0]).includes("Still waiting for resume prompt")
