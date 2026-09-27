@@ -9,7 +9,7 @@ import { resolveWorktreePath } from "../../src/session/worktree";
 // Isolate DB writes from the real sessions.db (mirrors tests/infra/db.test.ts).
 process.env.SUPERVISOR_DB_PATH = ":memory:";
 
-const { SessionManager } = await import("../../src/session/manager");
+const { SessionManager, redactPaneSecrets } = await import("../../src/session/manager");
 const { createFakeEffects } = await import(
   "../../src/session/adapters-fake"
 );
@@ -658,5 +658,27 @@ describe("SessionManager resume single-flight & liveness (#171)", () => {
       projectDir
     );
     expect(info.status).toBe("running");
+  });
+});
+
+// PR #487 review (Devin): the pane tail is written to supervisor.stderr.log,
+// so secret-looking values on screen must be masked before logging. The
+// session UUID must survive — it is the diagnostic we log the tail for.
+describe("redactPaneSecrets (PR #487 review)", () => {
+  test("masks tokens and key=value secrets but keeps the session UUID", () => {
+    const pane = [
+      "No conversation found with session ID: 134a0815-94de-4cc5-a7c0-134db76d6759",
+      "export ANTHROPIC_API_KEY=sk-ant-abc123DEF456ghi789",
+      "gh token ghp_ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789",
+      "password: hunter2",
+      "blob QWxhZGRpbjpvcGVuIHNlc2FtZQQWxhZGRpbjpvcGVu",
+    ].join("\n");
+    const out = redactPaneSecrets(pane);
+    expect(out).toContain("134a0815-94de-4cc5-a7c0-134db76d6759");
+    expect(out).not.toContain("sk-ant-abc123DEF456ghi789");
+    expect(out).not.toContain("ghp_ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789");
+    expect(out).not.toContain("hunter2");
+    expect(out).not.toContain("QWxhZGRpbjpvcGVuIHNlc2FtZQQWxhZGRpbjpvcGVu");
+    expect(out).toContain("[REDACTED]");
   });
 });

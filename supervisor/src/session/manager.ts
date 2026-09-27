@@ -190,8 +190,24 @@ const RESUME_FAILURE_PANE_TAIL_LINES = 20;
  * session ID") is recoverable from supervisor.stderr.log. stderr only; never
  * sent to Discord.
  */
+/**
+ * PR #487 review: the pane tail lands in supervisor.stderr.log, and the screen
+ * may show credentials or file contents. Mask secret-looking values before
+ * logging. Dash-separated IDs such as the session UUID (segments of 12 or
+ * fewer chars) are kept, since they are the diagnostic the tail is logged for.
+ */
+export function redactPaneSecrets(text: string): string {
+  return text
+    .replace(/\b(?:sk-[\w-]+|gh[pousr]_\w+|xox[abpr]-[\w-]+)/g, "[REDACTED]")
+    .replace(
+      /\b((?:[\w-]*(?:token|secret|password|passwd|api[_-]?key)[\w-]*)\s*[:=]\s*)\S+/gi,
+      "$1[REDACTED]"
+    )
+    .replace(/[A-Za-z0-9+/_]{32,}={0,2}/g, "[REDACTED]");
+}
+
 function logResumePaneTail(tmuxName: string, pane: string): void {
-  const tail = pane
+  const tail = redactPaneSecrets(pane)
     .split("\n")
     .filter((line) => line.trim() !== "")
     .slice(-RESUME_FAILURE_PANE_TAIL_LINES)
