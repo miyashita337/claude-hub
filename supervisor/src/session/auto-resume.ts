@@ -381,6 +381,13 @@ const KNOWN_RESUME_FAILURES: ReadonlyArray<{ marker: string; cause: string }> = 
   { marker: "最大セッション数", cause: "最大セッション数に達しています" },
   { marker: "resume 処理中", cause: "この session は現在 resume 処理中です" },
   { marker: "既に稼働中", cause: "この session は既に稼働中です" },
+  // Issue #485: manager.ts (throwResumeSessionExited) throws `…起動直後に終了しました`
+  // when the resumed claude exits right away. The observed cause was that its
+  // transcript no longer existed.
+  {
+    marker: "起動直後に終了",
+    cause: "復帰した Claude Code が起動直後に終了しました（会話履歴が見つからない可能性があります）",
+  },
 ];
 
 /** Shown when the cause is not on the allowlist — assume it can carry a path. */

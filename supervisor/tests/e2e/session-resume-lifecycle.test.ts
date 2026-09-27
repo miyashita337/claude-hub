@@ -34,13 +34,14 @@
 // with not a single `console.log`/`console.warn` call anywhere in that
 // window — before FINALLY inserting the sessions.db row and logging success.
 //
-// Fix pinned by this test (manager.ts, PR #484): `confirmResumePromptIfPresent`
-// now warns once when the marker never appears after full exhaustion (still
-// registers the session — that documented "no picker ⇒ non-compacted resume"
-// fallback for the LEGITIMATE fast case is preserved), and logs a periodic
-// heartbeat during long waits. This does not shorten Issue #163's empirically
-// -tuned 5-minute budget for genuinely large/compacted sessions; it makes the
-// wait OBSERVABLE instead of silent, which is the actual production complaint.
+// Fix pinned by this test: PR #484 made the exhaustion observable (a warn
+// plus a periodic heartbeat). Issue #485 added a liveness check to every poll:
+// a session that is definitely gone fails immediately (unit-tested in
+// manager-resume.test.ts). A pane that is still ALIVE when the attempts run
+// out, like this mock, is still registered with a warn plus a stderr pane
+// tail. It is not killed, so a slow, very large resume (self-heal) or a TUI
+// wording change cannot become a hard failure. Issue #163's 5-minute budget is
+// unchanged.
 //
 // Required env (self-skips otherwise, same gating as session-lifecycle.test.ts):
 //   - SUPERVISOR_TMUX_SOCKET=claude-hub-test   (isolates from prod `claude-hub`)
@@ -172,57 +173,59 @@ afterAll(async () => {
   }
 });
 
-describe("SessionManager.resumeSession root-cause investigation (PR #484 review)", () => {
+describe("SessionManager.resumeSession root-cause investigation (PR #484 review / Issue #485)", () => {
   itE2E(
-    "confirms the exact stall: claude-mock.sh's pane never matches the " +
-      "resume-prompt/ready markers, so confirmResumePromptIfPresent silently " +
-      "consumes the FULL poll window (no early exit, zero console output) " +
-      "before resumeSession still reports success",
+    "claude-mock.sh's pane never matches the resume-prompt/ready markers: " +
+      "confirmResumePromptIfPresent consumes the full poll window, then " +
+      "resumeSession registers the still-alive session with a warn + stderr " +
+      "pane tail (Issue #485 only fails a session that is definitely gone)",
     async () => {
       const threadId = `resume-lifecycle-${process.pid}-${Date.now()}`;
       const claudeSessionId = randomUUID();
+      const tmuxName = SessionManager.tmuxSessionNameFor(threadId);
 
-      const logSpy = spyOn(console, "log");
-      const warnSpy = spyOn(console, "warn");
-      const logCallCountBeforeResume = logSpy.mock.calls.length;
-      const warnCallCountBeforeResume = warnSpy.mock.calls.length;
+      const warnSpy = spyOn(console, "warn").mockImplementation(() => {});
+      const errSpy = spyOn(console, "error").mockImplementation(() => {});
 
       const t0 = Date.now();
       try {
         // Mirrors the production condition confirmed against the real
         // sessions.db row: `existsSync(projectDir) === true`, so
-        // `recoverWorktreeForResume` (and therefore the git-timeout fix) is
-        // never invoked — this isolates confirmResumePromptIfPresent as the
-        // sole remaining candidate.
+        // `recoverWorktreeForResume` is never invoked — this isolates
+        // confirmResumePromptIfPresent.
         await manager.resumeSession(config, threadId, claudeSessionId, projectDir, null);
         const elapsed = Date.now() - t0;
 
-        // AC-1: the full window elapsed (no early exit) — proves the pane
-        // never matched either regex, exactly like claude-mock.sh's silence.
-        // 5 attempts × 200ms = 1000ms; allow scheduling slack, require at
-        // least 4 full intervals to rule out an early return.
+        // The full window elapsed (no early exit): the pane never matched
+        // either regex, and claude-mock.sh stays alive so the #485 liveness
+        // check does not fire. 5 attempts × 200ms; require ≥ 4 intervals.
         expect(elapsed).toBeGreaterThanOrEqual(4 * 200);
 
-        // AC-2 (the fix for the actual production complaint): before the fix
-        // this window produced ZERO console.log/warn calls at all — the exact
-        // "考え中" silence reported. `confirmResumePromptIfPresent` now warns
-        // once when the marker never appears (this exhaustion case), so the
-        // stall is diagnosable in the Supervisor's own logs instead of silent.
-        const logCallsDuringResume = logSpy.mock.calls.length - logCallCountBeforeResume;
-        const warnCallsDuringResume = warnSpy.mock.calls.length - warnCallCountBeforeResume;
-        expect(warnCallsDuringResume).toBe(1);
-        expect(String(warnSpy.mock.calls.at(-1)?.[0])).toContain("never appeared");
-        // The final "Resumed ..." success log is still exactly one call.
-        expect(logCallsDuringResume).toBe(1);
-        expect(String(logSpy.mock.calls.at(-1)?.[0])).toContain("Resumed");
+        // The exhaustion is logged loudly (PR #484) ...
+        expect(
+          warnSpy.mock.calls.some((c) => String(c[0]).includes("never appeared"))
+        ).toBe(true);
+        // ... and the last pane lines go to stderr for diagnosis (#485).
+        expect(
+          errSpy.mock.calls.some((c) => String(c[0]).includes("last captured pane lines"))
+        ).toBe(true);
 
-        // AC-3: despite the pane never reaching a picker/ready state,
-        // resumeSession still reports SUCCESS (the false-positive shape of
-        // this bug) — the session is tracked and the DB row exists.
+        // The pane is really alive (the #485 liveness check saw it on every
+        // poll), so the session is registered and left running, not killed.
         expect(manager.has(threadId)).toBe(true);
+        let alive = true;
+        try {
+          execFileSync(TMUX_PATH, [...TMUX_ARGS, "has-session", "-t", tmuxName], {
+            timeout: TMUX_OP_TIMEOUT,
+            stdio: "ignore",
+          });
+        } catch {
+          alive = false;
+        }
+        expect(alive).toBe(true);
       } finally {
-        logSpy.mockRestore();
         warnSpy.mockRestore();
+        errSpy.mockRestore();
         if (manager.has(threadId)) {
           await manager.stop(threadId, "manual").catch(() => {});
         }

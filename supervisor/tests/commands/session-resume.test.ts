@@ -1,4 +1,4 @@
-import { test, expect, describe, beforeEach, afterEach } from "bun:test";
+import { test, expect, describe, beforeEach, afterEach, spyOn } from "bun:test";
 import { mkdtempSync, writeFileSync, rmSync } from "fs";
 import { join } from "path";
 import { tmpdir } from "os";
@@ -386,6 +386,47 @@ describe("/session resume validation (#161)", () => {
     expect(editReplies[editReplies.length - 1]!.content).toContain(
       "セッション復帰に失敗"
     );
+  });
+
+  // Issue #485 AC-2: the resumed tmux pane died right after launch; before the
+  // fix resumeSession still resolved and Discord showed "✅ セッションを復帰しました".
+  // Now resumeSession rejects, and the handler must keep the interim status,
+  // then end on a sanitized failure notice — never the success text, and never
+  // the raw cause (tmux name / filesystem path) from the thrown error.
+  test("Issue #485 AC-2: resumed pane vanished → sanitized failure, not 復帰しました", async () => {
+    const errSpy = spyOn(console, "error").mockImplementation(() => {});
+    try {
+      const h = makeInteraction({
+        sessionId: VALID_ID,
+        channelName: "team-salary",
+        resumableRow: {
+          channel_name: "team-salary",
+          project_dir: "/Users/x/team_salary",
+          status: "stopped",
+        },
+        resumeImpl: async () => {
+          throw new Error(
+            "Claude Code の resume 起動直後に tmux セッション claude-thread-resu が終了しました (cwd=/Users/x/team_salary)"
+          );
+        },
+      });
+      await h.run();
+
+      const editReplies = h.replies.filter((r) => r.kind === "editReply");
+      // Interim status is still shown while resuming.
+      expect(editReplies.some((r) => r.content?.includes("復帰しています"))).toBe(true);
+      const last = editReplies[editReplies.length - 1]!.content ?? "";
+      expect(last).toContain("セッション復帰に失敗");
+      expect(last).not.toContain("✅");
+      expect(last).not.toContain("復帰しました");
+      // Sanitized: no raw cause leaks into Discord.
+      expect(last).not.toContain("/Users/x");
+      expect(last).not.toContain("claude-thread");
+      expect(h.threadDeleted).toBe(true);
+      expect(h.stopCalls).toHaveLength(0);
+    } finally {
+      errSpy.mockRestore();
+    }
   });
 
   test("notify failure after resume → session stopped, then thread deleted (PR #162: CodeRabbit Major)", async () => {

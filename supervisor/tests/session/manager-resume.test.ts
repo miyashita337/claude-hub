@@ -9,7 +9,7 @@ import { resolveWorktreePath } from "../../src/session/worktree";
 // Isolate DB writes from the real sessions.db (mirrors tests/infra/db.test.ts).
 process.env.SUPERVISOR_DB_PATH = ":memory:";
 
-const { SessionManager } = await import("../../src/session/manager");
+const { SessionManager, redactPaneSecrets } = await import("../../src/session/manager");
 const { createFakeEffects } = await import(
   "../../src/session/adapters-fake"
 );
@@ -108,37 +108,175 @@ describe("SessionManager.resumeSession (#161)", () => {
       resumePromptPollAttempts: 2,
       resumePromptPollIntervalMs: 5,
     });
-    // capturePane returns "" (no marker) for the whole poll window.
-    await manager.resumeSession(makeConfig(projectDir), THREAD_ID, VALID_ID, projectDir);
-
-    expect(effects.tmux.sendKeysCalls).toHaveLength(0);
+    const errSpy = spyOn(console, "error").mockImplementation(() => {});
+    const warnSpy = spyOn(console, "warn").mockImplementation(() => {});
+    try {
+      // capturePane returns "" (no marker) for the whole poll window.
+      await manager.resumeSession(makeConfig(projectDir), THREAD_ID, VALID_ID, projectDir);
+      expect(effects.tmux.sendKeysCalls).toHaveLength(0);
+    } finally {
+      errSpy.mockRestore();
+      warnSpy.mockRestore();
+    }
   });
 
-  // PR #484 review (2nd Discord E2E FAIL): decisively reproduced with real tmux
-  // in tests/e2e/session-resume-lifecycle.test.ts that a pane which NEVER
-  // matches either marker silently exhausts the full poll window with zero
-  // console output, then still reports success. These pin the observability
-  // fix at the unit level (fast, no real tmux needed).
-  test("PR #484: warns once when the resume prompt/ready marker never appears (full exhaustion)", async () => {
+  // Issue #485 AC-1: in production the resumed `claude --resume <id>` exited
+  // ~2s after launch ("No conversation found with session ID"), yet the poll
+  // kept capturing the dead pane for the full 300×1s window and then reported
+  // success. The loop must check liveness every iteration and abort at once.
+  test("Issue #485 AC-1: aborts immediately as a failure when the tmux session vanishes mid-poll", async () => {
+    manager = new SessionManager({
+      effects,
+      gracefulKillTimeoutMs: 0,
+      // A huge budget: without the liveness check this would poll ~10s.
+      resumePromptPollAttempts: 1000,
+      resumePromptPollIntervalMs: 10,
+    });
+    // Simulate claude printing its fatal error and exiting right after the
+    // first capture: the pane shows the message once, then the session is gone.
+    const realCapture = effects.tmux.capturePane.bind(effects.tmux);
+    let captures = 0;
+    effects.tmux.capturePane = async (name: string) => {
+      captures += 1;
+      const pane = await realCapture(name);
+      await effects.tmux.killSession(name);
+      return pane;
+    };
+    effects.tmux.setPaneContent(
+      tmuxName,
+      "No conversation found with session ID: " + VALID_ID
+    );
+    const errSpy = spyOn(console, "error").mockImplementation(() => {});
+    const warnSpy = spyOn(console, "warn").mockImplementation(() => {});
+    try {
+      const t0 = Date.now();
+      await expect(
+        manager.resumeSession(makeConfig(projectDir), THREAD_ID, VALID_ID, projectDir)
+      ).rejects.toThrow(/終了/);
+      expect(Date.now() - t0).toBeLessThan(1000);
+      expect(captures).toBeLessThanOrEqual(2);
+
+      // Not registered as resumed (no false success, no DB "running" row).
+      expect(manager.has(THREAD_ID)).toBe(false);
+      expect(manager.count()).toBe(0);
+      expect(effects.tmux.list()).toHaveLength(0);
+      expect(effects.tmux.sendKeysCalls).toHaveLength(0);
+
+      // Diagnosability: the last captured pane lines go to stderr.
+      const errText = errSpy.mock.calls.map((c) => c.map(String).join(" ")).join("\n");
+      expect(errText).toContain("No conversation found with session ID");
+    } finally {
+      errSpy.mockRestore();
+      warnSpy.mockRestore();
+    }
+  });
+
+  // PR #487 review (CodeRabbit): the early returns (ready marker / picker
+  // confirmed) must re-check liveness, or a session that died between the
+  // hasSession check and the return is registered as resumed.
+  test.each([
+    ["ready marker", "? for shortcuts", "capture"],
+    ["resume picker", "Resume from summary", "sendKeys"],
+  ] as const)(
+    "PR #487 review: session gone right after the %s → failure, not registered",
+    async (_label, paneText, dieAfter) => {
+      manager = new SessionManager({
+        effects,
+        gracefulKillTimeoutMs: 0,
+        resumePromptPollAttempts: 10,
+        resumePromptPollIntervalMs: 1,
+      });
+      if (dieAfter === "capture") {
+        const realCapture = effects.tmux.capturePane.bind(effects.tmux);
+        effects.tmux.capturePane = async (name: string) => {
+          const pane = await realCapture(name);
+          await effects.tmux.killSession(name);
+          return pane;
+        };
+      } else {
+        const realSendKeys = effects.tmux.sendKeys.bind(effects.tmux);
+        effects.tmux.sendKeys = async (name: string, keys: string[]) => {
+          await realSendKeys(name, keys);
+          await effects.tmux.killSession(name);
+        };
+      }
+      effects.tmux.setPaneContent(tmuxName, paneText);
+      const errSpy = spyOn(console, "error").mockImplementation(() => {});
+      const warnSpy = spyOn(console, "warn").mockImplementation(() => {});
+      try {
+        await expect(
+          manager.resumeSession(makeConfig(projectDir), THREAD_ID, VALID_ID, projectDir)
+        ).rejects.toThrow(/終了/);
+        expect(manager.has(THREAD_ID)).toBe(false);
+        expect(manager.count()).toBe(0);
+      } finally {
+        errSpy.mockRestore();
+        warnSpy.mockRestore();
+      }
+    }
+  );
+
+  // Issue #485 AC-2 (attempts-exhausted half): the attempt budget runs out and
+  // the session dies during the final wait. That counts as a failure (dead is
+  // dead), not the old "proceeding anyway" success.
+  test("Issue #485 AC-2: session gone at exhaustion → failure, rolled back", async () => {
     manager = new SessionManager({
       effects,
       gracefulKillTimeoutMs: 0,
       resumePromptPollAttempts: 3,
       resumePromptPollIntervalMs: 5,
     });
+    const realCapture = effects.tmux.capturePane.bind(effects.tmux);
+    let captures = 0;
+    effects.tmux.capturePane = async (name: string) => {
+      captures += 1;
+      const pane = await realCapture(name);
+      // Dies right after the LAST capture, so only the post-loop check sees it.
+      if (captures === 3) await effects.tmux.killSession(name);
+      return pane;
+    };
+    effects.tmux.setPaneContent(tmuxName, "some unexpected pane state");
     const warnSpy = spyOn(console, "warn").mockImplementation(() => {});
+    const errSpy = spyOn(console, "error").mockImplementation(() => {});
     try {
-      // capturePane returns "" (no marker) for the whole poll window — the
-      // exact claude-mock.sh pane shape from the real-tmux E2E repro.
-      await manager.resumeSession(makeConfig(projectDir), THREAD_ID, VALID_ID, projectDir);
-
-      expect(warnSpy).toHaveBeenCalledTimes(1);
-      expect(String(warnSpy.mock.calls[0]?.[0])).toContain("never appeared");
-      // The false-positive shape of the bug: still reports success despite the
-      // marker never appearing.
-      expect(manager.has(THREAD_ID)).toBe(true);
+      await expect(
+        manager.resumeSession(makeConfig(projectDir), THREAD_ID, VALID_ID, projectDir)
+      ).rejects.toThrow(/起動直後に終了/);
+      expect(manager.has(THREAD_ID)).toBe(false);
+      expect(effects.tmux.list()).toHaveLength(0);
+      const errText = errSpy.mock.calls.map((c) => c.map(String).join(" ")).join("\n");
+      expect(errText).toContain("some unexpected pane state");
     } finally {
       warnSpy.mockRestore();
+      errSpy.mockRestore();
+    }
+  });
+
+  // Issue #485 (devils-advocate review): when the pane is still alive at the
+  // end of the attempts, it is NOT killed. A slow resume of a large session
+  // (self-heal resumes ~800k-token sessions) or a TUI wording change must not
+  // turn into a hard failure. Warn loudly and log the pane tail instead.
+  test("Issue #485: session still alive at exhaustion → registered with warn + pane tail (not killed)", async () => {
+    manager = new SessionManager({
+      effects,
+      gracefulKillTimeoutMs: 0,
+      resumePromptPollAttempts: 3,
+      resumePromptPollIntervalMs: 5,
+    });
+    effects.tmux.setPaneContent(tmuxName, "still rendering a huge transcript");
+    const warnSpy = spyOn(console, "warn").mockImplementation(() => {});
+    const errSpy = spyOn(console, "error").mockImplementation(() => {});
+    try {
+      await manager.resumeSession(makeConfig(projectDir), THREAD_ID, VALID_ID, projectDir);
+      expect(warnSpy).toHaveBeenCalledTimes(1);
+      expect(String(warnSpy.mock.calls[0]?.[0])).toContain("never appeared");
+      expect(manager.has(THREAD_ID)).toBe(true);
+      expect(effects.tmux.list()).toContain(tmuxName);
+      const errText = errSpy.mock.calls.map((c) => c.map(String).join(" ")).join("\n");
+      expect(errText).toContain("still rendering a huge transcript");
+    } finally {
+      warnSpy.mockRestore();
+      errSpy.mockRestore();
     }
   });
 
@@ -520,5 +658,27 @@ describe("SessionManager resume single-flight & liveness (#171)", () => {
       projectDir
     );
     expect(info.status).toBe("running");
+  });
+});
+
+// PR #487 review (Devin): the pane tail is written to supervisor.stderr.log,
+// so secret-looking values on screen must be masked before logging. The
+// session UUID must survive — it is the diagnostic we log the tail for.
+describe("redactPaneSecrets (PR #487 review)", () => {
+  test("masks tokens and key=value secrets but keeps the session UUID", () => {
+    const pane = [
+      "No conversation found with session ID: 134a0815-94de-4cc5-a7c0-134db76d6759",
+      "export ANTHROPIC_API_KEY=sk-ant-abc123DEF456ghi789",
+      "gh token ghp_ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789",
+      "password: hunter2",
+      "blob QWxhZGRpbjpvcGVuIHNlc2FtZQQWxhZGRpbjpvcGVu",
+    ].join("\n");
+    const out = redactPaneSecrets(pane);
+    expect(out).toContain("134a0815-94de-4cc5-a7c0-134db76d6759");
+    expect(out).not.toContain("sk-ant-abc123DEF456ghi789");
+    expect(out).not.toContain("ghp_ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789");
+    expect(out).not.toContain("hunter2");
+    expect(out).not.toContain("QWxhZGRpbjpvcGVuIHNlc2FtZQQWxhZGRpbjpvcGVu");
+    expect(out).toContain("[REDACTED]");
   });
 });
