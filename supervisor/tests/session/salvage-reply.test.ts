@@ -106,6 +106,33 @@ describe("buildSalvageReply (#169)", () => {
     expect(reply).toContain(`/session resume ${claudeId}`);
   });
 
+  // #451: hub-work rows carry the synthetic channel_name "claude-hub-work" but
+  // buildSalvageReply never branches on channel_name — the wording (and its
+  // `/session resume <id>` line) is identical to any other channel. The line
+  // becomes actually reachable once handleResume (session.ts) special-cases
+  // this channel_name; this test just pins that the guidance itself is already
+  // correct and does not regress when it does.
+  test("dead hub-work session → same actionable resume guidance as any other channel", async () => {
+    const claudeId = "66666666-6666-6666-6666-666666666666";
+    insertSession({
+      id: "s-hub-work",
+      channel_name: "claude-hub-work",
+      thread_id: "thread-hub-work-dead",
+      project_dir: "/tmp/claude-hub",
+      pid: 4242,
+      claude_session_id: claudeId,
+      started_at: new Date().toISOString(),
+      last_activity_at: new Date().toISOString(),
+      status: "running",
+    });
+    updateSessionStatus("s-hub-work", "stopped", "supervisor_restart");
+
+    const reply = await buildSalvageReply(manager, "thread-hub-work-dead");
+    expect(reply).toContain("停止しています");
+    expect(reply).toContain(claudeId);
+    expect(reply).toContain(`/session resume ${claudeId}`);
+  });
+
   test("alive without id → suggests start (resume is not actionable without an id)", async () => {
     const threadId = "thread-alivnoid";
     insertSession({

@@ -70,6 +70,20 @@ describe("Reaper.buildIdleNotice", () => {
     expect(notice).toContain("/session start corp-dispatch-9");
     expect(notice).not.toContain("/session resume");
   });
+
+  // #451: buildIdleNotice takes no channel information at all (ReapedSessionInfo
+  // is just { claudeSessionId, branch }), so a hub-work session's idle teardown
+  // notice is identical in shape to any other channel's — the guidance becomes
+  // actually reachable once handleResume (session.ts) special-cases the
+  // hub-work channel_name. This pins that the notice text itself is unaffected.
+  test("hub-work session idle teardown gets the same actionable /session resume line", () => {
+    const notice = Reaper.buildIdleNotice(7 * HOUR, {
+      claudeSessionId: "hub-work-session-id",
+      branch: undefined,
+    });
+    expect(notice).toContain("自動終了");
+    expect(notice).toContain("/session resume hub-work-session-id");
+  });
 });
 
 function makeSession(over: Partial<SessionInfo> & { threadId: string }): SessionInfo {

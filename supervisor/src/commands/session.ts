@@ -21,6 +21,11 @@ import {
   DEFAULT_COMPACT_INTENT,
 } from "./compact-button";
 import { sanitizedFailureNotice } from "../session/user-error-notice";
+import {
+  buildHubWorkConfig,
+  HUB_WORK_CHANNEL_NAME,
+  HUB_WORK_PARENT_CHANNEL,
+} from "../session/hub-work";
 
 export function createSessionCommand() {
   return new SlashCommandBuilder()
@@ -670,6 +675,35 @@ async function handleResume(
     return;
   }
 
+  // Issue #451 (devils-advocate review on the hub-work resume fix): enforce
+  // access.json `allowFrom` BEFORE resuming, exactly like `handleStart` does
+  // (Issue #32 / S7 Critical). `resumeSession` spawns a Claude process with
+  // `--dangerously-skip-permissions` just as `start` does, so an un-gated
+  // resume is the same privilege escalation — and without this check, the
+  // hub-work special-case below would let anyone in a registered channel
+  // relaunch a session in the claude-hub repo itself. Fail-closed, keyed on
+  // the parent channel id (threads inherit their parent's opt-in).
+  {
+    const parentChannelId =
+      channel.isThread() && channel.parentId ? channel.parentId : channel.id;
+    const decision = evaluateAccess({
+      channelKey: parentChannelId,
+      userId: interaction.user.id,
+      isMention: true,
+    });
+    if (!decision.allowed) {
+      console.warn(
+        `[Session] /session resume access denied (reason=${decision.reason}) in channel ${channelName}`
+      );
+      await interaction.reply({
+        content:
+          "❌ このチャンネルでセッションを復帰する権限がありません（アクセスポリシー）。",
+        flags: 64,
+      });
+      return;
+    }
+  }
+
   const sessionId = interaction.options.getString("session_id")?.trim() ?? "";
   if (!sessionId) {
     await interaction.reply({
@@ -688,13 +722,34 @@ async function handleResume(
     });
     return;
   }
-  if (row.channel_name !== channelName) {
+  // Issue #451: hub-work rows carry the synthetic channel_name
+  // HUB_WORK_CHANNEL_NAME, which never matches a real Discord channel (contract:
+  // it must never be registered in CHANNEL_MAP — see hub-work.ts). Without this
+  // branch the equality check below always rejects them, making
+  // `/session resume` structurally unreachable for every hub-work session. The
+  // only place a hub-work thread actually lives is under HUB_WORK_PARENT_CHANNEL
+  // (corp), so that is the one channel resume is allowed from.
+  const isHubWorkRow = row.channel_name === HUB_WORK_CHANNEL_NAME;
+  if (isHubWorkRow) {
+    if (channelName !== HUB_WORK_PARENT_CHANNEL) {
+      await interaction.reply({
+        content: `❌ この session は work セッション（#${HUB_WORK_PARENT_CHANNEL} 配下）のものです。#${HUB_WORK_PARENT_CHANNEL} チャンネルで実行してください。`,
+        flags: 64,
+      });
+      return;
+    }
+  } else if (row.channel_name !== channelName) {
     await interaction.reply({
       content: `❌ この session は別チャンネル (\`${row.channel_name}\`) のものです。そのチャンネルで実行してください。`,
       flags: 64,
     });
     return;
   }
+  // resumeSession/thread naming below must use the session's OWN config, not
+  // the Discord channel's CHANNEL_MAP entry: a hub-work row resumes with the
+  // ephemeral hub-work config (CONTRACT: never registered in CHANNEL_MAP)
+  // even though the command runs from the real "corp" channel.
+  const resumeConfig = isHubWorkRow ? buildHubWorkConfig() : config;
   // Issue #171 (穴 A): trust the authoritative liveness verdict (#168), not the
   // DB `status` column. A stale `status='running'` row (process died without a
   // clean stop) must NOT block a legitimate resume; conversely a genuinely-live
@@ -729,7 +784,9 @@ async function handleResume(
     // to a display-name-only title inside buildThreadTitle). Sequence counts
     // same-branch live sessions; with a null branch it counts channel-wide,
     // preserving the legacy "(N)" behaviour.
-    const liveSessions = sessionManager.listRunningByChannel(channelName);
+    const liveSessions = sessionManager.listRunningByChannel(
+      resumeConfig.channelName
+    );
     const sessionNum =
       (row.branch
         ? liveSessions.filter((s) => s.branch === row.branch).length
@@ -737,7 +794,7 @@ async function handleResume(
     const threadName = buildThreadTitle(
       "resume",
       row.branch,
-      config.displayName,
+      resumeConfig.displayName,
       sessionNum
     );
 
@@ -762,11 +819,30 @@ async function handleResume(
     });
     createdThread = thread;
 
+    // PR #484 review: a large/compacted session's resume prompt can take up
+    // to ~5 minutes to render (Issue #163), during which resumeSession() below
+    // produces no observable signal to Discord at all — leaving the
+    // interaction on Discord's own "考え中" placeholder with nothing to show
+    // it isn't stuck. Replace it with an accurate interim status pointing at
+    // the (already-created) thread instead of leaving that ambiguous for
+    // minutes. Best-effort: a failure here is purely cosmetic and must not
+    // abort the resume itself.
+    try {
+      await interaction.editReply({
+        content: `⏳ セッションを復帰しています → ${thread}\n（会話履歴が大きい場合、数分かかることがあります）`,
+      });
+    } catch (err) {
+      console.error(
+        `[Session] resume interim status update failed for thread ${thread.id}:`,
+        err
+      );
+    }
+
     // Resume in the directory the original session ran in (row.project_dir),
     // not a worktree — `claude --resume` keys the transcript by cwd. Awaited so
     // the resume prompt is confirmed before the welcome message is posted.
     await sessionManager.resumeSession(
-      config,
+      resumeConfig,
       thread.id,
       sessionId,
       row.project_dir,
@@ -775,7 +851,7 @@ async function handleResume(
     resumed = true;
 
     await thread.send(
-      `♻️ **${config.displayName}** のセッションを復帰しました（resume）\n\n` +
+      `♻️ **${resumeConfig.displayName}** のセッションを復帰しました（resume）\n\n` +
         `📁 ディレクトリ: \`${row.project_dir}\`\n` +
         `🔑 Claude session: \`${sessionId}\`\n` +
         `📊 稼働中セッション: ${sessionManager.count()}/${MAX_SESSIONS}\n\n` +

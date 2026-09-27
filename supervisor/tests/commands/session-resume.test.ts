@@ -1,4 +1,7 @@
-import { test, expect, describe } from "bun:test";
+import { test, expect, describe, beforeEach, afterEach } from "bun:test";
+import { mkdtempSync, writeFileSync, rmSync } from "fs";
+import { join } from "path";
+import { tmpdir } from "os";
 import { createSessionHandler } from "../../src/commands/session";
 
 /**
@@ -11,7 +14,44 @@ import { createSessionHandler } from "../../src/commands/session";
  *
  * "team-salary" is a real CHANNEL_MAP key, so the channel-registration gate
  * passes; "claude-hub-hijoguchi" is intentionally NOT in CHANNEL_MAP.
+ *
+ * Issue #451 (devils-advocate review on the hub-work resume fix): `handleResume`
+ * now enforces access.json exactly like `handleStart` does (Issue #32 / S7
+ * Critical) — resume spawns a `--dangerously-skip-permissions` Claude process
+ * just like start does, and without this gate the hub-work special-case added
+ * for #451 would let anyone in a registered channel relaunch a session in the
+ * claude-hub repo itself. These validation tests assert behavior AFTER access
+ * is granted (mirrors session-start-branch.test.ts); access-denial behavior is
+ * covered in session-resume-access.test.ts.
  */
+const FIXTURE_CHANNEL_ID = "fixture-parent-channel";
+const FIXTURE_USER_ID = "fixture-user";
+let accessDir: string;
+const prevAccessPath = process.env.SUPERVISOR_ACCESS_JSON_PATH;
+
+beforeEach(() => {
+  accessDir = mkdtempSync(join(tmpdir(), "session-resume-access-"));
+  const accessPath = join(accessDir, "access.json");
+  writeFileSync(
+    accessPath,
+    JSON.stringify({
+      groups: {
+        [FIXTURE_CHANNEL_ID]: {
+          requireMention: true,
+          allowFrom: [FIXTURE_USER_ID],
+        },
+      },
+    }),
+  );
+  process.env.SUPERVISOR_ACCESS_JSON_PATH = accessPath;
+});
+
+afterEach(() => {
+  if (prevAccessPath === undefined)
+    delete process.env.SUPERVISOR_ACCESS_JSON_PATH;
+  else process.env.SUPERVISOR_ACCESS_JSON_PATH = prevAccessPath;
+  rmSync(accessDir, { recursive: true, force: true });
+});
 
 const VALID_ID = "3139aa23-fe2a-485a-831a-2209081f9935";
 
@@ -39,6 +79,14 @@ function makeInteraction(opts: {
    * "dead" so legacy stopped-row tests keep passing.
    */
   liveness?: "alive" | "dead" | "unknown";
+  /**
+   * Issue #451 (devils-advocate review gap): simulate running `/session
+   * resume` from INSIDE a thread (e.g. the dead hub-work thread itself) whose
+   * parent is `channelName`, instead of from the top-level channel. Exercises
+   * the `channel.isThread() && channel.parent` branch that resolves
+   * `channelName` via the parent, which the non-thread mock never reaches.
+   */
+  asThread?: boolean;
 }) {
   const replies: ReplyRecord[] = [];
   const resumeCalls: unknown[][] = [];
@@ -57,11 +105,15 @@ function makeInteraction(opts: {
     },
   };
 
-  const channel = {
-    isThread: () => false,
+  // Reused as both the top-level channel (non-thread case) and the parent
+  // channel (thread case) — both need isTextBased/isDMBased/threads.create,
+  // and reusing FIXTURE_CHANNEL_ID as its id keeps the access.json fixture
+  // above valid for either shape.
+  const parentChannelLike = {
+    id: FIXTURE_CHANNEL_ID,
+    name: opts.channelName ?? "team-salary",
     isTextBased: () => true,
     isDMBased: () => false,
-    name: opts.channelName ?? "team-salary",
     threads: {
       create: async () => {
         threadCreated = true;
@@ -70,7 +122,19 @@ function makeInteraction(opts: {
     },
   };
 
+  const channel = opts.asThread
+    ? {
+        id: "dead-hub-work-thread-id",
+        isThread: () => true,
+        parent: parentChannelLike,
+        parentId: parentChannelLike.id,
+        isTextBased: () => true,
+        isDMBased: () => false,
+      }
+    : { ...parentChannelLike, isThread: () => false };
+
   const interaction = {
+    user: { id: FIXTURE_USER_ID },
     options: {
       getSubcommand: () => "resume",
       getString: (name: string) =>
@@ -177,6 +241,69 @@ describe("/session resume validation (#161)", () => {
     expect(h.resumeCalls).toHaveLength(0);
     expect(h.replies[0]!.content).toContain("別チャンネル");
     expect(h.replies[0]!.content).toContain("agent-base");
+  });
+
+  test("hub-work row (#451) resumed from #corp → resumeSession called with hub-work config", async () => {
+    const h = makeInteraction({
+      sessionId: VALID_ID,
+      channelName: "corp",
+      resumableRow: {
+        channel_name: "claude-hub-work",
+        project_dir: "/Users/x/claude-hub",
+        status: "stopped",
+      },
+    });
+    await h.run();
+
+    expect(h.threadCreated).toBe(true);
+    expect(h.resumeCalls).toHaveLength(1);
+    // resumeSession(config, threadId, sessionId, projectDir, branch) — the
+    // config passed must be the ephemeral hub-work config (channelName
+    // "claude-hub-work"), never CHANNEL_MAP's real "corp" entry, and CHANNEL_MAP
+    // itself must stay untouched (absolute rule).
+    const passedConfig = h.resumeCalls[0]![0] as { channelName: string };
+    expect(passedConfig.channelName).toBe("claude-hub-work");
+    const editReplies = h.replies.filter((r) => r.kind === "editReply");
+    expect(editReplies[editReplies.length - 1]!.content).toContain("復帰しました");
+  });
+
+  test("hub-work row (#451) resumed from INSIDE the dead hub-work thread (parent=#corp)", async () => {
+    // devils-advocate review gap: resume is most often invoked from inside the
+    // archived hub-work thread itself, not from the top-level #corp channel.
+    // channelName must resolve via channel.parent.name in that case.
+    const h = makeInteraction({
+      sessionId: VALID_ID,
+      channelName: "corp",
+      asThread: true,
+      resumableRow: {
+        channel_name: "claude-hub-work",
+        project_dir: "/Users/x/claude-hub",
+        status: "stopped",
+      },
+    });
+    await h.run();
+
+    expect(h.threadCreated).toBe(true);
+    expect(h.resumeCalls).toHaveLength(1);
+    const passedConfig = h.resumeCalls[0]![0] as { channelName: string };
+    expect(passedConfig.channelName).toBe("claude-hub-work");
+  });
+
+  test("hub-work row (#451) resume attempted outside #corp → rejected, guided to #corp", async () => {
+    const h = makeInteraction({
+      sessionId: VALID_ID,
+      channelName: "team-salary",
+      resumableRow: {
+        channel_name: "claude-hub-work",
+        project_dir: "/Users/x/claude-hub",
+        status: "stopped",
+      },
+    });
+    await h.run();
+
+    expect(h.resumeCalls).toHaveLength(0);
+    expect(h.threadCreated).toBe(false);
+    expect(h.replies[0]!.content).toContain("corp");
   });
 
   test("session genuinely alive (liveness=alive) → warns, no resume (#171 穴 A)", async () => {
