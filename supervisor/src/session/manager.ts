@@ -1817,27 +1817,34 @@ export class SessionManager {
     // diagnosable. stderr only — pane text can hold anything, so it must never
     // reach Discord (the thrown message is sanitized by the caller, #360).
     let lastPane = "";
-    for (let i = 0; i < this.resumePromptPollAttempts; i++) {
-      // Issue #485 AC-1: a resumed claude that exits right after launch
-      // leaves no tmux session. Without this check the loop captured the
-      // missing pane for the whole ~5min window and then reported success.
-      // hasSession returns true on a tmux timeout (liveness unknown, #369),
-      // so only a definite "no such session" aborts here.
+    // Issue #485 AC-1: a resumed claude that exits right after launch leaves
+    // no tmux session. hasSession returns true on a tmux timeout (liveness
+    // unknown, #369), so only a definite "no such session" aborts.
+    const assertAlive = async (attempt: number) => {
       if (!(await this.effects.tmux.hasSession(tmuxName))) {
-        throwResumeSessionExited(tmuxName, lastPane, i, this.resumePromptPollAttempts);
+        throwResumeSessionExited(tmuxName, lastPane, attempt, this.resumePromptPollAttempts);
       }
+    };
+    for (let i = 0; i < this.resumePromptPollAttempts; i++) {
+      // Without this check the loop captured the missing pane for the whole
+      // ~5min window and then reported success.
+      await assertAlive(i);
       const pane = await this.effects.tmux.capturePane(tmuxName);
       if (pane.trim()) lastPane = pane;
       if (RESUME_PROMPT_RE.test(pane)) {
         // Down moves from option 1 (summary, highlighted) to option 2 (full
         // session as-is); C-m confirms. See Issue #163.
         await this.effects.tmux.sendKeys(tmuxName, ["Down", "C-m"]);
+        // PR #487 review: re-check before returning so a session that died
+        // after the check above is not registered as resumed.
+        await assertAlive(i);
         return;
       }
       // Reached the normal input prompt with no picker — stop polling instead
       // of waiting out the (multi-minute) window for a picker that won't appear
       // (Issue #163). Checked after the picker so the picker always wins.
       if (RESUME_READY_RE.test(pane)) {
+        await assertAlive(i);
         return;
       }
       // PR #484 review: a heartbeat every N attempts so a long-but-legitimate

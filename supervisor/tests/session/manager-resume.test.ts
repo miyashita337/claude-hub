@@ -171,6 +171,51 @@ describe("SessionManager.resumeSession (#161)", () => {
     }
   });
 
+  // PR #487 review (CodeRabbit): the early returns (ready marker / picker
+  // confirmed) must re-check liveness, or a session that died between the
+  // hasSession check and the return is registered as resumed.
+  test.each([
+    ["ready marker", "? for shortcuts", "capture"],
+    ["resume picker", "Resume from summary", "sendKeys"],
+  ] as const)(
+    "PR #487 review: session gone right after the %s → failure, not registered",
+    async (_label, paneText, dieAfter) => {
+      manager = new SessionManager({
+        effects,
+        gracefulKillTimeoutMs: 0,
+        resumePromptPollAttempts: 10,
+        resumePromptPollIntervalMs: 1,
+      });
+      if (dieAfter === "capture") {
+        const realCapture = effects.tmux.capturePane.bind(effects.tmux);
+        effects.tmux.capturePane = async (name: string) => {
+          const pane = await realCapture(name);
+          await effects.tmux.killSession(name);
+          return pane;
+        };
+      } else {
+        const realSendKeys = effects.tmux.sendKeys.bind(effects.tmux);
+        effects.tmux.sendKeys = async (name: string, keys: string[]) => {
+          await realSendKeys(name, keys);
+          await effects.tmux.killSession(name);
+        };
+      }
+      effects.tmux.setPaneContent(tmuxName, paneText);
+      const errSpy = spyOn(console, "error").mockImplementation(() => {});
+      const warnSpy = spyOn(console, "warn").mockImplementation(() => {});
+      try {
+        await expect(
+          manager.resumeSession(makeConfig(projectDir), THREAD_ID, VALID_ID, projectDir)
+        ).rejects.toThrow(/終了/);
+        expect(manager.has(THREAD_ID)).toBe(false);
+        expect(manager.count()).toBe(0);
+      } finally {
+        errSpy.mockRestore();
+        warnSpy.mockRestore();
+      }
+    }
+  );
+
   // Issue #485 AC-2 (attempts-exhausted half): the attempt budget runs out and
   // the session dies during the final wait. That counts as a failure (dead is
   // dead), not the old "proceeding anyway" success.
