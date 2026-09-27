@@ -203,6 +203,23 @@ function logResumePaneTail(tmuxName: string, pane: string): void {
 }
 
 /**
+ * Issue #485: the resumed tmux session is definitely gone. Log the pane tail
+ * and throw. The "起動直後に終了" wording is also the marker that
+ * auto-resume.ts `classifyResumeFailure` matches, so keep the two in sync.
+ */
+function throwResumeSessionExited(
+  tmuxName: string,
+  lastPane: string,
+  attempt: number,
+  attempts: number
+): never {
+  logResumePaneTail(tmuxName, lastPane);
+  throw new Error(
+    `resume した Claude Code の tmux セッション ${tmuxName} が起動直後に終了しました（attempt ${attempt}/${attempts}）`
+  );
+}
+
+/**
  * Input-ready marker for a freshly STARTED session's Ink TUI (same prompt
  * markers as {@link RESUME_READY_RE}; a `--dangerously-skip-permissions` session
  * shows the "bypass permissions" banner + "? for shortcuts" hint once it can
@@ -1807,10 +1824,7 @@ export class SessionManager {
       // hasSession returns true on a tmux timeout (liveness unknown, #369),
       // so only a definite "no such session" aborts here.
       if (!(await this.effects.tmux.hasSession(tmuxName))) {
-        logResumePaneTail(tmuxName, lastPane);
-        throw new Error(
-          `resume した Claude Code の tmux セッション ${tmuxName} が起動直後に終了しました（attempt ${i}/${this.resumePromptPollAttempts}）`
-        );
+        throwResumeSessionExited(tmuxName, lastPane, i, this.resumePromptPollAttempts);
       }
       const pane = await this.effects.tmux.capturePane(tmuxName);
       if (pane.trim()) lastPane = pane;
@@ -1848,21 +1862,26 @@ export class SessionManager {
     // status` reporting "稼働中" over a session that never actually became
     // interactive.
     //
-    // Issue #485 AC-2: "proceeding anyway" registered a session that never
-    // became interactive and Discord showed "✅ 復帰しました" (false success).
-    // Exhaustion is now a failure; launchResume's catch kills the tmux
-    // session and handleResume replies with the sanitized failure notice.
-    // `attempts === 0` means polling is disabled (unit-test knob), not a
-    // failure.
+    // Issue #485 AC-2: running out of attempts does not by itself prove the
+    // resume failed. Only a session that is definitely gone counts as a
+    // failure, which is the same rule as the check inside the loop. A pane
+    // that is still running is registered with a loud warn, as before.
+    // Throwing in that case would kill a resume that is just slow: the
+    // self-heal path resumes ~800k-token sessions, and a 239k one already
+    // took ~4min. It would also turn any future TUI wording change
+    // (RW-027/047) into every resume failing, instead of a 5-minute delay
+    // (devils-advocate review of #485).
+    // `attempts === 0` means polling is disabled (unit-test knob).
     if (this.resumePromptPollAttempts > 0) {
+      if (!(await this.effects.tmux.hasSession(tmuxName))) {
+        throwResumeSessionExited(tmuxName, lastPane, this.resumePromptPollAttempts, this.resumePromptPollAttempts);
+      }
       console.warn(
         `[SessionManager] Resume prompt/ready marker never appeared on ${tmuxName} ` +
-          `after ${this.resumePromptPollAttempts} attempts; aborting resume as a failure`
+          `after ${this.resumePromptPollAttempts} attempts; the session is still alive, proceeding anyway ` +
+          `(the resumed pane may be in an unexpected state)`
       );
       logResumePaneTail(tmuxName, lastPane);
-      throw new Error(
-        `resume した Claude Code の入力プロンプトが ${this.resumePromptPollAttempts} 回のポーリングで現れませんでした（${tmuxName}）`
-      );
     }
   }
 

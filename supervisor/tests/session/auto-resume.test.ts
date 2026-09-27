@@ -448,6 +448,15 @@ describe("autoResumeThread (#456)", () => {
     expect(leaked).not.toContain(projectDir);
     expect(leaked).toContain("Supervisor のログ");
   });
+
+  test("Issue #485: a resumed session that exits right away maps to a path-free, actionable cause", () => {
+    const text = classifyResumeFailure(
+      "resume した Claude Code の tmux セッション claude-155363398439 が起動直後に終了しました（attempt 2/300）",
+    );
+    expect(text).toContain("会話履歴が見つからない");
+    // Authored text only: the tmux name from the raw reason is not echoed.
+    expect(text).not.toContain("claude-155363398439");
+  });
 });
 
 /**

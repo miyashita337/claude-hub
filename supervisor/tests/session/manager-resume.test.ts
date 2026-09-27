@@ -111,12 +111,8 @@ describe("SessionManager.resumeSession (#161)", () => {
     const errSpy = spyOn(console, "error").mockImplementation(() => {});
     const warnSpy = spyOn(console, "warn").mockImplementation(() => {});
     try {
-      // capturePane returns "" (no marker) for the whole poll window. Issue
-      // #485: that exhaustion is now a failure, but it must still never send
-      // stray keystrokes into a pane that never showed the picker.
-      await expect(
-        manager.resumeSession(makeConfig(projectDir), THREAD_ID, VALID_ID, projectDir)
-      ).rejects.toThrow();
+      // capturePane returns "" (no marker) for the whole poll window.
+      await manager.resumeSession(makeConfig(projectDir), THREAD_ID, VALID_ID, projectDir);
       expect(effects.tmux.sendKeysCalls).toHaveLength(0);
     } finally {
       errSpy.mockRestore();
@@ -175,33 +171,64 @@ describe("SessionManager.resumeSession (#161)", () => {
     }
   });
 
-  // Issue #485 AC-2 (attempts-exhausted half): a legitimate resume, however
-  // slow, returns early via the picker or the ready marker, so a full
-  // exhaustion is always anomalous. It used to log "proceeding anyway" and
-  // report success; it is now a failure, with the tmux session rolled back.
-  test("Issue #485 AC-2: fails (not success) and rolls back when the marker never appears", async () => {
+  // Issue #485 AC-2 (attempts-exhausted half): the attempt budget runs out and
+  // the session dies during the final wait. That counts as a failure (dead is
+  // dead), not the old "proceeding anyway" success.
+  test("Issue #485 AC-2: session gone at exhaustion → failure, rolled back", async () => {
     manager = new SessionManager({
       effects,
       gracefulKillTimeoutMs: 0,
       resumePromptPollAttempts: 3,
       resumePromptPollIntervalMs: 5,
     });
+    const realCapture = effects.tmux.capturePane.bind(effects.tmux);
+    let captures = 0;
+    effects.tmux.capturePane = async (name: string) => {
+      captures += 1;
+      const pane = await realCapture(name);
+      // Dies right after the LAST capture, so only the post-loop check sees it.
+      if (captures === 3) await effects.tmux.killSession(name);
+      return pane;
+    };
     effects.tmux.setPaneContent(tmuxName, "some unexpected pane state");
     const warnSpy = spyOn(console, "warn").mockImplementation(() => {});
     const errSpy = spyOn(console, "error").mockImplementation(() => {});
     try {
-      // capturePane returns a non-marker pane for the whole window — the
-      // exact claude-mock.sh pane shape from the real-tmux E2E repro.
       await expect(
         manager.resumeSession(makeConfig(projectDir), THREAD_ID, VALID_ID, projectDir)
-      ).rejects.toThrow(/never|現れ/);
-
-      expect(warnSpy).toHaveBeenCalledTimes(1);
-      expect(String(warnSpy.mock.calls[0]?.[0])).toContain("never appeared");
+      ).rejects.toThrow(/起動直後に終了/);
       expect(manager.has(THREAD_ID)).toBe(false);
       expect(effects.tmux.list()).toHaveLength(0);
       const errText = errSpy.mock.calls.map((c) => c.map(String).join(" ")).join("\n");
       expect(errText).toContain("some unexpected pane state");
+    } finally {
+      warnSpy.mockRestore();
+      errSpy.mockRestore();
+    }
+  });
+
+  // Issue #485 (devils-advocate review): when the pane is still alive at the
+  // end of the attempts, it is NOT killed. A slow resume of a large session
+  // (self-heal resumes ~800k-token sessions) or a TUI wording change must not
+  // turn into a hard failure. Warn loudly and log the pane tail instead.
+  test("Issue #485: session still alive at exhaustion → registered with warn + pane tail (not killed)", async () => {
+    manager = new SessionManager({
+      effects,
+      gracefulKillTimeoutMs: 0,
+      resumePromptPollAttempts: 3,
+      resumePromptPollIntervalMs: 5,
+    });
+    effects.tmux.setPaneContent(tmuxName, "still rendering a huge transcript");
+    const warnSpy = spyOn(console, "warn").mockImplementation(() => {});
+    const errSpy = spyOn(console, "error").mockImplementation(() => {});
+    try {
+      await manager.resumeSession(makeConfig(projectDir), THREAD_ID, VALID_ID, projectDir);
+      expect(warnSpy).toHaveBeenCalledTimes(1);
+      expect(String(warnSpy.mock.calls[0]?.[0])).toContain("never appeared");
+      expect(manager.has(THREAD_ID)).toBe(true);
+      expect(effects.tmux.list()).toContain(tmuxName);
+      const errText = errSpy.mock.calls.map((c) => c.map(String).join(" ")).join("\n");
+      expect(errText).toContain("still rendering a huge transcript");
     } finally {
       warnSpy.mockRestore();
       errSpy.mockRestore();
@@ -240,10 +267,8 @@ describe("SessionManager.resumeSession (#161)", () => {
     const logSpy = spyOn(console, "log").mockImplementation(() => {});
     try {
       // capturePane returns "" the whole time (no marker) — exercises the
-      // heartbeat path on the way to exhaustion (a failure since #485).
-      await expect(
-        manager.resumeSession(makeConfig(projectDir), THREAD_ID, VALID_ID, projectDir)
-      ).rejects.toThrow();
+      // heartbeat path on the way to exhaustion.
+      await manager.resumeSession(makeConfig(projectDir), THREAD_ID, VALID_ID, projectDir);
 
       const heartbeats = logSpy.mock.calls.filter((c) =>
         String(c[0]).includes("Still waiting for resume prompt")

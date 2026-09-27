@@ -35,11 +35,13 @@
 // window — before FINALLY inserting the sessions.db row and logging success.
 //
 // Fix pinned by this test: PR #484 made the exhaustion observable (a warn
-// plus a periodic heartbeat). Issue #485 then made it a FAILURE instead of a
-// false success: a legitimate resume, however slow, returns early via the
-// picker or the ready marker, so exhausting the window without either means
-// the pane never became interactive. The session is not registered and the
-// tmux session is rolled back. Issue #163's 5-minute budget is unchanged.
+// plus a periodic heartbeat). Issue #485 added a liveness check to every poll:
+// a session that is definitely gone fails immediately (unit-tested in
+// manager-resume.test.ts). A pane that is still ALIVE when the attempts run
+// out, like this mock, is still registered with a warn plus a stderr pane
+// tail. It is not killed, so a slow, very large resume (self-heal) or a TUI
+// wording change cannot become a hard failure. Issue #163's 5-minute budget is
+// unchanged.
 //
 // Required env (self-skips otherwise, same gating as session-lifecycle.test.ts):
 //   - SUPERVISOR_TMUX_SOCKET=claude-hub-test   (isolates from prod `claude-hub`)
@@ -175,7 +177,8 @@ describe("SessionManager.resumeSession root-cause investigation (PR #484 review 
   itE2E(
     "claude-mock.sh's pane never matches the resume-prompt/ready markers: " +
       "confirmResumePromptIfPresent consumes the full poll window, then " +
-      "resumeSession FAILS (Issue #485) instead of reporting a false success",
+      "resumeSession registers the still-alive session with a warn + stderr " +
+      "pane tail (Issue #485 only fails a session that is definitely gone)",
     async () => {
       const threadId = `resume-lifecycle-${process.pid}-${Date.now()}`;
       const claudeSessionId = randomUUID();
@@ -190,9 +193,7 @@ describe("SessionManager.resumeSession root-cause investigation (PR #484 review 
         // sessions.db row: `existsSync(projectDir) === true`, so
         // `recoverWorktreeForResume` is never invoked — this isolates
         // confirmResumePromptIfPresent.
-        await expect(
-          manager.resumeSession(config, threadId, claudeSessionId, projectDir, null)
-        ).rejects.toThrow();
+        await manager.resumeSession(config, threadId, claudeSessionId, projectDir, null);
         const elapsed = Date.now() - t0;
 
         // The full window elapsed (no early exit): the pane never matched
@@ -209,9 +210,9 @@ describe("SessionManager.resumeSession root-cause investigation (PR #484 review 
           errSpy.mock.calls.some((c) => String(c[0]).includes("last captured pane lines"))
         ).toBe(true);
 
-        // Issue #485 AC-2: no false success — not registered, and the real
-        // tmux session was rolled back instead of being left orphaned.
-        expect(manager.has(threadId)).toBe(false);
+        // The pane is really alive (the #485 liveness check saw it on every
+        // poll), so the session is registered and left running, not killed.
+        expect(manager.has(threadId)).toBe(true);
         let alive = true;
         try {
           execFileSync(TMUX_PATH, [...TMUX_ARGS, "has-session", "-t", tmuxName], {
@@ -221,7 +222,7 @@ describe("SessionManager.resumeSession root-cause investigation (PR #484 review 
         } catch {
           alive = false;
         }
-        expect(alive).toBe(false);
+        expect(alive).toBe(true);
       } finally {
         warnSpy.mockRestore();
         errSpy.mockRestore();
