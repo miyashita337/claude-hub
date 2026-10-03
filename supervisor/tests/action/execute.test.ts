@@ -11,12 +11,77 @@ import {
 } from "../../src/action/execute";
 
 describe("action/execute allowlist", () => {
-  test("only compact is allowed", () => {
+  test("only compact and the permission answers are allowed", () => {
     expect(isActionAllowed("compact")).toBe(true);
+    expect(isActionAllowed("perm-allow")).toBe(true);
+    expect(isActionAllowed("perm-deny")).toBe(true);
     expect(isActionAllowed("rm-rf")).toBe(false);
     expect(isActionAllowed("COMPACT")).toBe(false);
     expect(isActionAllowed("")).toBe(false);
-    expect([...ALLOWED_ACTIONS]).toEqual(["compact"]);
+    expect([...ALLOWED_ACTIONS]).toEqual(["compact", "perm-allow", "perm-deny"]);
+  });
+});
+
+// Issue #488: one-tap approve/deny for a waiting PermissionRequest hook
+describe("action/execute perm-allow / perm-deny", () => {
+  const base: ExecuteDeps = {
+    resolveSession: async () => null,
+    send: async () => {
+      throw new Error("must not send keys for a permission answer");
+    },
+  };
+
+  test("writes allow / deny for a pending request", async () => {
+    const written: [string, string][] = [];
+    const deps: ExecuteDeps = {
+      ...base,
+      writePermDecision: async (id, d) => {
+        written.push([id, d]);
+        return true;
+      },
+    };
+    expect((await executeAction("perm-allow", "req-1234abcd", deps)).ok).toBe(true);
+    expect((await executeAction("perm-deny", "req-5678abcd", deps)).ok).toBe(true);
+    expect(written).toEqual([
+      ["req-1234abcd", "allow"],
+      ["req-5678abcd", "deny"],
+    ]);
+  });
+
+  test("unsafe ids never reach the filesystem", async () => {
+    let called = false;
+    const deps: ExecuteDeps = {
+      ...base,
+      writePermDecision: async () => {
+        called = true;
+        return true;
+      },
+    };
+    for (const bad of ["../../etc/x", "a/b", "short", "id.with.dots", ""]) {
+      const r = await executeAction("perm-allow", bad, deps);
+      expect(r.ok).toBe(false);
+    }
+    expect(called).toBe(false);
+  });
+
+  test("no pending request (timed out / unknown) → target_not_found", async () => {
+    const r = await executeAction("perm-allow", "req-1234abcd", {
+      ...base,
+      writePermDecision: async () => false,
+    });
+    expect(r.ok).toBe(false);
+    if (!r.ok) expect(r.reason).toBe("target_not_found");
+  });
+
+  test("a second answer for the same request is reported, not swallowed", async () => {
+    const r = await executeAction("perm-deny", "req-1234abcd", {
+      ...base,
+      writePermDecision: async () => {
+        throw new Error("EEXIST");
+      },
+    });
+    expect(r.ok).toBe(false);
+    if (!r.ok) expect(r.reason).toBe("send_failed");
   });
 });
 
@@ -152,5 +217,30 @@ describe("action/execute realpathOrResolve", () => {
   test("falls back to resolve for a non-existent path (no throw)", () => {
     const p = "/definitely/not/here/xyz-12345";
     expect(realpathOrResolve(p)).toBe(p);
+  });
+});
+
+describe("action/execute realWritePermDecision", () => {
+  test("writes only when <id>.pending exists, and only once", async () => {
+    const { mkdtempSync, writeFileSync, readFileSync, existsSync } = await import("fs");
+    const { tmpdir } = await import("os");
+    const { join } = await import("path");
+    const { realWritePermDecision } = await import("../../src/action/execute");
+    const dir = mkdtempSync(join(tmpdir(), "perm-"));
+    const prev = process.env.PERM_REQUEST_DIR;
+    process.env.PERM_REQUEST_DIR = dir;
+    try {
+      expect(await realWritePermDecision("req-nopending", "allow")).toBe(false);
+      expect(existsSync(join(dir, "req-nopending.decision"))).toBe(false);
+
+      writeFileSync(join(dir, "req-12345678.pending"), "");
+      expect(await realWritePermDecision("req-12345678", "allow")).toBe(true);
+      expect(readFileSync(join(dir, "req-12345678.decision"), "utf8")).toBe("allow");
+      await expect(realWritePermDecision("req-12345678", "deny")).rejects.toThrow();
+      expect(readFileSync(join(dir, "req-12345678.decision"), "utf8")).toBe("allow");
+    } finally {
+      if (prev === undefined) delete process.env.PERM_REQUEST_DIR;
+      else process.env.PERM_REQUEST_DIR = prev;
+    }
   });
 });

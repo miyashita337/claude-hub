@@ -218,13 +218,36 @@ describe("action/receiver resolveBindHost", () => {
   });
 
   test("no Tailscale IP → null (endpoint disabled, not a broader bind)", async () => {
-    expect(await resolveBindHost({ env: {}, runTailscale: async () => null })).toBeNull();
+    expect(
+      await resolveBindHost({ env: {}, runTailscale: async () => null, listIpv4: () => [] })
+    ).toBeNull();
   });
 
   test("Tailscale returning a wildcard / non-IP → null", async () => {
-    expect(await resolveBindHost({ env: {}, runTailscale: async () => "0.0.0.0" })).toBeNull();
-    expect(await resolveBindHost({ env: {}, runTailscale: async () => "not-an-ip" })).toBeNull();
-    expect(await resolveBindHost({ env: {}, runTailscale: async () => "999.1.1.1" })).toBeNull();
+    const none = () => [];
+    expect(await resolveBindHost({ env: {}, runTailscale: async () => "0.0.0.0", listIpv4: none })).toBeNull();
+    expect(await resolveBindHost({ env: {}, runTailscale: async () => "not-an-ip", listIpv4: none })).toBeNull();
+    expect(await resolveBindHost({ env: {}, runTailscale: async () => "999.1.1.1", listIpv4: none })).toBeNull();
+  });
+
+  // Issue #488: under launchd the app-bundle CLI prints "The Tailscale GUI failed to start"
+  test("CLI error text → falls back to the tailnet interface address", async () => {
+    const host = await resolveBindHost({
+      env: {},
+      runTailscale: async () => "The Tailscale GUI failed to start: (Tailscale.CLIError error 3.)",
+      listIpv4: () => ["192.168.10.107", "100.80.156.14"],
+    });
+    expect(host).toBe("100.80.156.14");
+  });
+
+  test("interface fallback never picks a non-tailnet address", async () => {
+    expect(
+      await resolveBindHost({
+        env: {},
+        runTailscale: async () => null,
+        listIpv4: () => ["192.168.10.107", "10.0.0.5", "100.128.0.1"],
+      })
+    ).toBeNull();
   });
 });
 

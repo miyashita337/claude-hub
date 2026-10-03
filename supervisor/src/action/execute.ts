@@ -1,7 +1,9 @@
 import { execFile } from "child_process";
 import { promisify } from "util";
-import { realpathSync } from "fs";
-import { resolve } from "path";
+import { existsSync, realpathSync } from "fs";
+import { writeFile } from "fs/promises";
+import { homedir } from "os";
+import { join, resolve } from "path";
 import { TMUX_PATH, TMUX_ARGS } from "../session/tmux";
 
 const execFileAsync = promisify(execFile);
@@ -26,7 +28,42 @@ const execFileAsync = promisify(execFile);
  * switch is the contract: a member here without a `case` would resolve the
  * session then fall through to `disallowed_action` (fail-closed, not silent).
  */
-export const ALLOWED_ACTIONS: ReadonlySet<string> = new Set(["compact"]);
+export const ALLOWED_ACTIONS: ReadonlySet<string> = new Set([
+  "compact",
+  "perm-allow",
+  "perm-deny",
+]);
+
+/**
+ * Request ids minted by `hooks/remote-approve-permission.sh` (Issue #488). The
+ * id becomes a file name, so anything outside this shape (path separators,
+ * dots) is rejected before touching the filesystem.
+ */
+const PERM_REQUEST_ID = /^[A-Za-z0-9-]{8,64}$/;
+
+/**
+ * Directory shared with the PermissionRequest hook. The hook creates
+ * `<id>.pending` when it starts waiting and polls for `<id>.decision`.
+ */
+export function permRequestDir(env: NodeJS.ProcessEnv = process.env): string {
+  return env.PERM_REQUEST_DIR ?? join(homedir(), ".claude", "state", "perm-requests");
+}
+
+/**
+ * Record an approve/deny for a waiting permission request. Writes only when the
+ * hook's `<id>.pending` marker exists, so a tap can never create arbitrary
+ * files or answer a request that already timed out. Returns false when there
+ * is no such pending request.
+ */
+export async function realWritePermDecision(
+  id: string,
+  decision: "allow" | "deny"
+): Promise<boolean> {
+  const dir = permRequestDir();
+  if (!existsSync(join(dir, `${id}.pending`))) return false;
+  await writeFile(join(dir, `${id}.decision`), decision, { flag: "wx" });
+  return true;
+}
 
 export function isActionAllowed(action: string): boolean {
   return ALLOWED_ACTIONS.has(action);
@@ -121,6 +158,11 @@ export interface ExecuteDeps {
    * type keeps the seam honest instead of pretending the callee returns nothing.
    */
   send: (tmuxSession: string, text: string) => Promise<unknown>;
+  /**
+   * Answer a waiting PermissionRequest hook (production: {@link realWritePermDecision}).
+   * Resolves false when the request is not pending (unknown id / already timed out).
+   */
+  writePermDecision?: (id: string, decision: "allow" | "deny") => Promise<boolean>;
 }
 
 /**
@@ -152,6 +194,26 @@ export async function executeAction(
         };
       }
       return { ok: true, tmuxSession, sentText: text };
+    }
+    case "perm-allow":
+    case "perm-deny": {
+      if (!PERM_REQUEST_ID.test(target) || !deps.writePermDecision) {
+        return { ok: false, reason: "target_not_found" };
+      }
+      const decision = action === "perm-allow" ? "allow" : "deny";
+      let written: boolean;
+      try {
+        written = await deps.writePermDecision(target, decision);
+      } catch (err) {
+        // `wx` refuses a second answer for the same request (e.g. approve then deny)
+        return {
+          ok: false,
+          reason: "send_failed",
+          detail: err instanceof Error ? err.message : String(err),
+        };
+      }
+      if (!written) return { ok: false, reason: "target_not_found" };
+      return { ok: true, tmuxSession: "", sentText: decision };
     }
     default:
       // Unreachable when the receiver enforces the allowlist first, but kept as
