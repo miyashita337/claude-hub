@@ -141,3 +141,14 @@ describe("remote-approve-permission.sh", () => {
     expect(notifyCount()).toBe(0);
   });
 });
+
+describe("remote-approve-permission.sh idle detection while waiting", () => {
+  test("idle time becomes unreadable while waiting → stop waiting (CodeRabbit #489)", async () => {
+    const counter = join(root, "idle-count2");
+    const idleCmd = `if [ -f ${counter} ]; then echo oops; else touch ${counter}; echo 600; fi`;
+    const started = Date.now();
+    const r = await runHook({ REMOTE_APPROVE_IDLE_CMD: idleCmd, REMOTE_APPROVE_WAIT_SEC: "30" });
+    expect(r.stdout.toString()).toBe("");
+    expect(Date.now() - started).toBeLessThan(5000);
+  });
+});

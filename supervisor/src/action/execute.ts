@@ -1,7 +1,7 @@
 import { execFile } from "child_process";
 import { promisify } from "util";
 import { existsSync, realpathSync } from "fs";
-import { writeFile } from "fs/promises";
+import { link, unlink, writeFile } from "fs/promises";
 import { homedir } from "os";
 import { join, resolve } from "path";
 import { TMUX_PATH, TMUX_ARGS } from "../session/tmux";
@@ -60,8 +60,19 @@ export async function realWritePermDecision(
   decision: "allow" | "deny"
 ): Promise<boolean> {
   const dir = permRequestDir();
-  if (!existsSync(join(dir, `${id}.pending`))) return false;
-  await writeFile(join(dir, `${id}.decision`), decision, { flag: "wx" });
+  const pending = join(dir, `${id}.pending`);
+  if (!existsSync(pending)) return false;
+  // The hook polls for `<id>.decision`; writing it in place could expose an
+  // empty/partial file. Write a temp file first, then publish with link(),
+  // which fails with EEXIST instead of replacing an earlier answer.
+  const tmp = join(dir, `.${id}.${process.pid}.${Date.now()}.tmp`);
+  await writeFile(tmp, decision, { flag: "wx" });
+  try {
+    if (!existsSync(pending)) return false;
+    await link(tmp, join(dir, `${id}.decision`));
+  } finally {
+    await unlink(tmp).catch(() => {});
+  }
   return true;
 }
 

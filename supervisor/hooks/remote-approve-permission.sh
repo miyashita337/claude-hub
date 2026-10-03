@@ -100,10 +100,12 @@ while [ "$(date +%s)" -lt "$DEADLINE" ]; do
     exit 0
   fi
   # ユーザーが Mac に戻ってきたら待つのをやめ、Mac の確認画面に任せる
+  # 在席判定ができなくなったら、Mac に戻っていても気付けないので待つのをやめる
   NOW_IDLE=$(idle_seconds)
-  case "$NOW_IDLE" in ''|*[!0-9]*) ;; *)
-    if [ "$NOW_IDLE" -lt 30 ]; then log "back at Mac id=${ID}"; exit 0; fi ;;
+  case "$NOW_IDLE" in
+    ''|*[!0-9]*) log "idle time unavailable while waiting id=${ID}"; exit 0 ;;
   esac
+  if [ "$NOW_IDLE" -lt 30 ]; then log "back at Mac id=${ID}"; exit 0; fi
   sleep "$POLL_SEC"
 done
 log "timeout id=${ID}"
