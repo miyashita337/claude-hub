@@ -192,6 +192,7 @@ jobs:
                    tests/hooks/auto-approve-permission.test.ts \
                    tests/hooks/headless-pending-guard.test.ts \
                    tests/hooks/progress-relay.test.ts \
+                   tests/hooks/remote-approve-permission.test.ts \
                    tests/scripts/cleanup-idle-claude.test.ts \
                    tests/scripts/setup-agent-base.test.ts \
                    tests/session/ask-user-relay.test.ts \

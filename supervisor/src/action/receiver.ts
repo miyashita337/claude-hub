@@ -1,8 +1,10 @@
 import { execFile } from "child_process";
+import { networkInterfaces } from "os";
 import { promisify } from "util";
 import { parseToken, verifySignature, isExpired } from "./token";
 import {
   executeAction,
+  realWritePermDecision,
   resolveTmuxSessionForTarget,
   realTmuxPaneList,
   realpathOrResolve,
@@ -124,9 +126,14 @@ export async function evaluateAction(
 }
 
 /** Fixed, non-reflective user message per outcome (no token/target echoed → no XSS). */
-function messageFor(outcome: ReceiverOutcome): { title: string; body: string } {
+function messageFor(
+  outcome: ReceiverOutcome,
+  action?: string
+): { title: string; body: string } {
   switch (outcome) {
     case "sent":
+      if (action === "perm-allow") return { title: "承認しました", body: "✅ 実行を承認しました" };
+      if (action === "perm-deny") return { title: "拒否しました", body: "🛑 実行を拒否しました" };
       return { title: "送信しました", body: "✅ /compact を送信しました" };
     case "malformed":
       return { title: "無効なリンク", body: "❌ リンクが不正です" };
@@ -152,7 +159,7 @@ function messageFor(outcome: ReceiverOutcome): { title: string; body: string } {
  * request input are never reflected, so there is no injection surface.
  */
 export function renderResultHtml(result: EvaluateResult): string {
-  const { title, body } = messageFor(result.outcome);
+  const { title, body } = messageFor(result.outcome, result.action);
   return `<!doctype html>
 <html lang="ja">
 <head>
@@ -212,6 +219,30 @@ export interface BindResolveDeps {
   env?: NodeJS.ProcessEnv;
   /** Returns `tailscale ip -4` stdout, or null when unavailable. Injectable for tests. */
   runTailscale?: () => Promise<string | null>;
+  /** Local IPv4 addresses (os.networkInterfaces). Injectable for tests. */
+  listIpv4?: () => string[];
+}
+
+/**
+ * Tailscale assigns node addresses from the CGNAT range 100.64.0.0/10. Used to
+ * pick the tailnet interface when the `tailscale` CLI cannot answer — under
+ * launchd the macOS app-bundle CLI fails with "The Tailscale GUI failed to
+ * start" (Issue #488), which left this endpoint disabled since it shipped.
+ */
+export function isTailscaleCgnatIpv4(host: string): boolean {
+  if (!isPlausibleIpv4(host)) return false;
+  const [a, b = -1] = host.split(".").map(Number);
+  return a === 100 && b >= 64 && b <= 127;
+}
+
+function defaultListIpv4(): string[] {
+  const out: string[] = [];
+  for (const addrs of Object.values(networkInterfaces())) {
+    for (const a of addrs ?? []) {
+      if (a.family === "IPv4" && !a.internal) out.push(a.address);
+    }
+  }
+  return out;
 }
 
 /** Reject wildcard/any-address binds — the spec forbids exposing beyond the tailnet. */
@@ -250,12 +281,17 @@ export async function resolveBindHost(deps: BindResolveDeps = {}): Promise<strin
 
   const run = deps.runTailscale ?? defaultRunTailscale;
   const ip = (await run())?.trim();
-  if (!ip) return null;
-  if (isWildcardBind(ip) || !isPlausibleIpv4(ip)) {
-    console.warn(`[action-receiver] tailscale returned an unusable bind address '${ip}' — endpoint disabled`);
-    return null;
+  if (ip && !isWildcardBind(ip) && isPlausibleIpv4(ip)) return ip;
+  if (ip) {
+    console.warn(`[action-receiver] tailscale returned an unusable bind address '${ip}' — trying the tailnet interface`);
   }
-  return ip;
+
+  const fromInterface = (deps.listIpv4 ?? defaultListIpv4)().find(isTailscaleCgnatIpv4);
+  if (fromInterface) {
+    console.log(`[action-receiver] using tailnet interface address ${fromInterface}`);
+    return fromInterface;
+  }
+  return null;
 }
 
 async function defaultRunTailscale(): Promise<string | null> {
@@ -431,7 +467,11 @@ async function buildProductionEvaluateBase(): Promise<EvaluateBase> {
     isActionAllowed,
     consumeNonce: consumeActionNonce,
     execute: (action, target) =>
-      executeAction(action, target, { resolveSession, send: sendToPane }),
+      executeAction(action, target, {
+        resolveSession,
+        send: sendToPane,
+        writePermDecision: realWritePermDecision,
+      }),
   };
 }
 
