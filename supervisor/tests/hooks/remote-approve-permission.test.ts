@@ -87,6 +87,7 @@ describe("remote-approve-permission.sh", () => {
     const r = await runHook({ REMOTE_APPROVE_IDLE_CMD: "echo 10" });
     expect(r.stdout.toString()).toBe("");
     expect(notifyCount()).toBe(0);
+    expect(readFileSync(join(root, "hook.log"), "utf8")).toContain("skip: at Mac (idle=10s");
   });
 
   test("away + tapped approve → allow, one notification with the approve link", async () => {
