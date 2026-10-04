@@ -43,7 +43,8 @@ idle_seconds() {
 
 IDLE=$(idle_seconds)
 case "$IDLE" in ''|*[!0-9]*) log "skip: idle time unavailable"; exit 0 ;; esac
-[ "$IDLE" -lt "$AWAY_SEC" ] && exit 0
+# 在席中はログだけ残して通常ダイアログへ（「通知が来ない」の切り分け用, #490）
+if [ "$IDLE" -lt "$AWAY_SEC" ]; then log "skip: at Mac (idle=${IDLE}s < ${AWAY_SEC}s)"; exit 0; fi
 
 INPUT=$(cat)
 TOOL=$(printf '%s' "$INPUT" | jq -r '.tool_name // "unknown"')
@@ -70,7 +71,7 @@ BODY="<b>$(printf '%s' "$TOOL" | html_escape)</b> の実行許可を待ってい
 $(printf '%s' "$DETAIL" | html_escape)
 場所: $(printf '%s' "$CWD" | html_escape)
 
-上のボタンで承認 / <a href=\"${RECEIVER_URL}${SEP}t=${DENY_TOKEN}\">🛑 拒否する</a>
+下の「✅ 承認する」で承認 / <a href=\"${RECEIVER_URL}${SEP}t=${DENY_TOKEN}\">🛑 拒否する</a>
 （${WAIT_SEC} 秒で期限切れ。その後は Mac の確認画面に戻ります）"
 
 # 承認リンクは pushover-notify の action_spec で url ボタンとして付く
