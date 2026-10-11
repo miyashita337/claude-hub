@@ -95,7 +95,10 @@ export class ResourceMonitor {
           rssKB = sumTreeRssKB(session.launcherPid, rows);
           // The launcher exiting first re-parents claude to init, so the
           // launcher-rooted tree is empty (Issue #494). Fall back to claude's
-          // own tree rather than skipping the guard.
+          // own tree rather than skipping the guard. This covers the window in
+          // which the tmux pane is still up; once the pane is gone too, the
+          // faster tmux watcher reaps claude itself (SessionManager
+          // watchTmuxSession, PR #495 review) instead of leaving it to us.
           if (rssKB === 0) rssKB = sumTreeRssKB(session.pid, rows);
         } else {
           const { stdout } = await execAsync(`ps -o rss= -p ${session.pid}`);

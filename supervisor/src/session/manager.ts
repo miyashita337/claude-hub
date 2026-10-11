@@ -50,6 +50,8 @@ import {
   parseProxyBanner,
   stripProxyBanner,
   waitForClaudePid,
+  reapLauncherGroup,
+  type ProcRow,
   ALL_ORGS_EXHAUSTED_MARKER,
 } from "./launcher";
 import { notifyPushover } from "./notify-pushover";
@@ -683,6 +685,21 @@ export interface SessionManagerOptions {
    */
   watchIntervalMs?: number;
   /**
+   * Test seam for the launcher reap (Issue #494): overrides the `ps`-backed
+   * process-group listing that {@link reapLauncherGroup} waits on, so unit
+   * tests on the DI fakes (whose pids are made up) never consult the real
+   * process table. Production leaves this undefined.
+   */
+  listGroupPidsFn?: (pgid: number) => Promise<number[]>;
+  /**
+   * Test seam for the launcher pid resolution (Issue #492): overrides the
+   * `ps`-backed process table that {@link waitForClaudePid} polls. On the DI
+   * fakes the launcher pid is made up, so the 20 polls would only burn real
+   * `ps` calls (≈1s each on a busy Mac — enough to trip a 15s test timeout).
+   * Production leaves this undefined.
+   */
+  listProcTableFn?: () => Promise<ProcRow[]>;
+  /**
    * Test seam for the headless completion probe (Issue #342): overrides the
    * transcript read+parse (`probePendingWork`) so unit tests control the
    * pending verdict without writing real files under `~/.claude/projects`.
@@ -772,6 +789,8 @@ export class SessionManager {
   private readonly inputReadyPollAttempts: number;
   private readonly inputReadyPollIntervalMs: number;
   private readonly watchIntervalMs: number;
+  private readonly listGroupPidsFn?: (pgid: number) => Promise<number[]>;
+  private readonly listProcTableFn?: () => Promise<ProcRow[]>;
   private readonly probePendingWorkFn: (
     transcriptPath: string,
   ) => PendingWorkProbe;
@@ -802,6 +821,8 @@ export class SessionManager {
     this.inputReadyPollIntervalMs =
       options.inputReadyPollIntervalMs ?? 1000;
     this.watchIntervalMs = options.watchIntervalMs ?? 10_000;
+    this.listGroupPidsFn = options.listGroupPidsFn;
+    this.listProcTableFn = options.listProcTableFn;
     this.probePendingWorkFn = options.probePendingWorkFn ?? probePendingWork;
     this.probeArtifactsFn = options.probeArtifactsFn ?? probeArtifacts;
 
@@ -1531,6 +1552,7 @@ export class SessionManager {
     if (!launcher) return { pid: panePid };
     let proxyLogPath: string | undefined;
     const claudePid = await waitForClaudePid(panePid, {
+      list: this.listProcTableFn,
       onAttempt: async () => {
         if (proxyLogPath) return;
         const banner = parseProxyBanner(
@@ -1541,7 +1563,16 @@ export class SessionManager {
     });
     if (claudePid == null && !(await this.effects.tmux.hasSession(tmuxName))) {
       // Issue #494: the launcher exited right after launch (bad path, ccorg
-      // crash). Registering it as running would hide the failure.
+      // crash). Registering it as running would hide the failure — but the
+      // launcher may already have spawned claude, which the OS re-parented to
+      // init when the launcher died (so the descendant search above missed
+      // it). Throwing alone would leave that claude running, untracked and
+      // unstoppable (PR #495 Devin must): reap the launcher's group first.
+      await this.reapLauncherRemnants(
+        panePid,
+        undefined,
+        `launcher exited during start of ${tmuxName}`,
+      );
       this.cleanupRelayUrlFile(claudeSessionId);
       throw new Error(
         `launcher ${launcher[0]} が起動直後に終了しました（tmux セッション ${tmuxName} が消えています）`
@@ -1558,12 +1589,48 @@ export class SessionManager {
     return { pid: claudePid ?? panePid, launcherPid: panePid, proxyLogPath };
   }
 
+  /**
+   * Issue #494: signal a dead launcher's process group (plus claude's own pid
+   * when known) and wait briefly for the remnants to go. The pane / detached
+   * spawn makes the launcher the group leader, so the group outlives it and
+   * still contains the claude it spawned. Best effort — see
+   * {@link reapLauncherGroup}; survivors are logged, never thrown, because
+   * every caller is already on a failure/teardown path.
+   */
+  private async reapLauncherRemnants(
+    launcherPid: number,
+    claudePid: number | undefined,
+    what: string,
+  ): Promise<void> {
+    const left = await reapLauncherGroup(launcherPid, {
+      claudePid,
+      kill: (pid, signal) => this.effects.process.kill(pid, signal),
+      isAlive: (pid) => this.effects.process.isAlive(pid),
+      members: this.listGroupPidsFn,
+    });
+    if (left === null) {
+      console.error(
+        `[SessionManager] ${what}: launcher group ${launcherPid} signalled but could not be observed (ps failed); reap unverified`,
+      );
+    } else if (left.length > 0) {
+      console.error(
+        `[SessionManager] ${what}: pids still alive after reaping launcher group ${launcherPid}: ${left.join(", ")}`,
+      );
+    } else {
+      console.log(
+        `[SessionManager] ${what}: launcher process group ${launcherPid} reaped`,
+      );
+    }
+  }
+
   /** Headless counterpart of {@link resolveLaunchedPids}; runs after spawn. */
   private async repointHeadlessPid(
     info: SessionInfo,
     launcherPid: number,
   ): Promise<void> {
-    const claudePid = await waitForClaudePid(launcherPid);
+    const claudePid = await waitForClaudePid(launcherPid, {
+      list: this.listProcTableFn,
+    });
     if (claudePid == null) {
       console.warn(
         `[SessionManager] No claude descendant under launcher PID ${launcherPid} (thread: ${info.threadId}); tracking the launcher pid`,
@@ -2641,6 +2708,30 @@ export class SessionManager {
           }
           updateSessionStatus(sessionId, "stopped", "tmux_exited");
           this.clearWatcher(threadId);
+          if (session?.launcherPid) {
+            // Issue #494 (PR #495 CodeRabbit): without a launcher the pane
+            // process IS claude, so a gone pane means a gone claude. Under a
+            // launcher the pane process is the launcher; claude is its child
+            // and can outlive both it and the pane, re-parented to init. This
+            // 10s watcher drops the session before the 30s ResourceMonitor
+            // would ever apply its RSS fallback, so reap here — an untracked
+            // claude with no pane is unreachable to the user anyway. Runs
+            // AFTER the bookkeeping above: the reap waits up to a few seconds
+            // and must neither delay the DB status flip nor, if it throws,
+            // leave the row `running` and the watcher armed.
+            try {
+              await this.reapLauncherRemnants(
+                session.launcherPid,
+                session.pid,
+                `tmux session ${tmuxName} exited`,
+              );
+            } catch (err) {
+              console.error(
+                `[SessionManager] tmux session ${tmuxName} exited: launcher reap failed:`,
+                err,
+              );
+            }
+          }
         }
       } finally {
         isChecking = false;

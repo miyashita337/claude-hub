@@ -12,6 +12,7 @@ import {
   findClaudeDescendant,
   sumTreeRssKB,
   waitForClaudePid,
+  reapLauncherGroup,
   ALL_ORGS_EXHAUSTED_MARKER,
   type ProcRow,
 } from "../../src/session/launcher";
@@ -84,6 +85,17 @@ describe("splitLauncher (AC-3: quoted paths stay one word)", () => {
     expect(splitLauncher("'/a b/ccorg' proxy")).toEqual(["/a b/ccorg", "proxy"]);
     expect(splitLauncher("/a\\ b/ccorg proxy")).toEqual(["/a b/ccorg", "proxy"]);
     expect(splitLauncher('"" x')).toEqual(["", "x"]);
+  });
+
+  test("a backslash inside double quotes is literal unless it escapes \\ or \" (PR #495 review)", () => {
+    expect(splitLauncher('"/tmp/team\\build/ccorg" proxy')).toEqual([
+      "/tmp/team\\build/ccorg",
+      "proxy",
+    ]);
+    expect(splitLauncher('"a\\"b" x')).toEqual(['a"b', "x"]);
+    expect(splitLauncher('"a\\\\b" x')).toEqual(["a\\b", "x"]);
+    // `\\` right before the closing quote is one backslash, not an escaped quote.
+    expect(splitLauncher('"c:\\\\" x')).toEqual(["c:\\", "x"]);
   });
 
   test("unterminated quote is rejected loudly", () => {
@@ -235,31 +247,123 @@ describe("all-orgs exhaustion (proxy 503)", () => {
   });
 });
 
+describe("reapLauncherGroup (Issue #494) on injected signals", () => {
+  const recorder = () => {
+    const calls: { pid: number; signal: NodeJS.Signals }[] = [];
+    return { calls, kill: (pid: number, signal: NodeJS.Signals) => void calls.push({ pid, signal }) };
+  };
+
+  test("an empty group after SIGTERM is clean: no SIGKILL", async () => {
+    const { calls, kill } = recorder();
+    const left = await reapLauncherGroup(500, {
+      claudePid: 501,
+      kill,
+      isAlive: () => false,
+      members: async () => [],
+      attempts: 1,
+      intervalMs: 0,
+    });
+    expect(left).toEqual([]);
+    expect(calls).toEqual([
+      { pid: -500, signal: "SIGTERM" },
+      { pid: 501, signal: "SIGTERM" },
+    ]);
+  });
+
+  test("survivors after SIGTERM get SIGKILL and are reported", async () => {
+    const { calls, kill } = recorder();
+    let killed = false;
+    const left = await reapLauncherGroup(500, {
+      kill: (pid, signal) => {
+        kill(pid, signal);
+        if (signal === "SIGKILL") killed = true;
+      },
+      members: async () => (killed ? [] : [501]),
+      attempts: 1,
+      intervalMs: 0,
+    });
+    expect(left).toEqual([]);
+    expect(calls.map((c) => c.signal)).toEqual(["SIGTERM", "SIGKILL"]);
+  });
+
+  test("an unobservable group (ps failed) is not treated as clean: SIGKILL still goes out, result is null (CodeRabbit CLI)", async () => {
+    const { calls, kill } = recorder();
+    const left = await reapLauncherGroup(500, {
+      kill,
+      members: async () => {
+        throw new Error("ps timed out");
+      },
+      attempts: 1,
+      intervalMs: 0,
+    });
+    expect(left).toBeNull();
+    expect(calls).toEqual([
+      { pid: -500, signal: "SIGTERM" },
+      { pid: -500, signal: "SIGKILL" },
+    ]);
+  });
+
+  test("ESRCH from kill is swallowed (group already empty)", async () => {
+    const left = await reapLauncherGroup(500, {
+      kill: () => {
+        const e = new Error("kill ESRCH") as NodeJS.ErrnoException;
+        e.code = "ESRCH";
+        throw e;
+      },
+      members: async () => [],
+      attempts: 1,
+      intervalMs: 0,
+    });
+    expect(left).toEqual([]);
+  });
+});
+
 describe("SessionManager.start when the launcher exits immediately (AC-2)", () => {
   let effects: FakeSessionEffects;
   let manager: SessionManager;
-  const saved = process.env.SUPERVISOR_CLAUDE_LAUNCHER;
+  const saved = {
+    l: process.env.SUPERVISOR_CLAUDE_LAUNCHER,
+    s: process.env.SUPERVISOR_CLAUDE_LAUNCHER_SCOPE,
+  };
+  const restore = (key: string, value: string | undefined) => {
+    if (value === undefined) delete process.env[key];
+    else process.env[key] = value;
+  };
 
   beforeEach(() => {
     effects = createFakeEffects();
-    manager = new SessionManager({ effects, gracefulKillTimeoutMs: 0 });
+    manager = new SessionManager({
+      effects,
+      gracefulKillTimeoutMs: 0,
+      // Fake pids never exist in the real process table; keep both the claude
+      // pid poll and the reap wait off `ps` so this test is hermetic (a real
+      // `ps` takes up to ~1s on a busy Mac, 20 polls of it trip the timeout).
+      listProcTableFn: async () => [],
+      listGroupPidsFn: async () => [],
+    });
     process.env.SUPERVISOR_CLAUDE_LAUNCHER = "ccorg proxy";
+    // Pin the scope: with e.g. SCOPE=dispatch in the environment, the
+    // interactive start would not use the launcher and never reach the
+    // launcher-exit branch (PR #495 review).
+    process.env.SUPERVISOR_CLAUDE_LAUNCHER_SCOPE = "all";
   });
 
   afterEach(async () => {
     await manager.shutdownAll();
-    if (saved === undefined) delete process.env.SUPERVISOR_CLAUDE_LAUNCHER;
-    else process.env.SUPERVISOR_CLAUDE_LAUNCHER = saved;
+    restore("SUPERVISOR_CLAUDE_LAUNCHER", saved.l);
+    restore("SUPERVISOR_CLAUDE_LAUNCHER_SCOPE", saved.s);
   });
 
-  test("tmux session gone and no claude descendant => start fails, nothing registered", async () => {
+  test("tmux session gone and no claude descendant => start fails, nothing registered, launcher group reaped", async () => {
     const dir = resolve(tmpdir(), `launcher-exit-${process.pid}`);
     mkdirSync(dir, { recursive: true });
     const config: ChannelConfig = { channelName: "chan-x", dir, displayName: "X" };
     // The pane pid is read, then the launcher dies and takes the session along.
+    let panePid: number | null = null;
     const getPid = effects.tmux.getPid.bind(effects.tmux);
     effects.tmux.getPid = async (name: string) => {
       const pid = await getPid(name);
+      panePid = pid;
       await effects.tmux.killSession(name);
       return pid;
     };
@@ -268,6 +372,12 @@ describe("SessionManager.start when the launcher exits immediately (AC-2)", () =
       "起動直後に終了",
     );
     expect(manager.entries().next().done).toBe(true);
+    // Issue #494 (Devin must): the launcher's process group — where the claude
+    // it may have spawned still lives — is signalled before the throw.
+    expect(panePid).not.toBeNull();
+    expect(effects.process.killCalls).toEqual([
+      { pid: -panePid!, signal: "SIGTERM" },
+    ]);
   }, 15_000);
 });
 
@@ -285,6 +395,8 @@ describe("SessionManager.runHeadless under a launcher", () => {
     manager = new SessionManager({
       effects,
       gracefulKillTimeoutMs: 0,
+      // Fake launcher pids: never poll the real process table (see above).
+      listProcTableFn: async () => [],
       probeArtifactsFn: async () => ({
         status: "found" as const,
         detail: "x",
