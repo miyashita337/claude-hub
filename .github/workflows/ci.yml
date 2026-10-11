@@ -208,6 +208,8 @@ jobs:
                    tests/session/orchestrate.test.ts \
                    tests/session/adapters-executor.test.ts \
                    tests/session/manager-headless.test.ts \
+                   tests/session/launcher.test.ts \
+                   tests/session/launcher-real-process.test.ts \
                    tests/session/headless-liveness.test.ts \
                    tests/session/pending-work.test.ts \
                    tests/session/reaper.test.ts \

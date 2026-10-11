@@ -52,7 +52,8 @@ export type DialogKind =
   | "press-enter"
   | "feedback-survey"
   | "ask-user-question"
-  | "usage-limit";
+  | "usage-limit"
+  | "all-orgs-limit";
 
 export interface DialogMatch {
   /** Detected dialog family. */
@@ -101,6 +102,8 @@ export const AUTO_ACCEPT_KEYS: Record<DialogKind, string[]> = {
   "feedback-survey": ["0", "C-m"],
   "ask-user-question": [],
   "usage-limit": [],
+  // Issue #492: same as usage-limit — only waiting/human action recovers it.
+  "all-orgs-limit": [],
 };
 
 /**
@@ -167,6 +170,15 @@ const ASK_OPTION_MARKER =
  * later, unrelated turn.
  */
 const USAGE_LIMIT_MARKER = /^\s*You['’]ve reached your .+ limit\b/im;
+
+/**
+ * Issue #492: under a claude-org proxy (`SUPERVISOR_CLAUDE_LAUNCHER`) every org
+ * being unavailable surfaces as the proxy's 503 body inside Claude Code's API
+ * error line, e.g. "API Error: 503 all orgs rate-limited or unreachable" —
+ * not as {@link USAGE_LIMIT_MARKER}. Source: claude-org lib/proxy.js
+ * `refuse(clientRes, 503, 'all orgs rate-limited or unreachable')`.
+ */
+const ALL_ORGS_LIMIT_MARKER = /^.*all orgs rate-limited or unreachable.*$/im;
 
 /** Number of trailing lines to inspect. Dialogs render at the bottom of
  *  the visible pane; older content is scrollback noise. */
@@ -238,6 +250,16 @@ export function detectDialog(paneText: string): DialogMatch | null {
       kind: "usage-limit",
       autoAcceptable: false,
       line: usageLimitMatch[0].trim(),
+    };
+  }
+
+  // 0.7. Every org behind the claude-org proxy is exhausted (Issue #492).
+  const allOrgsMatch = windowText.match(ALL_ORGS_LIMIT_MARKER);
+  if (allOrgsMatch) {
+    return {
+      kind: "all-orgs-limit",
+      autoAcceptable: false,
+      line: allOrgsMatch[0].trim(),
     };
   }
 

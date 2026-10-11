@@ -93,6 +93,20 @@ function buildMessage(info: DialogStuckInfo): string {
       .filter(Boolean)
       .join("\n");
   }
+  // Issue #492: claude-org proxy answered 503 — all orgs are at their limit.
+  if (info.kind === "all-orgs-limit") {
+    return [
+      "🛑 **全 org が上限**です（proxy が 503 を返しました）。セッションは応答できません。",
+      "どれかの org の 5h 窓がリセットされるまで待つか、`SUPERVISOR_CLAUDE_LAUNCHER` を外して再起動してください。",
+      "tmux attach して状況を確認してください:",
+      "```",
+      `tmux -L ${TMUX_SOCKET} attach -t ${info.tmuxSessionName}`,
+      "```",
+      info.line ? `検出行: \`${info.line.replace(/`/g, "'")}\`` : "",
+    ]
+      .filter(Boolean)
+      .join("\n");
+  }
   const label =
     info.kind === "stall"
       ? "応答待ちでブロック中"

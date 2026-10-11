@@ -44,6 +44,15 @@ export interface SessionInfo {
    * tmux-shaped check to a headless session. Undefined is treated as `"tmux"`.
    */
   executor?: "tmux" | "headless";
+  /**
+   * Issue #492: pid of the external launcher (e.g. `ccorg proxy`, a node
+   * process) when the session runs under `SUPERVISOR_CLAUDE_LAUNCHER`. `pid`
+   * then points at the real `claude` descendant. Undefined without a launcher.
+   * In-memory only: the DB row keeps just the claude pid.
+   */
+  launcherPid?: number;
+  /** Issue #492: proxy log path parsed from the launcher's stderr banner. */
+  proxyLogPath?: string;
 }
 
 /**
