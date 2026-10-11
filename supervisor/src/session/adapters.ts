@@ -155,6 +155,8 @@ export interface HeadlessRunOptions {
   env: Record<string, string | undefined>;
   /** Wall-clock ceiling; on expiry the child is killed and `timedOut` is set. */
   timeoutMs: number;
+  /** Called with each stderr chunk as it arrives (Issue #492: proxy banner). */
+  onStderr?: (chunk: string) => void;
   /**
    * Invoked exactly once with the child pid immediately after spawn (before the
    * child exits). Lets {@link import("./manager").SessionManager} register the
@@ -439,7 +441,7 @@ export const realExecutorAdapter: ExecutorAdapter = {
   // they keep the stdout pipe open, so the 'close' event — and this promise —
   // would hang until they exit (observed as a Linux-CI deadlock with an
   // orphaned grandchild). Group SIGKILL closes the pipes promptly.
-  runHeadless({ claudePath, args, cwd, env, timeoutMs, onSpawn }) {
+  runHeadless({ claudePath, args, cwd, env, timeoutMs, onSpawn, onStderr }) {
     return new Promise<HeadlessRunResult>((resolve, reject) => {
       let child;
       try {
@@ -473,6 +475,7 @@ export const realExecutorAdapter: ExecutorAdapter = {
       });
       child.stderr?.on("data", (d: string) => {
         stderr += d;
+        onStderr?.(d);
       });
 
       let timedOut = false;

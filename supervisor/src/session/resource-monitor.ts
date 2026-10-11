@@ -6,6 +6,7 @@ import {
   MAX_MEMORY_PER_SESSION_MB,
 } from "../config/channels";
 import { AdmissionController } from "./admission";
+import { listProcTable, sumTreeRssKB } from "./launcher";
 
 const execAsync = promisify(exec);
 
@@ -85,9 +86,17 @@ export class ResourceMonitor {
     for (const [threadId, session] of Array.from(this.sessionManager.entries())) {
       if (!session.pid) continue;
       try {
-        const { stdout } = await execAsync(`ps -o rss= -p ${session.pid}`);
-        const rssKB = parseInt(stdout.trim(), 10);
-        if (isNaN(rssKB)) continue;
+        let rssKB: number;
+        if (session.launcherPid) {
+          // Issue #492: under a launcher (e.g. `ccorg proxy`) the limit covers
+          // the launcher's whole tree — proxy node + claude + tool children —
+          // not only the claude pid, which would hide the launcher's own growth.
+          rssKB = sumTreeRssKB(session.launcherPid, await listProcTable());
+        } else {
+          const { stdout } = await execAsync(`ps -o rss= -p ${session.pid}`);
+          rssKB = parseInt(stdout.trim(), 10);
+        }
+        if (isNaN(rssKB) || rssKB === 0) continue;
 
         const rssMB = rssKB / 1024;
         if (rssMB > this.maxMemoryMb) {

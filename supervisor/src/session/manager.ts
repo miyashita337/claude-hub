@@ -13,6 +13,7 @@ import {
   insertSession,
   updateSessionStatus,
   updateSessionActivity,
+  updateSessionPid,
   getRunningSessions,
   getSessionByClaudeSessionId,
   getSessionByThreadId,
@@ -43,6 +44,15 @@ import {
   type SelfHealer,
 } from "./self-heal";
 import { compactClaudeHubExit } from "./primary-compact";
+import {
+  resolveLauncher,
+  shellQuote,
+  parseProxyBanner,
+  stripProxyBanner,
+  waitForClaudePid,
+  ALL_ORGS_EXHAUSTED_MARKER,
+} from "./launcher";
+import { notifyPushover } from "./notify-pushover";
 import { logRawError } from "./user-error-notice";
 import { formatDispatchReport } from "./dispatch-report";
 import {
@@ -77,6 +87,16 @@ export const ORPHAN_TMUX_REAP_REASON: StopReason = "orphan_tmux_reaped";
 function claudePath(): string {
   const envPath = process.env.SUPERVISOR_CLAUDE_PATH;
   return envPath && envPath.length > 0 ? resolve(envPath) : DEFAULT_CLAUDE_PATH;
+}
+
+/**
+ * The word(s) the tmux shell command `exec`s: the quoted claude path, or the
+ * quoted launcher argv (Issue #492; the launcher starts `claude` itself).
+ */
+function tmuxClaudeBin(launcher: string[] | null): string {
+  return launcher
+    ? launcher.map(shellQuote).join(" ")
+    : `"${claudePath()}"`;
 }
 
 /**
@@ -1061,6 +1081,12 @@ export class SessionManager {
     // silently time out (curl --max-time 3 in progress-relay.sh).
     this.cleanupRelayUrlFile(claudeSessionId);
 
+    // Issue #492: optional external launcher (e.g. `ccorg proxy`) in place of
+    // the claude binary; null keeps the pre-#492 command byte-for-byte.
+    const launcher = resolveLauncher({
+      channelName: config.channelName,
+      headless: false,
+    });
     const claudeCmd = [
       "unset ANTHROPIC_API_KEY",
       `export PATH="${resolve(homedir(), ".local/bin")}:${resolve(homedir(), ".bun/bin")}:/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin"`,
@@ -1073,7 +1099,7 @@ export class SessionManager {
       // it is shell-safe to embed here.
       // Quote claudePath() so SUPERVISOR_CLAUDE_PATH values containing spaces
       // (e.g. a test fixture under "/Users/Test User/...") don't word-split.
-      `exec "${claudePath()}" --session-id ${claudeSessionId} ${buildClaudeFlags(config, model).join(" ")}`,
+      `exec ${tmuxClaudeBin(launcher)} --session-id ${claudeSessionId} ${buildClaudeFlags(config, model).join(" ")}`,
     ].join(" && ");
 
     // Launch via tmux (provides a real TTY). Uses Supervisor's dedicated
@@ -1106,6 +1132,9 @@ export class SessionManager {
       );
     }
 
+    const launched = await this.resolveLaunchedPids(tmuxName, pid, launcher);
+    pid = launched.pid;
+
     const now = new Date();
     const info: SessionInfo = {
       id: sessionId,
@@ -1113,6 +1142,8 @@ export class SessionManager {
       threadId,
       projectDir,
       pid,
+      launcherPid: launched.launcherPid,
+      proxyLogPath: launched.proxyLogPath,
       claudeSessionId,
       process: null as unknown as any, // tmux manages the process
       startedAt: now,
@@ -1251,9 +1282,32 @@ export class SessionManager {
       // post-exit orphan probe.
       let spawnedPid: number | null = null;
 
+      // Issue #492: under a launcher the spawned child is the launcher, so the
+      // registered pid is re-pointed at the claude descendant after spawn.
+      const launcher = resolveLauncher({
+        channelName: config.channelName,
+        headless: true,
+      });
+      let stderrSeen = "";
+      let proxyLogLogged = false;
+
       const result = await this.effects.executor.runHeadless({
-        claudePath: claudePath(),
-        args,
+        claudePath: launcher ? launcher[0]! : claudePath(),
+        args: launcher ? [...launcher.slice(1), ...args] : args,
+        onStderr: launcher
+          ? (chunk) => {
+              if (proxyLogLogged) return;
+              stderrSeen += chunk;
+              const banner = parseProxyBanner(stderrSeen);
+              if (!banner) return;
+              proxyLogLogged = true;
+              const live = this.sessions.get(threadId);
+              if (live) live.proxyLogPath = banner.logPath;
+              console.log(
+                `[SessionManager] Proxy for thread ${threadId}: 127.0.0.1:${banner.port} (log: ${banner.logPath})`,
+              );
+            }
+          : undefined,
         cwd: projectDir,
         env: buildHeadlessEnv(),
         timeoutMs: headlessTimeoutMs(),
@@ -1277,6 +1331,7 @@ export class SessionManager {
             worktree,
             executor: "headless",
           };
+          if (launcher) info.launcherPid = pid;
           this.sessions.set(threadId, info);
           this.pendingStarts.delete(threadId);
           insertSession({
@@ -1294,6 +1349,7 @@ export class SessionManager {
           console.log(
             `[SessionManager] Started ${config.channelName} headless (PID: ${pid}, thread: ${threadId}, cmd: ${initialCommand})`,
           );
+          if (launcher) void this.repointHeadlessPid(info, pid);
         },
       });
 
@@ -1350,7 +1406,9 @@ export class SessionManager {
       const outcome: HeadlessSessionResult = {
         exitCode: result.exitCode,
         stdout: parsed.text,
-        stderr: result.stderr,
+        // The launcher's proxy banner is not an error; keep it out of the
+        // failure tail the dispatch report echoes (Issue #492).
+        stderr: launcher ? stripProxyBanner(result.stderr) : result.stderr,
         timedOut: result.timedOut,
         durationMs: result.durationMs,
         tokens: parsed.tokens,
@@ -1359,6 +1417,13 @@ export class SessionManager {
         completion,
         artifacts,
       };
+
+      if (
+        launcher &&
+        ALL_ORGS_EXHAUSTED_MARKER.test(`${result.stdout}\n${result.stderr}`)
+      ) {
+        await this.notifyAllOrgsExhausted(config.channelName, threadId);
+      }
 
       // Post the Dispatch 実行レポート to the target Issue BEFORE finishHeadless
       // removes the worktree — gh runs in that worktree cwd (#289). Fail-soft:
@@ -1448,6 +1513,79 @@ export class SessionManager {
         status: "unknown",
         detail: `completion probe failed: ${err instanceof Error ? err.message : String(err)}`,
       };
+    }
+  }
+
+  /**
+   * Issue #492: for a launcher-backed tmux session, replace the pane pid (the
+   * launcher) with the `claude` descendant and capture the proxy log path from
+   * the pane. Without a launcher this is the identity. If claude never shows
+   * up the launcher pid is kept (loudly) so the session is still tracked.
+   */
+  private async resolveLaunchedPids(
+    tmuxName: string,
+    panePid: number,
+    launcher: string[] | null,
+  ): Promise<{ pid: number; launcherPid?: number; proxyLogPath?: string }> {
+    if (!launcher) return { pid: panePid };
+    let proxyLogPath: string | undefined;
+    const claudePid = await waitForClaudePid(panePid, {
+      onAttempt: async () => {
+        if (proxyLogPath) return;
+        const banner = parseProxyBanner(
+          await this.effects.tmux.capturePane(tmuxName),
+        );
+        if (banner) proxyLogPath = banner.logPath;
+      },
+    });
+    if (claudePid == null) {
+      console.warn(
+        `[SessionManager] No claude descendant under launcher PID ${panePid} (tmux: ${tmuxName}); tracking the launcher pid`,
+      );
+    }
+    console.log(
+      `[SessionManager] Launcher ${launcher.join(" ")} for ${tmuxName}: launcher PID ${panePid}, claude PID ${claudePid ?? "unresolved"}, proxy log ${proxyLogPath ?? "not captured"}`,
+    );
+    return { pid: claudePid ?? panePid, launcherPid: panePid, proxyLogPath };
+  }
+
+  /** Headless counterpart of {@link resolveLaunchedPids}; runs after spawn. */
+  private async repointHeadlessPid(
+    info: SessionInfo,
+    launcherPid: number,
+  ): Promise<void> {
+    const claudePid = await waitForClaudePid(launcherPid);
+    if (claudePid == null) {
+      console.warn(
+        `[SessionManager] No claude descendant under launcher PID ${launcherPid} (thread: ${info.threadId}); tracking the launcher pid`,
+      );
+      return;
+    }
+    // The run may have finished while we were polling; only re-point a live entry.
+    if (this.sessions.get(info.threadId) !== info) return;
+    info.pid = claudePid;
+    updateSessionPid(info.id, claudePid);
+  }
+
+  /**
+   * Issue #492: the proxy answered 503 for every org. The dialog watchdog
+   * covers tmux sessions; this is the headless leg (Discord thread is already
+   * told by the dispatch failure notice, so the phone page is what is missing).
+   */
+  private async notifyAllOrgsExhausted(
+    channelName: string,
+    threadId: string,
+  ): Promise<void> {
+    console.error(
+      `[SessionManager] All orgs exhausted for ${channelName} (thread ${threadId})`,
+    );
+    try {
+      await notifyPushover(
+        "Claude Code: 全 org 上限",
+        `${channelName} (thread ${threadId}): proxy が全 org を使えないと応答しました`,
+      );
+    } catch (err) {
+      console.warn("[SessionManager] all-orgs pushover failed:", err);
     }
   }
 
@@ -1708,6 +1846,10 @@ export class SessionManager {
       claudeSessionId,
       ...buildClaudeFlags(config),
     ];
+    const launcher = resolveLauncher({
+      channelName: config.channelName,
+      headless: false,
+    });
     const claudeCmd = [
       "unset ANTHROPIC_API_KEY",
       `export PATH="${resolve(homedir(), ".local/bin")}:${resolve(homedir(), ".bun/bin")}:/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin"`,
@@ -1716,7 +1858,7 @@ export class SessionManager {
       `printf "%s" "${relayUrl}" > "${relayUrlFile}"`,
       `cd "${projectDir}"`,
       // Quote claudePath() (space-safe); resume path mirrors start's exec above.
-      `exec "${claudePath()}" ${resumeFlags.join(" ")}`,
+      `exec ${tmuxClaudeBin(launcher)} ${resumeFlags.join(" ")}`,
     ].join(" && ");
 
     await this.effects.tmux.newSession(tmuxName, claudeCmd);
@@ -1739,6 +1881,9 @@ export class SessionManager {
       );
     }
 
+    const launched = await this.resolveLaunchedPids(tmuxName, pid, launcher);
+    pid = launched.pid;
+
     const now = new Date();
     const info: SessionInfo = {
       id: sessionId,
@@ -1746,6 +1891,8 @@ export class SessionManager {
       threadId,
       projectDir,
       pid,
+      launcherPid: launched.launcherPid,
+      proxyLogPath: launched.proxyLogPath,
       process: null as unknown as any, // tmux manages the process
       claudeSessionId,
       startedAt: now,
@@ -2269,6 +2416,15 @@ export class SessionManager {
       `[SessionManager] Stopping ${session.channelName} in thread ${threadId} (reason: ${reason})`
     );
 
+    // Issue #492: signal the launcher first — claude-org forwards the signal
+    // to claude and waits for it, so neither is left orphaned.
+    if (session.launcherPid && session.launcherPid !== session.pid) {
+      try {
+        this.effects.process.kill(session.launcherPid, "SIGTERM");
+      } catch {
+        // Launcher already gone
+      }
+    }
     // Send SIGTERM to the claude process
     try {
       this.effects.process.kill(session.pid, "SIGTERM");
