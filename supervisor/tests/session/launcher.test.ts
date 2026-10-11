@@ -4,6 +4,7 @@ import { tmpdir } from "os";
 import { resolve } from "path";
 import {
   resolveLauncher,
+  splitLauncher,
   shellQuote,
   parseProxyBanner,
   stripProxyBanner,
@@ -67,6 +68,35 @@ describe("resolveLauncher (AC-1: unset => off)", () => {
     expect(
       resolveLauncher(ctx, env("dispatch, channel:dev-tool")),
     ).not.toBeNull();
+  });
+});
+
+describe("splitLauncher (AC-3: quoted paths stay one word)", () => {
+  test("plain words split on whitespace", () => {
+    expect(splitLauncher("ccorg  proxy")).toEqual(["ccorg", "proxy"]);
+  });
+
+  test("double / single quotes and backslash keep a spaced path as one word", () => {
+    expect(splitLauncher('"/Users/Test User/bin/ccorg" proxy')).toEqual([
+      "/Users/Test User/bin/ccorg",
+      "proxy",
+    ]);
+    expect(splitLauncher("'/a b/ccorg' proxy")).toEqual(["/a b/ccorg", "proxy"]);
+    expect(splitLauncher("/a\\ b/ccorg proxy")).toEqual(["/a b/ccorg", "proxy"]);
+    expect(splitLauncher('"" x')).toEqual(["", "x"]);
+  });
+
+  test("unterminated quote is rejected loudly", () => {
+    expect(() => splitLauncher('"/a b/ccorg proxy')).toThrow("引用符");
+  });
+
+  test("resolveLauncher uses it", () => {
+    expect(
+      resolveLauncher(
+        { channelName: "c", headless: false },
+        { SUPERVISOR_CLAUDE_LAUNCHER: '"/x y/ccorg" proxy' },
+      ),
+    ).toEqual(["/x y/ccorg", "proxy"]);
   });
 });
 
@@ -203,6 +233,42 @@ describe("all-orgs exhaustion (proxy 503)", () => {
       detectDialog(`● all orgs rate-limited or unreachable is the message\n> `),
     ).toBeNull();
   });
+});
+
+describe("SessionManager.start when the launcher exits immediately (AC-2)", () => {
+  let effects: FakeSessionEffects;
+  let manager: SessionManager;
+  const saved = process.env.SUPERVISOR_CLAUDE_LAUNCHER;
+
+  beforeEach(() => {
+    effects = createFakeEffects();
+    manager = new SessionManager({ effects, gracefulKillTimeoutMs: 0 });
+    process.env.SUPERVISOR_CLAUDE_LAUNCHER = "ccorg proxy";
+  });
+
+  afterEach(async () => {
+    await manager.shutdownAll();
+    if (saved === undefined) delete process.env.SUPERVISOR_CLAUDE_LAUNCHER;
+    else process.env.SUPERVISOR_CLAUDE_LAUNCHER = saved;
+  });
+
+  test("tmux session gone and no claude descendant => start fails, nothing registered", async () => {
+    const dir = resolve(tmpdir(), `launcher-exit-${process.pid}`);
+    mkdirSync(dir, { recursive: true });
+    const config: ChannelConfig = { channelName: "chan-x", dir, displayName: "X" };
+    // The pane pid is read, then the launcher dies and takes the session along.
+    const getPid = effects.tmux.getPid.bind(effects.tmux);
+    effects.tmux.getPid = async (name: string) => {
+      const pid = await getPid(name);
+      await effects.tmux.killSession(name);
+      return pid;
+    };
+
+    await expect(manager.start(config, "t-exit")).rejects.toThrow(
+      "起動直後に終了",
+    );
+    expect(manager.entries().next().done).toBe(true);
+  }, 15_000);
 });
 
 describe("SessionManager.runHeadless under a launcher", () => {

@@ -11,7 +11,8 @@ const execFileAsync = promisify(execFile);
  * sites (tmux start, tmux resume, headless): the launcher is exec'd with the
  * same argv and starts `claude` itself (claude-org looks it up on PATH). The
  * value is operator-controlled, same trust level as `SUPERVISOR_CLAUDE_PATH`;
- * it is split on whitespace and never passed through a shell unquoted.
+ * it is split like a shell word list (whitespace, `'...'`, `"..."`, `\\ `) so a
+ * path containing spaces can be quoted, and never passed through a shell unquoted.
  *
  * Rollout is gated by `SUPERVISOR_CLAUDE_LAUNCHER_SCOPE` (comma separated):
  *   - `all`              every session (stage 3)
@@ -43,7 +44,43 @@ export function resolveLauncher(
     scope.includes("all") ||
     (ctx.headless && scope.includes("dispatch")) ||
     scope.includes(`channel:${ctx.channelName}`);
-  return inScope ? raw.split(/\s+/) : null;
+  return inScope ? splitLauncher(raw) : null;
+}
+
+/**
+ * Split `SUPERVISOR_CLAUDE_LAUNCHER` into argv. Supports single quotes, double
+ * quotes and backslash escapes (no variable or glob expansion), so
+ * `"/Users/Test User/bin/ccorg" proxy` stays two words (Issue #494).
+ */
+export function splitLauncher(raw: string): string[] {
+  const words: string[] = [];
+  let cur = "";
+  let inWord = false;
+  let quote: "'" | '"' | null = null;
+  for (let i = 0; i < raw.length; i++) {
+    const ch = raw[i]!;
+    if (quote) {
+      if (ch === quote) quote = null;
+      else if (ch === "\\" && quote === '"' && i + 1 < raw.length) cur += raw[++i];
+      else cur += ch;
+    } else if (ch === "'" || ch === '"') {
+      quote = ch;
+      inWord = true;
+    } else if (ch === "\\" && i + 1 < raw.length) {
+      cur += raw[++i];
+      inWord = true;
+    } else if (/\s/.test(ch)) {
+      if (inWord) words.push(cur);
+      cur = "";
+      inWord = false;
+    } else {
+      cur += ch;
+      inWord = true;
+    }
+  }
+  if (quote) throw new Error(`SUPERVISOR_CLAUDE_LAUNCHER に閉じられていない引用符があります: ${raw}`);
+  if (inWord) words.push(cur);
+  return words;
 }
 
 /** POSIX single-quote a word so the tmux shell command cannot re-parse it. */

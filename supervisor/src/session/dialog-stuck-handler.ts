@@ -97,7 +97,7 @@ function buildMessage(info: DialogStuckInfo): string {
   if (info.kind === "all-orgs-limit") {
     return [
       "🛑 **全 org が上限**です（proxy が 503 を返しました）。セッションは応答できません。",
-      "どれかの org の 5h 窓がリセットされるまで待つか、`SUPERVISOR_CLAUDE_LAUNCHER` を外して再起動してください。",
+      "どれかの org の 5h 窓がリセットされるまで待つか、`SUPERVISOR_CLAUDE_LAUNCHER` を外してください（設定解除は新規セッションから有効。このセッションの復旧は `/session stop` → `/session start`）。",
       "tmux attach して状況を確認してください:",
       "```",
       `tmux -L ${TMUX_SOCKET} attach -t ${info.tmuxSessionName}`,

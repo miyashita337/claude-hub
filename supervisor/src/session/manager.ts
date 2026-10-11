@@ -1132,7 +1132,7 @@ export class SessionManager {
       );
     }
 
-    const launched = await this.resolveLaunchedPids(tmuxName, pid, launcher);
+    const launched = await this.resolveLaunchedPids(tmuxName, pid, launcher, claudeSessionId);
     pid = launched.pid;
 
     const now = new Date();
@@ -1526,6 +1526,7 @@ export class SessionManager {
     tmuxName: string,
     panePid: number,
     launcher: string[] | null,
+    claudeSessionId: string,
   ): Promise<{ pid: number; launcherPid?: number; proxyLogPath?: string }> {
     if (!launcher) return { pid: panePid };
     let proxyLogPath: string | undefined;
@@ -1538,6 +1539,14 @@ export class SessionManager {
         if (banner) proxyLogPath = banner.logPath;
       },
     });
+    if (claudePid == null && !(await this.effects.tmux.hasSession(tmuxName))) {
+      // Issue #494: the launcher exited right after launch (bad path, ccorg
+      // crash). Registering it as running would hide the failure.
+      this.cleanupRelayUrlFile(claudeSessionId);
+      throw new Error(
+        `launcher ${launcher[0]} が起動直後に終了しました（tmux セッション ${tmuxName} が消えています）`
+      );
+    }
     if (claudePid == null) {
       console.warn(
         `[SessionManager] No claude descendant under launcher PID ${panePid} (tmux: ${tmuxName}); tracking the launcher pid`,
@@ -1881,7 +1890,7 @@ export class SessionManager {
       );
     }
 
-    const launched = await this.resolveLaunchedPids(tmuxName, pid, launcher);
+    const launched = await this.resolveLaunchedPids(tmuxName, pid, launcher, claudeSessionId);
     pid = launched.pid;
 
     const now = new Date();

@@ -91,7 +91,12 @@ export class ResourceMonitor {
           // Issue #492: under a launcher (e.g. `ccorg proxy`) the limit covers
           // the launcher's whole tree — proxy node + claude + tool children —
           // not only the claude pid, which would hide the launcher's own growth.
-          rssKB = sumTreeRssKB(session.launcherPid, await listProcTable());
+          const rows = await listProcTable();
+          rssKB = sumTreeRssKB(session.launcherPid, rows);
+          // The launcher exiting first re-parents claude to init, so the
+          // launcher-rooted tree is empty (Issue #494). Fall back to claude's
+          // own tree rather than skipping the guard.
+          if (rssKB === 0) rssKB = sumTreeRssKB(session.pid, rows);
         } else {
           const { stdout } = await execAsync(`ps -o rss= -p ${session.pid}`);
           rssKB = parseInt(stdout.trim(), 10);

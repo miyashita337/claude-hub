@@ -163,4 +163,48 @@ describe("launcher with real processes", () => {
       .filter((l) => l.includes(join(dir, "claude")));
     expect(left).toEqual([]);
   });
+
+  test("AC-1 (#494): launcher exiting first still lets the guard stop claude", async () => {
+    const { launcherPid } = startLauncher();
+    const claudePid = (await waitForClaudePid(launcherPid))!;
+    // SIGKILL: the launcher cannot forward a signal, so claude is re-parented.
+    process.kill(launcherPid, "SIGKILL");
+    expect(await until(() => !alive(launcherPid))).toBe(true);
+    expect(alive(claudePid)).toBe(true);
+
+    const rows = await listProcTable();
+    expect(sumTreeRssKB(launcherPid, rows)).toBe(0);
+
+    const session = {
+      id: "s",
+      channelName: "dev-tool",
+      threadId: "t2",
+      projectDir: "/x",
+      pid: claudePid,
+      launcherPid,
+      process: null,
+      startedAt: new Date(),
+      lastActivityAt: new Date(),
+      status: "running",
+    } as unknown as SessionInfo;
+    const sessions = new Map([["t2", session]]);
+    const stops: StopReason[] = [];
+    const manager = {
+      entries: () => sessions.entries(),
+      stop: async (threadId: string, reason: StopReason) => {
+        stops.push(reason);
+        process.kill(session.pid, "SIGTERM");
+        sessions.delete(threadId);
+      },
+    } as unknown as SessionManager;
+    const monitor = new ResourceMonitor(manager, {
+      maxMemoryMb: 0,
+      admission: new AdmissionController(),
+    });
+
+    await monitor.check();
+
+    expect(stops).toEqual(["resource_limit"]);
+    expect(await until(() => !alive(claudePid))).toBe(true);
+  });
 });

@@ -29,6 +29,8 @@ related_issue: https://github.com/miyashita337/claude-hub/issues/492
 - `session.pid` は launcher の子孫のうち実行ファイル名が `claude` のものに解決する。launcher の pid は `session.launcherPid`（メモリのみ）に持つ。解決できないときは warn して launcher の pid を追跡する
 - `ResourceMonitor` は `launcherPid` があるとき、launcher を根とするプロセスツリー全体（proxy + claude + 子）の RSS 合計で判定する。launcher なしの挙動は変えない
 - `stop()` は launcher → claude の順に SIGTERM を送る
+- launcher の値はシェル風に分割する（空白・`'...'`・`"..."`・`\ `）。空白を含むパスは引用符で囲む。launcher が先に終了して launcher 起点のツリー RSS が 0 になったら claude 自身のツリーで判定する。launcher が起動直後に終了し claude 子孫も tmux セッションも無い場合は起動失敗として扱う（#494）
+- launcher の値はシェル風に分割する（空白・`'...'`・`"..."`・`\ `）。空白を含むパスは引用符で囲む。launcher が先に終了して launcher 起点のツリー RSS が 0 になったら claude 自身のツリーで判定する。launcher が起動直後に終了し claude 子孫も tmux セッションも無い場合は起動失敗として扱う（#494）
 - proxy の stderr バナー（`-> proxy 127.0.0.1:<port> (... log: <path>)`）から log パスを `session.proxyLogPath` に記録する（tmux は pane 取得、headless は stderr 受信）。headless の失敗理由（stderr tail）からはバナー行を除く
 - proxy が全 org 不可のとき返す 503 本文（`all orgs rate-limited or unreachable`）を新しい dialog kind `all-orgs-limit` として検知し、usage-limit と同じ経路（Discord + Pushover）で通知する。headless は実行後に Pushover を送る
 
