@@ -11,7 +11,8 @@ const execFileAsync = promisify(execFile);
  * sites (tmux start, tmux resume, headless): the launcher is exec'd with the
  * same argv and starts `claude` itself (claude-org looks it up on PATH). The
  * value is operator-controlled, same trust level as `SUPERVISOR_CLAUDE_PATH`;
- * it is split on whitespace and never passed through a shell unquoted.
+ * it is split like a shell word list (whitespace, `'...'`, `"..."`, `\\ `) so a
+ * path containing spaces can be quoted, and never passed through a shell unquoted.
  *
  * Rollout is gated by `SUPERVISOR_CLAUDE_LAUNCHER_SCOPE` (comma separated):
  *   - `all`              every session (stage 3)
@@ -43,7 +44,53 @@ export function resolveLauncher(
     scope.includes("all") ||
     (ctx.headless && scope.includes("dispatch")) ||
     scope.includes(`channel:${ctx.channelName}`);
-  return inScope ? raw.split(/\s+/) : null;
+  return inScope ? splitLauncher(raw) : null;
+}
+
+/**
+ * Split `SUPERVISOR_CLAUDE_LAUNCHER` into argv. Supports single quotes, double
+ * quotes and backslash escapes (no variable or glob expansion), so
+ * `"/Users/Test User/bin/ccorg" proxy` stays two words (Issue #494).
+ *
+ * Inside double quotes a backslash only escapes `\\` and `"` (the subset of the
+ * POSIX shell rule that applies without `$`/backtick expansion); any other
+ * backslash is a literal character, so `"/tmp/team\build/ccorg"` keeps its
+ * backslash instead of collapsing to `/tmp/teambuild/ccorg` (PR #495 review).
+ */
+export function splitLauncher(raw: string): string[] {
+  const words: string[] = [];
+  let cur = "";
+  let inWord = false;
+  let quote: "'" | '"' | null = null;
+  for (let i = 0; i < raw.length; i++) {
+    const ch = raw[i]!;
+    if (quote) {
+      if (ch === quote) quote = null;
+      else if (
+        ch === "\\" &&
+        quote === '"' &&
+        (raw[i + 1] === "\\" || raw[i + 1] === '"')
+      )
+        cur += raw[++i];
+      else cur += ch;
+    } else if (ch === "'" || ch === '"') {
+      quote = ch;
+      inWord = true;
+    } else if (ch === "\\" && i + 1 < raw.length) {
+      cur += raw[++i];
+      inWord = true;
+    } else if (/\s/.test(ch)) {
+      if (inWord) words.push(cur);
+      cur = "";
+      inWord = false;
+    } else {
+      cur += ch;
+      inWord = true;
+    }
+  }
+  if (quote) throw new Error(`SUPERVISOR_CLAUDE_LAUNCHER に閉じられていない引用符があります: ${raw}`);
+  if (inWord) words.push(cur);
+  return words;
 }
 
 /** POSIX single-quote a word so the tmux shell command cannot re-parse it. */
@@ -192,4 +239,116 @@ export async function waitForClaudePid(
     await new Promise((r) => setTimeout(r, intervalMs));
   }
   return null;
+}
+
+/** Pids currently in process group `pgid` (`ps -axo pid=,pgid=`). */
+export async function listGroupPids(pgid: number): Promise<number[]> {
+  const { stdout } = await execFileAsync("ps", ["-axo", "pid=,pgid="], {
+    encoding: "utf8",
+    timeout: 5000,
+    maxBuffer: 8 * 1024 * 1024,
+  });
+  const pids: number[] = [];
+  for (const line of stdout.split("\n")) {
+    const m = line.match(/^\s*(\d+)\s+(\d+)\s*$/);
+    if (m && Number(m[2]) === pgid) pids.push(Number(m[1]));
+  }
+  return pids;
+}
+
+export interface ReapOptions {
+  /** The claude pid when known (tmux_exited path); signalled directly too. */
+  claudePid?: number;
+  kill?: (pid: number, signal: NodeJS.Signals) => void;
+  isAlive?: (pid: number) => boolean;
+  members?: (pgid: number) => Promise<number[]>;
+  attempts?: number;
+  intervalMs?: number;
+}
+
+/**
+ * Issue #494 (PR #495 Devin must): reap what a launcher left behind.
+ *
+ * When the launcher dies right after spawning `claude` (bad path, ccorg crash)
+ * or its tmux pane goes away, the OS re-parents the still-running claude to
+ * init: it is no longer a descendant of `launcherPid`, so neither
+ * {@link findClaudeDescendant} nor the launcher-rooted RSS tree sees it, and
+ * nothing would ever stop it. The process GROUP survives its leader, though:
+ * the tmux pane and the headless `detached` spawn both make the launcher a
+ * group leader, and claude-org starts claude without detaching, so
+ * `kill(-launcherPid)` still reaches claude (and its tool children) after the
+ * launcher is gone. `claudePid`, when the caller knows it, is signalled as
+ * well in case claude moved to its own group.
+ *
+ * Best effort: an empty group / a dead pid is ESRCH and ignored. SIGTERM
+ * first (claude flushes its transcript on it), SIGKILL for whatever is still
+ * there after the wait. Returns the pids that survived even that (empty =
+ * clean) so the caller can log them, or null when the group could not be
+ * observed at all (`ps` failure) — unverified, not clean.
+ */
+export async function reapLauncherGroup(
+  launcherPid: number,
+  opts: ReapOptions = {},
+): Promise<number[] | null> {
+  const {
+    claudePid,
+    kill = (pid, signal) => process.kill(pid, signal),
+    isAlive = (pid) => {
+      try {
+        process.kill(pid, 0);
+        return true;
+      } catch (err) {
+        return (err as NodeJS.ErrnoException).code === "EPERM";
+      }
+    },
+    members = listGroupPids,
+    attempts = 20,
+    intervalMs = 100,
+  } = opts;
+  const signal = (pid: number, sig: NodeJS.Signals) => {
+    try {
+      kill(pid, sig);
+    } catch {
+      // ESRCH (nothing left in the group / pid already gone) or EPERM: there
+      // is nothing more this process can do about it.
+    }
+  };
+  const sweep = (sig: NodeJS.Signals) => {
+    signal(-launcherPid, sig);
+    if (claudePid != null && claudePid !== launcherPid) signal(claudePid, sig);
+  };
+  const survivors = async (): Promise<number[]> => {
+    const left = new Set<number>(await members(launcherPid));
+    if (claudePid != null && isAlive(claudePid)) left.add(claudePid);
+    return [...left];
+  };
+  // null = the group could not be observed (`ps` failed / timed out under
+  // load). That is NOT "clean": the caller must not skip the SIGKILL sweep or
+  // log a verified reap on it.
+  const waitGone = async (): Promise<number[] | null> => {
+    let left: number[] = [];
+    for (let i = 0; i < attempts; i++) {
+      try {
+        left = await survivors();
+      } catch (err) {
+        console.warn("[Launcher] process group read failed during reap:", err);
+        return null;
+      }
+      if (left.length === 0) return [];
+      await new Promise((r) => setTimeout(r, intervalMs));
+    }
+    return left;
+  };
+
+  sweep("SIGTERM");
+  let left = await waitGone();
+  if (left !== null && left.length === 0) return [];
+  console.warn(
+    left === null
+      ? `[Launcher] process group ${launcherPid} could not be observed after SIGTERM; sending SIGKILL unverified`
+      : `[Launcher] process group ${launcherPid} still has ${left.join(", ")} after SIGTERM; sending SIGKILL`,
+  );
+  sweep("SIGKILL");
+  left = await waitGone();
+  return left;
 }

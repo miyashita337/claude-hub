@@ -97,7 +97,11 @@ function buildMessage(info: DialogStuckInfo): string {
   if (info.kind === "all-orgs-limit") {
     return [
       "🛑 **全 org が上限**です（proxy が 503 を返しました）。セッションは応答できません。",
-      "どれかの org の 5h 窓がリセットされるまで待つか、`SUPERVISOR_CLAUDE_LAUNCHER` を外して再起動してください。",
+      // The launcher env is read from the supervisor's own process.env, so
+      // unsetting it in the launchd plist does nothing until the supervisor is
+      // restarted; `/session stop` → `/session start` alone would pick the same
+      // launcher again (PR #495 review).
+      "どれかの org の 5h 窓がリセットされるまで待つか、`SUPERVISOR_CLAUDE_LAUNCHER` を外してください（設定解除は supervisor 再起動後の新規セッションから有効。既存セッションは `/session stop`、再起動は `launchctl bootout` + `bootstrap`）。",
       "tmux attach して状況を確認してください:",
       "```",
       `tmux -L ${TMUX_SOCKET} attach -t ${info.tmuxSessionName}`,
