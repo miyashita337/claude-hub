@@ -179,6 +179,30 @@ describe("all-orgs exhaustion (proxy 503)", () => {
     expect(m?.kind).toBe("all-orgs-limit");
     expect(m?.autoAcceptable).toBe(false);
   });
+
+  test("dialog-detect matches the raw JSON 503 body claude prints", () => {
+    const json =
+      'API Error: 503 {"type":"error","error":{"type":"claude_org_proxy","message":"all orgs rate-limited or unreachable"}}';
+    expect(detectDialog(`  ⎿  ${json}\n> `)?.kind).toBe("all-orgs-limit");
+  });
+
+  test("dialog-detect ignores the phrase when merely quoted (PR #493 review)", () => {
+    // Quoted by the user in the prompt box, or echoed by Claude in prose: no
+    // API-error prefix at the start of the line, so not a proxy 503.
+    expect(
+      detectDialog(
+        `> what does "all orgs rate-limited or unreachable" mean?\n`,
+      ),
+    ).toBeNull();
+    expect(
+      detectDialog(
+        `● The proxy answers "API Error: 503 all orgs rate-limited or unreachable" when every org is exhausted.\n> `,
+      ),
+    ).toBeNull();
+    expect(
+      detectDialog(`● all orgs rate-limited or unreachable is the message\n> `),
+    ).toBeNull();
+  });
 });
 
 describe("SessionManager.runHeadless under a launcher", () => {

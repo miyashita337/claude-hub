@@ -174,11 +174,19 @@ const USAGE_LIMIT_MARKER = /^\s*You['’]ve reached your .+ limit\b/im;
 /**
  * Issue #492: under a claude-org proxy (`SUPERVISOR_CLAUDE_LAUNCHER`) every org
  * being unavailable surfaces as the proxy's 503 body inside Claude Code's API
- * error line, e.g. "API Error: 503 all orgs rate-limited or unreachable" —
- * not as {@link USAGE_LIMIT_MARKER}. Source: claude-org lib/proxy.js
- * `refuse(clientRes, 503, 'all orgs rate-limited or unreachable')`.
+ * error line, e.g. "API Error: 503 all orgs rate-limited or unreachable" or
+ * the raw JSON body `API Error: 503 {"type":"error","error":{...,"message":
+ * "all orgs rate-limited or unreachable"}}` — not as {@link USAGE_LIMIT_MARKER}.
+ * Source: claude-org lib/proxy.js `refuse(clientRes, 503, 'all orgs
+ * rate-limited or unreachable')`.
+ *
+ * Anchored to the start of the API-error line (after Ink's `⎿` / bullet
+ * prefix): the phrase alone must not match, or a user or Claude merely quoting
+ * it in the pane would page the operator and freeze auto-accept (PR #493
+ * review).
  */
-const ALL_ORGS_LIMIT_MARKER = /^.*all orgs rate-limited or unreachable.*$/im;
+const ALL_ORGS_LIMIT_MARKER =
+  /^[\s⎿●✗✘]*API Error:\s*503\b.*all orgs rate-limited or unreachable/im;
 
 /** Number of trailing lines to inspect. Dialogs render at the bottom of
  *  the visible pane; older content is scrollback noise. */
