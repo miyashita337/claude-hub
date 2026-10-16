@@ -34,7 +34,8 @@
  * `<id>` は session row id / thread_id / claude_session_id のいずれでも可。
  */
 
-import { existsSync, readFileSync } from "fs";
+import { existsSync, readFileSync, readdirSync, writeFileSync } from "fs";
+import { dirname, join } from "path";
 import { Database } from "bun:sqlite";
 import { execFile } from "child_process";
 import { promisify } from "util";
@@ -80,6 +81,16 @@ export interface SessionCtlEffects {
   sleep(ms: number): Promise<void>;
   /** relay ポートファイルから Supervisor の relay ポートを読む（無ければ null）。 */
   readRelayPort(): number | null;
+  /**
+   * relay-port が無いときの復旧（#400）。同じ runtime dir の `*.relay-url` から
+   * ポートを取り出し、実際に relay サーバが応答するものだけを返す（死んだ URL は
+   * 使わない）。見つからなければ null。
+   */
+  recoverRelayPort(): Promise<number | null>;
+  /** 復旧したポートで relay-port を書き直す（best-effort。失敗しても投稿は続ける）。 */
+  writeRelayPort(port: number): void;
+  /** この runtime dir を使う Supervisor プロセスが居るか（エラー文言の出し分け用）。 */
+  supervisorRunning(): Promise<boolean>;
   httpPost(
     url: string,
     body: unknown,
@@ -341,6 +352,39 @@ async function cmdStop(
   return 0;
 }
 
+/**
+ * relay ポートを解決する（#400）。順序: relay-port → relay-url 復旧 → エラー。
+ * 失敗時のメッセージは「Supervisor 稼働中で探索ファイルだけ失われた」と
+ * 「Supervisor 未起動」を区別する（稼働中なのに未起動と誤診させない）。
+ */
+async function resolveRelayPort(
+  fx: SessionCtlEffects,
+): Promise<{ port: number } | { error: string }> {
+  const direct = fx.readRelayPort();
+  if (direct != null) return { port: direct };
+  const recovered = await fx.recoverRelayPort();
+  if (recovered != null) {
+    fx.out(
+      `⚠️ relay-port が無いため relay-url から relay ポート ${recovered} を復旧しました（応答確認済み）。`,
+    );
+    fx.writeRelayPort(recovered);
+    return { port: recovered };
+  }
+  if (await fx.supervisorRunning()) {
+    return {
+      error:
+        "relay-port（ポートファイル）が失われていますが Supervisor プロセスは稼働中です。" +
+        "relay-url からの復旧にも失敗しました（稼働中セッションが無い可能性）。" +
+        "Supervisor を再起動するか、稼働中の relay ポートで relay-port を手動作成してください。",
+    };
+  }
+  return {
+    error:
+      "Supervisor が起動していません（relay-port なし・応答する relay-url なし）。" +
+      "Supervisor を起動してください。",
+  };
+}
+
 async function cmdStartHubWorker(
   fx: SessionCtlEffects,
   branch: string,
@@ -352,14 +396,12 @@ async function cmdStartHubWorker(
     return 1;
   }
   const issueNumber = Number(issueArg);
-  const port = fx.readRelayPort();
-  if (port == null) {
-    fx.err(
-      "Supervisor の relay ポートを発見できません（ポートファイルなし）。" +
-        "Supervisor が起動しているか確認してください。",
-    );
+  const resolved = await resolveRelayPort(fx);
+  if ("error" in resolved) {
+    fx.err(resolved.error);
     return 1;
   }
+  const port = resolved.port;
   const payload: Record<string, unknown> = { branch, issueNumber };
   if (selector !== undefined) payload.selector = selector;
   let res: { status: number; body: unknown };
@@ -400,14 +442,12 @@ async function cmdPostChannel(
     fx.err("投稿テキストが空です。");
     return 1;
   }
-  const port = fx.readRelayPort();
-  if (port == null) {
-    fx.err(
-      "Supervisor の relay ポートを発見できません（ポートファイルなし）。" +
-        "Supervisor が起動しているか確認してください。",
-    );
+  const resolved = await resolveRelayPort(fx);
+  if ("error" in resolved) {
+    fx.err(resolved.error);
     return 1;
   }
+  const port = resolved.port;
   let res: { status: number; body: unknown };
   try {
     res = await fx.httpPost(
@@ -499,6 +539,88 @@ export async function runSessionCtl(
 }
 
 /** 実 DB（読み取り専用）+ 実 tmux + 実 HTTP のアダプタを組み立てる。 */
+/** relay サーバが本当にそのポートで応答するか（GET /health/sessions が 200 + 期待形）。 */
+async function probeRelay(port: number): Promise<boolean> {
+  try {
+    const res = await fetch(`http://127.0.0.1:${port}/health/sessions`, {
+      signal: AbortSignal.timeout(1500),
+    });
+    if (res.status !== 200) return false;
+    const body = (await res.json().catch(() => null)) as {
+      count?: unknown;
+      sessions?: unknown;
+    } | null;
+    return typeof body?.count === "number" && Array.isArray(body?.sessions);
+  } catch {
+    return false;
+  }
+}
+
+/**
+ * runtime dir の `*.relay-url`（`http://localhost:<port>/relay/<thread>`）から
+ * 応答する relay ポートを探す（#400）。新しい順に試し、最初に応答したものを返す。
+ */
+export async function recoverRelayPortFromRelayUrls(
+  runtimeDir: string,
+  probe: (port: number) => Promise<boolean> = probeRelay,
+): Promise<number | null> {
+  let names: string[];
+  try {
+    names = readdirSync(runtimeDir).filter((n) => n.endsWith(".relay-url"));
+  } catch {
+    return null;
+  }
+  const ports: number[] = [];
+  for (const name of names) {
+    try {
+      const m = readFileSync(join(runtimeDir, name), "utf8").match(
+        /^https?:\/\/(?:localhost|127\.0\.0\.1):(\d+)\//,
+      );
+      const port = m ? Number(m[1]) : NaN;
+      if (Number.isSafeInteger(port) && port > 0 && !ports.includes(port)) {
+        ports.push(port);
+      }
+    } catch {
+      // 読めない relay-url は候補から外す
+    }
+  }
+  for (const port of ports) {
+    if (await probe(port)) return port;
+  }
+  return null;
+}
+
+/**
+ * 同じ runtime dir（XDG_RUNTIME_DIR）を使う Supervisor プロセスが居るか。
+ * `supervisor/index.ts` を実行中のプロセスのうち、環境変数 XDG_RUNTIME_DIR が
+ * 呼び出し側と一致するものだけを数える（隔離 Supervisor と本番を取り違えない）。
+ */
+async function isSupervisorRunning(xdg: string | undefined): Promise<boolean> {
+  try {
+    const { stdout } = await execFileAsync("/usr/bin/pgrep", ["-f", "supervisor/index.ts"], {
+      timeout: 5000,
+    });
+    const pids = stdout.split("\n").map((l) => l.trim()).filter(Boolean);
+    for (const pid of pids) {
+      try {
+        const { stdout: env } = await execFileAsync(
+          "/bin/ps",
+          ["eww", "-p", pid, "-o", "command="],
+          { timeout: 5000 },
+        );
+        const m = env.match(/(?:^|\s)XDG_RUNTIME_DIR=(\S+)/);
+        if ((m ? m[1] : undefined) === (xdg || undefined)) return true;
+      } catch {
+        // プロセスが途中で消えた
+      }
+    }
+    return false;
+  } catch {
+    // pgrep は 1 件も無いと exit 1
+    return false;
+  }
+}
+
 export function createRealEffects(): SessionCtlEffects {
   let db: Database | null = null;
   const getReadonlyDb = (): Database => {
@@ -610,6 +732,15 @@ export function createRealEffects(): SessionCtlEffects {
         return null;
       }
     },
+    recoverRelayPort: async () => recoverRelayPortFromRelayUrls(dirname(relayPortFilePath())),
+    writeRelayPort: (port) => {
+      try {
+        writeFileSync(relayPortFilePath(), String(port));
+      } catch {
+        // best-effort: 書けなくても今回の投稿は復旧したポートで続行できる
+      }
+    },
+    supervisorRunning: () => isSupervisorRunning(process.env.XDG_RUNTIME_DIR),
     httpPost: async (url, body) => {
       const res = await fetch(url, {
         method: "POST",

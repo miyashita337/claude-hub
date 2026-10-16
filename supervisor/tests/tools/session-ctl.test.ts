@@ -12,6 +12,8 @@ import {
   type SessionStore,
 } from "../../tools/session-ctl";
 import { SessionManager } from "../../src/session/manager";
+import { recoverRelayPortFromRelayUrls } from "../../tools/session-ctl";
+import { writeFileSync } from "fs";
 
 /**
  * session-ctl ローカル CLI（Epic #316 Phase 3 / #320）の fake adapters テスト。
@@ -45,6 +47,7 @@ interface FakeCalls {
   killedPids: Array<{ pid: number; signal: string }>;
   killedTmux: string[];
   posts: Array<{ url: string; body: unknown }>;
+  writtenPorts: number[];
   out: string[];
   err: string[];
 }
@@ -54,6 +57,10 @@ function fakeFx(opts: {
   tmuxAlive?: boolean;
   pidAlive?: boolean;
   relayPort?: number | null;
+  /** relay-port 不在時に relay-url から復旧できるポート（#400）。 */
+  recoveredPort?: number | null;
+  /** Supervisor プロセスが居るか（#400）。 */
+  supervisorRunning?: boolean;
   httpResponse?: { status: number; body: unknown };
   /** stop 中、tmux kill 後に store が返す status（Supervisor watcher 反映の模擬）。 */
   statusAfterKill?: string;
@@ -67,6 +74,7 @@ function fakeFx(opts: {
     killedPids: [],
     killedTmux: [],
     posts: [],
+    writtenPorts: [],
     out: [],
     err: [],
   };
@@ -117,6 +125,11 @@ function fakeFx(opts: {
       opts.pidCommand === undefined ? null : opts.pidCommand,
     sleep: async () => {},
     readRelayPort: () => (opts.relayPort === undefined ? 45678 : opts.relayPort),
+    recoverRelayPort: async () => opts.recoveredPort ?? null,
+    writeRelayPort: (port) => {
+      calls.writtenPorts.push(port);
+    },
+    supervisorRunning: async () => opts.supervisorRunning ?? false,
     httpPost: async (url, body) => {
       calls.posts.push({ url, body });
       return opts.httpResponse ?? { status: 200, body: { ok: true, threadId: "T1", queued: false, injected: "/impl 1" } };
@@ -504,5 +517,88 @@ describe("post-channel (#339)", () => {
       await runSessionCtl(["post-channel", "111122223333444455", "hello"], fx),
     ).toBe(1);
     expect(calls.err[0]).toContain("接続に失敗");
+  });
+});
+
+describe("relay-port 不在時の復旧とエラー文言 (#400)", () => {
+  const CH = ["post-channel", "111122223333444455", "hello"];
+
+  test("AC-2: relay-port 不在でも relay-url から復旧したポートで投稿し、relay-port を書き直す", async () => {
+    const { fx, calls } = fakeFx({ relayPort: null, recoveredPort: 50123 });
+    expect(await runSessionCtl(CH, fx)).toBe(0);
+    expect(calls.posts[0]!.url).toBe(
+      "http://127.0.0.1:50123/channel-post/111122223333444455",
+    );
+    expect(calls.writtenPorts).toEqual([50123]);
+  });
+
+  test("AC-2: start-hub-worker も同じ復旧経路を通る", async () => {
+    const { fx, calls } = fakeFx({ relayPort: null, recoveredPort: 50123 });
+    expect(await runSessionCtl(["start-hub-worker", "feat-1", "1"], fx)).toBe(0);
+    expect(calls.posts[0]!.url).toBe("http://127.0.0.1:50123/hub-work");
+  });
+
+  test("AC-3: 復旧できなければ（死んだ relay-url のみ）投稿せずエラー、relay-port も書かない", async () => {
+    const { fx, calls } = fakeFx({ relayPort: null, recoveredPort: null });
+    expect(await runSessionCtl(CH, fx)).toBe(1);
+    expect(calls.posts).toHaveLength(0);
+    expect(calls.writtenPorts).toHaveLength(0);
+  });
+
+  test("AC-4: プロセス稼働中なら『稼働中』、非稼働なら『起動していません』と別文言", async () => {
+    const running = fakeFx({ relayPort: null, supervisorRunning: true });
+    await runSessionCtl(CH, running.fx);
+    const down = fakeFx({ relayPort: null, supervisorRunning: false });
+    await runSessionCtl(CH, down.fx);
+    expect(running.calls.err[0]).toContain("稼働中");
+    expect(running.calls.err[0]).not.toContain("起動していません");
+    expect(down.calls.err[0]).toContain("起動していません");
+    expect(down.calls.err[0]).not.toContain("稼働中");
+  });
+
+  test("通常時（relay-port あり）は復旧経路に入らない（回帰なし）", async () => {
+    const { fx, calls } = fakeFx({ recoveredPort: 59999 });
+    expect(await runSessionCtl(CH, fx)).toBe(0);
+    expect(calls.posts[0]!.url).toContain(":45678/");
+    expect(calls.writtenPorts).toHaveLength(0);
+  });
+
+  describe("recoverRelayPortFromRelayUrls", () => {
+    function withDir(fn: (dir: string) => Promise<void>) {
+      return async () => {
+        const dir = mkdtempSync(join(tmpdir(), "relay-url-"));
+        try {
+          await fn(dir);
+        } finally {
+          rmSync(dir, { recursive: true, force: true });
+        }
+      };
+    }
+
+    test("応答する relay のポートだけを返す（死んだポートは飛ばす）", withDir(async (dir) => {
+      writeFileSync(join(dir, "a.relay-url"), "http://localhost:1111/relay/T1");
+      writeFileSync(join(dir, "b.relay-url"), "http://localhost:2222/relay/T2");
+      const probed: number[] = [];
+      const port = await recoverRelayPortFromRelayUrls(dir, async (p) => {
+        probed.push(p);
+        return p === 2222;
+      });
+      expect(port).toBe(2222);
+      expect(probed.sort()).toEqual([1111, 2222]);
+    }));
+
+    test("全て死んでいれば null", withDir(async (dir) => {
+      writeFileSync(join(dir, "a.relay-url"), "http://localhost:1111/relay/T1");
+      expect(await recoverRelayPortFromRelayUrls(dir, async () => false)).toBeNull();
+    }));
+
+    test("relay-url が無い / 不正な内容 / dir 不在は null", withDir(async (dir) => {
+      writeFileSync(join(dir, "bad.relay-url"), "garbage");
+      writeFileSync(join(dir, "relay-port"), "5555");
+      expect(await recoverRelayPortFromRelayUrls(dir, async () => true)).toBeNull();
+      expect(
+        await recoverRelayPortFromRelayUrls(join(dir, "nope"), async () => true),
+      ).toBeNull();
+    }));
   });
 });
