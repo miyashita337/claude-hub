@@ -15,4 +15,5 @@
 preload = [
   "./tests/setup/runtime-dir-isolation.ts",
   "./tests/setup/db-isolation.ts",
+  "./tests/setup/tmux-socket-isolation.ts",
 ]
