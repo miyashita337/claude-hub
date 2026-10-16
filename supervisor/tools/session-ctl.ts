@@ -539,8 +539,12 @@ export async function runSessionCtl(
 }
 
 /** 実 DB（読み取り専用）+ 実 tmux + 実 HTTP のアダプタを組み立てる。 */
-/** relay サーバが本当にそのポートで応答するか（GET /health/sessions が 200 + 期待形）。 */
-export async function probeRelay(port: number): Promise<boolean> {
+/**
+ * relay サーバが本当にそのポートで応答するか（GET /health/sessions が 200 + 期待形）。
+ * 応答の形だけでは Supervisor を識別できないため、relay-url に書かれた thread が
+ * 応答の sessions に含まれることまで要求する（同じポートを別サービスが使っていても誤送信しない）。
+ */
+export async function probeRelay(port: number, threadId: string): Promise<boolean> {
   try {
     const res = await fetch(`http://127.0.0.1:${port}/health/sessions`, {
       signal: AbortSignal.timeout(1500),
@@ -551,11 +555,15 @@ export async function probeRelay(port: number): Promise<boolean> {
       max?: unknown;
       sessions?: unknown;
     } | null;
-    // 別サービスが偶然同ポートを使っていても誤認しないよう、relay 固有の形（count/max/sessions）を要求する
-    return (
-      typeof body?.count === "number" &&
-      typeof body?.max === "number" &&
-      Array.isArray(body?.sessions)
+    if (
+      typeof body?.count !== "number" ||
+      typeof body?.max !== "number" ||
+      !Array.isArray(body?.sessions)
+    ) {
+      return false;
+    }
+    return body.sessions.some(
+      (s) => typeof s === "object" && s !== null && (s as { threadId?: unknown }).threadId === threadId,
     );
   } catch {
     return false;
@@ -568,7 +576,7 @@ export async function probeRelay(port: number): Promise<boolean> {
  */
 export async function recoverRelayPortFromRelayUrls(
   runtimeDir: string,
-  probe: (port: number) => Promise<boolean> = probeRelay,
+  probe: (port: number, threadId: string) => Promise<boolean> = probeRelay,
 ): Promise<number | null> {
   let names: string[];
   try {
@@ -580,22 +588,23 @@ export async function recoverRelayPortFromRelayUrls(
   } catch {
     return null;
   }
-  const ports: number[] = [];
+  const candidates: { port: number; threadId: string }[] = [];
   for (const name of names) {
     try {
       const m = readFileSync(join(runtimeDir, name), "utf8").match(
-        /^https?:\/\/(?:localhost|127\.0\.0\.1):(\d+)\//,
+        /^https?:\/\/(?:localhost|127\.0\.0\.1):(\d+)\/relay\/([^/?#\s]+)/,
       );
       const port = m ? Number(m[1]) : NaN;
-      if (Number.isSafeInteger(port) && port > 0 && !ports.includes(port)) {
-        ports.push(port);
+      if (m && Number.isSafeInteger(port) && port > 0) {
+        // manager.ts は thread を encodeURIComponent して relay-url に書く
+        candidates.push({ port, threadId: decodeURIComponent(m[2]!) });
       }
     } catch {
       // 読めない relay-url は候補から外す
     }
   }
-  for (const port of ports) {
-    if (await probe(port)) return port;
+  for (const { port, threadId } of candidates) {
+    if (await probe(port, threadId)) return port;
   }
   return null;
 }

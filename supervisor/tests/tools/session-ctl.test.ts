@@ -604,22 +604,35 @@ describe("relay-port 不在時の復旧とエラー文言 (#400)", () => {
     }));
   });
   describe("実アダプタ", () => {
-    const healthBody = { count: 0, max: 5, sessions: [] };
+    const healthBody = { count: 1, max: 5, sessions: [{ threadId: "T1" }] };
 
     test("probeRelay: relay 固有の形を返すサーバだけ true", async () => {
       const good = Bun.serve({ port: 0, hostname: "127.0.0.1", fetch: () => Response.json(healthBody) });
       const other = Bun.serve({ port: 0, hostname: "127.0.0.1", fetch: () => Response.json({ count: 1 }) });
       const notFound = Bun.serve({ port: 0, hostname: "127.0.0.1", fetch: () => new Response("x", { status: 404 }) });
       try {
-        expect(await probeRelay(good.port!)).toBe(true);
-        expect(await probeRelay(other.port!)).toBe(false);
-        expect(await probeRelay(notFound.port!)).toBe(false);
+        expect(await probeRelay(good.port!, "T1")).toBe(true);
+        expect(await probeRelay(other.port!, "T1")).toBe(false);
+        expect(await probeRelay(notFound.port!, "T1")).toBe(false);
       } finally {
         good.stop(true);
         other.stop(true);
         notFound.stop(true);
       }
-      expect(await probeRelay(good.port!)).toBe(false);
+      expect(await probeRelay(good.port!, "T1")).toBe(false);
+    });
+
+    test("probeRelay: 形が同じでも relay-url の thread を持たないサーバは false（別サービスへ誤送信しない）", async () => {
+      const impostor = Bun.serve({
+        port: 0,
+        hostname: "127.0.0.1",
+        fetch: () => Response.json({ count: 1, max: 5, sessions: [{ threadId: "OTHER" }] }),
+      });
+      try {
+        expect(await probeRelay(impostor.port!, "T1")).toBe(false);
+      } finally {
+        impostor.stop(true);
+      }
     });
 
     test("新しい relay-url を優先して試す（mtime 降順）", async () => {
