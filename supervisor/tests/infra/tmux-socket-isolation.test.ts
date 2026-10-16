@@ -48,7 +48,7 @@ test("leak then fail", () => {
 });
 `,
         );
-        const env = { ...process.env, TMUX_PATH };
+        const env: Record<string, string | undefined> = { ...process.env, TMUX_PATH };
         delete env.SUPERVISOR_TMUX_SOCKET;
         const res = spawnSync("bun", ["test", fixture], {
           cwd: SUPERVISOR_DIR,
