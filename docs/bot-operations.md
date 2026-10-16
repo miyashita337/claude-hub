@@ -99,8 +99,7 @@ claude-hub プロジェクトで運用している Discord Bot の役割分担�
 ## 関連ファイル
 
 - `supervisor/src/config/channels.ts` — CHANNEL_MAP 定義 + claude-hub ガード
-- `supervisor/com.channel.supervisor.plist` — launchd plist (caffeinate wrapper 付き)
-- `~/Library/LaunchAgents/com.claude-hub.supervisor.plist` — 実際にロードされている plist
+- `com.claude-hub.supervisor.plist`（リポ直下）— launchd plist (caffeinate wrapper 付き)。`~/Library/LaunchAgents/com.claude-hub.supervisor.plist` として実際にロードされる
 - `~/claude-hub/logs/supervisor.{stdout,stderr}.log` — supervisor ログ
 - `scripts/list-mcp-load-time.sh` — 各設定での cold-start 計測 (Issue #104 / Epic #101)
 
