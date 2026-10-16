@@ -392,7 +392,7 @@ describe("#382 real git: removeWorktree (Q3) and resume recovery (#217/#281)", (
 describe("#382 real git: SessionManager teardown", () => {
   let fake: FakeSessionEffects;
 
-  function makeManager(opts: { watchIntervalMs?: number } = {}): SessionManager {
+  function makeManager(opts: { watchIntervalMs?: number; resumePromptPollAttempts?: number } = {}): SessionManager {
     fake = createFakeEffects();
     const effects: SessionEffects = { ...fake, worktree: realWorktreeAdapter };
     const manager = new SessionManager({
@@ -450,6 +450,35 @@ describe("#382 real git: SessionManager teardown", () => {
 
     expect(existsSync(wt)).toBe(true);
     expect(readFileSync(join(wt, "WIP.txt"), "utf8")).toBe("uncommitted\n");
+  });
+
+  test("#380 journey: self_heal_restart stop → resume keeps the uncommitted file in the SAME real worktree", async () => {
+    // No picker poll: resume would otherwise wait out the production prompt wait.
+    const manager = makeManager({ resumePromptPollAttempts: 0 });
+    const session = await manager.start(makeConfig(), "thread-heal-old", EXISTING_BRANCH);
+    const wt = session.worktree!.path;
+    const cid = session.claudeSessionId!;
+    writeFileSync(join(wt, "WIP.txt"), "uncommitted before self-heal\n");
+    expect(await git(wt, "status", "--porcelain")).toContain("WIP.txt");
+
+    // The critical-context restart: stop (self_heal_restart) then resume the same
+    // claude session id into a fresh thread at the recorded projectDir/branch.
+    await manager.stop("thread-heal-old", "self_heal_restart");
+    expect(existsSync(wt)).toBe(true);
+    const resumed = await manager.resumeSession(
+      makeConfig(),
+      "thread-heal-new",
+      cid,
+      wt,
+      EXISTING_BRANCH,
+    );
+
+    expect(resumed.projectDir).toBe(wt);
+    expect(await git(wt, "status", "--porcelain")).toContain("WIP.txt");
+    expect(readFileSync(join(wt, "WIP.txt"), "utf8")).toBe("uncommitted before self-heal\n");
+    const entry = await worktreeEntry(repoDir, wt);
+    expect(entry?.branch).toBe(EXISTING_BRANCH);
+    expect(entry?.prunable).toBe(false);
   });
 
   test("Q3 control: an explicit stop('manual') DOES remove the real worktree", async () => {
