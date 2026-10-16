@@ -15,6 +15,7 @@ import {
   isValidModelId,
   AUTO_COMPACT_INTENT,
   relayUrlFilePath,
+  WORKTREE_PRESERVING_STOP_REASONS,
 } from "../../src/session/manager";
 import {
   createFakeEffects,
@@ -750,6 +751,69 @@ describe("SessionManager worktree integration (#154)", () => {
     await manager.start(config, "thread-sr-stop", "feature-foo");
     await manager.stop("thread-sr-stop", "supervisor_restart");
     expect(effects.worktree.removeCalls).toHaveLength(0);
+  });
+
+  test("#380 AC-1: stop('self_heal_restart') preserves the worktree and records the reason", async () => {
+    const session = await manager.start(config, "thread-sh-stop", "feature-foo");
+    await manager.stop("thread-sh-stop", "self_heal_restart");
+    expect(effects.worktree.removeCalls).toHaveLength(0);
+    expect(effects.worktree.existingPaths.has(session.worktree!.path)).toBe(true);
+    const row = getSessionByClaudeSessionId(session.claudeSessionId!);
+    expect(row?.stopped_reason).toBe("self_heal_restart");
+  });
+
+  test("#380 AC-2: the preserving-reason set is exactly supervisor_restart + self_heal_restart", () => {
+    expect([...WORKTREE_PRESERVING_STOP_REASONS].sort()).toEqual([
+      "self_heal_restart",
+      "supervisor_restart",
+    ]);
+  });
+
+  test("#380 AC-3: resume after a self_heal_restart stop reuses the existing worktree (no re-create)", async () => {
+    const wtPath = `${config.dir}/.claude/worktrees/feature-sh-resume`;
+    const session = await manager.start(config, "thread-sh-old", "feature-sh-resume");
+    expect(session.worktree!.path).toBe(wtPath);
+    mkdirSync(wtPath, { recursive: true }); // the fake ensure() creates nothing on disk
+    await manager.stop("thread-sh-old", "self_heal_restart");
+
+    const resumer = new SessionManager({
+      effects,
+      gracefulKillTimeoutMs: 0,
+      resumePromptPollAttempts: 0,
+    });
+    try {
+      await resumer.resumeSession(
+        config,
+        "thread-sh-new",
+        session.claudeSessionId!,
+        wtPath,
+        "feature-sh-resume"
+      );
+      expect(effects.worktree.recreateForBranchCalls).toHaveLength(0);
+      expect(effects.worktree.removeCalls).toHaveLength(0);
+
+      // Devin review on #501: the resumed session owns the kept worktree, so
+      // another session on the same branch stopping must NOT remove it from
+      // under the live resumed session; the last user removes it.
+      await resumer.start(config, "thread-sh-other", "feature-sh-resume");
+      await resumer.stop("thread-sh-other", "manual");
+      expect(effects.worktree.removeCalls).toHaveLength(0);
+      await resumer.stop("thread-sh-new", "manual");
+      expect(effects.worktree.removeCalls).toEqual([
+        { mainRepoDir: config.dir, worktreePath: wtPath },
+      ]);
+    } finally {
+      await resumer.shutdownAll();
+    }
+  });
+
+  test("#380 AC-4: terminal reasons (manual / idle_timeout) still remove the worktree", async () => {
+    await manager.start(config, "thread-term-1", "feature-foo");
+    await manager.stop("thread-term-1", "manual");
+    expect(effects.worktree.removeCalls).toHaveLength(1);
+    await manager.start(config, "thread-term-2", "feature-foo");
+    await manager.stop("thread-term-2", "idle_timeout");
+    expect(effects.worktree.removeCalls).toHaveLength(2);
   });
 
   test("Q4: two sessions share one worktree → only the last stop removes it", async () => {

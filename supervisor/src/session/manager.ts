@@ -68,6 +68,7 @@ import {
   type ArtifactProbe,
   type ArtifactProbeInput,
 } from "./artifact-probe";
+import { resolveWorktreePath } from "./worktree";
 
 const DEFAULT_CLAUDE_PATH = resolve(homedir(), ".local", "bin", "claude");
 const TMUX_SESSION_PREFIX = "claude-";
@@ -78,6 +79,21 @@ const TMUX_SESSION_PREFIX = "claude-";
  * {@link import("./orphan-dispatch-reaper").ORPHAN_REAP_REASON}.
  */
 export const ORPHAN_TMUX_REAP_REASON: StopReason = "orphan_tmux_reaped";
+
+/**
+ * Stop reasons whose worktree is KEPT on disk (Issue #380, follow-up of #369).
+ * These stops are not an explicit teardown — the conversation is about to be
+ * `claude --resume`d at the same cwd (supervisor shutdown; critical-context
+ * self-heal restart #244) — so `git worktree remove --force` would destroy
+ * uncommitted work that only exists in the worktree. resumeSession reuses an
+ * existing projectDir as-is and only re-creates a missing one, so a kept
+ * worktree is picked straight back up. Deliberately a separate constant from
+ * StopReason: it is a policy over reasons, not a reason itself.
+ */
+export const WORKTREE_PRESERVING_STOP_REASONS: ReadonlySet<StopReason> = new Set<StopReason>([
+  "supervisor_restart",
+  "self_heal_restart",
+]);
 
 /**
  * Resolve the `claude` executable path at use-time (not module-load-time) so the
@@ -1893,6 +1909,13 @@ export class SessionManager {
             `プロジェクトディレクトリが見つかりません: ${projectDir}（worktree が削除された可能性があります）`
           );
         }
+      } else {
+        // Issue #380 (Devin review): a KEPT worktree (self_heal_restart /
+        // supervisor_restart) is reused as-is, so this resumed session must own
+        // it too. Otherwise isWorktreePathInUse would not see it and a manual
+        // stop of another session on the same branch would `--force` remove the
+        // directory under this live session (RW-046 class).
+        recoveredWorktree = this.ownedWorktreeForResume(config.dir, projectDir, branch);
       }
       return await this.launchResume(
         config,
@@ -2557,16 +2580,18 @@ export class SessionManager {
     updateSessionStatus(session.id, "stopped", reason);
     this.cleanupRelayUrlFile(session.claudeSessionId);
 
+    // Issue #380: self_heal_restart is preserved as well (see
+    // WORKTREE_PRESERVING_STOP_REASONS).
     // Issue #369 (cause A): a supervisor shutdown (SIGTERM / launchctl
     // kickstart) is NOT an explicit teardown — the user never chose to drop
     // this work. `git worktree remove --force` here destroyed uncommitted work
     // three times in the handoff-96-2 incident. Preserve the worktree so
     // `/session resume` can pick the branch back up (matches the
     // tmux_exited/recoverFromDb paths, and docs/e2e-orchestrate.md).
-    if (reason === "supervisor_restart") {
+    if (WORKTREE_PRESERVING_STOP_REASONS.has(reason)) {
       if (session.worktree) {
         console.log(
-          `[SessionManager] Preserving worktree ${session.worktree.path} (supervisor restart; resume with /session resume)`
+          `[SessionManager] Preserving worktree ${session.worktree.path} (${reason}; resume with /session resume)`
         );
       }
       return;
@@ -2621,6 +2646,30 @@ export class SessionManager {
       );
       return false;
     }
+  }
+
+  /**
+   * Issue #380: the worktree info a resumed session should own when its
+   * projectDir already exists. Only claimed when projectDir is exactly the
+   * managed per-branch worktree path, so a resume into the main checkout (or any
+   * other directory) never gets a worktree it could later remove.
+   */
+  private ownedWorktreeForResume(
+    mainRepoDir: string,
+    projectDir: string,
+    branch?: string | null
+  ): SessionInfo["worktree"] {
+    const trimmed = branch?.trim();
+    if (!trimmed) return undefined;
+    let expected: string;
+    try {
+      expected = resolveWorktreePath(mainRepoDir, trimmed);
+    } catch {
+      // Unsafe / malformed branch name from the DB: not a managed worktree.
+      return undefined;
+    }
+    if (resolve(projectDir) !== expected) return undefined;
+    return { mainRepoDir, path: projectDir, branch: trimmed };
   }
 
   /** True if a still-running session (other than the one just removed) uses this worktree path. */
