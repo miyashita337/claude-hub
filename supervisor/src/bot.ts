@@ -130,6 +130,7 @@ import {
   openBriefWindowForBrief,
   parseBriefWindowThreadName,
   reportBriefWindowResolutionFailure,
+  routeSessionlessThreadMessage,
   type BriefWindowDeps,
   type BriefWindowMessageOutcome,
 } from "./session/brief-window";
@@ -1836,68 +1837,26 @@ export async function startBot(token: string): Promise<void> {
       // and only it may fall back to a fresh start + `/brief-window <date>`
       // when there is no transcript to resume (#504). The name check inside is
       // a cheap early-out, so ordinary threads reach the wake path unchanged.
-      let windowOutcome: BriefWindowMessageOutcome = "not_window";
-      try {
-        windowOutcome = await tryRestartBriefWindow(message, threadId);
-      } catch (err) {
-        console.error("[Bot] Brief window restart error:", err);
-        // スレッド名で窓口と確定しているなら、例外でも汎用 wake に落とさない
-        // （#463 と同じ理由。素の --resume が kill-switch を素通りする）。
-        if (
-          parseBriefWindowThreadName((message.channel as ThreadChannel).name) !==
-          null
-        ) {
-          windowOutcome = await reportBriefWindowResolutionFailure(
-            "parent",
-            threadId,
-            (c) => (message.channel as ThreadChannel).send(c),
-          );
-        }
-      }
-      // #463: "not_window" 以外＝窓口スレッドと判定できた場合は、起動できた
-      // かどうかに関わらず汎用 wake（#456）には落とさない。落とすと素の
-      // --resume が先に噛み、kill-switch で止めたはずの窓口が起き上がる。
-      // "resumed"（#504）だけは汎用 wake の resumed と同じく下の relay へ進む。
-      switch (windowOutcome) {
-        case "restarted":
-        case "blocked":
-          return;
-        case "resumed":
-        case "not_window":
-          break;
-      }
-      if (windowOutcome === "not_window") {
-        const wake = await autoResumeThread(sessionManager, threadId);
-        const { relay, reply } = await resolveWakeReply(wake, {
-          mentioned: isBotMentioned(message, client.user),
-          buildSalvage: (verdict) =>
-            buildSalvageReply(sessionManager, threadId, verdict),
-        });
-
-        if (reply) {
-          try {
-            await (message.channel as ThreadChannel).send(reply);
-          } catch (err) {
-            // On the resume path the session IS live, so losing the courtesy
-            // notice must not cost the user their message — fall through to the
-            // relay either way.
-            console.error(
-              `[Bot] Failed to reply in thread ${threadId}:`,
-              err
-            );
-          }
-        }
-
-        if (!relay) {
-          if (!reply) {
-            console.debug(
-              `[Bot] Ignoring message in thread ${threadId} (no active session, wake=${wake.kind})`
-            );
-          }
-          return;
-        }
-        // Fall through: the relay below now finds the resumed session.
-      }
+      const sessionlessThread = message.channel as ThreadChannel;
+      const relay = await routeSessionlessThreadMessage(threadId, {
+        tryWindow: () => tryRestartBriefWindow(message, threadId),
+        isWindowThreadName: () =>
+          parseBriefWindowThreadName(sessionlessThread.name) !== null,
+        reportWindowFailure: () =>
+          reportBriefWindowResolutionFailure("parent", threadId, (c) =>
+            sessionlessThread.send(c),
+          ),
+        wake: () => autoResumeThread(sessionManager, threadId),
+        resolveReply: (wake) =>
+          resolveWakeReply(wake, {
+            mentioned: isBotMentioned(message, client.user),
+            buildSalvage: (verdict) =>
+              buildSalvageReply(sessionManager, threadId, verdict),
+          }),
+        send: (c) => sessionlessThread.send(c),
+      });
+      // Fall through only when the relay below finds a (resumed) session.
+      if (!relay) return;
     }
 
     const thread = message.channel as ThreadChannel;
