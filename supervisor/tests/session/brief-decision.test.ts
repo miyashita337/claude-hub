@@ -600,6 +600,40 @@ describe("runBriefDecideFlow", () => {
     expect(capture.notifications).toEqual(["朝レポ提案の Issue 状態を確認できず"]);
   });
 
+  test("提案が closed 未決のみなら「提案なし」ではなく決裁不要と案内する（#500）", async () => {
+    const { capture, input } = flowDeps({
+      code: 0,
+      stdout: proposalsJson([{ id: "a-1", title: "A", decision: null, issueState: "closed" }]),
+      stderr: "",
+    });
+    await expect(runBriefDecideFlow(input)).resolves.toBe(true);
+    const text = capture.channelPosts.join("\n");
+    expect(text).not.toContain("提案はありません");
+    expect(text).toContain("決裁が必要な提案はありません");
+    expect(text).toContain("close）済みの未決提案 1 件");
+  });
+
+  test("決裁メッセージの post 失敗でも issueStateUnknown の通知は送り false を返す（#500）", async () => {
+    const { capture, input } = flowDeps(
+      {
+        code: 0,
+        stdout: JSON.stringify({
+          date: "2026-08-23",
+          proposals: [{ id: "a-1", title: "A", decision: null, issueState: "unknown" }],
+          issueStateUnknown: ["a-1"],
+        }),
+        stderr: "",
+      },
+      {
+        postDecisionMessage: async () => {
+          throw new Error("50013 Missing Permissions");
+        },
+      },
+    );
+    await expect(runBriefDecideFlow(input)).resolves.toBe(false);
+    expect(capture.notifications).toEqual(["朝レポ提案の Issue 状態を確認できず"]);
+  });
+
   test("issueStateUnknown が空配列なら通知しない（#500）", async () => {
     const { capture, input } = flowDeps({
       code: 0,

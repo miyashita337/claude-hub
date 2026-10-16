@@ -102,7 +102,7 @@ export interface BriefProposal {
   decision: ProposalDecision | null;
   /**
    * 提案元 Issue の状態（corp#179）。KPI 起点・旧形式 JSON（フィールド無し）は null。
-   * closed かつ未決の提案はボタン化せず {@link ParsedProposals} の closedPendingCount に数える。
+   * closed かつ未決の提案はボタン化せず {@link ParsedProposals} の closedPending に集める。
    */
   issueState: IssueState | null;
 }
@@ -492,12 +492,15 @@ export async function runBriefDecideFlow(
   };
 
   if (proposals.pendingCount === 0 && proposals.skipped === 0) {
-    await input.postToChannel(
-      buildAllDecidedMessage(
-        input.date,
-        proposals.total - proposals.closedPending.length,
-      ),
-    );
+    const visible = proposals.total - proposals.closedPending.length;
+    // 除外分だけで 0 件になったとき「提案なし」と言うと直後の除外通知と矛盾するため出し分ける。
+    if (visible === 0 && proposals.closedPending.length > 0) {
+      await input.postToChannel(
+        `ℹ️ 朝レポ（${input.date}）に決裁が必要な提案はありません（未決 0 件）。`,
+      );
+    } else {
+      await input.postToChannel(buildAllDecidedMessage(input.date, visible));
+    }
     await reportExtras();
     return true;
   }
@@ -510,6 +513,10 @@ export async function runBriefDecideFlow(
     console.error(
       `[brief-decision] decision post failed in channel ${input.channelName}:`,
       err,
+    );
+    // 投稿に失敗しても照会失敗の通知は握りつぶさない（false は維持し dedup は記録させない）。
+    await reportExtras().catch((e) =>
+      console.warn("[brief-decision] extras report failed after post failure:", e),
     );
     return false;
   }
