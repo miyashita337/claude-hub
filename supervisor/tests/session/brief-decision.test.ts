@@ -608,7 +608,7 @@ describe("runBriefDecideFlow", () => {
     });
     await expect(runBriefDecideFlow(input)).resolves.toBe(true);
     const text = capture.channelPosts.join("\n");
-    expect(text).not.toContain("提案はありません");
+    expect(text).not.toContain("CEO 提案はありません");
     expect(text).toContain("決裁が必要な提案はありません");
     expect(text).toContain("close）済みの未決提案 1 件");
   });
