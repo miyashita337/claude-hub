@@ -12,8 +12,8 @@ import {
   type SessionStore,
 } from "../../tools/session-ctl";
 import { SessionManager } from "../../src/session/manager";
-import { recoverRelayPortFromRelayUrls } from "../../tools/session-ctl";
-import { writeFileSync } from "fs";
+import { recoverRelayPortFromRelayUrls, probeRelay } from "../../tools/session-ctl";
+import { writeFileSync, utimesSync, readFileSync, mkdirSync } from "fs";
 
 /**
  * session-ctl ローカル CLI（Epic #316 Phase 3 / #320）の fake adapters テスト。
@@ -578,6 +578,8 @@ describe("relay-port 不在時の復旧とエラー文言 (#400)", () => {
     test("応答する relay のポートだけを返す（死んだポートは飛ばす）", withDir(async (dir) => {
       writeFileSync(join(dir, "a.relay-url"), "http://localhost:1111/relay/T1");
       writeFileSync(join(dir, "b.relay-url"), "http://localhost:2222/relay/T2");
+      utimesSync(join(dir, "a.relay-url"), 2000, 2000);
+      utimesSync(join(dir, "b.relay-url"), 1000, 1000);
       const probed: number[] = [];
       const port = await recoverRelayPortFromRelayUrls(dir, async (p) => {
         probed.push(p);
@@ -600,5 +602,65 @@ describe("relay-port 不在時の復旧とエラー文言 (#400)", () => {
         await recoverRelayPortFromRelayUrls(join(dir, "nope"), async () => true),
       ).toBeNull();
     }));
+  });
+  describe("実アダプタ", () => {
+    const healthBody = { count: 0, max: 5, sessions: [] };
+
+    test("probeRelay: relay 固有の形を返すサーバだけ true", async () => {
+      const good = Bun.serve({ port: 0, hostname: "127.0.0.1", fetch: () => Response.json(healthBody) });
+      const other = Bun.serve({ port: 0, hostname: "127.0.0.1", fetch: () => Response.json({ count: 1 }) });
+      const notFound = Bun.serve({ port: 0, hostname: "127.0.0.1", fetch: () => new Response("x", { status: 404 }) });
+      try {
+        expect(await probeRelay(good.port!)).toBe(true);
+        expect(await probeRelay(other.port!)).toBe(false);
+        expect(await probeRelay(notFound.port!)).toBe(false);
+      } finally {
+        good.stop(true);
+        other.stop(true);
+        notFound.stop(true);
+      }
+      expect(await probeRelay(good.port!)).toBe(false);
+    });
+
+    test("新しい relay-url を優先して試す（mtime 降順）", async () => {
+      const dir = mkdtempSync(join(tmpdir(), "relay-url-"));
+      try {
+        writeFileSync(join(dir, "old.relay-url"), "http://localhost:1111/relay/T1");
+        writeFileSync(join(dir, "new.relay-url"), "http://localhost:2222/relay/T2");
+        utimesSync(join(dir, "old.relay-url"), 1000, 1000);
+        utimesSync(join(dir, "new.relay-url"), 2000, 2000);
+        expect(await recoverRelayPortFromRelayUrls(dir, async () => true)).toBe(2222);
+      } finally {
+        rmSync(dir, { recursive: true, force: true });
+      }
+    });
+
+    test("createRealEffects: relay-url から復旧 → relay-port 書き直し（既存なら上書きしない）", async () => {
+      const server = Bun.serve({ port: 0, hostname: "127.0.0.1", fetch: () => Response.json(healthBody) });
+      const xdg = mkdtempSync(join(tmpdir(), "relay-xdg-"));
+      const saved = process.env.XDG_RUNTIME_DIR;
+      process.env.XDG_RUNTIME_DIR = xdg;
+      try {
+        const rd = join(xdg, "claude-hub-supervisor");
+        mkdirSync(rd, { recursive: true });
+        writeFileSync(join(rd, "s.relay-url"), `http://localhost:${server.port}/relay/T1`);
+        const fx = createRealEffects();
+        expect(fx.readRelayPort()).toBeNull();
+        const port = await fx.recoverRelayPort();
+        expect(port).toBe(server.port!);
+        fx.writeRelayPort(port!);
+        expect(readFileSync(join(rd, "relay-port"), "utf8")).toBe(String(port));
+        fx.writeRelayPort(1);
+        expect(readFileSync(join(rd, "relay-port"), "utf8")).toBe(String(port));
+        expect(fx.readRelayPort()).toBe(port);
+        // この隔離 XDG を使う Supervisor プロセスは居ない
+        expect(await fx.supervisorRunning()).toBe(false);
+      } finally {
+        if (saved === undefined) delete process.env.XDG_RUNTIME_DIR;
+        else process.env.XDG_RUNTIME_DIR = saved;
+        server.stop(true);
+        rmSync(xdg, { recursive: true, force: true });
+      }
+    });
   });
 });

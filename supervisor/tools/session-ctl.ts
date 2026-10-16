@@ -34,7 +34,7 @@
  * `<id>` は session row id / thread_id / claude_session_id のいずれでも可。
  */
 
-import { existsSync, readFileSync, readdirSync, writeFileSync } from "fs";
+import { existsSync, readFileSync, readdirSync, statSync, writeFileSync } from "fs";
 import { dirname, join } from "path";
 import { Database } from "bun:sqlite";
 import { execFile } from "child_process";
@@ -540,7 +540,7 @@ export async function runSessionCtl(
 
 /** 実 DB（読み取り専用）+ 実 tmux + 実 HTTP のアダプタを組み立てる。 */
 /** relay サーバが本当にそのポートで応答するか（GET /health/sessions が 200 + 期待形）。 */
-async function probeRelay(port: number): Promise<boolean> {
+export async function probeRelay(port: number): Promise<boolean> {
   try {
     const res = await fetch(`http://127.0.0.1:${port}/health/sessions`, {
       signal: AbortSignal.timeout(1500),
@@ -548,9 +548,15 @@ async function probeRelay(port: number): Promise<boolean> {
     if (res.status !== 200) return false;
     const body = (await res.json().catch(() => null)) as {
       count?: unknown;
+      max?: unknown;
       sessions?: unknown;
     } | null;
-    return typeof body?.count === "number" && Array.isArray(body?.sessions);
+    // 別サービスが偶然同ポートを使っていても誤認しないよう、relay 固有の形（count/max/sessions）を要求する
+    return (
+      typeof body?.count === "number" &&
+      typeof body?.max === "number" &&
+      Array.isArray(body?.sessions)
+    );
   } catch {
     return false;
   }
@@ -558,7 +564,7 @@ async function probeRelay(port: number): Promise<boolean> {
 
 /**
  * runtime dir の `*.relay-url`（`http://localhost:<port>/relay/<thread>`）から
- * 応答する relay ポートを探す（#400）。新しい順に試し、最初に応答したものを返す。
+ * 応答する relay ポートを探す（#400）。mtime の新しい順に試し、最初に応答したものを返す。
  */
 export async function recoverRelayPortFromRelayUrls(
   runtimeDir: string,
@@ -566,7 +572,11 @@ export async function recoverRelayPortFromRelayUrls(
 ): Promise<number | null> {
   let names: string[];
   try {
-    names = readdirSync(runtimeDir).filter((n) => n.endsWith(".relay-url"));
+    names = readdirSync(runtimeDir)
+      .filter((n) => n.endsWith(".relay-url"))
+      .map((n) => ({ n, t: statSync(join(runtimeDir, n)).mtimeMs }))
+      .sort((a, b) => b.t - a.t)
+      .map((x) => x.n);
   } catch {
     return null;
   }
@@ -735,9 +745,10 @@ export function createRealEffects(): SessionCtlEffects {
     recoverRelayPort: async () => recoverRelayPortFromRelayUrls(dirname(relayPortFilePath())),
     writeRelayPort: (port) => {
       try {
-        writeFileSync(relayPortFilePath(), String(port));
+        // flag "wx": 復旧中に Supervisor が再起動して新しい relay-port を書いていたら上書きしない
+        writeFileSync(relayPortFilePath(), String(port), { flag: "wx" });
       } catch {
-        // best-effort: 書けなくても今回の投稿は復旧したポートで続行できる
+        // best-effort: 書けなくても（既に存在する場合を含む）今回の投稿は復旧したポートで続行できる
       }
     },
     supervisorRunning: () => isSupervisorRunning(process.env.XDG_RUNTIME_DIR),
