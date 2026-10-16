@@ -90,6 +90,8 @@ export const DECISION_LABELS: Record<ProposalDecision, string> = {
  * 元から CLI 側でサポートされている。ここで決裁済みを落としていたため、朝レポに 4 件並んでも
  * 押せるのは未決 1 件だけ、という状態になっていた。
  */
+export type IssueState = "open" | "closed" | "unknown";
+
 export interface BriefProposal {
   id: string;
   title: string;
@@ -98,6 +100,11 @@ export interface BriefProposal {
   pendingDays: number | null;
   /** 現在の決裁。未決は null。決裁済みはそのボタンだけ disabled にする。 */
   decision: ProposalDecision | null;
+  /**
+   * 提案元 Issue の状態（corp#179）。KPI 起点・旧形式 JSON（フィールド無し）は null。
+   * closed かつ未決の提案はボタン化せず {@link ParsedProposals} の closedPending に集める。
+   */
+  issueState: IssueState | null;
 }
 
 export type ParsedProposals =
@@ -113,6 +120,10 @@ export type ParsedProposals =
       pendingCount: number;
       /** id が {@link PROPOSAL_ID_RE} を通らず除外した件数。 */
       skipped: number;
+      /** Issue が close 済みで未決のためボタンから外した提案（corp#179 / #500）。 */
+      closedPending: BriefProposal[];
+      /** 照会失敗（issueState を確認できなかった）提案 ID。空でなければ会長へ知らせる。 */
+      issueStateUnknown: string[];
     }
   | { kind: "error"; reason: string };
 
@@ -176,10 +187,54 @@ export function parseProposalsOutput(stdout: string): ParsedProposals {
       targetDept: typeof r.targetDept === "string" ? r.targetDept : null,
       pendingDays: typeof r.pendingDays === "number" ? r.pendingDays : null,
       decision,
+      issueState: isIssueState(r.issueState) ? r.issueState : null,
     });
   }
-  const pendingCount = proposals.filter((p) => p.decision === null).length;
-  return { kind: "ok", date, total: rows.length, proposals, pendingCount, skipped };
+  // close 済み Issue の未決提案は決裁対象外（既に作業が終わっている）。決裁済みの closed は
+  // 押し直しの余地を残すためボタンに残す。
+  const closedPending = proposals.filter(
+    (p) => p.issueState === "closed" && p.decision === null,
+  );
+  const buttons = proposals.filter((p) => !closedPending.includes(p));
+  const pendingCount = buttons.filter((p) => p.decision === null).length;
+  const issueStateUnknown = Array.isArray(obj.issueStateUnknown)
+    ? obj.issueStateUnknown.filter((v): v is string => typeof v === "string")
+    : [];
+  return {
+    kind: "ok",
+    date,
+    total: rows.length,
+    proposals: buttons,
+    pendingCount,
+    skipped,
+    closedPending,
+    issueStateUnknown,
+  };
+}
+
+function isIssueState(v: unknown): v is IssueState {
+  return v === "open" || v === "closed" || v === "unknown";
+}
+
+/** close 済みで決裁対象から外した提案の 1 行報告。0 件なら null。 */
+export function buildClosedPendingNotice(
+  closedPending: BriefProposal[],
+): string | null {
+  if (closedPending.length === 0) return null;
+  const ids = closedPending.map((p) => `\`${p.id}\``).join(", ");
+  return truncate(
+    `ℹ️ Issue が完了（close）済みの未決提案 ${closedPending.length} 件は決裁対象から外しました: ${ids}`,
+    CONTENT_LIMIT,
+  );
+}
+
+/** Issue の状態を確認できなかった提案がある旨の通知文。空なら null。 */
+export function buildIssueStateUnknownNotice(ids: string[]): string | null {
+  if (ids.length === 0) return null;
+  return truncate(
+    `⚠️ Issue の状態を確認できなかった提案が ${ids.length} 件あります（close 済みでもボタンに出ている可能性があります）: ${ids.map((i) => `\`${i}\``).join(", ")}`,
+    CONTENT_LIMIT,
+  );
 }
 
 export function buildBriefDecisionCustomId(
@@ -413,10 +468,40 @@ export async function runBriefDecideFlow(
   // （現在の決裁と同じボタンは disabled）だけが並ぶと、押すべきものがあるように見えるため。
   // 未決が 1 件でもあれば従来どおり決裁済みも含めてボタン化し押し直せる（#132 / #458）。
   // id 不正で落とした提案（skipped）があるときは下の経路でその旨を出す（黙って消さない）。
-  if (proposals.pendingCount === 0 && proposals.skipped === 0) {
-    await input.postToChannel(
-      buildAllDecidedMessage(input.date, proposals.total),
+  const reportExtras = async (): Promise<void> => {
+    const closedNotice = buildClosedPendingNotice(proposals.closedPending);
+    if (closedNotice) await input.postToChannel(closedNotice);
+    // corp の BUGBOT 規約: 照会失敗は黙らず通知する（チャンネル + ページ）。
+    const unknownNotice = buildIssueStateUnknownNotice(
+      proposals.issueStateUnknown,
     );
+    if (unknownNotice) {
+      console.warn(
+        `[brief-decision] issueState unknown for ${proposals.issueStateUnknown.length} proposal(s) in channel ${input.channelName}`,
+      );
+      await input.postToChannel(unknownNotice);
+      await input
+        .notifyFailure(
+          "朝レポ提案の Issue 状態を確認できず",
+          `#${input.channelName} の ${input.date} 朝レポで ${proposals.issueStateUnknown.length} 件の Issue 状態を確認できませんでした。`,
+        )
+        .catch((err) =>
+          console.warn("[brief-decision] issueState notify failed:", err),
+        );
+    }
+  };
+
+  if (proposals.pendingCount === 0 && proposals.skipped === 0) {
+    const visible = proposals.total - proposals.closedPending.length;
+    // 除外分だけで 0 件になったとき「提案なし」と言うと直後の除外通知と矛盾するため出し分ける。
+    if (visible === 0 && proposals.closedPending.length > 0) {
+      await input.postToChannel(
+        `ℹ️ 朝レポ（${input.date}）に決裁が必要な提案はありません（未決 0 件）。`,
+      );
+    } else {
+      await input.postToChannel(buildAllDecidedMessage(input.date, visible));
+    }
+    await reportExtras();
     return true;
   }
 
@@ -428,6 +513,10 @@ export async function runBriefDecideFlow(
     console.error(
       `[brief-decision] decision post failed in channel ${input.channelName}:`,
       err,
+    );
+    // 投稿に失敗しても照会失敗の通知は握りつぶさない（false は維持し dedup は記録させない）。
+    await reportExtras().catch((e) =>
+      console.warn("[brief-decision] extras report failed after post failure:", e),
     );
     return false;
   }
@@ -442,6 +531,7 @@ export async function runBriefDecideFlow(
         `作業ディレクトリで proposals コマンドを直接確認してください。`,
     );
   }
+  await reportExtras();
   return true;
 }
 
