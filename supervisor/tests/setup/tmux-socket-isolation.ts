@@ -29,7 +29,9 @@ const cleanup = () => {
   try {
     // kill-server on the test socket only; never touches `-L claude-hub`.
     spawnSync(
-      process.env.TMUX_PATH ?? "/opt/homebrew/bin/tmux",
+      // PATH fallback: a hard-coded Homebrew path would silently skip cleanup on
+      // Linux runners that don't set TMUX_PATH.
+      process.env.TMUX_PATH ?? "tmux",
       ["-L", isolatedSocket, "kill-server"],
       { stdio: "ignore", timeout: 3000 },
     );
