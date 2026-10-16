@@ -515,6 +515,12 @@ export interface HeadlessCompletion {
   status: HeadlessCompletionStatus;
   /** Human-readable evidence (pending task ids / probe error), "" when clean. */
   detail: string;
+  /**
+   * Issue #390: the run ended on a CLI API connection error (the CLI's own
+   * retry budget ran out). Always reported as `pending`; finishHeadless records
+   * the distinct `headless_api_error` stop reason for it.
+   */
+  apiConnectionError?: boolean;
 }
 
 /**
@@ -524,12 +530,19 @@ export interface HeadlessCompletion {
  *     tmux path's `unset ANTHROPIC_API_KEY`),
  *   - PATH prefixed with the same dirs the tmux path exports, so tools the run
  *     shells out to (git / gh / bun) resolve regardless of the supervisor's PATH.
+ *   - CLAUDE_CODE_RETRY_WATCHDOG=1 (Issue #390) unless the operator set it:
+ *     the CLI's default budget is 10 retries (~3 min of backoff, measured on
+ *     v2.1.301 against an unreachable proxy) before a run dies with
+ *     "API Error: Connection refused". The watchdog raises it to 300 (~3 h)
+ *     for dropped/refused connections, per
+ *     https://code.claude.com/docs/en/env-vars (requires v2.1.199+).
  * SUPERVISOR_RELAY_URL is intentionally NOT set: headless captures stdout
  * directly, so the PostToolUse progress-relay hook has nothing to POST to.
  */
-function buildHeadlessEnv(): Record<string, string | undefined> {
+export function buildHeadlessEnv(): Record<string, string | undefined> {
   const env: Record<string, string | undefined> = { ...process.env };
   delete env.ANTHROPIC_API_KEY;
+  env.CLAUDE_CODE_RETRY_WATCHDOG ??= "1";
   const extraPath = [
     resolve(homedir(), ".local/bin"),
     resolve(homedir(), ".bun/bin"),
@@ -1525,8 +1538,16 @@ export class SessionManager {
       }
       const summary = describePendingWork(probe.value);
       if (summary) details.push(summary);
-      if (groupAlive || summary) {
-        return { status: "pending", detail: details.join(" / ") };
+      // Issue #390: a run that died on an API connection error stopped
+      // mid-work — keep its worktree and record it as a failure.
+      const apiError = probe.value.apiConnectionError;
+      if (apiError) details.push(`API 接続エラーで終了 (${apiError})`);
+      if (groupAlive || summary || apiError) {
+        return {
+          status: "pending",
+          detail: details.join(" / "),
+          ...(apiError ? { apiConnectionError: true } : {}),
+        };
       }
       return { status: "clean", detail: "" };
     } catch (err) {
@@ -1678,7 +1699,9 @@ export class SessionManager {
     this.clearWatcher(threadId); // defensive: headless never sets one
     const reason: StopReason = result.timedOut
       ? "headless_timeout"
-      : "headless_exited";
+      : completion.apiConnectionError
+        ? "headless_api_error"
+        : "headless_exited";
     updateSessionStatus(sessionId, "stopped", reason);
     // No relay-url file to clean: buildHeadlessEnv() does not set
     // SUPERVISOR_RELAY_URL and the headless child never writes one (stdout is

@@ -294,3 +294,83 @@ describe("describePendingWork", () => {
     ).toBe("");
   });
 });
+
+/**
+ * Issue #390 AC-2: a run whose LAST assistant entry is the CLI-synthesized API
+ * connection error died mid-work. Fixture shapes are the real transcript lines
+ * (2026-08-09 corp /orchestrate, and v2.1.301 against
+ * HTTPS_PROXY=http://127.0.0.1:9 — metadata lines follow the error entry).
+ */
+describe("apiConnectionError (#390)", () => {
+  function apiErrorAssistant(text: string): string {
+    return JSON.stringify({
+      type: "assistant",
+      message: { model: "<synthetic>", content: [{ type: "text", text }] },
+      error: "server_error",
+      isApiErrorMessage: true,
+    });
+  }
+  function assistantText(text: string): string {
+    return JSON.stringify({
+      type: "assistant",
+      message: { content: [{ type: "text", text }] },
+    });
+  }
+  const metadataTail = [
+    JSON.stringify({ type: "last-prompt" }),
+    JSON.stringify({ type: "cost-state", totalCostUSD: 0 }),
+  ];
+
+  test("2026-08-09 wording (Unable to connect to API) → detected", () => {
+    const text = "API Error: Unable to connect to API (ConnectionRefused)";
+    const work = parsePendingWork(
+      [plainUserPrompt("/pdca 1"), apiErrorAssistant(text), ...metadataTail].join("\n"),
+    );
+    expect(work.apiConnectionError).toBe(text);
+  });
+
+  test("v2.1.301 wording (ECONNREFUSED) → detected with metadata lines after it", () => {
+    const text =
+      "API Error: Connection refused — a firewall or proxy may be blocking it (ECONNREFUSED)";
+    const work = parsePendingWork(
+      [plainUserPrompt("say ok"), apiErrorAssistant(text), ...metadataTail].join("\n"),
+    );
+    expect(work.apiConnectionError).toBe(text);
+  });
+
+  test("a normal assistant reply after the error (recovered run) → not detected", () => {
+    const work = parsePendingWork(
+      [
+        plainUserPrompt("/pdca 1"),
+        apiErrorAssistant("API Error: Unable to connect to API (ConnectionRefused)"),
+        assistantText("ok"),
+      ].join("\n"),
+    );
+    expect(work.apiConnectionError).toBeUndefined();
+  });
+
+  test("a non-connection API error (rate limit) → not detected", () => {
+    const work = parsePendingWork(
+      [plainUserPrompt("x"), apiErrorAssistant("API Error: Rate limit reached")].join("\n"),
+    );
+    expect(work.apiConnectionError).toBeUndefined();
+  });
+
+  test("model prose quoting the wording (no isApiErrorMessage flag) → not detected", () => {
+    const work = parsePendingWork(
+      [plainUserPrompt("x"), assistantText("I saw ECONNREFUSED earlier")].join("\n"),
+    );
+    expect(work.apiConnectionError).toBeUndefined();
+  });
+
+  test("the Stop-hook summary ignores it (the hook must not block on a dead connection)", () => {
+    const work = parsePendingWork(
+      [
+        plainUserPrompt("x"),
+        apiErrorAssistant("API Error: Connection refused (ECONNREFUSED)"),
+      ].join("\n"),
+    );
+    expect(work.apiConnectionError).toBeDefined();
+    expect(describePendingWork(work)).toBe("");
+  });
+});
