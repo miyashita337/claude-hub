@@ -1,4 +1,5 @@
 import { test, expect, describe, mock } from "bun:test";
+import { TMUX_SOCKET } from "../../src/session/tmux";
 import {
   buildDialogStuckHandler,
   createPageOnce,
@@ -31,7 +32,7 @@ describe("buildDialogStuckHandler", () => {
     expect(thread.sent).toHaveLength(1);
     const msg = thread.sent[0]!;
     expect(msg).toContain("claude-abc123");
-    expect(msg).toContain("tmux -L claude-hub attach -t claude-abc123");
+    expect(msg).toContain(`tmux -L ${TMUX_SOCKET} attach -t claude-abc123`);
     expect(msg).toContain("ink-confirm");
     expect(pushover).toHaveBeenCalledTimes(1);
   });
@@ -55,7 +56,7 @@ describe("buildDialogStuckHandler", () => {
     expect(msg).toContain("質問");
     expect(msg).toContain("自動では選ばれません");
     // Still tells the user how to reach the session.
-    expect(msg).toContain("tmux -L claude-hub attach -t claude-abc123");
+    expect(msg).toContain(`tmux -L ${TMUX_SOCKET} attach -t claude-abc123`);
     // Must NOT reuse the generic "手動操作要求" framing — that wording is what
     // made an invented answer indistinguishable from a real one.
     expect(msg).not.toContain("手動操作要求");
@@ -81,7 +82,7 @@ describe("buildDialogStuckHandler", () => {
     const msg = thread.sent[0]!;
     expect(msg).toContain("モデル利用上限");
     expect(msg).toContain("/model");
-    expect(msg).toContain("tmux -L claude-hub attach -t claude-abc123");
+    expect(msg).toContain(`tmux -L ${TMUX_SOCKET} attach -t claude-abc123`);
     expect(msg).toContain("reached your Fable 5 limit");
     expect(pushover).toHaveBeenCalledTimes(1);
   });
@@ -117,7 +118,7 @@ describe("buildDialogStuckHandler", () => {
 
     expect(thread.sent[0]!).toContain("/session enter");
     // The terminal path stays available as a fallback.
-    expect(thread.sent[0]!).toContain("tmux -L claude-hub attach -t claude-stall2");
+    expect(thread.sent[0]!).toContain(`tmux -L ${TMUX_SOCKET} attach -t claude-stall2`);
   });
 
   test("an unsubmitted input says the text is waiting and how to submit it from Discord (#357)", async () => {
@@ -134,7 +135,7 @@ describe("buildDialogStuckHandler", () => {
     const msg = thread.sent[0]!;
     expect(msg).toContain("送信（Enter）が確定していません");
     expect(msg).toContain("/session enter");
-    expect(msg).toContain("tmux -L claude-hub attach -t claude-unsub1");
+    expect(msg).toContain(`tmux -L ${TMUX_SOCKET} attach -t claude-unsub1`);
     // Not framed as a dialog: nothing on screen is a dialog to click through.
     expect(msg).not.toContain("ダイアログ検出");
     expect(pushover).toHaveBeenCalledTimes(1);
