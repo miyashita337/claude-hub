@@ -33,6 +33,7 @@ function proposal(over: Partial<BriefProposal> = {}): BriefProposal {
     targetDept: "social",
     pendingDays: 1,
     decision: null,
+    issueState: null,
     ...over,
   };
 }
@@ -86,6 +87,66 @@ describe("parseProposalsOutput", () => {
     expect(parseProposalsOutput("{broken").kind).toBe("error");
     expect(parseProposalsOutput(JSON.stringify({ date: "2026-08-23" })).kind).toBe("error");
     expect(parseProposalsOutput(JSON.stringify({ proposals: [] })).kind).toBe("error");
+  });
+});
+
+describe("issueState の解釈（#500・corp#179 形式）", () => {
+  test("closed 未決は proposals から外れ closedPending に入る。決裁済み closed は残る", () => {
+    const out = parseProposalsOutput(
+      proposalsJson([
+        { id: "o-1", title: "O", decision: null, issueState: "open" },
+        { id: "c-1", title: "C", decision: null, issueState: "closed" },
+        { id: "c-2", title: "D", decision: "approved", issueState: "closed" },
+        { id: "k-1", title: "KPI", decision: null, issueState: null },
+        { id: "u-1", title: "U", decision: null, issueState: "unknown" },
+      ]),
+    );
+    expect(out.kind).toBe("ok");
+    if (out.kind === "ok") {
+      expect(out.proposals.map((p: BriefProposal) => p.id)).toEqual(["o-1", "c-2", "k-1", "u-1"]);
+      expect(out.closedPending.map((p: BriefProposal) => p.id)).toEqual(["c-1"]);
+      expect(out.pendingCount).toBe(3);
+      expect(out.total).toBe(5);
+    }
+  });
+
+  test("旧形式（issueState / issueStateUnknown なし）でも壊れない（後方互換）", () => {
+    const out = parseProposalsOutput(
+      proposalsJson([{ id: "a-1", title: "A", decision: null }]),
+    );
+    expect(out.kind).toBe("ok");
+    if (out.kind === "ok") {
+      expect(out.proposals[0]?.issueState).toBeNull();
+      expect(out.closedPending).toEqual([]);
+      expect(out.issueStateUnknown).toEqual([]);
+      expect(out.pendingCount).toBe(1);
+    }
+  });
+
+  test("未知の issueState 値・非配列の issueStateUnknown は null / 空に倒す", () => {
+    const out = parseProposalsOutput(
+      JSON.stringify({
+        date: "2026-08-23",
+        proposals: [{ id: "a-1", title: "A", decision: null, issueState: "weird" }],
+        issueStateUnknown: "a-1",
+      }),
+    );
+    expect(out.kind).toBe("ok");
+    if (out.kind === "ok") {
+      expect(out.proposals[0]?.issueState).toBeNull();
+      expect(out.issueStateUnknown).toEqual([]);
+    }
+  });
+
+  test("issueStateUnknown は文字列 ID のみ拾う", () => {
+    const out = parseProposalsOutput(
+      JSON.stringify({
+        date: "2026-08-23",
+        proposals: [],
+        issueStateUnknown: ["a-1", 3, null, "b-2"],
+      }),
+    );
+    expect(out.kind === "ok" && out.issueStateUnknown).toEqual(["a-1", "b-2"]);
   });
 });
 
@@ -487,6 +548,87 @@ describe("runBriefDecideFlow", () => {
     await expect(runBriefDecideFlow(input)).resolves.toBe(true);
     expect(capture.decisionPosts).toBe(1);
     expect(capture.channelPosts.join("\n")).toContain("1 件は id または決裁値をボタン化できず");
+  });
+
+  test("closed かつ未決はボタンから外し、その旨を 1 行報告する（#500）", async () => {
+    const { capture, input } = flowDeps({
+      code: 0,
+      stdout: proposalsJson([
+        { id: "a-1", title: "A", decision: null, issueState: "open" },
+        { id: "a-2", title: "B", decision: null, issueState: "closed" },
+        { id: "a-3", title: "C", decision: null, issueState: null },
+      ]),
+      stderr: "",
+    });
+    await expect(runBriefDecideFlow(input)).resolves.toBe(true);
+    expect(capture.decisionPosts).toBe(1);
+    const text = capture.channelPosts.join("\n");
+    expect(text).toContain("close）済みの未決提案 1 件");
+    expect(text).toContain("a-2");
+    expect(capture.notifications.length).toBe(0);
+  });
+
+  test("未決が closed のみなら決裁ボタンなし・「すべて決裁済み」に closed を数えない（#500）", async () => {
+    const { capture, input } = flowDeps({
+      code: 0,
+      stdout: proposalsJson([
+        { id: "a-1", title: "A", decision: "approved", issueState: "open" },
+        { id: "a-2", title: "B", decision: null, issueState: "closed" },
+      ]),
+      stderr: "",
+    });
+    await expect(runBriefDecideFlow(input)).resolves.toBe(true);
+    expect(capture.decisionPosts).toBe(0);
+    const text = capture.channelPosts.join("\n");
+    expect(text).toContain("提案 1 件はすべて決裁済み");
+    expect(text).toContain("close）済みの未決提案 1 件");
+  });
+
+  test("issueStateUnknown が空でなければチャンネル通知 + ページ（#500）", async () => {
+    const { capture, input } = flowDeps({
+      code: 0,
+      stdout: JSON.stringify({
+        date: "2026-08-23",
+        proposals: [{ id: "a-1", title: "A", decision: null, issueState: "unknown" }],
+        issueStateUnknown: ["a-1"],
+      }),
+      stderr: "",
+    });
+    await expect(runBriefDecideFlow(input)).resolves.toBe(true);
+    expect(capture.decisionPosts).toBe(1);
+    expect(capture.channelPosts.join("\n")).toContain("Issue の状態を確認できなかった提案が 1 件");
+    expect(capture.notifications).toEqual(["朝レポ提案の Issue 状態を確認できず"]);
+  });
+
+  test("issueStateUnknown が空配列なら通知しない（#500）", async () => {
+    const { capture, input } = flowDeps({
+      code: 0,
+      stdout: JSON.stringify({
+        date: "2026-08-23",
+        proposals: [{ id: "a-1", title: "A", decision: null, issueState: "open" }],
+        issueStateUnknown: [],
+      }),
+      stderr: "",
+    });
+    await expect(runBriefDecideFlow(input)).resolves.toBe(true);
+    expect(capture.channelPosts.join("\n")).not.toContain("確認できなかった");
+    expect(capture.notifications.length).toBe(0);
+  });
+
+  test("issueState 通知の notify 失敗でも flow は落ちない（#500）", async () => {
+    const { input } = flowDeps({
+      code: 0,
+      stdout: JSON.stringify({
+        date: "2026-08-23",
+        proposals: [{ id: "a-1", title: "A", decision: null }],
+        issueStateUnknown: ["a-1"],
+      }),
+      stderr: "",
+    });
+    input.notifyFailure = async () => {
+      throw new Error("pushover down");
+    };
+    await expect(runBriefDecideFlow(input)).resolves.toBe(true);
   });
 
   test("notify 自体の失敗で flow は落ちない", async () => {
