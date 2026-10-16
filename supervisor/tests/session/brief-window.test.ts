@@ -12,6 +12,8 @@ import {
   briefWindowResolutionFailure,
   reportBriefWindowResolutionFailure,
   BRIEF_WINDOW_RESTART_NOTICE,
+  BRIEF_WINDOW_RESTART_RESUME_DISABLED_NOTICE,
+  BRIEF_WINDOW_ALIVE_NOTICE,
   createBriefWindowDeps,
   evaluateBriefWindowOpen,
   evaluateBriefWindowRestart,
@@ -22,6 +24,7 @@ import {
   parseBriefWindowThreadName,
   type BriefWindowDeps,
 } from "../../src/session/brief-window";
+import type { AutoResumeOutcome } from "../../src/session/auto-resume";
 
 /**
  * Issue #454: the morning brief opens ONE conversation window (thread +
@@ -608,13 +611,179 @@ describe("reportBriefWindowResolutionFailure (#463 / CodeRabbit)", () => {
 });
 
 describe("handleBriefWindowThreadMessage (lazy entry)", () => {
+  /** The prior session's claude id, as sessions.db would record it. */
+  const PRIOR_ID = "d118c817-0000-4000-8000-000000000001";
+
+  /** A `resume` stub that records calls and answers with `outcome`. */
+  function resumeStub(
+    outcome: AutoResumeOutcome = {
+      kind: "not-resumable",
+      reason: "no-transcript",
+      verdict: "dead",
+    },
+  ) {
+    const state = { calls: 0 };
+    const resume = async () => {
+      state.calls++;
+      return outcome;
+    };
+    return { resume, state };
+  }
+
+  const noHistory = resumeStub();
   const base = {
     threadId: "win-1",
     threadName: `朝レポ窓口 ${DATE}`,
     hasBriefConfig: true,
     sessionCount: 2,
     maxSessions: 10,
+    resume: noHistory.resume,
   };
+
+  test("#504 AC-1: resumes the prior conversation instead of re-injecting /brief-window", async () => {
+    const { deps: d, calls } = deps();
+    const notice = `♻️ 自動で復帰しました\n🔑 claude_session_id: \`${PRIOR_ID}\``;
+    const { resume, state } = resumeStub({
+      kind: "resumed",
+      claudeSessionId: PRIOR_ID,
+      notice,
+    });
+    const outcome = await handleBriefWindowThreadMessage({ ...base, resume, deps: d });
+
+    expect(outcome).toBe("resumed");
+    expect(state.calls).toBe(1);
+    // No fresh start and no /brief-window injection.
+    expect(calls.started).toEqual([]);
+    expect(calls.sent).toEqual([]);
+    // The auto-resume banner (carrying the resumed id) is posted; the "resend"
+    // notice is NOT, because the triggering message is relayed (AC-4).
+    expect(calls.thread).toEqual([{ threadId: "win-1", content: notice }]);
+    expect(calls.thread[0]!.content).toContain(PRIOR_ID);
+  });
+
+  test("#504 AC-4: a joined in-flight resume relays without repeating the banner", async () => {
+    const { deps: d, calls } = deps();
+    const { resume } = resumeStub({
+      kind: "resumed",
+      claudeSessionId: PRIOR_ID,
+      notice: null,
+    });
+    const outcome = await handleBriefWindowThreadMessage({ ...base, resume, deps: d });
+    expect(outcome).toBe("resumed");
+    expect(calls.thread).toEqual([]);
+    expect(calls.started).toEqual([]);
+  });
+
+  test("#504: a failed resume is reported and does not silently start a new conversation", async () => {
+    const { deps: d, calls } = deps();
+    const notice = `⚠️ 自動復帰できませんでした\n▶️ \`/session resume ${PRIOR_ID}\``;
+    const { resume } = resumeStub({
+      kind: "failed",
+      reason: "worktree gone",
+      notice,
+    });
+    const outcome = await handleBriefWindowThreadMessage({ ...base, resume, deps: d });
+    expect(outcome).toBe("blocked");
+    expect(calls.started).toEqual([]);
+    expect(calls.thread.map((c) => c.content)).toEqual([notice]);
+  });
+
+  test("#504 AC-2: no transcript → fresh start + /brief-window + 'no history' notice", async () => {
+    const { deps: d, calls } = deps();
+    const { resume, state } = resumeStub({
+      kind: "not-resumable",
+      reason: "no-transcript",
+      verdict: "dead",
+    });
+    const consumed = await handleBriefWindowThreadMessage({ ...base, resume, deps: d });
+
+    expect(state.calls).toBe(1);
+    expect(consumed).toBe("restarted");
+    expect(calls.started).toEqual([
+      { threadId: "win-1", branch: `corp-brief-window-${DATE}` },
+    ]);
+    expect(calls.sent).toEqual([
+      { threadId: "win-1", text: `/brief-window ${DATE}` },
+    ]);
+    expect(calls.thread.map((c) => c.content)).toEqual([
+      STANDBY,
+      BRIEF_WINDOW_RESTART_NOTICE,
+    ]);
+    expect(BRIEF_WINDOW_RESTART_NOTICE).toContain("履歴が無いため新しい会話で起動");
+  });
+
+  test("#504 AC-2: a thread with no session row also falls back to a fresh start", async () => {
+    const { deps: d, calls } = deps();
+    const { resume } = resumeStub({ kind: "no-history" });
+    const consumed = await handleBriefWindowThreadMessage({ ...base, resume, deps: d });
+    expect(consumed).toBe("restarted");
+    expect(calls.started.length).toBe(1);
+  });
+
+  test("#504: a prior session still alive is neither resumed nor duplicated", async () => {
+    const { deps: d, calls } = deps();
+    const { resume } = resumeStub({
+      kind: "not-resumable",
+      reason: "alive",
+      verdict: "alive",
+    });
+    const outcome = await handleBriefWindowThreadMessage({ ...base, resume, deps: d });
+    expect(outcome).toBe("blocked");
+    expect(calls.started).toEqual([]);
+    expect(calls.thread.map((c) => c.content)).toEqual([BRIEF_WINDOW_ALIVE_NOTICE]);
+  });
+
+  test("#504: with AUTO_RESUME_DISABLED the fresh start does not claim history is missing", async () => {
+    const { deps: d, calls } = deps();
+    const { resume } = resumeStub({ kind: "no-history" });
+    const outcome = await handleBriefWindowThreadMessage({
+      ...base,
+      resume,
+      deps: d,
+      env: { AUTO_RESUME_DISABLED: "1" },
+    });
+    expect(outcome).toBe("restarted");
+    expect(calls.started.length).toBe(1);
+    const posted = calls.thread.map((c) => c.content);
+    expect(posted).toContain(BRIEF_WINDOW_RESTART_RESUME_DISABLED_NOTICE);
+    expect(posted).not.toContain(BRIEF_WINDOW_RESTART_NOTICE);
+  });
+
+  test("#504: two quick messages start the fresh window only once", async () => {
+    let release!: () => void;
+    const gate = new Promise<void>((r) => (release = r));
+    const { deps: d, calls } = deps({
+      start: async (threadId, branch) => {
+        calls.started.push({ threadId, branch });
+        await gate;
+      },
+    });
+    const { resume, state } = resumeStub();
+    const first = handleBriefWindowThreadMessage({ ...base, resume, deps: d });
+    const second = handleBriefWindowThreadMessage({ ...base, resume, deps: d });
+    release();
+    expect(await first).toBe("restarted");
+    // The joiner is consumed quietly: the first message already asked to resend.
+    expect(await second).toBe("blocked");
+    expect(calls.started.length).toBe(1);
+    expect(state.calls).toBe(1);
+    expect(calls.failures).toEqual([]);
+  });
+
+  test("#504: a message joining an in-flight resume is relayed too", async () => {
+    let release!: () => void;
+    const gate = new Promise<void>((r) => (release = r));
+    const { deps: d } = deps();
+    const resume = async (): Promise<AutoResumeOutcome> => {
+      await gate;
+      return { kind: "resumed", claudeSessionId: PRIOR_ID, notice: "♻️" };
+    };
+    const first = handleBriefWindowThreadMessage({ ...base, resume, deps: d });
+    const second = handleBriefWindowThreadMessage({ ...base, resume, deps: d });
+    release();
+    expect(await first).toBe("resumed");
+    expect(await second).toBe("resumed");
+  });
 
   test("AC-5: restarts the window and tells the chairman to resend", async () => {
     const { deps: d, calls } = deps();
@@ -636,25 +805,33 @@ describe("handleBriefWindowThreadMessage (lazy entry)", () => {
 
   test("hands non-window threads back to the existing salvage path", async () => {
     const { deps: d, calls } = deps();
+    const { resume, state } = resumeStub();
     const consumed = await handleBriefWindowThreadMessage({
       ...base,
       threadName: "corp-dispatch-12 Corp CEO 1",
+      resume,
       deps: d,
     });
     expect(consumed).toBe("not_window");
     expect(calls.started).toEqual([]);
+    // The generic wake in bot.ts owns non-window threads; no resume here.
+    expect(state.calls).toBe(0);
   });
 
   test("#463: keeps a disabled window away from the generic wake and says why", async () => {
     const { deps: d, calls } = deps();
+    const { resume, state } = resumeStub();
     const consumed = await handleBriefWindowThreadMessage({
       ...base,
+      resume,
       deps: d,
       env: { CORP_BRIEF_WINDOW_DISABLED: "1" },
     });
     // "not_window" ではないので bot.ts は汎用 auto-resume に落とさない。
     expect(consumed).toBe("blocked");
     expect(calls.started).toEqual([]);
+    // #504 AC-3: kill-switch で止めた窓口は resume も試みない。
+    expect(state.calls).toBe(0);
     expect(calls.thread.map((c) => c.content)).toEqual([
       BRIEF_WINDOW_DISABLED_NOTICE,
     ]);
@@ -676,13 +853,16 @@ describe("handleBriefWindowThreadMessage (lazy entry)", () => {
 
   test("#463: same for a window thread whose channel has no brief config", async () => {
     const { deps: d, calls } = deps();
+    const { resume, state } = resumeStub();
     const consumed = await handleBriefWindowThreadMessage({
       ...base,
       hasBriefConfig: false,
+      resume,
       deps: d,
     });
     expect(consumed).toBe("blocked");
     expect(calls.started).toEqual([]);
+    expect(state.calls).toBe(0);
     expect(calls.thread.map((c) => c.content)).toEqual([
       BRIEF_WINDOW_NO_CONFIG_NOTICE,
     ]);
@@ -690,14 +870,17 @@ describe("handleBriefWindowThreadMessage (lazy entry)", () => {
 
   test("consumes the message at the session cap (the reason was posted in-thread)", async () => {
     const { deps: d, calls } = deps();
+    const { resume, state } = resumeStub();
     const consumed = await handleBriefWindowThreadMessage({
       ...base,
       sessionCount: 10,
+      resume,
       deps: d,
     });
     expect(consumed).toBe("blocked");
     expect(calls.thread.length).toBe(1);
     expect(calls.started).toEqual([]);
+    expect(state.calls).toBe(0);
   });
 
   test("consumes the message when the restart itself fails (already reported)", async () => {
