@@ -56,6 +56,15 @@ export interface PendingWork {
   pendingWakeup: boolean;
   /** Lines that failed to parse as JSON (diagnostic; >0 weakens confidence). */
   skippedLines: number;
+  /**
+   * Issue #390: the error text when the run's LAST assistant entry is a
+   * CLI-synthesized API connection error, i.e. the CLI exhausted its own
+   * retries against an unreachable API and gave up mid-work. Absent otherwise
+   * (including when a later normal assistant reply shows the run recovered).
+   * Deliberately NOT part of {@link describePendingWork}: the Stop hook must
+   * not block on it (another turn would just hit the same dead connection).
+   */
+  apiConnectionError?: string;
 }
 
 export type PendingWorkProbe =
@@ -78,6 +87,33 @@ const TIMEOUT_BACKGROUNDED_RE = /moved to the background \(ID: ([A-Za-z0-9_-]+)\
 
 /** `<tool-use-id>` values inside a `<task-notification>` completion block. */
 const NOTIFICATION_TOOL_USE_ID_RE = /<tool-use-id>([^<]+)<\/tool-use-id>/g;
+
+/**
+ * Connection-failure wording of the CLI's synthesized `isApiErrorMessage`
+ * entry. Pinned against real transcripts:
+ *   - 2026-08-09 corp /orchestrate (Issue #390): "API Error: Unable to connect
+ *     to API (ConnectionRefused)"
+ *   - v2.1.301, HTTPS_PROXY=http://127.0.0.1:9: "API Error: Connection refused
+ *     — a firewall or proxy may be blocking it (ECONNREFUSED)"
+ * plus the other connection-error labels listed in the "Find your error" table
+ * of https://code.claude.com/docs/en/errors ("Can't reach the API server",
+ * "No internet route", "Couldn't connect through your proxy", "Connection
+ * dropped"). Other API errors (rate limit, overloaded, auth) are not
+ * connection failures and stay unmatched. The `isApiErrorMessage` flag gates
+ * the match, so model prose quoting these words never counts.
+ */
+const API_CONNECTION_ERROR_RE =
+  /Unable to connect to API|Connection refused|ECONNREFUSED|Can't reach the API|No internet route|Couldn't connect through your proxy|Connection dropped/;
+
+/** Text of an assistant entry that is a CLI API connection error, else null. */
+function apiConnectionErrorText(entry: Record<string, unknown>): string | null {
+  if (entry.type !== "assistant" || entry.isApiErrorMessage !== true) {
+    return null;
+  }
+  const content = (entry.message as { content?: unknown } | undefined)?.content;
+  const text = toolResultText(content);
+  return API_CONNECTION_ERROR_RE.test(text) ? text : null;
+}
 
 /**
  * Derive the transcript path Claude Code writes for a session: the cwd with
@@ -155,6 +191,7 @@ export function parsePendingWork(jsonlText: string): PendingWork {
   // and the index of the last plain user prompt (a fired wakeup appears as one).
   let lastWakeupIdx = -1;
   let lastPlainUserIdx = -1;
+  let lastApiConnectionError: string | null = null;
 
   // Collect completion ids only from the containers that actually carry
   // notifications: `queue-operation` entries and user-message TEXT (the
@@ -188,6 +225,12 @@ export function parsePendingWork(jsonlText: string): PendingWork {
 
     if (isPlainUserPrompt(entry)) {
       lastPlainUserIdx = i;
+    }
+
+    // Only the LAST assistant entry decides: a normal reply after an error
+    // means the run recovered (Issue #390).
+    if (entry.type === "assistant") {
+      lastApiConnectionError = apiConnectionErrorText(entry);
     }
 
     const message = entry.message;
@@ -251,7 +294,11 @@ export function parsePendingWork(jsonlText: string): PendingWork {
   // A wakeup is pending unless a plain user prompt LANDED AFTER it (= it fired).
   const pendingWakeup = lastWakeupIdx >= 0 && lastPlainUserIdx <= lastWakeupIdx;
 
-  return { pendingTasks, pendingWakeup, skippedLines };
+  const work: PendingWork = { pendingTasks, pendingWakeup, skippedLines };
+  if (lastApiConnectionError !== null) {
+    work.apiConnectionError = lastApiConnectionError;
+  }
+  return work;
 }
 
 /**

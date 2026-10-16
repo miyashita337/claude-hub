@@ -6,6 +6,7 @@ import {
   HEADLESS_TIMEOUT_MS,
   SessionManager,
   buildHeadlessClaudeFlags,
+  buildHeadlessEnv,
   buildPendingGuardFlags,
   resolveDispatchModel,
 } from "../../src/session/manager";
@@ -102,6 +103,33 @@ describe("SessionManager.runHeadless", () => {
     // env carries no ANTHROPIC_API_KEY (Claude Max) and a PATH.
     expect(call.env.ANTHROPIC_API_KEY).toBeUndefined();
     expect(call.env.PATH).toBeTruthy();
+  });
+
+  // Issue #390 AC-3 (案 A): the CLI's own retry budget is widened for
+  // unattended headless runs; an operator-set value is respected.
+  test("enables CLAUDE_CODE_RETRY_WATCHDOG unless the operator set it (#390)", () => {
+    const prev = process.env.CLAUDE_CODE_RETRY_WATCHDOG;
+    try {
+      delete process.env.CLAUDE_CODE_RETRY_WATCHDOG;
+      expect(buildHeadlessEnv().CLAUDE_CODE_RETRY_WATCHDOG).toBe("1");
+      process.env.CLAUDE_CODE_RETRY_WATCHDOG = "0";
+      expect(buildHeadlessEnv().CLAUDE_CODE_RETRY_WATCHDOG).toBe("0");
+    } finally {
+      if (prev === undefined) delete process.env.CLAUDE_CODE_RETRY_WATCHDOG;
+      else process.env.CLAUDE_CODE_RETRY_WATCHDOG = prev;
+    }
+  });
+
+  test("the executor receives the watchdog env on a real runHeadless call (#390)", async () => {
+    const prev = process.env.CLAUDE_CODE_RETRY_WATCHDOG;
+    delete process.env.CLAUDE_CODE_RETRY_WATCHDOG;
+    try {
+      await manager.runHeadless(config, "thread-wd", "/impl 43", "corp-dispatch-43");
+      const call = effects.executor.runHeadlessCalls[0]!;
+      expect(call.env.CLAUDE_CODE_RETRY_WATCHDOG).toBe("1");
+    } finally {
+      if (prev !== undefined) process.env.CLAUDE_CODE_RETRY_WATCHDOG = prev;
+    }
   });
 
   test("registers the session while the child runs and frees the slot on exit (AC-3)", async () => {
@@ -499,6 +527,47 @@ describe("SessionManager.runHeadless", () => {
       expect(res.completion.status).toBe("pending");
       expect(res.completion.detail).toContain("プロセスグループ");
       expect(fx.worktree.removeCalls).toHaveLength(0);
+      await mgr.shutdownAll();
+    });
+
+    // Issue #390 AC-3: the CLI gave up on an unreachable API mid-work. The run
+    // is a failure: worktree kept for recovery, distinct DB stop reason.
+    test("API connection error run RETAINS the worktree and records headless_api_error (#390)", async () => {
+      const { mgr, fx } = makeManager(() => ({
+        ok: true as const,
+        value: {
+          pendingTasks: [],
+          pendingWakeup: false,
+          skippedLines: 0,
+          apiConnectionError: "API Error: Unable to connect to API (ConnectionRefused)",
+        },
+      }));
+      fx.executor.result = {
+        exitCode: 1,
+        stdout: "",
+        stderr: "",
+        timedOut: false,
+        durationMs: 177_000,
+      };
+      const res = await mgr.runHeadless(config, "t-api", "/pdca 7", "corp-dispatch-7", 7);
+
+      expect(res.completion.status).toBe("pending");
+      expect(res.completion.apiConnectionError).toBe(true);
+      expect(res.completion.detail).toContain("API 接続エラーで終了");
+      expect(fx.worktree.removeCalls).toHaveLength(0);
+      expect(mgr.has("t-api")).toBe(false);
+      const row = getSessionByClaudeSessionId(res.claudeSessionId);
+      expect(row?.stopped_reason).toBe("headless_api_error");
+      expect(fx.issueReporter.postCommentCalls[0]!.body).toContain("- completion: pending");
+      await mgr.shutdownAll();
+    });
+
+    test("clean run keeps the plain headless_exited reason (no apiConnectionError flag)", async () => {
+      const { mgr } = makeManager(cleanProbe);
+      const res = await mgr.runHeadless(config, "t-plain", "/impl 8", "corp-dispatch-8");
+      expect(res.completion.apiConnectionError).toBeUndefined();
+      const row = getSessionByClaudeSessionId(res.claudeSessionId);
+      expect(row?.stopped_reason).toBe("headless_exited");
       await mgr.shutdownAll();
     });
 
