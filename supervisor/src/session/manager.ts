@@ -68,6 +68,7 @@ import {
   type ArtifactProbe,
   type ArtifactProbeInput,
 } from "./artifact-probe";
+import { resolveWorktreePath } from "./worktree";
 
 const DEFAULT_CLAUDE_PATH = resolve(homedir(), ".local", "bin", "claude");
 const TMUX_SESSION_PREFIX = "claude-";
@@ -1908,6 +1909,13 @@ export class SessionManager {
             `プロジェクトディレクトリが見つかりません: ${projectDir}（worktree が削除された可能性があります）`
           );
         }
+      } else {
+        // Issue #380 (Devin review): a KEPT worktree (self_heal_restart /
+        // supervisor_restart) is reused as-is, so this resumed session must own
+        // it too. Otherwise isWorktreePathInUse would not see it and a manual
+        // stop of another session on the same branch would `--force` remove the
+        // directory under this live session (RW-046 class).
+        recoveredWorktree = this.ownedWorktreeForResume(config.dir, projectDir, branch);
       }
       return await this.launchResume(
         config,
@@ -2638,6 +2646,30 @@ export class SessionManager {
       );
       return false;
     }
+  }
+
+  /**
+   * Issue #380: the worktree info a resumed session should own when its
+   * projectDir already exists. Only claimed when projectDir is exactly the
+   * managed per-branch worktree path, so a resume into the main checkout (or any
+   * other directory) never gets a worktree it could later remove.
+   */
+  private ownedWorktreeForResume(
+    mainRepoDir: string,
+    projectDir: string,
+    branch?: string | null
+  ): SessionInfo["worktree"] {
+    const trimmed = branch?.trim();
+    if (!trimmed) return undefined;
+    let expected: string;
+    try {
+      expected = resolveWorktreePath(mainRepoDir, trimmed);
+    } catch {
+      // Unsafe / malformed branch name from the DB: not a managed worktree.
+      return undefined;
+    }
+    if (resolve(projectDir) !== expected) return undefined;
+    return { mainRepoDir, path: projectDir, branch: trimmed };
   }
 
   /** True if a still-running session (other than the one just removed) uses this worktree path. */

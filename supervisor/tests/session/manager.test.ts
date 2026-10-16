@@ -791,6 +791,17 @@ describe("SessionManager worktree integration (#154)", () => {
       );
       expect(effects.worktree.recreateForBranchCalls).toHaveLength(0);
       expect(effects.worktree.removeCalls).toHaveLength(0);
+
+      // Devin review on #501: the resumed session owns the kept worktree, so
+      // another session on the same branch stopping must NOT remove it from
+      // under the live resumed session; the last user removes it.
+      await resumer.start(config, "thread-sh-other", "feature-sh-resume");
+      await resumer.stop("thread-sh-other", "manual");
+      expect(effects.worktree.removeCalls).toHaveLength(0);
+      await resumer.stop("thread-sh-new", "manual");
+      expect(effects.worktree.removeCalls).toEqual([
+        { mainRepoDir: config.dir, worktreePath: wtPath },
+      ]);
     } finally {
       await resumer.shutdownAll();
     }

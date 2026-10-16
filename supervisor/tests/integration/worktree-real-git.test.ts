@@ -479,6 +479,13 @@ describe("#382 real git: SessionManager teardown", () => {
     const entry = await worktreeEntry(repoDir, wt);
     expect(entry?.branch).toBe(EXISTING_BRANCH);
     expect(entry?.prunable).toBe(false);
+
+    // Devin review on #501: a second session on the same branch stopping must
+    // not delete the worktree under the live resumed session.
+    await manager.start(makeConfig(), "thread-heal-other", EXISTING_BRANCH);
+    await manager.stop("thread-heal-other", "manual");
+    expect(existsSync(wt)).toBe(true);
+    expect(readFileSync(join(wt, "WIP.txt"), "utf8")).toBe("uncommitted before self-heal\n");
   });
 
   test("Q3 control: an explicit stop('manual') DOES remove the real worktree", async () => {
