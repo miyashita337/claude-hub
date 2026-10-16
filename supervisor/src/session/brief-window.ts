@@ -24,11 +24,19 @@
  *      thread id を supervisor のメモリに持たないので、再起動を跨いでも壊れない。
  *   4. **停止機構を足さない**。生存期間は interactive セッション共通の idle reaper
  *      （`SESSION_IDLE_DEFAULT_MS`、既定 6h）に委ねる。閉じた後にそのスレッドへ
- *      発言されたら {@link evaluateBriefWindowRestart} 経由で起動し直す。
+ *      発言されたら {@link evaluateBriefWindowRestart} の判定を通したうえで、
+ *      直前の会話の transcript があれば `--resume` で同じ会話を再開し（#504）、
+ *      無いときだけ新規起動 + `/brief-window` 再注入に落とす。
  *
  * 判断はすべて純関数に閉じており、副作用は {@link BriefWindowDeps} として注入する
  * （`corp-brief.ts` / `dispatch.ts` と同じ設計方針）。
  */
+
+import {
+  isAutoResumeDisabled,
+  type AutoResumeOutcome,
+  type WakeReply,
+} from "./auto-resume";
 
 /** 窓口だけを止める kill-switch。決裁経路の `CORP_BRIEF_DISABLED` とは独立。 */
 export const BRIEF_WINDOW_DISABLED_ENV = "CORP_BRIEF_WINDOW_DISABLED";
@@ -240,13 +248,27 @@ export interface BriefWindowDeps {
  * 落としてはならない。窓口スレッドにも履歴があるため、素の `--resume` が先に
  * 噛むと「窓口を止めたのに窓口が起き上がる」ようになる。
  */
-export type BriefWindowMessageOutcome = "restarted" | "blocked" | "not_window";
+export type BriefWindowMessageOutcome =
+  | "restarted"
+  /**
+   * 直前の会話へ `--resume` で戻った（#504）。呼び出し元は汎用 wake を通さずに
+   * 引き金の発言をそのまま中継する（汎用 auto-resume の `resumed` と同じ扱い）。
+   */
+  | "resumed"
+  | "blocked"
+  | "not_window";
 
 export type BriefWindowResult =
-  | { ok: true; threadId: string; reused: boolean }
+  | {
+      ok: true;
+      threadId: string;
+      reused: boolean;
+      /** lazy 経路で `--resume` によって再開した（#504）。新規起動なら false。 */
+      resumed?: boolean;
+    }
   | {
       ok: false;
-      stage: "skipped" | "thread" | "start" | "inject";
+      stage: "skipped" | "thread" | "start" | "inject" | "resume";
       reason: string;
     };
 
@@ -321,12 +343,18 @@ export async function openBriefWindow(
 
 /**
  * 閉じた窓口スレッドへの発言でセッションを起動し直す（lazy 経路）。
- * スレッドは既にあるので、起動と注入だけを行う。
+ *
+ * kill-switch / 設定 / 上限の判定（#463）を先に通し、通ったときだけ `resume`
+ * （汎用 auto-resume #456 の `autoResumeThread`）で直前の会話へ戻る（#504）。
+ * 戻れる履歴が無いときだけ、従来どおり起動 + `/brief-window` 注入を行う。
+ * resume を試みて失敗したときは新規起動に落とさない。会話を黙って捨てることに
+ * なるため、失敗を通知して止める。
  */
 export async function restartBriefWindow(
   input: BriefWindowRestartInput,
   threadId: string,
   deps: BriefWindowDeps,
+  resume: () => Promise<AutoResumeOutcome>,
 ): Promise<BriefWindowResult> {
   const decision = evaluateBriefWindowRestart(input);
   if (decision.kind === "skip") {
@@ -343,6 +371,44 @@ export async function restartBriefWindow(
     }
     return { ok: false, stage: "skipped", reason: decision.reason };
   }
+
+  const wake = await resume();
+  if (wake.kind === "resumed" || wake.kind === "failed") {
+    // notice は auto-resume 側の文言（復帰の告知 / 失敗理由 + 手動 resume の案内）。
+    // null は同じスレッドの先行メッセージが既に告知済みの合流なので出さない。
+    if (wake.notice) {
+      await deps
+        .postToThread(threadId, wake.notice)
+        .catch((err) =>
+          console.error(
+            `[brief-window] resume notice failed (thread=${threadId}):`,
+            err,
+          ),
+        );
+    }
+    return wake.kind === "resumed"
+      ? { ok: true, threadId, reused: true, resumed: true }
+      : { ok: false, stage: "resume", reason: wake.reason };
+  }
+  if (wake.kind === "not-resumable" && wake.reason === "alive") {
+    // 前回のプロセスが生きている（または tmux 応答待ちで生存とみなした、#238）。
+    // ここで新規起動すると同じ worktree に 2 本目が立つ（RW-046 と同型）ため、
+    // 汎用 wake と同じく起こさずに理由を出す。
+    await deps
+      .postToThread(threadId, BRIEF_WINDOW_ALIVE_NOTICE)
+      .catch((err) =>
+        console.error(
+          `[brief-window] alive notice failed (thread=${threadId}):`,
+          err,
+        ),
+      );
+    return { ok: false, stage: "resume", reason: "alive" };
+  }
+  console.log(
+    `[brief-window] no resumable history for thread ${threadId} (${
+      wake.kind === "not-resumable" ? wake.reason : wake.kind
+    }); starting a new conversation`,
+  );
 
   return startWindowSession(
     decision.date,
@@ -584,7 +650,6 @@ export async function openBriefWindowForBrief(args: {
   }
 }
 
-/** 再起動時にスレッドへ出す案内。引き金になった発言は中継しないことを明示する。 */
 /** 応答が 1 つも返らなかったとき（#464）。無言で成功扱いにしない。 */
 export const BRIEF_WINDOW_EMPTY_REPLY_NOTICE =
   "⚠️ 窓口セッションは起動しましたが、待機報告が返りませんでした。" +
@@ -659,15 +724,47 @@ export async function reportBriefWindowResolutionFailure(
   return outcome;
 }
 
+/**
+ * 直前の会話へ戻れず新規起動に落ちたときの案内（#504）。文脈が失われたことを
+ * 黙らせない（resume できたときは auto-resume 側の復帰告知が出る）。
+ */
 export const BRIEF_WINDOW_RESTART_NOTICE =
-  "🔓 窓口セッションを再起動しました（前回は無操作で自動クローズされていました）。\n" +
-  "起動処理中のため、いまの発言はまだ届いていません。**もう一度送ってください**。";
+  "🆕 前回の会話履歴が無いため新しい会話で起動しました（窓口セッションは無操作で自動クローズされていました）。\n" +
+  "前回の会話内容は引き継いでいません。起動処理中のため、いまの発言はまだ届いていません。**もう一度送ってください**。";
+
+/**
+ * `AUTO_RESUME_DISABLED` で resume を止めているために新規起動したときの案内（#504）。
+ * 履歴の有無は確かめていないので「履歴が無い」とは言わない。
+ */
+export const BRIEF_WINDOW_RESTART_RESUME_DISABLED_NOTICE =
+  "🆕 自動 resume が停止中（kill-switch 有効）のため、新しい会話で起動しました。\n" +
+  "前回の会話内容は引き継いでいません。起動処理中のため、いまの発言はまだ届いていません。**もう一度送ってください**。";
+
+/**
+ * 新規起動の処理中に届いた後続の発言へ返す案内（#504 Devin 指摘）。先行の発言には
+ * {@link BRIEF_WINDOW_RESTART_NOTICE} が出るが、合流した発言にも個別に知らせる。
+ */
+export const BRIEF_WINDOW_JOINED_RESTART_NOTICE =
+  "⚠️ 窓口の起動処理中だったため、この発言もまだ届いていません。起動後に**もう一度送ってください**。";
+
+/** 前回の窓口セッションが稼働中とみなされ、再開も新規起動も見送ったとき（#504）。 */
+export const BRIEF_WINDOW_ALIVE_NOTICE =
+  "⚠️ この窓口の前回のセッションがまだ稼働している可能性があるため、再開を見送りました。\n" +
+  "しばらく待って再度発言するか、`@Channel-Supervisor status` で生死を確認してください。";
+
+/**
+ * スレッド単位の処理中マップ。起動には数秒かかり、その間に会長が続けて発言すると
+ * 2 本目の起動が走って失敗通知が出る（resume 側は autoResumeThread の inFlight が
+ * 合流させるが、新規起動側には無かった）。後続のメッセージは先行の結果に合流する。
+ */
+const handleInFlight = new Map<string, Promise<BriefWindowMessageOutcome>>();
 
 /**
  * lazy 経路のエントリ。セッション不在スレッドへの発言で呼ぶ。
  *
- * 戻り値 `true` = このメッセージを消費した（呼び出し元は以降の salvage 処理を
- * 止める）。`false` = 窓口ではない等で、従来の salvage 返信に委ねる。
+ * `"resumed"` = 直前の会話へ戻った（呼び出し元は引き金の発言を中継する）。
+ * `"restarted"` / `"blocked"` = このメッセージを消費した（呼び出し元は以降の
+ * 処理を止める）。`"not_window"` = 窓口ではないので従来経路に委ねる。
  */
 export async function handleBriefWindowThreadMessage(args: {
   threadId: string;
@@ -676,8 +773,40 @@ export async function handleBriefWindowThreadMessage(args: {
   sessionCount: number;
   maxSessions: number;
   deps: BriefWindowDeps;
+  /** 直前の会話への resume（bot.ts が `autoResumeThread` を束ねて渡す、#504）。 */
+  resume: () => Promise<AutoResumeOutcome>;
   env?: Record<string, string | undefined>;
 }): Promise<BriefWindowMessageOutcome> {
+  const existing = handleInFlight.get(args.threadId);
+  if (existing) {
+    // resumed なら後続の発言も中継する。新規起動に合流した発言は中継できない
+    // （起動直後の TUI への同時入力は RW-025 / RW-047 の取りこぼしを起こす）。
+    // 先行メッセージへの再送案内は 1 回しか出ないため、合流した発言ごとにも
+    // 「届いていない」と明示する。黙って捨てると会長は未処理に気付けない。
+    const outcome = await existing;
+    if (outcome === "resumed" || outcome === "not_window") return outcome;
+    if (outcome === "restarted") {
+      await args.deps
+        .postToThread(args.threadId, BRIEF_WINDOW_JOINED_RESTART_NOTICE)
+        .catch((err) =>
+          console.error(
+            `[brief-window] joined restart notice failed (thread=${args.threadId}):`,
+            err,
+          ),
+        );
+    }
+    return "blocked";
+  }
+  const run = handleOnce(args).finally(() => {
+    handleInFlight.delete(args.threadId);
+  });
+  handleInFlight.set(args.threadId, run);
+  return run;
+}
+
+async function handleOnce(
+  args: Parameters<typeof handleBriefWindowThreadMessage>[0],
+): Promise<BriefWindowMessageOutcome> {
   const result = await restartBriefWindow(
     {
       threadName: args.threadName,
@@ -690,15 +819,24 @@ export async function handleBriefWindowThreadMessage(args: {
     },
     args.threadId,
     args.deps,
+    args.resume,
   );
+
+  if (result.ok && result.resumed) {
+    console.log(`[brief-window] resumed (thread=${args.threadId})`);
+    return "resumed";
+  }
 
   if (result.ok) {
     console.log(`[brief-window] restarted (thread=${args.threadId})`);
     // 引き金の発言は中継しない: 起動直後の TUI に `/brief-window` と会長の発言を
     // 同時に打つと RW-025 / RW-047 と同じ入力取りこぼしを起こす。黙って捨てず、
     // 「もう一度送って」と明示する。
+    const notice = isAutoResumeDisabled(args.env ?? process.env)
+      ? BRIEF_WINDOW_RESTART_RESUME_DISABLED_NOTICE
+      : BRIEF_WINDOW_RESTART_NOTICE;
     await args.deps
-      .postToThread(args.threadId, BRIEF_WINDOW_RESTART_NOTICE)
+      .postToThread(args.threadId, notice)
       .catch((err) =>
         console.error(
           `[brief-window] restart notice failed (thread=${args.threadId}):`,
@@ -734,9 +872,62 @@ export async function handleBriefWindowThreadMessage(args: {
     return "blocked";
   }
 
-  // start / inject の失敗は既に post + notify 済み。二重に salvage を出さない。
+  // resume / start / inject の失敗は既に post（start / inject は notify も）済み。
+  // 二重に salvage を出さない。
   console.warn(
     `[brief-window] restart failed (thread=${args.threadId}, stage=${result.stage})`,
   );
   return "blocked";
+}
+
+/**
+ * セッションが無いスレッドへの発言の振り分け（#454 / #456 / #463 / #504）。
+ *
+ * 朝レポ窓口の判定を汎用 wake（#456）より先に通す。窓口と確定したスレッドは、
+ * 例外が出ても汎用 wake に落とさない（素の `--resume` が kill-switch を素通りする、
+ * #463）。窓口が resume できたときと、窓口でないスレッドが wake で起きたときだけ
+ * 引き金の発言を中継する。bot.ts に分岐を書くとテストが届かないため判断はここに置く。
+ *
+ * 戻り値 `true` = 呼び出し元は発言をセッションへ中継する。`false` = ここで終える。
+ */
+export async function routeSessionlessThreadMessage(
+  threadId: string,
+  deps: {
+    tryWindow: () => Promise<BriefWindowMessageOutcome>;
+    isWindowThreadName: () => boolean;
+    reportWindowFailure: () => Promise<BriefWindowMessageOutcome>;
+    wake: () => Promise<AutoResumeOutcome>;
+    resolveReply: (wake: AutoResumeOutcome) => Promise<WakeReply>;
+    send: (content: string) => Promise<unknown>;
+  },
+): Promise<boolean> {
+  let windowOutcome: BriefWindowMessageOutcome = "not_window";
+  try {
+    windowOutcome = await deps.tryWindow();
+  } catch (err) {
+    console.error("[Bot] Brief window restart error:", err);
+    if (deps.isWindowThreadName()) {
+      windowOutcome = await deps.reportWindowFailure();
+    }
+  }
+  if (windowOutcome === "resumed") return true;
+  if (windowOutcome !== "not_window") return false;
+
+  const wake = await deps.wake();
+  const { relay, reply } = await deps.resolveReply(wake);
+  if (reply) {
+    try {
+      await deps.send(reply);
+    } catch (err) {
+      // resume 経路ではセッションが生きているので、案内の投稿失敗で発言を
+      // 失わせない。どちらにせよ relay の判定に従う。
+      console.error(`[Bot] Failed to reply in thread ${threadId}:`, err);
+    }
+  }
+  if (!relay && !reply) {
+    console.debug(
+      `[Bot] Ignoring message in thread ${threadId} (no active session, wake=${wake.kind})`,
+    );
+  }
+  return relay;
 }

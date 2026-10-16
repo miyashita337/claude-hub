@@ -1,8 +1,11 @@
+import { existsSync } from "fs";
+import { homedir } from "os";
 import { CHANNEL_MAP, type ChannelConfig } from "../config/channels";
 import { getSessionByThreadId } from "../infra/db";
 import type { SessionRow } from "../infra/db";
 import type { Liveness } from "./manager";
 import { buildHubWorkConfig, HUB_WORK_CHANNEL_NAME } from "./hub-work";
+import { deriveTranscriptPath } from "./pending-work";
 
 /**
  * Message-triggered wake (Issue #456).
@@ -87,10 +90,15 @@ export type AutoResumeOutcome =
    * `no-claude-session-id` is a pre-#167 row with nothing to resume from. Both
    * are exactly what the salvage reply already explains, so the caller falls
    * back to it instead of inventing a second wording.
+   *
+   * `no-transcript` is only produced for a caller that passed
+   * {@link AutoResumeDeps.transcriptExists} (the morning window, #504): the
+   * row has an id but claude never wrote its jsonl, so `--resume` would exit
+   * straight away with "No conversation found" (#485).
    */
   | {
       kind: "not-resumable";
-      reason: "alive" | "no-claude-session-id";
+      reason: "alive" | "no-claude-session-id" | "no-transcript";
       /**
        * The verdict this decision was made on. Handed to the caller so
        * `buildSalvageReply` reuses it instead of re-deriving it — `livenessOf`
@@ -111,6 +119,27 @@ export interface AutoResumeDeps {
   lookupSession?: (threadId: string) => SessionRow | undefined;
   /** Overridable for tests; defaults to `process.env` at the point of use. */
   env?: Record<string, string | undefined>;
+  /**
+   * When given, resume is attempted only if this reports the transcript as
+   * present; otherwise the outcome is `not-resumable` / `no-transcript` and
+   * nothing is launched. Opt-in so the generic wake keeps its behaviour (its
+   * missing-transcript notice is #486's scope); the morning window passes
+   * {@link transcriptExistsOnDisk} so it can fall back to a fresh start (#504).
+   */
+  transcriptExists?: (projectDir: string, claudeSessionId: string) => boolean;
+}
+
+/**
+ * Whether claude wrote the transcript `claude --resume <id>` would load.
+ * The path is keyed by the cwd string, so it survives the worktree itself being
+ * removed on stop (resumeSession re-creates the worktree, #217).
+ */
+export function transcriptExistsOnDisk(
+  projectDir: string,
+  claudeSessionId: string,
+  home: string = homedir(),
+): boolean {
+  return existsSync(deriveTranscriptPath(projectDir, claudeSessionId, home));
 }
 
 /**
@@ -209,6 +238,16 @@ async function decide(
   const claudeSessionId = row.claude_session_id;
   if (!claudeSessionId) {
     return { kind: "not-resumable", reason: "no-claude-session-id", verdict };
+  }
+
+  if (
+    deps.transcriptExists &&
+    !deps.transcriptExists(row.project_dir, claudeSessionId)
+  ) {
+    console.log(
+      `${LOG} thread ${threadId}: transcript for claude session ${claudeSessionId} not found; not resuming`,
+    );
+    return { kind: "not-resumable", reason: "no-transcript", verdict };
   }
 
   // Issue #451: hub-work rows carry the synthetic channel_name

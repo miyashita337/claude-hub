@@ -1,5 +1,5 @@
 import { test, expect, describe, beforeEach, afterEach } from "bun:test";
-import { mkdirSync, mkdtempSync, rmSync } from "fs";
+import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "fs";
 import { tmpdir } from "os";
 import { join } from "path";
 
@@ -16,7 +16,9 @@ const {
   classifyResumeFailure,
   isAutoResumeDisabled,
   AUTO_RESUME_DISABLED_ENV,
+  transcriptExistsOnDisk,
 } = await import("../../src/session/auto-resume");
+const { deriveTranscriptPath } = await import("../../src/session/pending-work");
 const { SessionManager } = await import("../../src/session/manager");
 const { createFakeEffects } = await import("../../src/session/adapters-fake");
 const { MAX_SESSIONS } = await import("../../src/config/channels");
@@ -437,6 +439,61 @@ describe("autoResumeThread (#456)", () => {
     expect(isAutoResumeDisabled({ [AUTO_RESUME_DISABLED_ENV]: "0" })).toBe(false);
     expect(isAutoResumeDisabled({ [AUTO_RESUME_DISABLED_ENV]: "1" })).toBe(true);
     expect(isAutoResumeDisabled({ [AUTO_RESUME_DISABLED_ENV]: "true" })).toBe(true);
+  });
+
+  test("#504: transcriptExists=false → not-resumable/no-transcript and nothing launches", async () => {
+    const threadId = "thread-no-jsonl";
+    const claudeSessionId = seedStoppedSession(threadId)!;
+    const asked: Array<{ dir: string; id: string }> = [];
+
+    const outcome = await autoResumeThread(manager, threadId, {
+      channelMap,
+      transcriptExists: (dir, id) => {
+        asked.push({ dir, id });
+        return false;
+      },
+    });
+
+    expect(outcome).toEqual({
+      kind: "not-resumable",
+      reason: "no-transcript",
+      verdict: "dead",
+    });
+    // Checked against the row the resume would have used.
+    expect(asked).toEqual([{ dir: projectDir, id: claudeSessionId }]);
+    expect(manager.has(threadId)).toBe(false);
+    expect(effects.tmux.list()).toEqual([]);
+  });
+
+  test("#504: transcriptExists=true resumes the recorded claude session as before", async () => {
+    const threadId = "thread-has-jsonl";
+    const claudeSessionId = seedStoppedSession(threadId)!;
+
+    const outcome = await autoResumeThread(manager, threadId, {
+      channelMap,
+      transcriptExists: () => true,
+    });
+
+    expect(outcome.kind).toBe("resumed");
+    if (outcome.kind !== "resumed") throw new Error("unreachable");
+    expect(outcome.claudeSessionId).toBe(claudeSessionId);
+    const cmd = effects.tmux.getCommand(`claude-${threadId.slice(0, 12)}`) ?? "";
+    expect(cmd).toContain(`--resume ${claudeSessionId}`);
+  });
+
+  test("#504: transcriptExistsOnDisk looks where claude --resume reads the jsonl", () => {
+    const home = join(tmpRoot, "home");
+    const id = uuid(7);
+    // The worktree path itself need not exist: the key is the cwd string.
+    const cwd = "/Users/x/corp/.claude/worktrees/corp-brief-window-2026-10-11";
+    expect(transcriptExistsOnDisk(cwd, id, home)).toBe(false);
+
+    const path = deriveTranscriptPath(cwd, id, home);
+    mkdirSync(join(path, ".."), { recursive: true });
+    writeFileSync(path, "{}\n");
+    expect(transcriptExistsOnDisk(cwd, id, home)).toBe(true);
+    // A different session id in the same project dir does not count.
+    expect(transcriptExistsOnDisk(cwd, uuid(8), home)).toBe(false);
   });
 
   test("classifyResumeFailure keeps known causes and buries unknown ones", () => {
