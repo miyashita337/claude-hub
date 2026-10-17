@@ -16,7 +16,7 @@ CI（ubuntu）では実 Discord・launchd・macOS 固有の環境差（PATH、`l
 - 再起動の直前にもう一度稼働セッションを数える（取り込み中に始まったセッションを巻き込まない）
 - `bun install` や再起動に失敗したら status `failure` + Pushover。検証済みとは記録せず、次の周期でデプロイからやり直す
 - 本番ツリーが既に対象 SHA でも、その SHA で supervisor を再起動した記録（`deployed-sha`）がなければ再起動してから検証する（手動の `git pull` 後や初回導入時に旧コードを検証しない）
-- 結果の status を GitHub に投稿できなかったときは、E2E をやり直さずに次の周期で投稿し直す
+- 結果の status を GitHub に投稿できなかったときは、E2E をやり直さずに次の周期で投稿し直す。投稿し直せるまで次の SHA の canary は回さない
 - リポジトリは public なので、失敗 Issue には判定行と FAIL したシナリオ名だけを載せる。ログ本文はこの Mac の `runs/` にだけ残す
 - 1 回の実行は 45 分で打ち切り、配下のプロセス（bun / e2e-live / tmux 起動）ごと止める
 - モデルの判断で結果が揺れる s1 / s2-3 は canary に入れない。必要なら手動で `bash scripts/e2e-orchestrate.sh` を回す

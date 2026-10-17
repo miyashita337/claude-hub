@@ -260,6 +260,18 @@ assert "17: 次周期で success を再投稿" grep -q "status $target success r
 assert "17: E2E は再実行しない" test "$(count "$T/calls" '^e2e')" -eq 0
 assert "17: 投稿できたらマーカーを消す" test ! -f "$T/state/status-retry"
 
+# 17b. 再投稿にも失敗したまま main が進んだら、次の SHA を回さず前回分のマーカーを残す
+setup
+POST_RC=1
+push_commit c17a
+first=$(git -C "$T/origin.git" rev-parse main)
+canary
+push_commit c17b
+: >"$T/calls"
+canary
+assert "17b: 次の SHA の E2E を回さない" test "$(count "$T/calls" '^e2e')" -eq 0
+assert "17b: 前回分のマーカーを残す" test "$(head -c 40 "$T/state/status-retry")" = "$first"
+
 # 18. 既存 Issue の検索に失敗したら起票せず再試行に回す（重複 Issue を作らない）
 setup
 E2E_RC=1

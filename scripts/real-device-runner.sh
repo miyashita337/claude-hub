@@ -172,7 +172,12 @@ canary() {
   if [ -f "$STATE_DIR/status-retry" ]; then
     local ssha sstate sdesc
     { read -r ssha sstate; read -r sdesc; } <"$STATE_DIR/status-retry"
-    post_status "$ssha" "$sstate" "$CANARY_CONTEXT" "$sdesc" && rm -f "$STATE_DIR/status-retry"
+    # 再投稿もできないなら今回は進めない（次の SHA の結果でマーカーを上書きして前回分を失わないように）
+    if ! post_status "$ssha" "$sstate" "$CANARY_CONTEXT" "$sdesc"; then
+      log "canary: ${ssha:0:8} の status を再投稿できないため今回は見送り"
+      return 0
+    fi
+    rm -f "$STATE_DIR/status-retry"
   fi
   git -C "$REPO_DIR" fetch -q origin main || { log "ERROR: git fetch 失敗"; return 1; }
   local target last
