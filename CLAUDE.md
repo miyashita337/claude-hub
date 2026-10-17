@@ -35,6 +35,7 @@ Discord Bot 経由で Claude Code セッションを管理する Supervisor シ�
 | 種類 | 場所 |
 |---|---|
 | Bot 運用方針（絶対ルール / Access Policy / Permission Mode） | [`docs/bot-operations.md`](./docs/bot-operations.md) |
+| 実機ランナー（CI で測れない AC は PR に `real-device` ラベルで引き継ぐ） | [`docs/real-device-runner.md`](./docs/real-device-runner.md) |
 | ドメイン知識（技術スタック / レビュー観点） | [`.claude/rules/domain-expert.md`](./.claude/rules/domain-expert.md) |
 | Supervisor 設定 | [`.claude/settings.json`](./.claude/settings.json), [`.claude/settings.local.json`](./.claude/settings.local.json) |
 | プロジェクトメモリ | ~/.claude/projects/ 配下のプロジェクトパスに対応するディレクトリ |

@@ -1,0 +1,50 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN"
+  "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>com.claude-hub.real-device-runner</string>
+
+    <!--
+      Real-device E2E runner (Issue #507): post-merge canary on main and the
+      `real-device` PR label handoff, every 15 minutes. See docs/real-device-runner.md.
+      Paths use a /Users/YOUR_USER placeholder; install with:
+        sed "s|/Users/YOUR_USER|$HOME|g" com.claude-hub.real-device-runner.plist \
+          > ~/Library/LaunchAgents/com.claude-hub.real-device-runner.plist
+        launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/com.claude-hub.real-device-runner.plist
+      Stop without uninstalling: touch ~/.local/state/real-device-runner/disabled
+    -->
+
+    <key>ProgramArguments</key>
+    <array>
+        <string>/bin/bash</string>
+        <string>/Users/YOUR_USER/claude-hub/scripts/real-device-runner.sh</string>
+    </array>
+
+    <key>WorkingDirectory</key>
+    <string>/Users/YOUR_USER/claude-hub</string>
+
+    <key>EnvironmentVariables</key>
+    <dict>
+        <key>PATH</key>
+        <string>/Users/YOUR_USER/.local/bin:/Users/YOUR_USER/.bun/bin:/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin</string>
+        <key>HOME</key>
+        <string>/Users/YOUR_USER</string>
+        <!-- launchd defaults to the C locale; the runner slices Japanese status text -->
+        <key>LANG</key>
+        <string>en_US.UTF-8</string>
+    </dict>
+
+    <key>StartInterval</key>
+    <integer>900</integer>
+
+    <key>StandardOutPath</key>
+    <string>/Users/YOUR_USER/claude-hub/logs/real-device-runner.log</string>
+    <key>StandardErrorPath</key>
+    <string>/Users/YOUR_USER/claude-hub/logs/real-device-runner.log</string>
+
+    <key>ProcessType</key>
+    <string>Background</string>
+</dict>
+</plist>
