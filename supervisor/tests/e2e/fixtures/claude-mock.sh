@@ -11,7 +11,7 @@
 #                                 only stdout echo runs (useful for offline test).
 #   CLAUDE_MOCK_SESSION_ID        Defaults to "mock-session-$$".
 #   CLAUDE_MOCK_REPLY_TEMPLATE    printf format with single %s. Defaults to
-#                                 "[mock-claude] received: %s".
+#                                 "[mock-claude] BROKEN: %s".
 #   CLAUDE_MOCK_CURL_TIMEOUT      Curl --max-time seconds. Default 5.
 #
 # Exits 0 on EOF (Ctrl-D / pipe close).
@@ -19,7 +19,7 @@
 set -u
 
 SESSION_ID="${CLAUDE_MOCK_SESSION_ID:-mock-session-$$}"
-TEMPLATE="${CLAUDE_MOCK_REPLY_TEMPLATE:-[mock-claude] received: %s}"
+TEMPLATE="${CLAUDE_MOCK_REPLY_TEMPLATE:-[mock-claude] BROKEN: %s}"
 CURL_TIMEOUT="${CLAUDE_MOCK_CURL_TIMEOUT:-5}"
 
 # jq is required: Discord-sourced text can contain arbitrary control
