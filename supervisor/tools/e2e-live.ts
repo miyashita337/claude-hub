@@ -36,8 +36,9 @@
  *   --keep             cleanup をスキップ（残骸をデバッグ用に残す）
  *   --full             S1 で最終レポート到達まで待つ（Phase 5 受け入れ実走向け）
  *   --brain-timeout-min <n>  S1 のオーケストレーター頭脳検証の上限（既定 20）
- *   --scenario <id>    1 シナリオだけ実行する（id は {@link SCENARIO_IDS}）。
- *                      省略時は全シナリオ。S2-4 / S2-5 の単体デバッグ用
+ *   --scenario <id>    指定シナリオだけ実行する（id は {@link SCENARIO_IDS}）。
+ *                      カンマ区切りで複数指定可（例: s1b,s2-4。実機ランナー #507 が
+ *                      モデル依存の s1 / s2-3 を除いて回すため）。省略時は全シナリオ
  *
  * S2-4（error loop）/ S2-5（kill→resume 再入）は Issue #386 で SKIP を解除した。
  * モデルの意味判断に依存しない**機構**部分だけを決定的に検証する:
@@ -111,8 +112,9 @@ export const SCENARIO_IDS = [
 ] as const;
 type ScenarioId = (typeof SCENARIO_IDS)[number];
 const SCENARIO = argVal("--scenario", "").toLowerCase();
+const SCENARIOS = SCENARIO.split(",").map((s) => s.trim()).filter(Boolean);
 /** 選択されたシナリオか（未指定なら全 true）。 */
-const wants = (id: ScenarioId): boolean => SCENARIO === "" || SCENARIO === id;
+const wants = (id: ScenarioId): boolean => SCENARIOS.length === 0 || SCENARIOS.includes(id);
 
 // ---------- 結果集計 ----------
 type Verdict = "PASS" | "FAIL" | "SKIP";
@@ -244,9 +246,15 @@ async function main(): Promise<number> {
   console.log(`== e2e-live (Issue #321 / #386) ${new Date().toISOString()} ==`);
 
   // 未知のシナリオ名は fail-closed（typo で「全部 SKIP されて 0 終了」を防ぐ）。
-  if (SCENARIO && !(SCENARIO_IDS as readonly string[]).includes(SCENARIO)) {
+  const unknown = SCENARIOS.filter((s) => !(SCENARIO_IDS as readonly string[]).includes(s));
+  if (unknown.length > 0) {
     record("ARGS", "--scenario の値", "FAIL",
-      `未知のシナリオ: ${SCENARIO}（指定可能: ${SCENARIO_IDS.join(" / ")}）`);
+      `未知のシナリオ: ${unknown.join(",")}（指定可能: ${SCENARIO_IDS.join(" / ")}）`);
+    return finish();
+  }
+  // `--scenario ,` のように値はあるが名前が 0 件なら、未指定（全シナリオ実行）と区別して止める
+  if (SCENARIO && SCENARIOS.length === 0) {
+    record("ARGS", "--scenario の値", "FAIL", `シナリオ名がありません: "${SCENARIO}"`);
     return finish();
   }
   if (SCENARIO) console.log(`-- シナリオ絞り込み: ${SCENARIO} --`);

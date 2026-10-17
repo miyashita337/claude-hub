@@ -45,9 +45,12 @@ echo "== [2/2] ライブ E2E（実 Discord 駆動） =="
 # worktree から実行しても driver token を発見できるように fallback し、
 # .env が無い環境（CI で --skip-live 実行等）では --env-file なしで起動する
 #（ライブ実行時は e2e-live.ts のプリフライトが token 欠如を fail-closed に検出する）。
+# --skip-live では .env を読ませない（ライブ手順を回さないので不要。実機ランナー #507 は
+# PR のコードをこの経路で実行するため、本番の Bot 設定を PR のコードへ渡さない）。
 ENV_FILE="${E2E_ENV_FILE:-$ROOT/supervisor/.env}"
 if [ ! -f "$ENV_FILE" ]; then ENV_FILE="$HOME/claude-hub/supervisor/.env"; fi
-if [ -f "$ENV_FILE" ]; then
+for a in "$@"; do [ "$a" = "--skip-live" ] && ENV_FILE=""; done
+if [ -n "$ENV_FILE" ] && [ -f "$ENV_FILE" ]; then
   exec bun --env-file="$ENV_FILE" "$ROOT/supervisor/tools/e2e-live.ts" "$@"
 else
   exec bun "$ROOT/supervisor/tools/e2e-live.ts" "$@"
