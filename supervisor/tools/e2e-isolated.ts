@@ -75,7 +75,7 @@ import { join, resolve } from "path";
 // ---------------------------------------------------------------------------
 
 /** error loop と判定するまでの同一署名の反復回数（policy B-3「3 回一致」）。 */
-export const ERROR_LOOP_THRESHOLD = 3;
+export const ERROR_LOOP_THRESHOLD = 4;
 
 const ANSI_ESCAPE = /\u001B\[[0-?]*[ -/]*[@-~]/g;
 const ISO_TIMESTAMP =
