@@ -30,6 +30,10 @@ auto-land は結果が出るまで merge しない（pending は WAITING、failu
 
 ランナーは PR のコードをこの Mac で実行するので、対象を **同一リポジトリのブランチから出た、許可した作者の PR**（`RDR_PR_AUTHORS`、既定 `miyashita337`）に限る。fork の PR は対象外。
 PR の段は `--skip-live` で動き、`supervisor/.env`（本番の Bot 設定）を PR のコードへ渡さない。
+ただし PR のコードは本番と同じ OS ユーザーで動くので、`~/claude-hub/supervisor/.env` をファイルとして直接読むことは防げない。
+この Mac の Claude セッションも同じユーザーで `.env` を読めるため、PR の段だけを隔離しても危険はほとんど減らないと判断し、
+作者とリポジトリの制限だけで運用している。許可する作者を増やすとき、または fork の PR を受け付けるときは、
+専用 OS ユーザーか `sandbox-exec` で `.env` を読めない状態にしてから広げること。
 
 再実行の判定は GitHub 上の `real-device/pr` の状態で行う。success / failure / error が付いた head は飛ばし、pending か未投稿なら実行する
 （push・reopen・ラベルの付け直しで workflow が pending に戻すと、次の周期で回り直す）。
