@@ -52,9 +52,11 @@ post_status() { # sha state context description
     || log "WARN: commit status 投稿に失敗 ($3 $2 ${1:0:8})"
 }
 
-notify() { # title message
+notify() { # title message [priority]
+  # RDR_NOTIFY_PREFIX: 手動の確認実行で「[テスト]」等を付け、本番の通知と見分けられるようにする
+  local title="${RDR_NOTIFY_PREFIX:-}$1"
   if [ -x "$NOTIFY_SCRIPT" ] || [ -f "$NOTIFY_SCRIPT" ]; then
-    bash "$NOTIFY_SCRIPT" "$1" "$2" || log "WARN: Pushover 通知に失敗: $1"
+    bash "$NOTIFY_SCRIPT" "$title" "$2" "${3:-1}" || log "WARN: Pushover 通知に失敗: $title"
   else
     log "WARN: 通知スクリプトが無い ($NOTIFY_SCRIPT): $1 — $2"
   fi
@@ -99,12 +101,16 @@ run_canary_e2e() { # logfile
     bash "$REPO_DIR/scripts/e2e-orchestrate.sh" --scenario "$CANARY_SCENARIOS" >"$1" 2>&1
 }
 
-# 同じ SHA の失敗 Issue は 1 件だけ（15 分ごとの再実行で増やさない。RW-075 の型）
+# 同じ SHA の失敗 Issue は 1 件だけ（15 分ごとの再実行で増やさない。RW-075 の型）。
+# 起票済み・新規いずれも URL を $STATE_DIR/issue-url-<short> に残し、通知本文に載せる。
+# gh issue list / create は GraphQL でレート制限を他ツールと共有するため REST を使う
 open_failure_issue() { # sha logfile
-  local sha="$1" short="${1:0:8}" body
-  if [ -n "$(gh issue list -R "$GH_REPO_SLUG" --state all --search "real-device canary $short in:title" \
-      --json number -q '.[].number' 2>/dev/null)" ]; then
-    log "既存の失敗 Issue あり ($short)。起票しない"
+  local sha="$1" short="${1:0:8}" body url
+  url=$(gh api "search/issues?q=repo:$GH_REPO_SLUG+in:title+%22real-device+canary+$short%22" \
+    -q '.items[0].html_url // ""' 2>/dev/null)
+  if [ -n "$url" ]; then
+    log "既存の失敗 Issue あり ($url)。起票しない"
+    echo "$url" >"$STATE_DIR/issue-url-$short"
     return 0
   fi
   body="$STATE_DIR/issue-$short.md"
@@ -117,9 +123,24 @@ open_failure_issue() { # sha logfile
     echo
     echo "全ログ: 実行した Mac の \`${2/#$HOME/~}\`"
   } >"$body"
-  local title="bug: real-device canary $short が FAIL"
-  gh issue create -R "$GH_REPO_SLUG" --title "$title" --body-file "$body" --label bug >/dev/null \
-    || gh issue create -R "$GH_REPO_SLUG" --title "$title" --body-file "$body" >/dev/null
+  url=$(gh api -X POST "repos/$GH_REPO_SLUG/issues" -f title="bug: real-device canary $short が FAIL" \
+    -F "body=@$body" -f 'labels[]=bug' -q .html_url 2>/dev/null) \
+    || url=$(gh api -X POST "repos/$GH_REPO_SLUG/issues" -f title="bug: real-device canary $short が FAIL" \
+      -F "body=@$body" -q .html_url) || return 1
+  echo "$url" >"$STATE_DIR/issue-url-$short"
+}
+
+# 通知本文。スマホの通知だけで「何が・どこで・次に何を見るか」が分かるようにする
+canary_message() { # sha description logfile
+  local subject
+  subject=$(git -C "$REPO_DIR" log -1 --format=%s "$1" 2>/dev/null)
+  echo "main ${1:0:8}: ${subject:-(件名不明)}"
+  echo "判定: $2"
+  if [ -n "$3" ] && [ -f "$3" ]; then
+    grep -E '^❌ \[' "$3" | sed -E 's/^❌ //' | cut -c1-120 | head -n 5
+  fi
+  [ -f "$STATE_DIR/issue-url-${1:0:8}" ] && echo "Issue: $(cat "$STATE_DIR/issue-url-${1:0:8}")"
+  echo "コミット: https://github.com/$GH_REPO_SLUG/commit/$1"
 }
 
 summary_line() { # logfile → 「N PASS / M FAIL / K SKIP」行（無ければ空）
@@ -198,11 +219,15 @@ canary() {
 finish_canary() { # sha state description logfile
   post_status "$1" "$2" "$CANARY_CONTEXT" "$3"
   if [ "$2" = "failure" ]; then
-    notify "claude-hub 実機 canary FAIL" "${1:0:8}: $3"
+    # 起票を先に行い、通知に Issue の URL を載せる
     if [ -n "$4" ] && ! open_failure_issue "$1" "$4"; then
       log "WARN: 失敗 Issue の起票に失敗。次回再試行"
       echo "$1 $4" >"$STATE_DIR/issue-retry"
     fi
+    notify "claude-hub 実機 canary FAIL（main ${1:0:8}）" "$(canary_message "$1" "$3" "$4")"
+  else
+    # 成功もスマホで確かめられるよう、音なし（-1）で知らせる
+    notify "claude-hub 実機 canary PASS（main ${1:0:8}）" "$(canary_message "$1" "$3" "$4")" -1
   fi
   echo "$1" >"$STATE_DIR/last-sha"
   rm -f "$STATE_DIR/deferred"

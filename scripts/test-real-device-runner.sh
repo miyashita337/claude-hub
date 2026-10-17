@@ -52,7 +52,7 @@ log() { :; }
 
 # --- stubs (recorded to $T/calls) ---
 post_status() { echo "status $1 $2 $3 $4" >>"$T/calls"; }
-notify() { echo "notify $1" >>"$T/calls"; }
+notify() { echo "notify $1 prio=${3:-1}" >>"$T/calls"; printf '%s\n' "$2" >"$T/last-notify-body"; }
 # RUNNING_SEQ="0 1" なら 1 回目 0、2 回目以降 1（チェックと再起動の間に始まるセッションの再現）
 running_session_count() {
   if [ -n "$RUNNING_SEQ" ]; then
@@ -66,16 +66,24 @@ running_session_count() {
 }
 kickstart_supervisor() { echo "kickstart" >>"$T/calls"; return "$KICK_RC"; }
 bun() { echo "bun $*" >>"$T/calls"; }
-run_canary_e2e() { echo "e2e" >>"$T/calls"; echo "合計: 6 PASS / 0 FAIL / 0 SKIP" >"$1"; return "$E2E_RC"; }
+run_canary_e2e() {
+  echo "e2e" >>"$T/calls"
+  if [ "$E2E_RC" -eq 0 ]; then
+    echo "合計: 6 PASS / 0 FAIL / 0 SKIP" >"$1"
+  else
+    printf '%s\n' "❌ [S2-4] error loop 停止 — 未検知: 同一署名 3 回" "合計: 5 PASS / 1 FAIL / 0 SKIP" >"$1"
+  fi
+  return "$E2E_RC"
+}
 gh() {
   echo "gh $*" >>"$T/calls"
   case "$1 $2" in
-    "issue list") echo "$ISSUE_EXISTS" ;;
-    "issue create") return "$ISSUE_CREATE_RC" ;;
+    "api search/issues"*) [ -n "$ISSUE_EXISTS" ] && echo "https://github.com/o/r/issues/$ISSUE_EXISTS" ;;
     "api repos/miyashita337/claude-hub/pulls?state=open&per_page=100") cat "$T/prs" 2>/dev/null ;;
     "api -X")
       case "$*" in
         *"/comments"*) return "$COMMENT_RC" ;;
+        *"/issues "*) [ "$ISSUE_CREATE_RC" -eq 0 ] && echo "https://github.com/o/r/issues/999"; return "$ISSUE_CREATE_RC" ;;
       esac ;;
   esac
 }
@@ -91,6 +99,9 @@ assert "1: ff-only でデプロイされる" test "$(git -C "$T/prod" rev-parse 
 assert "1: supervisor を再起動する" test "$(count "$T/calls" '^kickstart')" -eq 1
 assert "1: success status を投稿" grep -q "status $target success real-device/canary" "$T/calls"
 assert "1: last-sha を記録" test "$(cat "$T/state/last-sha")" = "$target"
+assert "1: PASS も音なしで通知（スマホで AC-1 を確かめられる）" grep -q "^notify claude-hub 実機 canary PASS.*prio=-1" "$T/calls"
+assert "1: 通知にコミット件名" grep -q "^main ${target:0:8}: c2$" "$T/last-notify-body"
+assert "1: 通知にコミットの URL" grep -q "^コミット: https://github.com/miyashita337/claude-hub/commit/$target$" "$T/last-notify-body"
 
 # 2. 同じ SHA → 何もしない
 : >"$T/calls"
@@ -129,14 +140,16 @@ target=$(git -C "$T/origin.git" rev-parse main)
 canary
 assert "6: failure status" grep -q "status $target failure real-device/canary" "$T/calls"
 assert "6: Pushover 通知" grep -q '^notify claude-hub 実機 canary FAIL' "$T/calls"
-assert "6: Issue を起票" test "$(count "$T/calls" '^gh issue create')" -eq 1
+assert "6: 通知に落ちたシナリオと理由" grep -q '^\[S2-4\] error loop 停止 — 未検知' "$T/last-notify-body"
+assert "6: 通知に Issue の URL" grep -q '^Issue: https://github.com/o/r/issues/999' "$T/last-notify-body"
+assert "6: Issue を起票" test "$(count "$T/calls" '^gh api -X POST repos/[^ ]*/issues -f')" -eq 1
 assert "6: 同じ SHA は再実行しない" test "$(cat "$T/state/last-sha")" = "$target"
 setup
 E2E_RC=1
 ISSUE_EXISTS=123
 push_commit c6b
 canary
-assert "6b: 同じ SHA の Issue があれば起票しない" test "$(count "$T/calls" '^gh issue create')" -eq 0
+assert "6b: 同じ SHA の Issue があれば起票しない" test "$(count "$T/calls" '^gh api -X POST repos/[^ ]*/issues -f')" -eq 0
 
 # 7. 本番ツリーに未コミット変更 → error で延期、触らない
 setup
@@ -221,7 +234,7 @@ assert "14: 再試行マーカーを残す" test -f "$T/state/issue-retry"
 ISSUE_CREATE_RC=0
 : >"$T/calls"
 canary
-assert "14: 次周期で起票し直す" test "$(count "$T/calls" '^gh issue create')" -ge 1
+assert "14: 次周期で起票し直す" test "$(count "$T/calls" '^gh api -X POST repos/[^ ]*/issues -f')" -ge 1
 assert "14: 成功したらマーカーを消す" test ! -f "$T/state/issue-retry"
 
 # 9. disabled → 何もしない
