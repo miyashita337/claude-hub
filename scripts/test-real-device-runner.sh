@@ -39,6 +39,7 @@ setup() {
   KICK_RC=0
   ISSUE_EXISTS=""
   ISSUE_CREATE_RC=0
+  COMMENT_RC=0
 }
 push_commit() {
   echo "$1" >>"$T/work/f" && git_q -C "$T/work" commit -am "$1" && git_q -C "$T/work" push origin main
@@ -71,7 +72,11 @@ gh() {
   case "$1 $2" in
     "issue list") echo "$ISSUE_EXISTS" ;;
     "issue create") return "$ISSUE_CREATE_RC" ;;
-    "pr list") cat "$T/prs" 2>/dev/null ;;
+    "api repos/miyashita337/claude-hub/pulls?state=open&per_page=100") cat "$T/prs" 2>/dev/null ;;
+    "api -X")
+      case "$*" in
+        *"/comments"*) return "$COMMENT_RC" ;;
+      esac ;;
   esac
 }
 run_pr() { echo "run_pr $1 $2" >>"$T/calls"; }
@@ -153,13 +158,26 @@ assert "8: pending（ラベル付け直し等）は再実行" test "$(count "$T/
 assert "8: status 未投稿も実行" test "$(count "$T/calls" '^run_pr 12 ccc')" -eq 1
 
 # 8b. fork の PR と許可外の作者の PR はこの Mac で実行しない（実際の jq で filter を評価）
+# REST /pulls の形（labels / head.repo / base.repo / user）
 sel=$(jq -r "$(pr_select_jq)" <<'JSON'
-[{"number":1,"headRefOid":"a","isCrossRepository":false,"author":{"login":"miyashita337"}},
- {"number":2,"headRefOid":"b","isCrossRepository":true,"author":{"login":"miyashita337"}},
- {"number":3,"headRefOid":"c","isCrossRepository":false,"author":{"login":"someone-else"}}]
+[{"number":1,"head":{"sha":"a","repo":{"full_name":"o/r"}},"base":{"repo":{"full_name":"o/r"}},"user":{"login":"miyashita337"},"labels":[{"name":"real-device"}]},
+ {"number":2,"head":{"sha":"b","repo":{"full_name":"fork/r"}},"base":{"repo":{"full_name":"o/r"}},"user":{"login":"miyashita337"},"labels":[{"name":"real-device"}]},
+ {"number":3,"head":{"sha":"c","repo":{"full_name":"o/r"}},"base":{"repo":{"full_name":"o/r"}},"user":{"login":"someone-else"},"labels":[{"name":"real-device"}]},
+ {"number":4,"head":{"sha":"d","repo":{"full_name":"o/r"}},"base":{"repo":{"full_name":"o/r"}},"user":{"login":"miyashita337"},"labels":[{"name":"bug"}]}]
 JSON
 )
-assert "8b: 同一リポ・許可作者の PR だけ選ぶ" test "$sel" = "1 a"
+assert "8b: real-device ラベル・同一リポ・許可作者の PR だけ選ぶ" test "$sel" = "1 a"
+
+# 8c. 結果コメントの投稿に失敗したら次周期で再投稿（GraphQL レート制限で 0 件だった実測の回帰）
+setup
+echo "body" >"$T/body.md"
+COMMENT_RC=1
+post_pr_comment 20 abcdef12 success "$T/body.md" "$T/log" 2>/dev/null
+assert "8c: 失敗したら再試行マーカーを残す" test -f "$T/state/comment-retry-20-abcdef12"
+COMMENT_RC=0
+: >"$T/prs"
+pr_handoff
+assert "8c: 次周期で再投稿してマーカーを消す" test ! -f "$T/state/comment-retry-20-abcdef12"
 
 # 11. 再起動に失敗 → last-sha を書かず次周期で再デプロイ（ツリーは新 SHA でも再起動し直す）
 setup

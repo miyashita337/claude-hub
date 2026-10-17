@@ -114,7 +114,7 @@ open_failure_issue() { # sha logfile
     echo "- 判定: $(summary_line "$2")"
     grep -E '^❌ \[' "$2" | sed -E 's/ — .*$//; s/^/- /' | head -n 20
     echo
-    echo "全ログ: 実行した Mac の \`$2\`"
+    echo "全ログ: 実行した Mac の \`${2/#$HOME/~}\`"
   } >"$body"
   local title="bug: real-device canary $short が FAIL"
   gh issue create -R "$GH_REPO_SLUG" --title "$title" --body-file "$body" --label bug >/dev/null \
@@ -236,11 +236,13 @@ defer() { # sha state reason
 
 # ---------- B. PR ハンドオフ ----------
 
+# gh の呼び出しは REST（gh api）に限る。gh pr list / gh pr comment は GraphQL を使い、
+# auto-land など同じアカウントの他ツールと枠を共有してレート制限に当たる（#507 の実測）
 pr_handoff() {
+  retry_pr_comments
   local lines
-  lines=$(gh pr list -R "$GH_REPO_SLUG" --label "$PR_LABEL" --state open \
-    --json number,headRefOid,isCrossRepository,author -q "$(pr_select_jq)") \
-    || { log "ERROR: gh pr list 失敗"; return 1; }
+  lines=$(gh api "repos/$GH_REPO_SLUG/pulls?state=open&per_page=100" -q "$(pr_select_jq)") \
+    || { log "ERROR: PR 一覧の取得に失敗"; return 1; }
   local n sha
   # fd 3 で読む（ループ内の gh / bun が標準入力を食べると後続 PR が読み落とされる）
   while read -r n sha <&3; do
@@ -272,9 +274,10 @@ run_pr() { # number sha
 
 # fork の PR と許可外の作者の PR は対象外（この Mac で他人のコードを実行しない）
 pr_select_jq() {
-  printf '%s' '.[] | select(.isCrossRepository | not)'
-  printf ' | select(.author.login as $a | "%s" | split(",") | index($a))' "$PR_AUTHORS"
-  printf '%s' ' | "\(.number) \(.headRefOid)"'
+  printf ' .[] | select(any(.labels[]; .name == "%s"))' "$PR_LABEL"
+  printf '%s' ' | select(.head.repo.full_name == .base.repo.full_name)'
+  printf ' | select(.user.login as $a | "%s" | split(",") | index($a))' "$PR_AUTHORS"
+  printf '%s' ' | "\(.number) \(.head.sha)"'
 }
 
 pr_status_state() { # sha → real-device/pr の最新 state（無ければ空）
@@ -294,9 +297,25 @@ post_pr_comment() { # number sha state table logfile
     cat "$4"
     echo
     echo "live Discord（s1b / s2-1 / s2-2 / s3）は merge 後の canary（\`$CANARY_CONTEXT\`）で実行されます。"
-    echo "全ログ: \`$5\`（実行した Mac 上）"
+    echo "全ログ: \`${5/#$HOME/~}\`（実行した Mac 上）"
   } >"$body"
-  gh pr comment "$1" -R "$GH_REPO_SLUG" --body-file "$body" >/dev/null || log "WARN: PR コメント投稿に失敗 (#$1)"
+  if ! gh api -X POST "repos/$GH_REPO_SLUG/issues/$1/comments" -F "body=@$body" >/dev/null; then
+    log "WARN: PR コメント投稿に失敗 (#$1)。次回再試行"
+    echo "$1 $body" >"$STATE_DIR/comment-retry-$1-${2:0:8}"
+  fi
+}
+
+# 投稿に失敗した結果コメントを再投稿する（status は success でも PR に結果表が無い状態を残さない）
+retry_pr_comments() {
+  local f n body
+  for f in "$STATE_DIR"/comment-retry-*; do
+    [ -f "$f" ] || continue
+    read -r n body <"$f"
+    if gh api -X POST "repos/$GH_REPO_SLUG/issues/$n/comments" -F "body=@$body" >/dev/null; then
+      rm -f "$f"
+      log "pr: #$n の結果コメントを再投稿"
+    fi
+  done
 }
 
 run_pr_suites() { # number sha logfile table → 全段 PASS で 0
@@ -369,7 +388,7 @@ main() {
   trap 'rm -rf "$STATE_DIR/lock"' EXIT
 
   if [ "${1:-}" = "--once-pr" ] && [ -n "${2:-}" ]; then
-    run_pr "$2" "$(gh pr view "$2" -R "$GH_REPO_SLUG" --json headRefOid -q .headRefOid)"
+    run_pr "$2" "$(gh api "repos/$GH_REPO_SLUG/pulls/$2" -q .head.sha)"
     return 0
   fi
   canary
