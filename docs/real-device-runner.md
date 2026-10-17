@@ -8,7 +8,7 @@ CI（ubuntu）では実 Discord・launchd・macOS 固有の環境差（PATH、`l
 
 | 段 | いつ | 何をする | 結果 |
 |---|---|---|---|
-| A. merge 後 canary | `origin/main` が前回検証した SHA から進んだとき | 稼働セッションが 0 件なら `~/claude-hub` を ff-only で更新し supervisor を再起動（= デプロイ）。続けて決定的なシナリオ `s1b,s2-1,s2-2,s2-4,s2-5,s3` を実 Discord で実行 | `real-device/canary` status。FAIL 時は Pushover + Issue（`bug: real-device canary <sha> が FAIL`、SHA ごとに 1 件） |
+| A. merge 後 canary | `origin/main` が前回検証した SHA から進んだとき | 稼働セッションが 0 件なら `~/claude-hub` を ff-only で更新し supervisor を再起動（= デプロイ）。続けて決定的なシナリオ `s1b,s2-1,s2-4,s2-5,s3` を実 Discord で実行 | `real-device/canary` status。FAIL 時は Pushover + Issue（`bug: real-device canary <sha> が FAIL`、SHA ごとに 1 件） |
 | B. PR の引き継ぎ | open PR に `real-device` ラベルがあり、head が未実行のとき | PR head を一時 worktree に取り出し、hermetic 回帰（`e2e-orchestrate.sh --skip-live`）と隔離スタック s2-4 / s2-5 を macOS 上で実行 | `real-device/pr` status + PR コメント（結果表） |
 
 - **稼働セッションがあるときはデプロイしない。** status を `pending`（延期）にして次回に回す。24 時間延期が続いたら 1 回だけ Pushover で知らせる。セッションを止めるかは人が決める

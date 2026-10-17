@@ -29,8 +29,9 @@ NOTIFY_SCRIPT="${RDR_NOTIFY_SCRIPT:-$HOME/.claude/scripts/pushover-notify.sh}"
 PR_LABEL="${RDR_PR_LABEL:-real-device}"
 # PR の段はこの Mac で PR のコードを実行する。同一リポかつこの作者の PR だけを対象にする
 PR_AUTHORS="${RDR_PR_AUTHORS:-miyashita337}"
-# モデルの判断に依存して結果が揺れる s1 / s2-3 は含めない（flaky な canary は信頼されなくなる）
-CANARY_SCENARIOS="${RDR_CANARY_SCENARIOS:-s1b,s2-1,s2-2,s2-4,s2-5,s3}"
+# モデルの判断に依存して結果が揺れる s1 / s2-3 は含めない（flaky な canary は信頼されなくなる）。
+# s2-2 は s2-3 で起動したオーケストレーターが前提のため、s2-3 なしでは常に SKIP になる（実測）
+CANARY_SCENARIOS="${RDR_CANARY_SCENARIOS:-s1b,s2-1,s2-4,s2-5,s3}"
 # supervisor 再起動後、relay port ファイルが書かれるまでの待ち
 BOOT_WAIT_SEC="${RDR_BOOT_WAIT_SEC:-30}"
 # 稼働セッションのせいでこの秒数以上デプロイできていなければ 1 回だけ通知する
@@ -296,7 +297,7 @@ post_pr_comment() { # number sha state table logfile
     echo "|---|---|---|"
     cat "$4"
     echo
-    echo "live Discord（s1b / s2-1 / s2-2 / s3）は merge 後の canary（\`$CANARY_CONTEXT\`）で実行されます。"
+    echo "live Discord（s1b / s2-1 / s3）は merge 後の canary（\`$CANARY_CONTEXT\`）で実行されます。"
     echo "全ログ: \`${5/#$HOME/~}\`（実行した Mac 上）"
   } >"$body"
   if ! gh api -X POST "repos/$GH_REPO_SLUG/issues/$1/comments" -F "body=@$body" >/dev/null; then
