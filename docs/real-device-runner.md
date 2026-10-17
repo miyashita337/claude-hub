@@ -15,6 +15,8 @@ CI（ubuntu）では実 Discord・launchd・macOS 固有の環境差（PATH、`l
 - 本番ツリー（`~/claude-hub`）が main 以外のブランチ、または追跡ファイルに未コミット変更があるときも触らない（status `error`）
 - 再起動の直前にもう一度稼働セッションを数える（取り込み中に始まったセッションを巻き込まない）
 - `bun install` や再起動に失敗したら status `failure` + Pushover。検証済みとは記録せず、次の周期でデプロイからやり直す
+- 本番ツリーが既に対象 SHA でも、その SHA で supervisor を再起動した記録（`deployed-sha`）がなければ再起動してから検証する（手動の `git pull` 後や初回導入時に旧コードを検証しない）
+- 結果の status を GitHub に投稿できなかったときは、E2E をやり直さずに次の周期で投稿し直す
 - リポジトリは public なので、失敗 Issue には判定行と FAIL したシナリオ名だけを載せる。ログ本文はこの Mac の `runs/` にだけ残す
 - 1 回の実行は 45 分で打ち切り、配下のプロセス（bun / e2e-live / tmux 起動）ごと止める
 - モデルの判断で結果が揺れる s1 / s2-3 は canary に入れない。必要なら手動で `bash scripts/e2e-orchestrate.sh` を回す
@@ -39,6 +41,8 @@ sed "s|/Users/YOUR_USER|$HOME|g" com.claude-hub.real-device-runner.plist \
   > ~/Library/LaunchAgents/com.claude-hub.real-device-runner.plist
 launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/com.claude-hub.real-device-runner.plist
 ```
+
+初回の周期で、稼働セッションが 0 件なら supervisor を 1 回再起動する（上の `deployed-sha` の記録がまだ無いため）。
 
 前提は `docs/e2e-orchestrate.md` の「前提（手動準備・初回のみ）」と同じ（driver Bot token、corp の `allowFrom`、orchestrate-runner スキル）。
 

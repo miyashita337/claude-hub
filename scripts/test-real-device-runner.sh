@@ -40,6 +40,8 @@ setup() {
   ISSUE_EXISTS=""
   ISSUE_CREATE_RC=0
   COMMENT_RC=0
+  POST_RC=0
+  SEARCH_RC=0
 }
 push_commit() {
   echo "$1" >>"$T/work/f" && git_q -C "$T/work" commit -am "$1" && git_q -C "$T/work" push origin main
@@ -49,9 +51,11 @@ export RDR_REPO_DIR="$T/prod" RDR_STATE_DIR="$T/state" RDR_DEFER_ALERT_SEC=100
 # shellcheck source=real-device-runner.sh
 source "$REPO_DIR_SRC/scripts/real-device-runner.sh"
 log() { :; }
+# 稼働数の集計は本物を残して 16 で検査する（下で stub に差し替える前に複製）
+eval "orig_running_session_count() $(declare -f running_session_count | tail -n +2)"
 
 # --- stubs (recorded to $T/calls) ---
-post_status() { echo "status $1 $2 $3 $4" >>"$T/calls"; }
+post_status() { echo "status $1 $2 $3 $4" >>"$T/calls"; return "$POST_RC"; }
 notify() { echo "notify $1 prio=${3:-1}" >>"$T/calls"; printf '%s\n' "$2" >"$T/last-notify-body"; }
 # RUNNING_SEQ="0 1" なら 1 回目 0、2 回目以降 1（チェックと再起動の間に始まるセッションの再現）
 running_session_count() {
@@ -78,7 +82,7 @@ run_canary_e2e() {
 gh() {
   echo "gh $*" >>"$T/calls"
   case "$1 $2" in
-    "api search/issues"*) [ -n "$ISSUE_EXISTS" ] && echo "https://github.com/o/r/issues/$ISSUE_EXISTS" ;;
+    "api search/issues"*) [ -n "$ISSUE_EXISTS" ] && echo "https://github.com/o/r/issues/$ISSUE_EXISTS"; return "$SEARCH_RC" ;;
     "api repos/miyashita337/claude-hub/pulls?state=open&per_page=100") cat "$T/prs" 2>/dev/null ;;
     "api -X")
       case "$*" in
@@ -236,6 +240,43 @@ ISSUE_CREATE_RC=0
 canary
 assert "14: 次周期で起票し直す" test "$(count "$T/calls" '^gh api -X POST repos/[^ ]*/issues -f')" -ge 1
 assert "14: 成功したらマーカーを消す" test ! -f "$T/state/issue-retry"
+
+# 16. 稼働数はセッション行だけ数える（session-ctl list の集計行「計 N 件 (status=running)」を含めない）
+rsc_with() { RSC_OUT="$1"; ( bun() { printf '%b\n' "$RSC_OUT"; }; orig_running_session_count ); }
+assert "16: 0 件の出力は 0" test "$(rsc_with '(running セッションなし)')" = 0
+assert "16: 2 件 + 集計行は 2" test "$(rsc_with 'id=1\tstatus=running\nid=2\tstatus=running\n計 2 件 (status=running)')" = 2
+
+# 17. 最終 status の投稿に失敗したら、E2E をやり直さずに次周期で再投稿する
+setup
+POST_RC=1
+push_commit c17
+target=$(git -C "$T/origin.git" rev-parse main)
+canary
+assert "17: 再投稿マーカーを残す" test -f "$T/state/status-retry"
+POST_RC=0
+: >"$T/calls"
+canary
+assert "17: 次周期で success を再投稿" grep -q "status $target success real-device/canary PASS" "$T/calls"
+assert "17: E2E は再実行しない" test "$(count "$T/calls" '^e2e')" -eq 0
+assert "17: 投稿できたらマーカーを消す" test ! -f "$T/state/status-retry"
+
+# 18. 既存 Issue の検索に失敗したら起票せず再試行に回す（重複 Issue を作らない）
+setup
+E2E_RC=1
+SEARCH_RC=1
+push_commit c18
+canary
+assert "18: 検索失敗では起票しない" test "$(count "$T/calls" '^gh api -X POST repos/[^ ]*/issues -f')" -eq 0
+assert "18: 再試行マーカーを残す" test -f "$T/state/issue-retry"
+
+# 19. ツリーが既に target でも、その SHA で再起動した記録がなければ再起動する（手動 pull・初回導入）
+setup
+push_commit c19
+target=$(git -C "$T/origin.git" rev-parse main)
+git_q -C "$T/prod" pull -q --ff-only
+canary
+assert "19: 旧コードの supervisor を再起動してから検証" test "$(count "$T/calls" '^kickstart')" -eq 1
+assert "19: 再起動した SHA を記録" test "$(cat "$T/state/deployed-sha")" = "$target"
 
 # 9. disabled → 何もしない
 setup

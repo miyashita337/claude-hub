@@ -252,6 +252,11 @@ async function main(): Promise<number> {
       `未知のシナリオ: ${unknown.join(",")}（指定可能: ${SCENARIO_IDS.join(" / ")}）`);
     return finish();
   }
+  // `--scenario ,` のように値はあるが名前が 0 件なら、未指定（全シナリオ実行）と区別して止める
+  if (SCENARIO && SCENARIOS.length === 0) {
+    record("ARGS", "--scenario の値", "FAIL", `シナリオ名がありません: "${SCENARIO}"`);
+    return finish();
+  }
   if (SCENARIO) console.log(`-- シナリオ絞り込み: ${SCENARIO} --`);
 
   if (SKIP_LIVE) {

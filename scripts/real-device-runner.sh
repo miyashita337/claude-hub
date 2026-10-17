@@ -38,6 +38,8 @@ BOOT_WAIT_SEC="${RDR_BOOT_WAIT_SEC:-30}"
 DEFER_ALERT_SEC="${RDR_DEFER_ALERT_SEC:-86400}"
 # 1 回の E2E 実行の上限（e2e-live の S2-3 は 8 分待つので余裕を持たせる）
 RUN_TIMEOUT_SEC="${RDR_RUN_TIMEOUT_SEC:-2700}"
+# bun install の上限（固まるとロックを握ったまま以降の周期がすべてスキップされる）
+INSTALL_TIMEOUT_SEC="${RDR_INSTALL_TIMEOUT_SEC:-600}"
 
 CANARY_CONTEXT="real-device/canary"
 PR_CONTEXT="real-device/pr"
@@ -46,10 +48,11 @@ log() { echo "[$(date '+%Y-%m-%dT%H:%M:%S%z')] $*"; }
 
 # ---------- 外部とのやり取り（テストでは差し替える） ----------
 
-post_status() { # sha state context description
+post_status() { # sha state context description → 投稿できなければ 1
   gh api -X POST "repos/$GH_REPO_SLUG/statuses/$1" \
-    -f state="$2" -f context="$3" -f description="${4:0:140}" >/dev/null \
-    || log "WARN: commit status 投稿に失敗 ($3 $2 ${1:0:8})"
+    -f state="$2" -f context="$3" -f description="${4:0:140}" >/dev/null && return 0
+  log "WARN: commit status 投稿に失敗 ($3 $2 ${1:0:8})"
+  return 1
 }
 
 notify() { # title message [priority]
@@ -68,7 +71,8 @@ running_session_count() {
     log "ERROR: session-ctl list が失敗: $out"
     return 1
   fi
-  printf '%s\n' "$out" | grep -c 'status=running' || true
+  # セッション行（id=…）だけを数える。末尾の集計行「計 N 件 (status=running)」は含めない
+  printf '%s\n' "$out" | grep -c '^id=.*status=running' || true
 }
 
 kickstart_supervisor() {
@@ -96,6 +100,10 @@ run_with_timeout() { # secs cmd...
   return "$rc"
 }
 
+bun_install() { # dir
+  (cd "$1" && bun install --frozen-lockfile)
+}
+
 run_canary_e2e() { # logfile
   run_with_timeout "$RUN_TIMEOUT_SEC" \
     bash "$REPO_DIR/scripts/e2e-orchestrate.sh" --scenario "$CANARY_SCENARIOS" >"$1" 2>&1
@@ -106,8 +114,12 @@ run_canary_e2e() { # logfile
 # gh issue list / create は GraphQL でレート制限を他ツールと共有するため REST を使う
 open_failure_issue() { # sha logfile
   local sha="$1" short="${1:0:8}" body url
-  url=$(gh api "search/issues?q=repo:$GH_REPO_SLUG+in:title+%22real-device+canary+$short%22" \
-    -q '.items[0].html_url // ""' 2>/dev/null)
+  # 検索の失敗を「該当なし」と扱うと、一時的な API 障害だけで同じ SHA の Issue が重複する
+  if ! url=$(gh api "search/issues?q=repo:$GH_REPO_SLUG+in:title+%22real-device+canary+$short%22" \
+    -q '.items[0].html_url // ""'); then
+    log "WARN: 既存 Issue の検索に失敗"
+    return 1
+  fi
   if [ -n "$url" ]; then
     log "既存の失敗 Issue あり ($url)。起票しない"
     echo "$url" >"$STATE_DIR/issue-url-$short"
@@ -156,6 +168,12 @@ canary() {
     read -r rsha rlog <"$STATE_DIR/issue-retry"
     open_failure_issue "$rsha" "$rlog" && rm -f "$STATE_DIR/issue-retry"
   fi
+  # 前回の最終 status を投稿できていなければ再投稿する（E2E はやり直さない）
+  if [ -f "$STATE_DIR/status-retry" ]; then
+    local ssha sstate sdesc
+    { read -r ssha sstate; read -r sdesc; } <"$STATE_DIR/status-retry"
+    post_status "$ssha" "$sstate" "$CANARY_CONTEXT" "$sdesc" && rm -f "$STATE_DIR/status-retry"
+  fi
   git -C "$REPO_DIR" fetch -q origin main || { log "ERROR: git fetch 失敗"; return 1; }
   local target last
   target=$(git -C "$REPO_DIR" rev-parse origin/main)
@@ -182,28 +200,27 @@ canary() {
 
   local before
   before=$(git -C "$REPO_DIR" rev-parse HEAD)
-  # 前回のデプロイが途中で失敗していたら（ツリーは新 SHA、supervisor は旧コード）やり直す
-  local redeploy=""
-  [ "$(cat "$STATE_DIR/deploy-failed" 2>/dev/null)" = "$target" ] && redeploy=1
-  if [ "$before" != "$target" ] || [ -n "$redeploy" ]; then
+  # supervisor が target のコードで動いているかは「最後に再起動できた SHA」で判断する。
+  # ツリーだけ新しい（デプロイ途中の失敗・手動の git pull・初回導入）なら旧コードが動いている
+  if [ "$(cat "$STATE_DIR/deployed-sha" 2>/dev/null)" != "$target" ] || [ "$before" != "$target" ]; then
     if [ "$before" != "$target" ] && ! git -C "$REPO_DIR" merge -q --ff-only origin/main; then
       defer "$target" "error" "ff-only merge 失敗（本番ツリーが main から分岐）"
       return 0
     fi
-    if [ -n "$redeploy" ] || ! git -C "$REPO_DIR" diff --quiet "$before" "$target" -- supervisor/bun.lock supervisor/package.json; then
-      (cd "$REPO_DIR/supervisor" && bun install --frozen-lockfile) \
+    # 取り込み済みのツリーを再起動し直すときは、前回の install が済んだか分からないので必ず入れる
+    if [ "$before" = "$target" ] || ! git -C "$REPO_DIR" diff --quiet "$before" "$target" -- supervisor/bun.lock supervisor/package.json; then
+      run_with_timeout "$INSTALL_TIMEOUT_SEC" bun_install "$REPO_DIR/supervisor" \
         || { deploy_failed "$target" "bun install 失敗"; return 0; }
     fi
     # fetch / merge / install の間に始まったセッションを巻き込まない
     running=$(running_session_count) || { deploy_failed "$target" "session-ctl list が失敗"; return 0; }
     if [ "$running" -gt 0 ]; then
-      echo "$target" >"$STATE_DIR/deploy-failed"
       defer "$target" "pending" "稼働セッション ${running} 件のためデプロイ延期"
       return 0
     fi
     log "canary: ${before:0:8} → ${target:0:8} をデプロイ（supervisor 再起動）"
     kickstart_supervisor || { deploy_failed "$target" "supervisor の再起動に失敗"; return 0; }
-    rm -f "$STATE_DIR/deploy-failed"
+    echo "$target" >"$STATE_DIR/deployed-sha"
   fi
 
   post_status "$target" pending "$CANARY_CONTEXT" "実機 E2E 実行中 ($CANARY_SCENARIOS)"
@@ -217,7 +234,9 @@ canary() {
 }
 
 finish_canary() { # sha state description logfile
-  post_status "$1" "$2" "$CANARY_CONTEXT" "$3"
+  if ! post_status "$1" "$2" "$CANARY_CONTEXT" "$3"; then
+    printf '%s %s\n%s\n' "$1" "$2" "$3" >"$STATE_DIR/status-retry"
+  fi
   if [ "$2" = "failure" ]; then
     # 起票を先に行い、通知に Issue の URL を載せる
     if [ -n "$4" ] && ! open_failure_issue "$1" "$4"; then
@@ -234,9 +253,8 @@ finish_canary() { # sha state description logfile
   log "canary: ${1:0:8} $2 — $3"
 }
 
-# デプロイ失敗: last-sha は書かず次周期でやり直す。status と通知は SHA・理由ごとに 1 回
+# デプロイ失敗: last-sha も deployed-sha も書かず次周期でやり直す。status と通知は SHA・理由ごとに 1 回
 deploy_failed() { # sha reason
-  echo "$1" >"$STATE_DIR/deploy-failed"
   defer "$1" "failure" "デプロイ失敗: $2"
 }
 
@@ -352,7 +370,7 @@ run_pr_suites() { # number sha logfile table → 全段 PASS で 0
     echo "| 準備 | FAIL | PR head の取り出しに失敗 |" >>"$table"
     return 1
   fi
-  if ! (cd "$wt/supervisor" && bun install --frozen-lockfile) >>"$logf" 2>&1; then
+  if ! run_with_timeout "$INSTALL_TIMEOUT_SEC" bun_install "$wt/supervisor" >>"$logf" 2>&1; then
     echo "| 準備 | FAIL | bun install 失敗 |" >>"$table"
     rc=1
   else
