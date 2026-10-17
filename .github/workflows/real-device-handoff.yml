@@ -1,0 +1,32 @@
+# Marks `real-device` labelled PRs as pending until the Mac runner reports (Issue #507).
+#
+# scripts/real-device-runner.sh polls every 15 minutes, so without this a PR
+# could look all-green to auto-land between the label/push and the first poll.
+# auto-land treats a pending StatusContext as WAITING, so posting it here closes
+# that window. The runner later overwrites the same context with success/failure.
+name: Real-device handoff
+
+on:
+  pull_request:
+    types: [labeled, synchronize, reopened]
+
+permissions:
+  statuses: write
+
+jobs:
+  mark-pending:
+    # labeled は任意のラベル付与で発火する。real-device 以外のラベルで既存の判定を
+    # pending に戻すと、runner の結果が上書きされたまま auto-land が待ち続けるため絞る
+    if: >-
+      contains(github.event.pull_request.labels.*.name, 'real-device') &&
+      (github.event.action != 'labeled' || github.event.label.name == 'real-device')
+    runs-on: ubuntu-latest
+    steps:
+      - name: Post pending real-device/pr status
+        env:
+          GH_TOKEN: ${{ github.token }}
+          SHA: ${{ github.event.pull_request.head.sha }}
+        run: |
+          gh api -X POST "repos/${GITHUB_REPOSITORY}/statuses/${SHA}" \
+            -f state=pending -f context=real-device/pr \
+            -f description="Mac の実機ランナー待ち（15 分以内に開始）"

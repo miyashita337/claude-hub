@@ -21,6 +21,7 @@ bun --env-file=supervisor/.env supervisor/tools/e2e-live.ts --scenario s2-5
 ```
 
 `--scenario` に指定できるのは `s1 / s1b / s2-1 / s2-2 / s2-3 / s2-4 / s2-5 / s3`。
+カンマ区切りで複数指定できる（例: `--scenario s1b,s2-4`。実機ランナー `docs/real-device-runner.md` が使う）。
 未知の値は fail-closed（typo で「全部スキップして 0 終了」にならない）。
 
 終了時に PASS/FAIL/SKIP のサマリ表を出力し、FAIL が 1 件でもあれば exit 1。

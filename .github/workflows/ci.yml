@@ -436,6 +436,9 @@ jobs:
       - name: Run launchd plist placeholder tests (#198)
         run: bash scripts/test-plist-placeholders.sh
 
+      - name: Run real-device runner branching tests (#507)
+        run: bash scripts/test-real-device-runner.sh
+
   # E2E verification of the Discord ↔ Supervisor ↔ Claude Code relay chain.
   # Covers AC-4/5/6/7 hermetically (tmux + mock claude + relay-server HTTP).
   # AC-1/2/3 require a live Discord bot token and are documented as manual
