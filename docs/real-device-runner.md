@@ -59,6 +59,18 @@ launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/com.claude-hub.real-devi
 | 同じ SHA の canary をやり直す | `rm ~/.local/state/real-device-runner/last-sha` |
 | 動いているか見る | `~/claude-hub/logs/real-device-runner.log`（実行ごとの全出力は `~/.local/state/real-device-runner/runs/`） |
 
+## 実測（この Mac: 10 コア / 32GB）
+
+| 状態 | 起きる頻度 | 所要時間 | CPU | メモリ |
+|---|---|---|---|---|
+| 何もしない周期 | 15 分ごと | 約 2.9 秒 | user+sys 約 0.25 秒 | 最大 46MB |
+| PR の段（hermetic + s2-4/s2-5） | ラベル付き PR の head が変わったとき | 約 97 秒 | 平均 1%・ピーク 20%（1 コア比） | プロセス合計のピーク 77MB |
+| canary（再起動 + live） | main が進んだとき 1 回 | 再起動から結果まで約 3 分 40 秒 | 未計測 | 未計測 |
+
+初回の本番運用（#508 merge 後、2026-10-18）: 稼働セッションがあるあいだ延期を 17 回（02:41〜06:42）。
+0 件になった 06:57 に supervisor を再起動し、07:00 に `16 PASS / 0 FAIL / 4 SKIP` で `real-device/canary` success。
+このときは本番ツリーを手動で c7d5704 に更新したため（ランナー本体が本番ツリーに入るまでの初回だけ）、自動の取り込みは次の merge で確認する。
+
 ## 撤退基準
 
 導入 1 か月後に、canary・PR の段のどちらも「merge 前後に不具合を検知した」実例が 0 件で、延期だけが続いているなら、
