@@ -88,5 +88,14 @@ for tpl in $TEMPLATES; do
   fi
 done
 
+# 4. The supervisor serves interactive requests (Discord, Pushover one-tap
+#    /act), so it must not run as ProcessType=Background. Under heavy load
+#    launchd's Background throttling starved it: /act gave no response for
+#    15 s while an otherwise identical Standard job answered in under 0.2 s
+#    (Issue #520).
+sup_type=$(grep -A1 '<key>ProcessType</key>' com.claude-hub.supervisor.plist | grep -oE '<string>[^<]+</string>' | sed -E 's#</?string>##g' || true)
+assert "supervisor plist ProcessType is not Background (got: ${sup_type:-unset})" \
+  test "$sup_type" != "Background"
+
 echo "Results: $PASS passed, $FAIL failed, $SKIP skipped"
 [ "$FAIL" -eq 0 ]
