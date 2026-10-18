@@ -131,7 +131,8 @@ open_failure_issue() { # sha logfile
     echo "main の \`$sha\` で実機 canary（scripts/real-device-runner.sh）が FAIL しました。"
     echo
     echo "- 判定: $(summary_line "$2")"
-    grep -E '^❌ \[' "$2" | sed -E 's/ — .*$//; s/^/- /' | head -n 20
+    # live の行だけ理由（— 以降）を落とす。bun test のテスト名は — を含むことがある
+    failed_lines "$2" | sed -E '/^\[/s/ — .*$//; s/^/- /' | head -n 20
     echo
     echo "全ログ: 実行した Mac の \`${2/#$HOME/~}\`"
   } >"$body"
@@ -149,14 +150,31 @@ canary_message() { # sha description logfile
   echo "main ${1:0:8}: ${subject:-(件名不明)}"
   echo "判定: $2"
   if [ -n "$3" ] && [ -f "$3" ]; then
-    grep -E '^❌ \[' "$3" | sed -E 's/^❌ //' | cut -c1-120 | head -n 5
+    failed_lines "$3" | cut -c1-120 | head -n 5
   fi
   [ -f "$STATE_DIR/issue-url-${1:0:8}" ] && echo "Issue: $(cat "$STATE_DIR/issue-url-${1:0:8}")"
   echo "コミット: https://github.com/$GH_REPO_SLUG/commit/$1"
 }
 
-summary_line() { # logfile → 「N PASS / M FAIL / K SKIP」行（無ければ空）
-  grep -E '^合計: ' "$1" | tail -n 1 | sed 's/^合計: //'
+summary_line() { # logfile → 「N PASS / M FAIL / K SKIP」行。live の集計まで届かなければ止まった段
+  local s stage nfail
+  s=$(grep -E '^合計: ' "$1" | tail -n 1 | sed 's/^合計: //')
+  if [ -z "$s" ]; then
+    # 前段の bun test（hermetic 回帰）で落ちると「合計:」行が出ず、判定が空になっていた（#523）
+    stage=$(grep -E '^== \[[0-9]+/[0-9]+\] ' "$1" | tail -n 1 | sed -E 's/^== //; s/ ==$//')
+    nfail=$(grep -E '^ *[0-9]+ fail$' "$1" | tail -n 1 | tr -dc '0-9')
+    s="${stage:-判定行なし（ログ参照）}${stage:+で停止}${nfail:+（bun test ${nfail} fail）}"
+  fi
+  echo "$s"
+}
+
+failed_lines() { # logfile → 落ちたシナリオ（live）か、無ければ落ちたテスト名（bun test）。重複は除く
+  if grep -qE '^❌ \[' "$1"; then
+    grep -E '^❌ \[' "$1" | sed -E 's/^❌ //'
+  else
+    # bun test は末尾で (fail) 行を再掲するので重複を落とす
+    grep -E '^\(fail\) ' "$1" | sed -E 's/ \[[0-9.]+ms\]$//' | awk '!seen[$0]++'
+  fi
 }
 
 # ---------- A. post-merge canary ----------
