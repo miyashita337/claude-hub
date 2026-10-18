@@ -82,7 +82,10 @@
     <key>ExitTimeOut</key>
     <integer>30</integer>
 
+    <!-- Standard, not Background: the supervisor answers Discord and Pushover
+         one-tap /act requests. Under heavy load, Background throttling left
+         /act unanswered for 15 s (Issue #520). -->
     <key>ProcessType</key>
-    <string>Background</string>
+    <string>Standard</string>
 </dict>
 </plist>
