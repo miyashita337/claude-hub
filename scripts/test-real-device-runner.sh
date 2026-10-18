@@ -35,7 +35,7 @@ setup() {
   : >"$T/calls"
   RUNNING=0
   RUNNING_SEQ=""
-  E2E_RC=0
+  E2E_RC=0 E2E_LOG=""
   KICK_RC=0
   ISSUE_EXISTS=""
   ISSUE_CREATE_RC=0
@@ -74,6 +74,15 @@ run_canary_e2e() {
   echo "e2e" >>"$T/calls"
   if [ "$E2E_RC" -eq 0 ]; then
     echo "合計: 6 PASS / 0 FAIL / 0 SKIP" >"$1"
+  elif [ "$E2E_LOG" = hermetic ]; then
+    # live の「合計:」行まで届かず、前段の bun test で落ちた実ログ（2026-10-18 078a0aff）の形
+    printf '%s\n' "== [1/2] S3 hermetic 回帰（既存機能の非破壊） ==" \
+      "(fail) tmuxSend integration (Issue #73 / AC-7) > ensurePaneNotInMode exits copy-mode [5011.61ms]" \
+      "  ^ this test timed out after 5000ms." \
+      "(fail) Issue #57 dialog stall — E2E with real tmux > AC-1: bash y/n dialog [3336.11ms]" \
+      "(fail) AC E2E verification (Issue #73) > AC-5: mock claude inside tmux receives and processes input [5029.63ms]" \
+      "(fail) tmuxSend integration (Issue #73 / AC-7) > ensurePaneNotInMode exits copy-mode [5011.61ms]" \
+      "" " 27 pass" " 3 skip" " 9 fail" " 2 errors" >"$1"
   else
     printf '%s\n' "❌ [S2-4] error loop 停止 — 未検知: 同一署名 3 回" "合計: 5 PASS / 1 FAIL / 0 SKIP" >"$1"
   fi
@@ -154,6 +163,21 @@ ISSUE_EXISTS=123
 push_commit c6b
 canary
 assert "6b: 同じ SHA の Issue があれば起票しない" test "$(count "$T/calls" '^gh api -X POST repos/[^ ]*/issues -f')" -eq 0
+
+# 6c. live の前段（hermetic 回帰）で落ちても「判定」を空にしない（#523 は「判定: 」だけだった）
+setup
+E2E_RC=1
+E2E_LOG=hermetic
+push_commit c6c
+target=$(git -C "$T/origin.git" rev-parse main)
+canary
+assert "6c: status に止まった段と件数" grep -q "status $target failure real-device/canary FAIL: \[1/2\] S3 hermetic 回帰（既存機能の非破壊）で停止（bun test 9 fail）" "$T/calls"
+assert "6c: 通知に落ちたテスト名" grep -q '^(fail) tmuxSend integration (Issue #73 / AC-7) > ensurePaneNotInMode exits copy-mode' "$T/last-notify-body"
+assert "6c: 通知でテスト名を重複させない" test "$(grep -c 'ensurePaneNotInMode exits copy-mode' "$T/last-notify-body")" -eq 1
+assert "6c: Issue 本文の判定が空でない" grep -q '^- 判定: .*で停止' "$T/state/issue-${target:0:8}.md"
+assert "6c: Issue 本文に落ちたテスト名" grep -q '^- (fail) AC E2E verification (Issue #73) > AC-5' "$T/state/issue-${target:0:8}.md"
+assert "6c: — を含むテスト名を途中で切らない" grep -q '^- (fail) Issue #57 dialog stall — E2E with real tmux > AC-1' "$T/state/issue-${target:0:8}.md"
+E2E_LOG=""
 
 # 7. 本番ツリーに未コミット変更 → error で延期、触らない
 setup
