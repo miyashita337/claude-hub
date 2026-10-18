@@ -169,7 +169,8 @@ describe("ask-user-remote.sh (via ask-user-relay.sh)", () => {
     const long = JSON.stringify({
       session_id: "s",
       tool_name: "AskUserQuestion",
-      tool_input: { questions: [{ question: "長".repeat(3000), options: [{ label: "A" }] }] },
+      // quotes grow 6x when escaped (" → &quot;), so the cut must happen after escaping
+      tool_input: { questions: [{ question: '"'.repeat(3000), options: [{ label: "A" }] }] },
       cwd: "/Users/x/proj",
     });
     await $`echo ${long} | bash ${RELAY_HOOK}`
@@ -189,7 +190,7 @@ describe("ask-user-remote.sh (via ask-user-relay.sh)", () => {
       .nothrow();
     const body = notifications()[0]![2]!;
     expect(body.length).toBeLessThan(1024);
-    expect(body).toContain("…");
+    expect(body).toContain("&quot;…");
     expect(body).toContain("👉 回答する");
   });
 });

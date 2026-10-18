@@ -15,6 +15,9 @@
 #   - 待ち時間切れ / 待っている間にユーザーが Mac に戻ってきた
 # 勝手に答えることは無い。
 #
+# 待ち時間（既定 1800 秒）は settings.json の AskUserQuestion hook の timeout（21660 秒。不足は
+# src/infra/hook-wiring-check.ts が起動時に警告）より短いこと。先に hook が殺されると回答が宙に浮く。
+#
 # 環境変数は remote-approve-permission.sh と共通（REMOTE_APPROVE_AWAY_SEC / _WAIT_SEC / _IDLE_CMD /
 # _POLL_SEC / _LOG, PERM_REQUEST_DIR, AGENT_BASE_SCRIPTS）。
 
@@ -87,8 +90,9 @@ TEXT=$(printf '%s' "$QUESTIONS" | jq -r --argjson max "$MAX_TEXT" '
              + (if (.value.description // "") != "" then " — \(.value.description)" else "" end) ]
          | join(""))
   ] | join("\n\n")
-  | (if length > $max then .[0:($max - 1)] + "…" else . end)
-  | @html')
+  | @html
+  # 長さはエスケープ後で数える（" → &quot; 等で伸びる）。切り口の書きかけの実体参照は落とす
+  | (if length > $max then (.[0:($max - 1)] | sub("&[#a-zA-Z0-9]*$"; "")) + "…" else . end)')
 BODY="${TEXT}
 
 ${LINK}
@@ -111,7 +115,8 @@ while [ "$(date +%s)" -lt "$DEADLINE" ]; do
         select(($a[0] | type) == "object")
         | {hookSpecificOutput: {hookEventName: "PreToolUse", permissionDecision: "allow",
             updatedInput: (.tool_input + {answers: $a[0]})}}') && [ -n "$OUT" ]; then
-      log "answered id=${ID} answers=$(jq -c . "$DIR/$ID.answer" | head -c 200)"
+      # 自由入力は本文を残さない（ログは平文のため）。答えた質問数だけ記録する
+      log "answered id=${ID} answers=$(jq 'length' "$DIR/$ID.answer")"
       printf '%s\n' "$OUT"
       exit 0
     fi

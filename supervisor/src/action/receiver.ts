@@ -260,6 +260,12 @@ function htmlResponse(status: number, html: string): Response {
     headers: {
       "Content-Type": "text/html; charset=utf-8",
       "Cache-Control": "no-store",
+      // The URL carries a signed token (and, for the ask form, the answers): never
+      // leak it via Referer. The ask form renders model-supplied text, so no
+      // scripts or external loads at all (#519).
+      "Referrer-Policy": "no-referrer",
+      "Content-Security-Policy":
+        "default-src 'none'; style-src 'unsafe-inline'; form-action 'self'",
     },
   });
 }
