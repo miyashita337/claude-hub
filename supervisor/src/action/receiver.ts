@@ -181,13 +181,16 @@ export async function handleAskRequest(
     );
     return htmlResponse(400, renderAskFormHtml(rawToken, questions, collected.missing));
   }
-  if (!deps.consumeNonce(token.nonce, token.action)) {
-    return finish({ status: 409, outcome: "nonce_reused", action: token.action });
-  }
+  // The nonce is spent only after the answer file is published, so a transient
+  // write failure can be retried from the same link. A second answer is still
+  // impossible: publishAnswerFile's link() refuses an existing `<id>.answer`.
   let written: boolean;
   try {
     written = await deps.ask.writeAnswers(token.target, collected.answers);
   } catch (err) {
+    if ((err as NodeJS.ErrnoException).code === "EEXIST") {
+      return finish({ status: 409, outcome: "nonce_reused", action: token.action });
+    }
     return finish({
       status: 502,
       outcome: "send_failed",
@@ -196,6 +199,9 @@ export async function handleAskRequest(
     });
   }
   if (!written) return finish(notFound);
+  if (!deps.consumeNonce(token.nonce, token.action)) {
+    return finish({ status: 409, outcome: "nonce_reused", action: token.action });
+  }
   return finish({ status: 200, outcome: "sent", action: token.action, target: token.target });
 }
 

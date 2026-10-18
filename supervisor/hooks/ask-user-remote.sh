@@ -54,6 +54,10 @@ fi
 
 QUESTIONS=$(printf '%s' "$INPUT" | jq -c '.tool_input.questions // [] | select(type == "array" and length > 0)' 2>/dev/null)
 [ -n "$QUESTIONS" ] || { log "skip: AskUserQuestion without questions"; exit 0; }
+# answers は質問文をキーにするため、同じ文の質問が 2 つあると片方の答えが消える。TUI に任せる
+if ! printf '%s' "$QUESTIONS" | jq -e '(map(.question) | unique | length) == length' >/dev/null; then
+  log "skip: AskUserQuestion with duplicate question text"; exit 0
+fi
 CWD=$(printf '%s' "$INPUT" | jq -r '.cwd // ""')
 FIRST_Q=$(printf '%s' "$QUESTIONS" | jq -r '.[0].question // ""' | tr '\n' ' ' | head -c 120)
 

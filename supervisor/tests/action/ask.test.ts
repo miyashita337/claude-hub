@@ -67,7 +67,9 @@ function spyAsk(questions: AskQuestion[] | null = QUESTIONS) {
   const written: Record<string, string>[] = [];
   const ask: AskDeps = {
     readQuestions: async () => questions,
+    // like publishAnswerFile: a second answer for the same id fails with EEXIST
     writeAnswers: async (_id, a) => {
+      if (written.length > 0) throw Object.assign(new Error("exists"), { code: "EEXIST" });
       written.push(a);
       return true;
     },
@@ -101,6 +103,8 @@ describe("action/ask collectAnswers", () => {
   test("unanswered, out of range, or two picks on a single-select → missing", () => {
     expect(collectAnswers(new URLSearchParams(""), QUESTIONS)).toEqual({ ok: false, missing: [0] });
     expect(collectAnswers(new URLSearchParams("q0=5"), QUESTIONS)).toEqual({ ok: false, missing: [0] });
+    // Number("") === 0 — an empty value must not pick option 1
+    expect(collectAnswers(new URLSearchParams("q0="), QUESTIONS)).toEqual({ ok: false, missing: [0] });
     expect(collectAnswers(new URLSearchParams("q0=0&q0=1"), QUESTIONS)).toEqual({
       ok: false,
       missing: [0],
@@ -113,6 +117,8 @@ describe("action/ask parse + render", () => {
     expect(parseAskQuestions([])).toBeNull();
     expect(parseAskQuestions("")).toBeNull();
     expect(parseAskQuestions([{ question: 1 }])).toBeNull();
+    // answers are keyed by question text — duplicates cannot be answered here
+    expect(parseAskQuestions([...QUESTIONS, ...QUESTIONS])).toBeNull();
     expect(parseAskQuestions(QUESTIONS)?.[0]?.options.length).toBe(2);
   });
 
@@ -160,6 +166,23 @@ describe("action/receiver ask-answer path", () => {
     expect(await res.text()).toContain("未回答です");
     expect(nonces).toEqual([]);
     expect(written).toEqual([]);
+  });
+
+  test("a failed write does not spend the nonce, so the same link can retry", async () => {
+    const nonces: string[] = [];
+    let fail = true;
+    const ask: AskDeps = {
+      readQuestions: async () => QUESTIONS,
+      writeAnswers: async () => {
+        if (fail) throw new Error("disk full");
+        return true;
+      },
+    };
+    const t = token({ nonce: "retry" });
+    expect((await handleActRequest(url(t, "&submit=1&q0=1"), makeDeps(ask, nonces))).status).toBe(502);
+    expect(nonces).toEqual([]);
+    fail = false;
+    expect((await handleActRequest(url(t, "&submit=1&q0=1"), makeDeps(ask, nonces))).status).toBe(200);
   });
 
   test("request no longer waiting (timed out) → 404", async () => {

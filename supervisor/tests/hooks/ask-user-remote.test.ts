@@ -159,6 +159,32 @@ describe("ask-user-remote.sh (via ask-user-relay.sh)", () => {
     expect(Date.now() - started).toBeLessThan(5000);
   });
 
+  test("duplicate question text → not relayed (answers would overwrite each other)", async () => {
+    const dup = JSON.stringify({
+      session_id: "s",
+      tool_name: "AskUserQuestion",
+      tool_input: { questions: [TOOL_INPUT.questions[0], TOOL_INPUT.questions[0]] },
+      cwd: "/p",
+    });
+    const r = await $`echo ${dup} | bash ${RELAY_HOOK}`
+      .env({
+        PATH: process.env.PATH ?? "",
+        HOME: root,
+        XDG_RUNTIME_DIR: join(root, "run"),
+        AGENT_BASE_SESSION_RELAY: "1",
+        AGENT_BASE_SCRIPTS: scripts,
+        PERM_REQUEST_DIR: permDir,
+        NOTIFY_LOG: notifyLog,
+        REMOTE_APPROVE_LOG: join(root, "hook.log"),
+        REMOTE_APPROVE_IDLE_CMD: "echo 600",
+      })
+      .quiet()
+      .nothrow();
+    expect(r.stdout.toString()).toBe("");
+    expect(notifications().length).toBe(0);
+    expect(hookLog()).toContain("duplicate question text");
+  });
+
   test("malformed answer file → no decision (TUI)", async () => {
     const r = await runHook({ FAKE_ANSWER: '["not","an","object"]' });
     expect(r.stdout.toString()).toBe("");

@@ -69,6 +69,9 @@ export function parseAskQuestions(raw: unknown): AskQuestion[] | null {
       options,
     });
   }
+  // `answers` is keyed by question text: two identical questions would overwrite
+  // each other, so such a request is not answerable here (the TUI handles it)
+  if (new Set(out.map((q) => q.question)).size !== out.length) return null;
   return out;
 }
 
@@ -93,7 +96,10 @@ export function collectAnswers(
       answers[q.question] = text;
       return;
     }
-    const picked = [...new Set(params.getAll(`q${i}`))].map(Number);
+    // Number("") is 0, so an empty `q0=` must not count as picking option 1
+    const picked = [
+      ...new Set(params.getAll(`q${i}`).filter((s) => /^\d+$/.test(s))),
+    ].map(Number);
     const valid =
       picked.length > 0 &&
       (q.multiSelect || picked.length === 1) &&
