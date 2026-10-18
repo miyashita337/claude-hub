@@ -6,12 +6,15 @@
 # PreToolUse deny envelope so Claude continues without blocking on a TUI
 # dialog that a Discord-only user can never see (Issue #370).
 #
-# Why deny instead of `updatedInput`: AskUserQuestion has no documented way to
-# pre-supply an answer through its input — rewriting the input still opens the
-# TUI dialog. A deny reason IS delivered to Claude as the tool result, so the
-# reason text mirrors the native answered-dialog wording ("Your questions have
-# been answered: ...") and Claude treats it as the user's answer, not a
-# refusal.
+# Why deny: when this was written, AskUserQuestion had no documented way to
+# pre-supply an answer. A deny reason IS delivered to Claude as the tool result,
+# so the reason text mirrors the native answered-dialog wording ("Your
+# questions have been answered: ...") and Claude treats it as the user's answer.
+# The hooks docs now document `permissionDecision: "allow"` + `updatedInput`
+# with `answers`, which ask-user-remote.sh uses (Issue #519). A real-CLI
+# comparison (2026-10-19) showed both deliver the answer, but deny renders as a
+# "hook error" in the TUI. This Discord path keeps deny for now (Issue #519
+# leaves the supervisor path out of scope).
 #
 # Skipping behaviour
 # ------------------
@@ -43,10 +46,20 @@
 
 INPUT=$(cat)
 
+# Not a supervisor session. With the opt-in AGENT_BASE_SESSION_RELAY=1 (set by
+# an orchestrator when it starts a child, Issue #519) the question goes to the
+# iPhone instead; otherwise exit 0 and keep the TUI dialog.
+not_supervisor() {
+  if [ "${AGENT_BASE_SESSION_RELAY:-0}" = "1" ]; then
+    printf '%s' "$INPUT" | exec bash "$(dirname "${BASH_SOURCE[0]}")/ask-user-remote.sh"
+  fi
+  exit 0
+}
+
 if [ -z "$SUPERVISOR_RELAY_URL" ]; then
   SESSION_ID=$(echo "$INPUT" | jq -r '.session_id // ""')
   if [ -z "$SESSION_ID" ]; then
-    exit 0
+    not_supervisor
   fi
   SANITISED=$(printf '%s' "$SESSION_ID" | sed -e 's|^/*||' -e 's|[^A-Za-z0-9._-]|_|g')
   if [ -n "$XDG_RUNTIME_DIR" ]; then
@@ -56,12 +69,12 @@ if [ -z "$SUPERVISOR_RELAY_URL" ]; then
   fi
   RELAY_URL_FILE="${RUNTIME_DIR}/${SANITISED}.relay-url"
   if [ ! -f "$RELAY_URL_FILE" ]; then
-    # Not running under a supervisor session — keep TUI behaviour unchanged.
-    exit 0
+    # Not running under a supervisor session.
+    not_supervisor
   fi
   SUPERVISOR_RELAY_URL=$(cat "$RELAY_URL_FILE")
   if [ -z "$SUPERVISOR_RELAY_URL" ]; then
-    exit 0
+    not_supervisor
   fi
 fi
 
