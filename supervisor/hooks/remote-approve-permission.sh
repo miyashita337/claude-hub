@@ -51,6 +51,12 @@ TOOL=$(printf '%s' "$INPUT" | jq -r '.tool_name // "unknown"')
 DETAIL=$(printf '%s' "$INPUT" | jq -r '.tool_input.command // .tool_input.file_path // .tool_input.url // "" ' | head -c 120)
 CWD=$(printf '%s' "$INPUT" | jq -r '.cwd // ""')
 
+# AskUserQuestion は承認／拒否では答えられない。opt-in のセッションでは PreToolUse の
+# ask-user-remote.sh が選択肢付きで中継済みなので、ここで 2 通目を出さず選択画面に任せる (#519)
+if [ "$TOOL" = "AskUserQuestion" ] && [ "${AGENT_BASE_SESSION_RELAY:-0}" = "1" ]; then
+  log "skip: AskUserQuestion is relayed by ask-user-remote.sh"; exit 0
+fi
+
 # shellcheck source=/dev/null
 source "$SCRIPTS/lib/keychain-get.sh" 2>/dev/null || { log "skip: keychain-get.sh not found"; exit 0; }
 RECEIVER_URL=$(keychain_get pushover-action-receiver-url 2>/dev/null || true)

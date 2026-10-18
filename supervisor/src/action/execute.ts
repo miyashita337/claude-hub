@@ -39,7 +39,7 @@ export const ALLOWED_ACTIONS: ReadonlySet<string> = new Set([
  * id becomes a file name, so anything outside this shape (path separators,
  * dots) is rejected before touching the filesystem.
  */
-const PERM_REQUEST_ID = /^[A-Za-z0-9-]{8,64}$/;
+export const PERM_REQUEST_ID = /^[A-Za-z0-9-]{8,64}$/;
 
 /**
  * Directory shared with the PermissionRequest hook. The hook creates
@@ -59,17 +59,31 @@ export async function realWritePermDecision(
   id: string,
   decision: "allow" | "deny"
 ): Promise<boolean> {
+  return publishAnswerFile(id, "decision", decision);
+}
+
+/**
+ * Publish `<id>.<ext>` for a hook that is waiting on `<id>.pending`. Shared by
+ * the permission answers and the AskUserQuestion answers (./ask, Issue #519).
+ * Returns false when the request is not pending; throws when it was already
+ * answered.
+ */
+export async function publishAnswerFile(
+  id: string,
+  ext: string,
+  content: string
+): Promise<boolean> {
   const dir = permRequestDir();
   const pending = join(dir, `${id}.pending`);
   if (!existsSync(pending)) return false;
-  // The hook polls for `<id>.decision`; writing it in place could expose an
+  // The hook polls for `<id>.<ext>`; writing it in place could expose an
   // empty/partial file. Write a temp file first, then publish with link(),
   // which fails with EEXIST instead of replacing an earlier answer.
   const tmp = join(dir, `.${id}.${process.pid}.${Date.now()}.tmp`);
-  await writeFile(tmp, decision, { flag: "wx" });
+  await writeFile(tmp, content, { flag: "wx" });
   try {
     if (!existsSync(pending)) return false;
-    await link(tmp, join(dir, `${id}.decision`));
+    await link(tmp, join(dir, `${id}.${ext}`));
   } finally {
     await unlink(tmp).catch(() => {});
   }

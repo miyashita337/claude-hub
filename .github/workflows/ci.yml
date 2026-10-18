@@ -190,6 +190,7 @@ jobs:
                    tests/guards/bot-mention-helper.test.ts \
                    tests/guards/user-error-notice-wired.test.ts \
                    tests/hooks/ask-user-relay.test.ts \
+                   tests/hooks/ask-user-remote.test.ts \
                    tests/hooks/auto-approve-permission.test.ts \
                    tests/hooks/headless-pending-guard.test.ts \
                    tests/hooks/progress-relay.test.ts \
@@ -234,6 +235,7 @@ jobs:
                    tests/action/token.test.ts \
                    tests/action/execute.test.ts \
                    tests/action/receiver.test.ts \
+                   tests/action/ask.test.ts \
                    tests/session/hub-work.test.ts \
                    tests/session/relay-server-hub-work.test.ts \
                    tests/session/relay-server-channel-post.test.ts \

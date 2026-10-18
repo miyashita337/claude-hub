@@ -2,6 +2,9 @@ import { execFile } from "child_process";
 import { networkInterfaces } from "os";
 import { promisify } from "util";
 import { parseToken, verifySignature, isExpired } from "./token";
+import type { ActionToken } from "./token";
+import { ASK_ACTION, collectAnswers, realAskDeps, renderAskFormHtml } from "./ask";
+import type { AskDeps } from "./ask";
 import {
   executeAction,
   realWritePermDecision,
@@ -40,6 +43,8 @@ export interface EvaluateBase {
   /** Atomically record a nonce; false = already used (replay). */
   consumeNonce: (nonce: string, action: string) => boolean;
   execute: (action: string, target: string) => Promise<ExecuteResult>;
+  /** AskUserQuestion answer files (Issue #519). Absent = `ask-answer` tokens find nothing. */
+  ask?: AskDeps;
 }
 
 export interface EvaluateDeps extends EvaluateBase {
@@ -80,18 +85,10 @@ export async function evaluateAction(
   rawToken: string,
   deps: EvaluateDeps
 ): Promise<EvaluateResult> {
-  const parsed = parseToken(rawToken);
-  if (!parsed.ok) {
-    return { status: 400, outcome: "malformed", detail: parsed.reason };
-  }
-  const { token, payload, sig } = parsed;
+  const verified = verifyToken(rawToken, deps);
+  if (!verified.ok) return verified.result;
+  const { token } = verified;
 
-  if (!verifySignature(payload, sig, deps.key)) {
-    return { status: 401, outcome: "bad_signature", action: token.action };
-  }
-  if (isExpired(token, deps.nowSeconds)) {
-    return { status: 410, outcome: "expired", action: token.action };
-  }
   if (!deps.isActionAllowed(token.action)) {
     return { status: 403, outcome: "disallowed_action", action: token.action };
   }
@@ -125,6 +122,89 @@ export async function evaluateAction(
   }
 }
 
+/** Signature → TTL, the first two steps every token goes through. */
+function verifyToken(
+  rawToken: string,
+  deps: Pick<EvaluateDeps, "key" | "nowSeconds">
+): { ok: true; token: ActionToken } | { ok: false; result: EvaluateResult } {
+  const parsed = parseToken(rawToken);
+  if (!parsed.ok) {
+    return { ok: false, result: { status: 400, outcome: "malformed", detail: parsed.reason } };
+  }
+  const { token, payload, sig } = parsed;
+  if (!verifySignature(payload, sig, deps.key)) {
+    return { ok: false, result: { status: 401, outcome: "bad_signature", action: token.action } };
+  }
+  if (isExpired(token, deps.nowSeconds)) {
+    return { ok: false, result: { status: 410, outcome: "expired", action: token.action } };
+  }
+  return { ok: true, token };
+}
+
+/**
+ * `ask-answer` tokens (Issue #519, ./ask). Without `submit` the page is the
+ * answer form and no nonce is spent; with `submit` the answers are checked,
+ * then the nonce is spent and the answers are published. An incomplete form is
+ * shown again without spending the nonce.
+ */
+export async function handleAskRequest(
+  url: URL,
+  rawToken: string,
+  deps: EvaluateDeps
+): Promise<Response> {
+  const finish = (result: EvaluateResult): Response => {
+    logOutcome(result);
+    return htmlResponse(result.status, renderResultHtml(result));
+  };
+  const verified = verifyToken(rawToken, deps);
+  if (!verified.ok) return finish(verified.result);
+  const { token } = verified;
+  const notFound: EvaluateResult = {
+    status: 404,
+    outcome: "target_not_found",
+    action: token.action,
+    target: token.target,
+  };
+  if (!deps.ask) return finish(notFound);
+
+  const questions = await deps.ask.readQuestions(token.target);
+  if (!questions) return finish(notFound);
+
+  if (!url.searchParams.has("submit")) {
+    console.log(`[action-receiver] outcome=form status=200 action=${token.action} target=${token.target}`);
+    return htmlResponse(200, renderAskFormHtml(rawToken, questions));
+  }
+  const collected = collectAnswers(url.searchParams, questions);
+  if (!collected.ok) {
+    console.warn(
+      `[action-receiver] outcome=incomplete status=400 action=${token.action} target=${token.target}`
+    );
+    return htmlResponse(400, renderAskFormHtml(rawToken, questions, collected.missing));
+  }
+  // The nonce is spent only after the answer file is published, so a transient
+  // write failure can be retried from the same link. A second answer is still
+  // impossible: publishAnswerFile's link() refuses an existing `<id>.answer`.
+  let written: boolean;
+  try {
+    written = await deps.ask.writeAnswers(token.target, collected.answers);
+  } catch (err) {
+    if ((err as NodeJS.ErrnoException).code === "EEXIST") {
+      return finish({ status: 409, outcome: "nonce_reused", action: token.action });
+    }
+    return finish({
+      status: 502,
+      outcome: "send_failed",
+      action: token.action,
+      detail: err instanceof Error ? err.message : String(err),
+    });
+  }
+  if (!written) return finish(notFound);
+  if (!deps.consumeNonce(token.nonce, token.action)) {
+    return finish({ status: 409, outcome: "nonce_reused", action: token.action });
+  }
+  return finish({ status: 200, outcome: "sent", action: token.action, target: token.target });
+}
+
 /** Fixed, non-reflective user message per outcome (no token/target echoed → no XSS). */
 function messageFor(
   outcome: ReceiverOutcome,
@@ -134,6 +214,7 @@ function messageFor(
     case "sent":
       if (action === "perm-allow") return { title: "承認しました", body: "✅ 実行を承認しました" };
       if (action === "perm-deny") return { title: "拒否しました", body: "🛑 実行を拒否しました" };
+      if (action === ASK_ACTION) return { title: "回答しました", body: "✅ 回答を送りました" };
       return { title: "送信しました", body: "✅ /compact を送信しました" };
     case "malformed":
       return { title: "無効なリンク", body: "❌ リンクが不正です" };
@@ -185,6 +266,12 @@ function htmlResponse(status: number, html: string): Response {
     headers: {
       "Content-Type": "text/html; charset=utf-8",
       "Cache-Control": "no-store",
+      // The URL carries a signed token (and, for the ask form, the answers): never
+      // leak it via Referer. The ask form renders model-supplied text, so no
+      // scripts or external loads at all (#519).
+      "Referrer-Policy": "no-referrer",
+      "Content-Security-Policy":
+        "default-src 'none'; style-src 'unsafe-inline'; form-action 'self'",
     },
   });
 }
@@ -204,7 +291,16 @@ export async function handleActRequest(
     console.warn("[action-receiver] request rejected: missing token");
     return htmlResponse(400, renderResultHtml({ status: 400, outcome: "malformed" }));
   }
+  const parsed = parseToken(token);
+  if (parsed.ok && parsed.token.action === ASK_ACTION) {
+    return handleAskRequest(url, token, deps);
+  }
   const result = await evaluateAction(token, deps);
+  logOutcome(result);
+  return htmlResponse(result.status, renderResultHtml(result));
+}
+
+function logOutcome(result: EvaluateResult): void {
   const targetNote = result.target ? ` target=${result.target}` : "";
   const detailNote = result.detail ? ` detail=${result.detail}` : "";
   const line =
@@ -212,7 +308,6 @@ export async function handleActRequest(
     ` action=${result.action ?? "-"}${targetNote}${detailNote}`;
   if (result.outcome === "sent") console.log(line);
   else console.warn(line);
-  return htmlResponse(result.status, renderResultHtml(result));
 }
 
 export interface BindResolveDeps {
@@ -472,6 +567,7 @@ async function buildProductionEvaluateBase(): Promise<EvaluateBase> {
         send: sendToPane,
         writePermDecision: realWritePermDecision,
       }),
+    ask: realAskDeps,
   };
 }
 
