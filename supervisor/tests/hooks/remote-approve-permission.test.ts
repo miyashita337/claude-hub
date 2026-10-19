@@ -14,7 +14,8 @@ let notifyLog: string;
 
 /**
  * Fake agent-base scripts. The fake notify-once records each call and, to stand
- * in for the phone tap, writes FAKE_DECISION into <id>.decision right away.
+ * in for the phone tap, writes FAKE_DECISION into <id>.decision (after
+ * FAKE_DECISION_DELAY seconds when set, otherwise right away).
  */
 function makeFakeScripts() {
   scripts = join(root, "scripts");
@@ -30,7 +31,13 @@ function makeFakeScripts() {
       "#!/bin/bash",
       'printf "%s\\t%s\\t%s\\n" "$1" "$3" "$7" >> "$NOTIFY_LOG"',
       '[ -n "${FAKE_NOTIFY_RC:-}" ] && exit "$FAKE_NOTIFY_RC"',
-      '[ -n "${FAKE_DECISION:-}" ] && printf "%s" "$FAKE_DECISION" > "$PERM_REQUEST_DIR/$1.decision"',
+      'if [ -n "${FAKE_DECISION:-}" ]; then',
+      '  if [ -n "${FAKE_DECISION_DELAY:-}" ]; then',
+      '    (sleep "$FAKE_DECISION_DELAY"; printf "%s" "$FAKE_DECISION" > "$PERM_REQUEST_DIR/$1.decision") >/dev/null 2>&1 &',
+      '  else',
+      '    printf "%s" "$FAKE_DECISION" > "$PERM_REQUEST_DIR/$1.decision"',
+      '  fi',
+      'fi',
       "exit 0",
       "",
     ].join("\n")
@@ -131,9 +138,30 @@ describe("remote-approve-permission.sh", () => {
     // 1 回目は離席 (600 秒)、2 回目以降は在席 (5 秒)
     const idleCmd = `if [ -f ${counter} ]; then echo 5; else touch ${counter}; echo 600; fi`;
     const started = Date.now();
-    const r = await runHook({ REMOTE_APPROVE_IDLE_CMD: idleCmd, REMOTE_APPROVE_WAIT_SEC: "30" });
+    const r = await runHook({
+      REMOTE_APPROVE_IDLE_CMD: idleCmd,
+      REMOTE_APPROVE_WAIT_SEC: "30",
+      REMOTE_APPROVE_BACK_SEC: "1",
+    });
     expect(r.stdout.toString()).toBe("");
     expect(Date.now() - started).toBeLessThan(5000);
+    expect(readFileSync(join(root, "hook.log"), "utf8")).toContain("back at Mac");
+  });
+
+  // #519 差し戻し: 送信直後の 1 回の入力で取り下げると、iPhone のリンクが「見つかりません」になる
+  test("a single input right after sending → keeps waiting and takes the phone decision", async () => {
+    const counter = join(root, "idle-seq");
+    // 1 回目（送信前）は離席、2 回目だけ在席（入力 1 回）、以降は離席に戻る
+    const idleCmd = `n=$(cat ${counter} 2>/dev/null || echo 0); echo $((n+1)) > ${counter}; if [ "$n" = 1 ]; then echo 3; else echo 600; fi`;
+    const r = await runHook({
+      REMOTE_APPROVE_IDLE_CMD: idleCmd,
+      REMOTE_APPROVE_WAIT_SEC: "30",
+      REMOTE_APPROVE_BACK_SEC: "5",
+      FAKE_DECISION: "allow",
+      FAKE_DECISION_DELAY: "1",
+    });
+    expect(JSON.parse(r.stdout.toString()).hookSpecificOutput.decision.behavior).toBe("allow");
+    expect(readFileSync(join(root, "hook.log"), "utf8")).not.toContain("back at Mac");
   });
 
   test("REMOTE_APPROVE=0 opts out", async () => {

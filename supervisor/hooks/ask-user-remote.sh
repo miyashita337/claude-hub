@@ -19,7 +19,9 @@
 # src/infra/hook-wiring-check.ts が起動時に警告）より短いこと。先に hook が殺されると回答が宙に浮く。
 #
 # 環境変数は remote-approve-permission.sh と共通（REMOTE_APPROVE_AWAY_SEC / _WAIT_SEC / _IDLE_CMD /
-# _POLL_SEC / _LOG, PERM_REQUEST_DIR, AGENT_BASE_SCRIPTS）。
+# _POLL_SEC / _BACK_SEC / _LOG, PERM_REQUEST_DIR, AGENT_BASE_SCRIPTS）。このほか:
+#   ASK_NOTIFY_STATE_DIR  質問通知だけの notify-once 状態ディレクトリ（既定 ~/.claude/state/notify-once-ask）
+#   ASK_NOTIFY_MAX        質問通知の 1 時間あたりの上限（既定 20）
 
 [ "${AGENT_BASE_SESSION_RELAY:-0}" = "1" ] || exit 0
 [ "${REMOTE_APPROVE:-1}" = "0" ] && exit 0
@@ -27,6 +29,7 @@
 AWAY_SEC="${REMOTE_APPROVE_AWAY_SEC:-300}"
 WAIT_SEC="${REMOTE_APPROVE_WAIT_SEC:-1800}"
 POLL_SEC="${REMOTE_APPROVE_POLL_SEC:-2}"
+BACK_SEC="${REMOTE_APPROVE_BACK_SEC:-60}"
 DIR="${PERM_REQUEST_DIR:-$HOME/.claude/state/perm-requests}"
 SCRIPTS="${AGENT_BASE_SCRIPTS:-$HOME/.claude/scripts}"
 LOG="${REMOTE_APPROVE_LOG:-$HOME/.claude/logs/remote-approve-permission.log}"
@@ -42,6 +45,18 @@ idle_seconds() {
   else
     ioreg -c IOHIDSystem | awk '/HIDIdleTime/ { print int($NF / 1000000000); exit }'
   fi
+}
+
+# 1 回の入力（キー 1 つ・マウスが触れた等）では戻ったとみなさない。無操作 30 秒未満が BACK_SEC 秒
+# 続いたときだけ戻ったとする。1 回の入力で取り下げると、iPhone で答えようとした時点でリンク先が
+# 「対象セッションが見つかりません」になる（#519 差し戻し: 送信 8 秒後の入力で取り下げた）
+PRESENT_SINCE=""
+still_away() {
+  local now
+  if [ "$1" -ge 30 ]; then PRESENT_SINCE=""; return 0; fi
+  now=$(date +%s)
+  [ -n "$PRESENT_SINCE" ] || PRESENT_SINCE=$now
+  [ $(( now - PRESENT_SINCE )) -lt "$BACK_SEC" ]
 }
 
 INPUT=$(cat)
@@ -102,6 +117,10 @@ BODY="${TEXT}
 ${LINK}
 ${FOOTER}"
 
+# 答えないと子が止まる通知なので、STALL・終端など読むだけの通知と上限を共有しない（共有すると並列の
+# 実走中に押し出されて TUI に戻る, #519 差し戻し）。連打防止のため別の状態ディレクトリで別枠の上限を持つ
+NOTIFY_ONCE_STATE_DIR="${ASK_NOTIFY_STATE_DIR:-$HOME/.claude/state/notify-once-ask}" \
+NOTIFY_ONCE_GLOBAL_MAX="${ASK_NOTIFY_MAX:-20}" \
 NOTIFY_ONCE_REPORT=1 PUSHOVER_HTML=1 bash "$SCRIPTS/lib/notify-once.sh" \
   "$ID" "ask-$ID" "質問待ち: AskUserQuestion" "$BODY" 1 "$CWD"
 RC=$?
@@ -132,7 +151,7 @@ while [ "$(date +%s)" -lt "$DEADLINE" ]; do
   case "$NOW_IDLE" in
     ''|*[!0-9]*) log "idle time unavailable while waiting id=${ID}"; exit 0 ;;
   esac
-  if [ "$NOW_IDLE" -lt 30 ]; then log "back at Mac id=${ID}"; exit 0; fi
+  if ! still_away "$NOW_IDLE"; then log "back at Mac id=${ID}"; exit 0; fi
   sleep "$POLL_SEC"
 done
 log "timeout id=${ID} tool=AskUserQuestion"
