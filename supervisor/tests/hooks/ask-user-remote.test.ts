@@ -16,8 +16,9 @@ let permDir: string;
 let notifyLog: string;
 
 /**
- * Fake agent-base scripts. The fake notify-once records the call (id, body) and,
- * to stand in for the phone answer, writes FAKE_ANSWER into <id>.answer.
+ * Fake agent-base scripts. The fake notify-once records the call (id, body) and the
+ * notify-once budget it was given, and, to stand in for the phone answer, writes
+ * FAKE_ANSWER into <id>.answer (after FAKE_ANSWER_DELAY seconds when set).
  */
 function makeFakeScripts() {
   scripts = join(root, "scripts");
@@ -34,7 +35,14 @@ function makeFakeScripts() {
       'printf "%s\\t%s\\t%s\\n" "$1" "$3" "$(printf "%s" "$4" | tr "\\n" "|")" >> "$NOTIFY_LOG"',
       'cp "$PERM_REQUEST_DIR/$1.pending" "$NOTIFY_LOG.pending"',
       '[ -n "${FAKE_NOTIFY_RC:-}" ] && exit "$FAKE_NOTIFY_RC"',
-      '[ -n "${FAKE_ANSWER:-}" ] && printf "%s" "$FAKE_ANSWER" > "$PERM_REQUEST_DIR/$1.answer"',
+      'printf "%s\\t%s\\n" "${NOTIFY_ONCE_STATE_DIR:-}" "${NOTIFY_ONCE_GLOBAL_MAX:-}" > "$NOTIFY_LOG.budget"',
+      'if [ -n "${FAKE_ANSWER:-}" ]; then',
+      '  if [ -n "${FAKE_ANSWER_DELAY:-}" ]; then',
+      '    (sleep "$FAKE_ANSWER_DELAY"; printf "%s" "$FAKE_ANSWER" > "$PERM_REQUEST_DIR/$1.answer") >/dev/null 2>&1 &',
+      '  else',
+      '    printf "%s" "$FAKE_ANSWER" > "$PERM_REQUEST_DIR/$1.answer"',
+      '  fi',
+      'fi',
       "exit 0",
       "",
     ].join("\n")
@@ -157,6 +165,45 @@ describe("ask-user-remote.sh (via ask-user-relay.sh)", () => {
     const r = await runHook({ FAKE_NOTIFY_RC: "10", REMOTE_APPROVE_WAIT_SEC: "30" });
     expect(r.stdout.toString()).toBe("");
     expect(Date.now() - started).toBeLessThan(5000);
+  });
+
+  // #519 差し戻し: 並列実走中は STALL・終端の通知で全体上限（1 時間 6 通）が埋まり、質問が押し出された
+  test("question notifications use their own notify-once budget, not the shared one", async () => {
+    await runHook({ FAKE_ANSWER: JSON.stringify({ "A か B か？": "A" }) });
+    const [stateDir, max] = readFileSync(`${notifyLog}.budget`, "utf8").trim().split("\t");
+    expect(stateDir).toBe(join(root, ".claude/state/notify-once-ask"));
+    expect(max).toBe("20");
+  });
+
+  // #519 差し戻し: 送信 8 秒後の Mac 入力 1 回で取り下げ、iPhone のリンクが「見つかりません」になった
+  test("a single input at the Mac right after sending → keeps waiting and takes the phone answer", async () => {
+    const counter = join(root, "idle-seq");
+    // 1 回目（送信前）は離席、2 回目だけ在席（入力 1 回）、以降は離席に戻る
+    const idleCmd = `n=$(cat ${counter} 2>/dev/null || echo 0); echo $((n+1)) > ${counter}; if [ "$n" = 1 ]; then echo 3; else echo 600; fi`;
+    const r = await runHook({
+      REMOTE_APPROVE_IDLE_CMD: idleCmd,
+      REMOTE_APPROVE_WAIT_SEC: "30",
+      REMOTE_APPROVE_BACK_SEC: "5",
+      FAKE_ANSWER: JSON.stringify({ "A か B か？": "B" }),
+      FAKE_ANSWER_DELAY: "1",
+    });
+    expect(JSON.parse(r.stdout.toString()).hookSpecificOutput.updatedInput.answers).toEqual({ "A か B か？": "B" });
+    expect(hookLog()).not.toContain("back at Mac");
+  });
+
+  test("using the Mac for BACK_SEC while waiting → stop waiting and fall back to the TUI", async () => {
+    const counter = join(root, "idle-seq");
+    const idleCmd = `if [ -f ${counter} ]; then echo 3; else touch ${counter}; echo 600; fi`;
+    const started = Date.now();
+    const r = await runHook({
+      REMOTE_APPROVE_IDLE_CMD: idleCmd,
+      REMOTE_APPROVE_WAIT_SEC: "30",
+      REMOTE_APPROVE_BACK_SEC: "1",
+    });
+    expect(r.stdout.toString()).toBe("");
+    expect(Date.now() - started).toBeLessThan(5000);
+    expect(hookLog()).toContain("back at Mac id=");
+    expect(readdirSync(permDir)).toEqual([]);
   });
 
   test("duplicate question text → not relayed (answers would overwrite each other)", async () => {

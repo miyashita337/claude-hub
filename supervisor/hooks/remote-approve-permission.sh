@@ -15,6 +15,7 @@
 #   REMOTE_APPROVE_AWAY_SEC   離席とみなす無操作秒数（既定 300）
 #   REMOTE_APPROVE_WAIT_SEC   iPhone の回答を待つ秒数（既定 1800。settings.json の timeout はこれより長く）
 #   REMOTE_APPROVE_IDLE_CMD   無操作秒数を出すコマンド（既定 ioreg の HIDIdleTime）
+#   REMOTE_APPROVE_BACK_SEC   待機中、操作が何秒続いたら Mac に戻ったとみなすか（既定 60）
 #   PERM_REQUEST_DIR          receiver と共有する待ちファイルの置き場所
 #   AGENT_BASE_SCRIPTS        notify-once.sh / action-token.sh の場所（既定 ~/.claude/scripts）
 
@@ -24,6 +25,7 @@
 AWAY_SEC="${REMOTE_APPROVE_AWAY_SEC:-300}"
 WAIT_SEC="${REMOTE_APPROVE_WAIT_SEC:-1800}"
 POLL_SEC="${REMOTE_APPROVE_POLL_SEC:-2}"
+BACK_SEC="${REMOTE_APPROVE_BACK_SEC:-60}"
 DIR="${PERM_REQUEST_DIR:-$HOME/.claude/state/perm-requests}"
 SCRIPTS="${AGENT_BASE_SCRIPTS:-$HOME/.claude/scripts}"
 LOG="${REMOTE_APPROVE_LOG:-$HOME/.claude/logs/remote-approve-permission.log}"
@@ -39,6 +41,17 @@ idle_seconds() {
   else
     ioreg -c IOHIDSystem | awk '/HIDIdleTime/ { print int($NF / 1000000000); exit }'
   fi
+}
+
+# 1 回の入力では戻ったとみなさない。無操作 30 秒未満が BACK_SEC 秒続いたときだけ戻ったとする
+# （1 回の入力で取り下げると iPhone のリンクが「対象が見つかりません」になる, #519 差し戻し）
+PRESENT_SINCE=""
+still_away() {
+  local now
+  if [ "$1" -ge 30 ]; then PRESENT_SINCE=""; return 0; fi
+  now=$(date +%s)
+  [ -n "$PRESENT_SINCE" ] || PRESENT_SINCE=$now
+  [ $(( now - PRESENT_SINCE )) -lt "$BACK_SEC" ]
 }
 
 IDLE=$(idle_seconds)
@@ -112,7 +125,7 @@ while [ "$(date +%s)" -lt "$DEADLINE" ]; do
   case "$NOW_IDLE" in
     ''|*[!0-9]*) log "idle time unavailable while waiting id=${ID}"; exit 0 ;;
   esac
-  if [ "$NOW_IDLE" -lt 30 ]; then log "back at Mac id=${ID}"; exit 0; fi
+  if ! still_away "$NOW_IDLE"; then log "back at Mac id=${ID}"; exit 0; fi
   sleep "$POLL_SEC"
 done
 log "timeout id=${ID}"
