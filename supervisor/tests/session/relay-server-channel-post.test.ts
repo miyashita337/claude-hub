@@ -28,6 +28,7 @@ describe("POST /channel-post/:threadId", () => {
   test("ハンドラ未登録は 503（fail-closed、黙って no-op しない）", async () => {
     const res = await fetch(channelPostUrl("111122223333444455"), {
       method: "POST",
+      headers: { "Content-Type": "application/json" },
       body: JSON.stringify({ text: "progress" }),
     });
     expect(res.status).toBe(503);
@@ -39,6 +40,7 @@ describe("POST /channel-post/:threadId", () => {
     });
     const res = await fetch(channelPostUrl("111122223333444455"), {
       method: "POST",
+      headers: { "Content-Type": "application/json" },
       body: "{oops",
     });
     expect(res.status).toBe(400);
@@ -51,6 +53,7 @@ describe("POST /channel-post/:threadId", () => {
     for (const body of [{}, { text: "   " }, { text: 42 }]) {
       const res = await fetch(channelPostUrl("111122223333444455"), {
         method: "POST",
+        headers: { "Content-Type": "application/json" },
         body: JSON.stringify(body),
       });
       expect(res.status).toBe(400);
@@ -63,7 +66,7 @@ describe("POST /channel-post/:threadId", () => {
     });
     const res = await fetch(
       `http://127.0.0.1:${getRelayPort()}/channel-post/%ZZ`,
-      { method: "POST", body: JSON.stringify({ text: "t" }) },
+      { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ text: "t" }) },
     );
     expect(res.status).toBe(400);
   });
@@ -76,6 +79,7 @@ describe("POST /channel-post/:threadId", () => {
     });
     const res = await fetch(channelPostUrl("111122223333444455"), {
       method: "POST",
+      headers: { "Content-Type": "application/json" },
       body: JSON.stringify({ text: "## 進捗\n```mermaid\ngraph TD\n```" }),
     });
     expect(res.status).toBe(200);
@@ -97,6 +101,7 @@ describe("POST /channel-post/:threadId", () => {
     }));
     const res = await fetch(channelPostUrl("000000000000000000"), {
       method: "POST",
+      headers: { "Content-Type": "application/json" },
       body: JSON.stringify({ text: "t" }),
     });
     expect(res.status).toBe(404);
@@ -110,6 +115,7 @@ describe("POST /channel-post/:threadId", () => {
     });
     const res = await fetch(channelPostUrl("111122223333444455"), {
       method: "POST",
+      headers: { "Content-Type": "application/json" },
       body: JSON.stringify({ text: "t" }),
     });
     expect(res.status).toBe(500);
@@ -121,6 +127,7 @@ describe("POST /channel-post/:threadId", () => {
     startRelayServer();
     const res = await fetch(channelPostUrl("111122223333444455"), {
       method: "POST",
+      headers: { "Content-Type": "application/json" },
       body: JSON.stringify({ text: "t" }),
     });
     expect(res.status).toBe(503);

@@ -30,6 +30,7 @@ describe("POST /hub-work", () => {
   test("ハンドラ未登録は 503（fail-closed、黙って no-op しない）", async () => {
     const res = await fetch(hubWorkUrl(), {
       method: "POST",
+      headers: { "Content-Type": "application/json" },
       body: JSON.stringify({ branch: "b", issueNumber: 1 }),
     });
     expect(res.status).toBe(503);
@@ -39,7 +40,7 @@ describe("POST /hub-work", () => {
     onHubWork(async () => {
       throw new Error("should not be called");
     });
-    const res = await fetch(hubWorkUrl(), { method: "POST", body: "{oops" });
+    const res = await fetch(hubWorkUrl(), { method: "POST", headers: { "Content-Type": "application/json" }, body: "{oops" });
     expect(res.status).toBe(400);
   });
 
@@ -49,6 +50,7 @@ describe("POST /hub-work", () => {
     });
     const res = await fetch(hubWorkUrl(), {
       method: "POST",
+      headers: { "Content-Type": "application/json" },
       body: JSON.stringify([1, 2, 3]),
     });
     expect(res.status).toBe(400);
@@ -62,6 +64,7 @@ describe("POST /hub-work", () => {
     });
     const res = await fetch(hubWorkUrl(), {
       method: "POST",
+      headers: { "Content-Type": "application/json" },
       body: JSON.stringify({ branch: "feat-320", issueNumber: 320, selector: "pdca" }),
     });
     expect(res.status).toBe(200);
@@ -80,6 +83,7 @@ describe("POST /hub-work", () => {
     onHubWork(async () => ({ ok: false, status: 400, error: "branch が不正" }));
     const res = await fetch(hubWorkUrl(), {
       method: "POST",
+      headers: { "Content-Type": "application/json" },
       body: JSON.stringify({ branch: "a;b", issueNumber: 1 }),
     });
     expect(res.status).toBe(400);
@@ -93,6 +97,7 @@ describe("POST /hub-work", () => {
     });
     const res = await fetch(hubWorkUrl(), {
       method: "POST",
+      headers: { "Content-Type": "application/json" },
       body: JSON.stringify({ branch: "b", issueNumber: 1 }),
     });
     expect(res.status).toBe(500);
@@ -104,6 +109,7 @@ describe("POST /hub-work", () => {
     startRelayServer();
     const res = await fetch(hubWorkUrl(), {
       method: "POST",
+      headers: { "Content-Type": "application/json" },
       body: JSON.stringify({ branch: "b", issueNumber: 1 }),
     });
     expect(res.status).toBe(503);
