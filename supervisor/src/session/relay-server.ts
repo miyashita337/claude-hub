@@ -491,6 +491,41 @@ export function cancelAskUser(threadId: string): void {
   pending.resolve({ status: 499 });
 }
 
+/**
+ * Issue #541: loopback-only bind does not stop a web page in the user's own
+ * browser from reaching the server.
+ *
+ * - DNS rebinding: an attacker domain re-resolved to 127.0.0.1 arrives with
+ *   its own name in `Host`. Only the names our clients use are accepted
+ *   (manager.ts / hooks use `localhost:<port>`, session-ctl and e2e tools use
+ *   `127.0.0.1:<port>`).
+ * - CSRF: `req.json()` parses any body, so a cross-site "simple request"
+ *   (`text/plain`, form encodings — no CORS preflight) would be processed.
+ *   Requiring `application/json` forces a preflight, which this server never
+ *   answers with CORS headers, so the browser never sends the POST.
+ *
+ * Returns the rejection response, or null when the request may proceed.
+ */
+export function rejectUntrustedRequest(req: Request, port: number): Response | null {
+  const host = (req.headers.get("host") ?? "").toLowerCase();
+  if (host !== `127.0.0.1:${port}` && host !== `localhost:${port}`) {
+    return Response.json({ error: "Forbidden host" }, { status: 403 });
+  }
+  if (req.method === "POST") {
+    const mediaType = (req.headers.get("content-type") ?? "")
+      .split(";")[0]!
+      .trim()
+      .toLowerCase();
+    if (mediaType !== "application/json") {
+      return Response.json(
+        { error: "Content-Type must be application/json" },
+        { status: 415 },
+      );
+    }
+  }
+  return null;
+}
+
 export function startRelayServer(): void {
   if (server) return;
 
@@ -526,6 +561,9 @@ export function startRelayServer(): void {
     idleTimeout: RELAY_IDLE_TIMEOUT_SEC,
     async fetch(req) {
       const url = new URL(req.url);
+
+      const rejected = rejectUntrustedRequest(req, server?.port ?? 0);
+      if (rejected) return rejected;
 
       if (url.pathname === "/health" && req.method === "GET") {
         return new Response("ok", { status: 200 });

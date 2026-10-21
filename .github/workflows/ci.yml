@@ -239,6 +239,7 @@ jobs:
                    tests/session/hub-work.test.ts \
                    tests/session/relay-server-hub-work.test.ts \
                    tests/session/relay-server-channel-post.test.ts \
+                   tests/session/relay-server-origin-guard.test.ts \
                    tests/session/relay-port-isolation.test.ts \
                    tests/tools/session-ctl.test.ts \
                    tests/tools/e2e-isolated.test.ts \
