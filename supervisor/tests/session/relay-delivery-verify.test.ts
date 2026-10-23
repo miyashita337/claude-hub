@@ -170,14 +170,17 @@ beforeAll(async () => {
 });
 
 describe("delivery probe helpers (#422)", () => {
-  test("probe is a whitespace-stripped, length-capped prefix", () => {
+  test("probe is a whitespace-stripped, length-capped suffix (#547)", () => {
     expect(buildDeliveryProbe("４１６実装開始")).toBe("４１６実装開始");
     expect(buildDeliveryProbe("状況報告。")).toBe("状況報告。");
     // Newlines/spaces are removed so a soft-wrapped input row still matches.
     expect(buildDeliveryProbe("a b\nc")).toBe("abc");
     const long = "0123456789abcdefghijklmnop";
     expect(buildDeliveryProbe(long)).toHaveLength(DELIVERY_PROBE_MAX_CHARS);
-    expect(long.startsWith(buildDeliveryProbe(long))).toBe(true);
+    expect(long.endsWith(buildDeliveryProbe(long))).toBe(true);
+    // Issue #547: the probe is the END of the text — the only part of a long
+    // input the TUI keeps on screen — never the beginning.
+    expect(buildDeliveryProbe(long)).toBe("abcdefghijklmnop");
   });
 
   test("probe never splits a surrogate pair", () => {
@@ -186,7 +189,7 @@ describe("delivery probe helpers (#422)", () => {
     const emoji = "🍣".repeat(20);
     const probe = buildDeliveryProbe(emoji);
     expect(Array.from(probe)).toHaveLength(DELIVERY_PROBE_MAX_CHARS);
-    expect(emoji.startsWith(probe)).toBe(true);
+    expect(emoji.endsWith(probe)).toBe(true);
   });
 
   test("empty / whitespace-only text yields no probe (verification skipped)", () => {
@@ -557,6 +560,40 @@ describe("delivery verification edge cases via an injected pane reader (#422)", 
   );
 
   itmux(
+    "#547: a long input whose head scrolled out of the input box is still verified",
+    async () => {
+      const name = makeSessionName("tall");
+      startEchoPane(name);
+      try {
+        // 329-char relay from the 2026-10-23 incident: taller than the 80x24
+        // input box, so the TUI showed only its last rows. A head-based probe
+        // read 0 hits, retyped, read 0 again and threw SEND_UNVERIFIED_ERROR
+        // with no Enter sent.
+        const head = "team_salaryにdispatch依頼。今日の記事をかいて下さい。お題はお任せします。";
+        const tail = "noteのURLを取得までしたら、ユーザに返却(およびPushoverで報告、noteのURLを添付)をしてください。";
+        const longPayload = `${head}${"テーマなどホットトピックスになるようなものを選んでください。".repeat(4)}${tail}`;
+        const visibleRows = `❯ ${tail.slice(0, 20)}\n  ${tail.slice(20)}`;
+        expect(visibleRows).not.toContain(head.slice(0, 16));
+        const attempts: number[] = [];
+        const outcome = await sendToPane(name, longPayload, TMUX_ARGS, {
+          verifyBackoffMs: FAST_BACKOFF,
+          onAttemptTyped: (n) => void attempts.push(n),
+          capturePane: scriptedReader([
+            "", //           baseline: empty input box (0)
+            visibleRows, //  poll 1: only the bottom of the input is on screen
+          ]),
+        });
+        expect(outcome.verdict).toBe("verified");
+        expect(outcome.verified).toBe(true);
+        expect(attempts).toEqual([1]);
+      } finally {
+        killSession(name);
+      }
+    },
+    30_000
+  );
+
+  itmux(
     "should-3: a baseline occurrence scrolling out does not force a retype",
     async () => {
       const name = makeSessionName("scroll");
@@ -629,6 +666,37 @@ describe("delivery verification edge cases via an injected pane reader (#422)", 
         expect(outcome.verdict).toBe("verified-retyped");
         expect(outcome.verified).toBe(true);
         expect(deliveryNoticeFor(outcome.verdict)).toBeNull();
+      } finally {
+        killSession(name);
+      }
+    },
+    30_000
+  );
+
+  itmux(
+    "#547 / PR #548 review: a pre-existing identical suffix (1 → 1 → 2) is one new copy, submitted once",
+    async () => {
+      const name = makeSessionName("same-suffix");
+      startEchoPane(name);
+      try {
+        const attempts: number[] = [];
+        let enters = 0;
+        const outcome = await sendToPane(name, payload, TMUX_ARGS, {
+          verifyBackoffMs: FAST_BACKOFF,
+          onAttemptTyped: (n) => void attempts.push(n),
+          beforeSubmit: () => void enters++,
+          capturePane: scriptedReader([
+            probe, //                 baseline: an earlier turn ends with the same 16 chars (1)
+            probe, probe, probe, probe, // attempt 1 polls: our type never rendered (1)
+            `${probe} ${probe}`, //   retype lands: exactly ONE new occurrence (2)
+          ]),
+        });
+        // The floor (1) is subtracted, so 1 → 1 → 2 is a single rendered copy
+        // after a lost first type — the #428 recovery — not a duplicate. A real
+        // duplicate is a rise of 2 over the floor (1 → 3), see should-2 above.
+        expect(outcome.verdict).toBe("verified-retyped");
+        expect(attempts).toEqual([1, 2]);
+        expect(enters).toBe(1);
       } finally {
         killSession(name);
       }

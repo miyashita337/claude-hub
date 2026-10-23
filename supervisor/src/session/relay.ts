@@ -276,9 +276,16 @@ export function flattenForSendKeys(text: string): string {
  * appear; anything else (TUI busy right after a turn, raw-mode stdin not being
  * drained, an unrendered modal) surfaces as a send failure instead of silence.
  *
- * The probe is a prefix of the user's own message — deliberately NOT a TUI
+ * The probe is the TAIL of the user's own message — deliberately NOT a TUI
  * literal such as "? for shortcuts". Matching on TUI chrome breaks on every
  * Claude Code redesign (RW-027 / `thin-scaffolding.md`); the user's text does not.
+ *
+ * Issue #547: it used to be the HEAD. The Claude Code input box scrolls long
+ * input and keeps only the cursor end on screen, so for any message taller than
+ * the box (measured: 329 chars in an 80x24 pane) the first row was gone from
+ * `capture-pane` while the text was fully typed — 0 hits, a retype, 0 hits
+ * again, then {@link SEND_UNVERIFIED_ERROR} with the message sitting twice in
+ * the pane and no Enter sent. The cursor end is always visible, so the tail is.
  */
 export const DELIVERY_PROBE_MAX_CHARS = 16;
 
@@ -333,6 +340,13 @@ export type DeliveryVerdict =
   /**
    * The text appeared, but the count rose by 2 — the delayed first type AND the
    * retype both rendered, so the pane now holds the message twice.
+   *
+   * Residual (#547, PR #548 review): with a tail probe, a first type that
+   * rendered late AND whose own tail then scrolled out of the input box (the
+   * doubled text is taller than the box) shows a rise of 1, i.e. reads as
+   * `verified-retyped`. Bounded by the render latency exceeding the whole
+   * {@link DELIVERY_VERIFY_BACKOFF_MS} schedule; the head probe failed the
+   * same case the other way (no Enter at all, the #547 incident).
    */
   | "duplicate"
   /** Whitespace-only message: no probe to look for. */
@@ -402,7 +416,12 @@ function isVerified(verdict: DeliveryVerdict): boolean {
 export const CAPTURE_PANE_TIMEOUT_MS = 3000;
 
 /**
- * Whitespace-stripped prefix of the message, used as the delivery probe.
+ * Whitespace-stripped SUFFIX of the message, used as the delivery probe.
+ *
+ * Suffix, not prefix (Issue #547): the TUI input box scrolls input taller than
+ * itself and only the end (where the cursor is) stays visible. A prefix probe
+ * therefore misses every long message; the suffix is on screen whenever the
+ * whole literal has been ingested, which is also the stronger statement.
  *
  * Trade-off (PR #428 review, nit-1): stripping whitespace on both sides makes
  * `"a b c"` and `"abc"` compare equal, so the match is slightly LOOSER than the
@@ -417,7 +436,7 @@ export const CAPTURE_PANE_TIMEOUT_MS = 3000;
  */
 export function buildDeliveryProbe(text: string): string {
   return Array.from(text.replace(/\s+/g, ""))
-    .slice(0, DELIVERY_PROBE_MAX_CHARS)
+    .slice(-DELIVERY_PROBE_MAX_CHARS)
     .join("");
 }
 
@@ -665,9 +684,9 @@ export async function sendToPane(
  * Issue #357: send Enter and confirm the pane reacted, re-sending (bounded) when
  * it provably did not.
  *
- *   1. Settle: re-read the pane until two consecutive reads match, so the rest
- *      of a long literal (only its first {@link DELIVERY_PROBE_MAX_CHARS} chars
- *      were verified) has finished rendering. Otherwise that late render would
+ *   1. Settle: re-read the pane until two consecutive reads match, so the TUI
+ *      has finished redrawing after the literal (the probe only proves its last
+ *      {@link DELIVERY_PROBE_MAX_CHARS} chars, #547). Otherwise that late render would
  *      read as "the pane changed after Enter" and hide a dropped Enter — and an
  *      Enter that arrives while the TUI is still ingesting the literal is the
  *      leading suspect for the drop (#32 class).
