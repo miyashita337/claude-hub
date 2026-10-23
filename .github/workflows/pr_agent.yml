@@ -45,7 +45,16 @@ permissions:
 jobs:
   pr_agent_job:
     # Bot 起因のイベントには反応しない（レビュー無限ループ・無駄な起動の防止）
-    if: ${{ github.event.sender.type != 'Bot' }}
+    # public リポのため本人/コラボレータ限定にする（#545）。issue_comment は base の
+    # secrets で動くので、第三者のコメントで GEMINI_API_KEY の無料枠を消費させない。
+    # 許可リストは cursor_review.yml と同じ。
+    if: >
+      github.event.sender.type != 'Bot' && (
+        (github.event_name == 'pull_request' &&
+          contains(fromJSON('["OWNER","MEMBER","COLLABORATOR"]'), github.event.pull_request.author_association)) ||
+        (github.event_name == 'issue_comment' && github.event.issue.pull_request &&
+          contains(fromJSON('["OWNER","MEMBER","COLLABORATOR"]'), github.event.comment.author_association))
+      )
     runs-on: ubuntu-latest
     name: Qodo pr-agent auto review
     steps:
