@@ -340,6 +340,13 @@ export type DeliveryVerdict =
   /**
    * The text appeared, but the count rose by 2 — the delayed first type AND the
    * retype both rendered, so the pane now holds the message twice.
+   *
+   * Residual (#547, PR #548 review): with a tail probe, a first type that
+   * rendered late AND whose own tail then scrolled out of the input box (the
+   * doubled text is taller than the box) shows a rise of 1, i.e. reads as
+   * `verified-retyped`. Bounded by the render latency exceeding the whole
+   * {@link DELIVERY_VERIFY_BACKOFF_MS} schedule; the head probe failed the
+   * same case the other way (no Enter at all, the #547 incident).
    */
   | "duplicate"
   /** Whitespace-only message: no probe to look for. */

@@ -673,6 +673,37 @@ describe("delivery verification edge cases via an injected pane reader (#422)", 
     30_000
   );
 
+  itmux(
+    "#547 / PR #548 review: a pre-existing identical suffix (1 → 1 → 2) is one new copy, submitted once",
+    async () => {
+      const name = makeSessionName("same-suffix");
+      startEchoPane(name);
+      try {
+        const attempts: number[] = [];
+        let enters = 0;
+        const outcome = await sendToPane(name, payload, TMUX_ARGS, {
+          verifyBackoffMs: FAST_BACKOFF,
+          onAttemptTyped: (n) => void attempts.push(n),
+          beforeSubmit: () => void enters++,
+          capturePane: scriptedReader([
+            probe, //                 baseline: an earlier turn ends with the same 16 chars (1)
+            probe, probe, probe, probe, // attempt 1 polls: our type never rendered (1)
+            `${probe} ${probe}`, //   retype lands: exactly ONE new occurrence (2)
+          ]),
+        });
+        // The floor (1) is subtracted, so 1 → 1 → 2 is a single rendered copy
+        // after a lost first type — the #428 recovery — not a duplicate. A real
+        // duplicate is a rise of 2 over the floor (1 → 3), see should-2 above.
+        expect(outcome.verdict).toBe("verified-retyped");
+        expect(attempts).toEqual([1, 2]);
+        expect(enters).toBe(1);
+      } finally {
+        killSession(name);
+      }
+    },
+    30_000
+  );
+
   /**
    * Issue #437 (blind spot documented in `typeLiteral`, PR #434 review
    * should-2): `tmuxSend`'s own transient-retry (Issue #73) can land the
