@@ -399,6 +399,17 @@ fi
 # misclassify. The `env` prefix sets them on the claude process directly.
 CLAUDE_CMD=$(printf 'env CLAUDE_HUB_HIJOGUCHI_SESSION=1 CLAUDE_HUB_STATE_DIR=%q LAST_MSG_TS_FILE=%q HIJOGUCHI_CHANNEL_ID=%q HIJOGUCHI_BOT_MENTION=%q ' \
   "${CLAUDE_HUB_STATE_DIR}" "${LAST_MSG_TS_FILE}" "${HIJOGUCHI_CHANNEL_ID}" "${HIJOGUCHI_BOT_MENTION}")
+# Multi-bot isolation (discord plugin README: "point DISCORD_STATE_DIR at a
+# different directory per instance"). When set, forward it on the SAME explicit
+# `env` prefix so the discord MCP subprocess reads its own access.json/.env dir
+# instead of the shared default (~/.claude/channels/discord), which another bot
+# (e.g. Channel-Supervisor) may own. Conditional on purpose: an empty
+# DISCORD_STATE_DIR= would point the plugin at "" and break state loading. Uses
+# the `env` prefix (not export) for the same tmux-server-env-cache reason
+# documented above.
+if [ -n "${DISCORD_STATE_DIR:-}" ]; then
+  CLAUDE_CMD+="$(printf 'DISCORD_STATE_DIR=%q ' "${DISCORD_STATE_DIR}")"
+fi
 # The rendered prompt must NOT be inlined (%q-escaped) into the tmux command
 # string: multibyte content escapes to ~3x its size and tmux rejects commands
 # over its ~16KB limit with "command too long" — the #311 prompt growth pushed
