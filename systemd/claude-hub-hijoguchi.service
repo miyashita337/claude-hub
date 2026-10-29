@@ -1,0 +1,38 @@
+# claude-hub claudeHubExit watchdog — systemd user service (WSL2/Linux).
+#
+# Design A (Issue #552): this unit is only the BOOT TRIGGER. It runs the
+# existing, machine-local WSL launcher ~/start-hijoguchi-wsl.sh, which already
+# owns env injection (HIJOGUCHI_CHANNEL_ID / HIJOGUCHI_BOT_MENTION / TMUX_PATH),
+# DISCORD_STATE_DIR isolation (keeps the bot's discord access.json/.env separate
+# from Channel-Supervisor's), a has-session double-start guard, and the
+# keep-alive restart loop (inner tmux session 'hijoguchi-wd' that re-runs
+# start-hijoguchi.sh — the launchd KeepAlive equivalent). systemd's job here is
+# purely "start it at boot", the piece WSL lacked vs. macOS launchd.
+#
+# Channel/bot IDs stay machine-local in the launcher (never committed —
+# fail-closed convention, Issue #63), exactly like the ids filled into the
+# installed launchd plist on macOS.
+#
+# __HOME__ is substituted by scripts/install-autostart.sh on install. Do NOT
+# hardcode a real path here.
+[Unit]
+Description=claude-hub claudeHubExit watchdog (WSL boot trigger)
+Documentation=https://github.com/miyashita337/claude-hub/issues/552
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+# oneshot: the launcher starts detached tmux sessions (hijoguchi-wd watchdog +
+# claudeHubExit bot) and exits 0. RemainAfterExit keeps the unit active so they
+# survive until an explicit stop. The launcher's has-session guard makes re-runs
+# idempotent (no double Gateway connection on the same token).
+Type=oneshot
+RemainAfterExit=yes
+Environment=PATH=__HOME__/.local/bin:__HOME__/.bun/bin:/usr/local/bin:/usr/bin:/bin
+ExecStart=/bin/bash __HOME__/start-hijoguchi-wsl.sh
+# Tear down both keep-alive tmux sessions on stop. `-` ignores "no such session".
+ExecStop=-/usr/bin/tmux kill-session -t hijoguchi-wd
+ExecStop=-/usr/bin/tmux kill-session -t claudeHubExit
+
+[Install]
+WantedBy=default.target

@@ -1,0 +1,34 @@
+# claude-hub Channel-Supervisor — systemd user service (WSL2/Linux).
+#
+# Design A (Issue #552): this unit is only the BOOT TRIGGER. It runs the
+# existing, machine-local WSL launcher ~/start-claude-hub-supervisor.sh, which
+# already owns the keep-alive restart loop (an inner tmux session
+# 'claude-supervisor' that re-runs `bun run index.ts` on crash — the launchd
+# KeepAlive equivalent). systemd's job here is purely "start it at boot", the
+# piece WSL lacked vs. macOS launchd.
+#
+# Both init configs live in the repo side by side (launchd plist +
+# this unit) so moving between macOS and WSL needs no rewrite.
+#
+# __HOME__ is substituted by scripts/install-autostart.sh on install (same
+# convention as the launchd plist templates). Do NOT hardcode a real path here.
+[Unit]
+Description=claude-hub Channel-Supervisor (WSL boot trigger)
+Documentation=https://github.com/miyashita337/claude-hub/issues/552
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+# oneshot: the launcher starts a detached tmux session and exits 0; the tmux
+# loop is the long-lived process. RemainAfterExit keeps the unit "active" so the
+# detached session is not torn down until an explicit stop. The launcher's own
+# has-session guard makes re-runs idempotent (no double Gateway connection).
+Type=oneshot
+RemainAfterExit=yes
+Environment=PATH=__HOME__/.local/bin:__HOME__/.bun/bin:/usr/local/bin:/usr/bin:/bin
+ExecStart=/bin/bash __HOME__/start-claude-hub-supervisor.sh
+# Tear down the keep-alive tmux session on stop. `-` ignores "no such session".
+ExecStop=-/usr/bin/tmux kill-session -t claude-supervisor
+
+[Install]
+WantedBy=default.target
