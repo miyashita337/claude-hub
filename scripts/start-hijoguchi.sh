@@ -2,9 +2,14 @@
 # claudeHubExit watchdog — keeps a tmux session named 'claudeHubExit' alive
 # running `claude --channels plugin:discord@claude-plugins-official`.
 #
-# Invoked by launchd (com.claude-hub.hijoguchi). Exits only on SIGTERM
-# from launchd; on any Claude crash, restarts the tmux session after a short
-# backoff. launchd KeepAlive restarts this script if it dies entirely.
+# Invoked by the OS init system (macOS launchd: com.claude-hub.hijoguchi;
+# WSL2/Linux systemd: claude-hub-hijoguchi.service — see Issue #552). Exits only
+# on SIGTERM from the init system; on any Claude crash, restarts the tmux
+# session after a short backoff. launchd KeepAlive / systemd Restart=always
+# re-exec this script if it dies entirely.
+#
+# This script is OS-agnostic on purpose so the same core works under both init
+# systems without a rewrite when the machine moves between macOS and WSL.
 #
 # See docs/bot-operations.md for rationale.
 
@@ -14,7 +19,11 @@ SESSION=claudeHubExit
 CLAUDE_HUB_DIR="${HOME}/claude-hub"
 LOG_DIR="${CLAUDE_HUB_DIR}/logs"
 CLAUDE_BIN="${HOME}/.local/bin/claude"
-TMUX_BIN="${TMUX_PATH:-/opt/homebrew/bin/tmux}"
+# tmux binary: honor an explicit TMUX_PATH override, else resolve from PATH
+# (WSL: /usr/bin/tmux). Fall back to the Homebrew path only when tmux is not on
+# PATH at all, so a bare macOS launchd env (minimal PATH) still finds it. This
+# keeps launchd (mac) and systemd (WSL) both working from one script (#552).
+TMUX_BIN="${TMUX_PATH:-$(command -v tmux 2>/dev/null || echo /opt/homebrew/bin/tmux)}"
 BACKOFF_SEC=5
 
 # --- Idle context reset (Issue #110) ---------------------------------------
