@@ -110,17 +110,29 @@ systemd_install() {
 
   # Lingering lets the user manager (and thus these units) start at boot without
   # an interactive login — the WSL-restart recovery this whole issue is about.
+  local linger_ok=1
   if loginctl enable-linger "$USER" 2>/dev/null; then
     log "Enabled linger for $USER (units start at boot without login)"
   else
-    log "WARN: 'loginctl enable-linger $USER' failed (may need: sudo loginctl enable-linger $USER)."
-    log "      Without linger the services will not auto-start until you log in."
+    linger_ok=0
+    log "WARN: 'loginctl enable-linger $USER' failed."
   fi
 
   systemctl --user daemon-reload
   systemctl --user enable --now "${UNIT_SUPERVISOR}" "${UNIT_HIJOGUCHI}"
   log "Enabled + started both units. Status:"
   systemctl --user --no-pager --full status "${UNIT_SUPERVISOR}" "${UNIT_HIJOGUCHI}" 2>&1 | grep -E 'Loaded|Active' || true
+
+  # linger is required for the stated goal (boot-without-login, Issue #552). The
+  # services are up + enabled now, but without linger they stop when the last
+  # session closes and won't start before first login. Return non-zero so the
+  # gap is surfaced instead of silently masked (CodeRabbit #553).
+  if [ "$linger_ok" = 0 ]; then
+    log "ACTION REQUIRED: services are running now, but will NOT survive logout or"
+    log "  auto-start on boot until you enable linger manually:"
+    log "    sudo loginctl enable-linger $USER"
+    return 1
+  fi
 }
 
 systemd_uninstall() {
@@ -155,7 +167,16 @@ launchd_install() {
 
   log "Installing Channel-Supervisor launchd job ..."
   mkdir -p "${plist_dir}" "${REPO_DIR}/logs"
-  sed -e "s|/Users/YOUR_USER|$HOME|g" "${sup_tmpl}" > "${sup_plist}"
+  # Do NOT clobber an already-installed plist: the template ships
+  # HIJOGUCHI_CHANNEL_ID blank by design (fail-closed), so re-templating would
+  # wipe a manually-filled id and silently disable the /session compact route
+  # (CodeRabbit #553). Only generate from template on a fresh install.
+  if [ -f "${sup_plist}" ]; then
+    log "Existing ${sup_plist} found — NOT overwriting (preserves filled HIJOGUCHI_CHANNEL_ID)."
+    log "  To regenerate from template, remove it first: rm ${sup_plist}"
+  else
+    sed -e "s|/Users/YOUR_USER|$HOME|g" "${sup_tmpl}" > "${sup_plist}"
+  fi
   launchctl bootout "gui/${uid}/com.claude-hub.supervisor" 2>/dev/null || true
   launchctl bootstrap "gui/${uid}" "${sup_plist}"
   log "Done. NOTE: fill HIJOGUCHI_CHANNEL_ID in ${sup_plist} then reload (bootout+bootstrap) — see plist comments."
@@ -176,9 +197,12 @@ log "Detected init system: ${INIT}  (override with CLAUDE_HUB_INIT=launchd|syste
 
 case "${INIT}" in
   systemd)
-    [ "$MODE" = "install" ] && systemd_install || systemd_uninstall ;;
+    # if/else (not `&& ... || ...`): with the short-circuit form a FAILED
+    # install would fall through to uninstall, and its non-zero exit would be
+    # masked (CodeRabbit #553). if/else propagates the install failure.
+    if [ "$MODE" = "install" ]; then systemd_install; else systemd_uninstall; fi ;;
   launchd)
-    [ "$MODE" = "install" ] && launchd_install || launchd_uninstall ;;
+    if [ "$MODE" = "install" ]; then launchd_install; else launchd_uninstall; fi ;;
   *)
     log "ERROR: no supported init system detected (not Darwin, systemd not PID 1)."
     log "       Set CLAUDE_HUB_INIT=launchd|systemd to force."
