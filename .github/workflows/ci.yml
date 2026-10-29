@@ -16,7 +16,14 @@ defaults:
 jobs:
   typecheck:
     name: Type Check
-    runs-on: ubuntu-latest
+    # Issue #554: pinned to 24.04. GitHub rolled `ubuntu-latest` from 24.04 to
+    # 26.04 (2026-10-27→29), where the runner's `ps` is slow/empty enough to
+    # break every process-table-dependent test (list-claude-processes argv0,
+    # cleanup-idle identity guard, launcher `ps -ax` reaping). 24.04 was the last
+    # green image; the supervisor only ships to macOS/WSL, so 26.04 is not a
+    # target env. Revisit when 24.04 nears runner EOL or the `ps` behaviour is
+    # fixed upstream.
+    runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@v4
 
@@ -68,7 +75,9 @@ jobs:
 
   unit-test:
     name: Unit Tests
-    runs-on: ubuntu-latest
+    # Issue #554: pinned to 24.04 (see Type Check job). This job carries the
+    # process-table tests that the 26.04 runner's `ps` regressed.
+    runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@v4
 
@@ -415,7 +424,8 @@ jobs:
 
   routing-tests:
     name: Routing Tests (S5 #51)
-    runs-on: ubuntu-latest
+    # Issue #554: pinned to 24.04 (see Type Check job).
+    runs-on: ubuntu-24.04
     defaults:
       run:
         working-directory: .
@@ -450,7 +460,9 @@ jobs:
   # payload) regressions are caught before merge — see Issue #73.
   e2e-tests:
     name: E2E Tests (AC-1..AC-7)
-    runs-on: ubuntu-latest
+    # Issue #554: pinned to 24.04 (see Type Check job). E2E spawns real tmux /
+    # process trees too, so it shares the 26.04 `ps` exposure.
+    runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@v4
 
