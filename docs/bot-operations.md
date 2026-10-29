@@ -103,6 +103,28 @@ claude-hub プロジェクトで運用している Discord Bot の役割分担�
 - `~/claude-hub/logs/supervisor.{stdout,stderr}.log` — supervisor ログ
 - `scripts/list-mcp-load-time.sh` — 各設定での cold-start 計測 (Issue #104 / Epic #101)
 
+## 自動起動: macOS(launchd) と WSL2(systemd) の両立 (Issue #552)
+
+常駐ジョブ（Channel-Supervisor + claudeHubExit watchdog）の boot 自動起動は OS で担い手が異なる。`scripts/install-autostart.sh` が OS を検出して正しい init system を選ぶ（`uname`=Darwin→launchd / systemd が PID1→systemd。`CLAUDE_HUB_INIT=launchd|systemd` で上書き可）。両構成は同一リポに並置するため、Mac↔WSL 間の移動で作り直しは不要。
+
+```bash
+bash scripts/install-autostart.sh              # この OS 用に設置 + 起動（冪等）
+bash scripts/install-autostart.sh --uninstall  # 撤去
+bash scripts/install-autostart.sh --dry-run     # 何もせず内容だけ表示
+```
+
+| OS | 担い手 | keep-alive(crash 復帰) | boot 起動 |
+|---|---|---|---|
+| macOS | launchd (`com.claude-hub.*.plist`) | launchd KeepAlive | launchd RunAtLoad |
+| WSL2/Linux | systemd user service (`systemd/claude-hub-*.service`) | ラッパー内側の tmux restart ループ | systemd + `loginctl enable-linger` |
+
+- **WSL は Design A**: systemd unit は Type=oneshot の **boot トリガー**のみ。実体は既存の machine-local ラッパー `~/start-hijoguchi-wsl.sh` / `~/start-claude-hub-supervisor.sh`（env 注入・DISCORD_STATE_DIR 分離・二重起動ガード・keep-alive ループを担う）。crash 復帰はラッパー内側の tmux ループが担当し、systemd は boot 起動だけを足す（WSL に欠けていた唯一のピース）
+- **channel/bot ID はラッパー側に machine-local で残す**（repo に入れない。fail-closed。launchd plist に ID を手入力するのと同じ扱い）
+- ラッパーが作る tmux セッション: `claude-supervisor` / `hijoguchi-wd`(watchdog) + `claudeHubExit`(bot 本体)。いずれも default socket
+- ログ: `logs/{supervisor,hijoguchi}.{stdout,stderr}.log`
+- テスト: `bash scripts/test-install-autostart.sh`（OS 検出・placeholder 置換・unit 契約を systemctl/launcher に触れず検証）
+- 復旧確認: `systemctl --user is-active claude-hub-supervisor claude-hub-hijoguchi`（両 active）+ `tmux ls`（3 セッション）
+
 ## メンテナンスジョブ: 添付ファイルの日次 GC (Issue #151 / #280)
 
 Discord 添付の保存先 `tmp/attachments` を毎日 04:00 に GC し、30 日超のファイルを削除する launchd ジョブ。**セットアップ時に手動インストールが必要**（supervisor 本体とは独立。未インストールだと GC が動かず添付が無限に溜まる — #280 で実際に未設置のまま放置されていた）。
