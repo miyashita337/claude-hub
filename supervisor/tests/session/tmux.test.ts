@@ -177,6 +177,10 @@ describe("ensureSocketConfigured unhappy-path (#85)", () => {
     expect(call.file).toBe(TMUX_PATH);
     expect(call.args).toEqual([
       "-L", TMUX_SOCKET,
+      // #268: start-server + exit-empty off create and pin the dedicated socket
+      // so the cold-start race (socket absent for the first relay op) is closed.
+      "start-server", ";",
+      "set-option", "-s", "exit-empty", "off", ";",
       "set-option", "-g", "mouse", "off", ";",
       "set-option", "-g", "mode-keys", "emacs", ";",
       "set-option", "-g", "history-limit", "10000",
