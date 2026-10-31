@@ -1,0 +1,14 @@
+# Periodic trigger for claude-hub-healthcheck.service. Issue #268 / #552.
+# OnBootSec: first health run shortly after boot (after the boot units settle).
+# OnUnitInactiveSec: re-run 2 min after each completion, giving <=2 min recovery
+# for a bot/tmux death that the oneshot boot units cannot recover on their own.
+[Unit]
+Description=Periodic claude-hub bots health re-run
+
+[Timer]
+OnBootSec=60
+OnUnitInactiveSec=120
+AccuracySec=10
+
+[Install]
+WantedBy=timers.target

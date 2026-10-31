@@ -1,0 +1,23 @@
+# claude-hub bots health re-run — systemd user service (WSL2/Linux).
+#
+# Supplies the crash-recovery that the #552 boot units (Type=oneshot +
+# RemainAfterExit) lack: if the tmux sessions/server die after boot, those units
+# stay "active (exited)" forever and never restart them. This service re-runs the
+# machine-local launchers; their has-session double-start guard makes it
+# idempotent (alive -> no-op, dead -> recreate). Driven by
+# claude-hub-healthcheck.timer every 2 min. Issue #268 / follow-up to #552.
+#
+# __HOME__ is substituted by scripts/install-autostart.sh on install.
+[Unit]
+Description=claude-hub bots health re-run (recreate dead tmux sessions)
+Documentation=https://github.com/miyashita337/claude-hub/issues/268
+
+[Service]
+Type=oneshot
+# KillMode=process: the launchers spawn a DETACHED tmux server (the real
+# long-lived process). The default control-group would reap that tmux when this
+# oneshot exits, killing the bots we just (re)started. process = kill only the
+# main bash on stop, leaving the tmux server alive.
+KillMode=process
+Environment=PATH=__HOME__/.local/bin:__HOME__/.bun/bin:/usr/local/bin:/usr/bin:/bin
+ExecStart=/bin/bash -lc 'bash __HOME__/start-claude-hub-supervisor.sh; bash __HOME__/start-hijoguchi-wsl.sh'
