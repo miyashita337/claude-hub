@@ -17,6 +17,7 @@ const {
   isAutoResumeDisabled,
   AUTO_RESUME_DISABLED_ENV,
   transcriptExistsOnDisk,
+  NO_TRANSCRIPT_NOTICE,
 } = await import("../../src/session/auto-resume");
 const { deriveTranscriptPath } = await import("../../src/session/pending-work");
 const { SessionManager } = await import("../../src/session/manager");
@@ -589,6 +590,32 @@ describe("resolveWakeReply (#456)", () => {
         { mentioned: false, buildSalvage: spy.buildSalvage }
       )
     ).toEqual({ relay: false, reply: null });
+    expect(spy.asked).toEqual([]);
+  });
+
+  test("#558: not-resumable/no-transcript → history-gone notice even without a mention", async () => {
+    const spy = salvageSpy();
+    expect(
+      await resolveWakeReply(
+        { kind: "not-resumable", reason: "no-transcript", verdict: "dead" },
+        { mentioned: false, buildSalvage: spy.buildSalvage }
+      )
+    ).toEqual({ relay: false, reply: NO_TRANSCRIPT_NOTICE });
+    // Terminal condition: the authored notice is used, not the salvage builder.
+    expect(spy.asked).toEqual([]);
+    // The wording must point at a fresh start, not a transient-fault retry.
+    expect(NO_TRANSCRIPT_NOTICE).toContain("会話履歴が見つかりません");
+    expect(NO_TRANSCRIPT_NOTICE).not.toContain("一時的な障害");
+  });
+
+  test("#558: not-resumable/no-transcript → same notice on a mention too", async () => {
+    const spy = salvageSpy();
+    expect(
+      await resolveWakeReply(
+        { kind: "not-resumable", reason: "no-transcript", verdict: "dead" },
+        { mentioned: true, buildSalvage: spy.buildSalvage }
+      )
+    ).toEqual({ relay: false, reply: NO_TRANSCRIPT_NOTICE });
     expect(spy.asked).toEqual([]);
   });
 

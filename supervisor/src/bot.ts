@@ -1846,7 +1846,15 @@ export async function startBot(token: string): Promise<void> {
           reportBriefWindowResolutionFailure("parent", threadId, (c) =>
             sessionlessThread.send(c),
           ),
-        wake: () => autoResumeThread(sessionManager, threadId),
+        // #558: pass transcriptExistsOnDisk so the generic wake, like the brief
+        // window above, refuses to `claude --resume` a session whose transcript
+        // is gone (supervisor restart left a `stopped` row before the jsonl was
+        // written). Without it, every message to such a thread spawns a claude
+        // that exits with "No conversation found", looping a misleading failure.
+        wake: () =>
+          autoResumeThread(sessionManager, threadId, {
+            transcriptExists: transcriptExistsOnDisk,
+          }),
         resolveReply: (wake) =>
           resolveWakeReply(wake, {
             mentioned: isBotMentioned(message, client.user),

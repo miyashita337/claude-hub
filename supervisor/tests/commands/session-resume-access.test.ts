@@ -80,6 +80,8 @@ function makeInteraction(opts: { userId: string; channelId?: string }) {
     count: () => 0,
     listRunningByChannel: () => [],
     livenessOfClaudeSession: () => "dead" as const,
+    // #558: present so these access-focused tests reach the resume launch.
+    hasResumableTranscript: () => true,
     findResumableSession: () => ({
       channel_name: "agent-base",
       project_dir: "/Users/x/agent-base",
