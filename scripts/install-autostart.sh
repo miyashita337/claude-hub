@@ -31,6 +31,9 @@ REPO_DIR="$(cd "$(dirname "$0")/.." && pwd)"
 SYSTEMD_SRC="${REPO_DIR}/systemd"
 UNIT_SUPERVISOR="claude-hub-supervisor.service"
 UNIT_HIJOGUCHI="claude-hub-hijoguchi.service"
+# Health-check supplies crash-recovery the oneshot boot units lack (#268/#552).
+UNIT_HEALTH_SVC="claude-hub-healthcheck.service"
+UNIT_HEALTH_TIMER="claude-hub-healthcheck.timer"
 # Machine-local WSL launchers the systemd units trigger (Design A). These hold
 # channel/bot IDs and are intentionally NOT tracked in the repo (fail-closed,
 # Issue #63) — same status as the IDs filled into an installed launchd plist.
@@ -105,8 +108,11 @@ systemd_install() {
   mkdir -p "${dest}" "${REPO_DIR}/logs"
   render_unit "${SYSTEMD_SRC}/${UNIT_SUPERVISOR}" > "${dest}/${UNIT_SUPERVISOR}"
   render_unit "${SYSTEMD_SRC}/${UNIT_HIJOGUCHI}"  > "${dest}/${UNIT_HIJOGUCHI}"
+  render_unit "${SYSTEMD_SRC}/${UNIT_HEALTH_SVC}"   > "${dest}/${UNIT_HEALTH_SVC}"
+  render_unit "${SYSTEMD_SRC}/${UNIT_HEALTH_TIMER}" > "${dest}/${UNIT_HEALTH_TIMER}"
   log "Wrote ${dest}/${UNIT_SUPERVISOR}"
   log "Wrote ${dest}/${UNIT_HIJOGUCHI}"
+  log "Wrote ${dest}/${UNIT_HEALTH_SVC} + ${UNIT_HEALTH_TIMER}"
 
   # Lingering lets the user manager (and thus these units) start at boot without
   # an interactive login — the WSL-restart recovery this whole issue is about.
@@ -120,7 +126,10 @@ systemd_install() {
 
   systemctl --user daemon-reload
   systemctl --user enable --now "${UNIT_SUPERVISOR}" "${UNIT_HIJOGUCHI}"
-  log "Enabled + started both units. Status:"
+  # The timer (not the oneshot service) is the enabled unit; it fires the
+  # health-check service on a schedule to recover dead bots (#268/#552).
+  systemctl --user enable --now "${UNIT_HEALTH_TIMER}"
+  log "Enabled + started both units + healthcheck timer. Status:"
   systemctl --user --no-pager --full status "${UNIT_SUPERVISOR}" "${UNIT_HIJOGUCHI}" 2>&1 | grep -E 'Loaded|Active' || true
 
   # linger is required for the stated goal (boot-without-login, Issue #552). The
@@ -137,8 +146,10 @@ systemd_install() {
 
 systemd_uninstall() {
   local dest; dest="$(systemd_user_dir)"
+  systemctl --user disable --now "${UNIT_HEALTH_TIMER}" 2>/dev/null || true
   systemctl --user disable --now "${UNIT_SUPERVISOR}" "${UNIT_HIJOGUCHI}" 2>/dev/null || true
-  rm -f "${dest}/${UNIT_SUPERVISOR}" "${dest}/${UNIT_HIJOGUCHI}"
+  rm -f "${dest}/${UNIT_SUPERVISOR}" "${dest}/${UNIT_HIJOGUCHI}" \
+        "${dest}/${UNIT_HEALTH_SVC}" "${dest}/${UNIT_HEALTH_TIMER}"
   systemctl --user daemon-reload 2>/dev/null || true
   log "Removed systemd user units. (linger left intact; run 'loginctl disable-linger $USER' to undo.)"
 }
