@@ -55,13 +55,23 @@ export const TMUX_CMD = `${TMUX_PATH} -L ${TMUX_SOCKET}`;
  * The three options are chained into a single tmux invocation via the
  * `\;` command separator so that we spawn one process instead of three.
  *
- * On the very first call there is no tmux server yet, so the chained
- * command fails with `no server running` — that is expected. Our caller
- * (`SessionManager.start`) invokes this again after `new-session -d`,
- * at which point the server is up and the options stick. Any other
- * failure (disk full, /tmp perms, etc.) is logged as a warning.
+ * Cold-start socket race (Issue #268): on a fresh boot the `-L <socket>`
+ * tmux server does not exist yet, and `set-option` does NOT create it — it
+ * fails with `error connecting to <socket> (No such file or directory)`.
+ * When the Supervisor is auto-started at boot (macOS launchd RunAtLoad or
+ * WSL2 systemd via Issue #552), the socket is then absent when the first
+ * relay `has-session` / `capture-pane` runs, so the Supervisor cannot read
+ * its session output and appears unresponsive. We therefore `start-server`
+ * FIRST (creates the server + socket) and pin it alive with `exit-empty off`
+ * (the server option that otherwise auto-exits a session-less server, leaving
+ * only a stale socket file), then apply the global options — all chained into
+ * ONE invocation so `exit-empty off` takes effect before the implicit client
+ * disconnects. Idempotent: `start-server` on a running server is a no-op.
+ * Any failure (disk full, /tmp perms, etc.) is logged as a warning.
  *
  * Options set:
+ * - `start-server` + `exit-empty off`: guarantee the dedicated socket exists
+ *   and persists across empty periods, closing the #268 cold-start race.
  * - `mouse off`: prevents WheelUpPane from auto-entering copy-mode (H1).
  * - `mode-keys emacs`: `Escape` cancels copy-mode when in one (in contrast
  *   to vi, where Escape is a no-op on the mode). This protects the Ink
@@ -87,6 +97,8 @@ export async function ensureSocketConfigured(): Promise<void> {
       TMUX_PATH,
       [
         ...TMUX_ARGS,
+        "start-server", ";",
+        "set-option", "-s", "exit-empty", "off", ";",
         "set-option", "-g", "mouse", "off", ";",
         "set-option", "-g", "mode-keys", "emacs", ";",
         "set-option", "-g", "history-limit", "10000",
