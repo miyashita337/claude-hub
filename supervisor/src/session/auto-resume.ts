@@ -323,7 +323,7 @@ async function decide(
  */
 export const NO_TRANSCRIPT_NOTICE =
   "⚠️ このスレッドの以前のセッションは復帰できません（会話履歴が見つかりません）。\n" +
-  "▶️ 新しく始めるには `/session start` を実行してください。";
+  "▶️ 新しく始めるには `/session start <branch>` を実行してください。";
 
 /**
  * What the caller should do with a wake outcome: what (if anything) to post in

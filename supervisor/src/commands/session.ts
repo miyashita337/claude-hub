@@ -780,7 +780,7 @@ async function handleResume(
     await interaction.reply({
       content:
         "❌ このセッションは復帰できません（会話履歴が見つかりません）。\n" +
-        "新しく始めるには `/session start` を実行してください。",
+        "新しく始めるには `/session start <branch>` を実行してください。",
       flags: 64,
     });
     return;
