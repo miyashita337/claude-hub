@@ -314,6 +314,16 @@ async function decide(
 }
 
 /**
+ * Shown when a thread's last session cannot resume because its transcript is
+ * gone (#558). Authored here, path-free, and actionable: the session is
+ * permanently unresumable, so point at a fresh start rather than implying a
+ * transient fault the user should wait out or retry.
+ */
+export const NO_TRANSCRIPT_NOTICE =
+  "⚠️ このスレッドの以前のセッションは復帰できません（会話履歴が見つかりません）。\n" +
+  "▶️ 新しく始めるには `/session start` を実行してください。";
+
+/**
  * What the caller should do with a wake outcome: what (if anything) to post in
  * the thread, and whether the triggering message should still be relayed.
  */
@@ -355,6 +365,15 @@ export async function resolveWakeReply(
       // #456 exists to remove. null only for a joined attempt, already reported.
       return { relay: false, reply: outcome.notice };
     case "not-resumable":
+      // #558: a thread whose last session can never resume (its transcript is
+      // gone) gets a plain, actionable notice REGARDLESS of mention — the user
+      // is posting to a thread that will never wake, and the old behaviour
+      // (silent, or a salvage hint only on mention) read as a stuck/temporary
+      // fault. Other not-resumable reasons (alive / no-claude-session-id) keep
+      // the mention-gated salvage so an unrelated thread is not spammed.
+      if (outcome.reason === "no-transcript") {
+        return { relay: false, reply: NO_TRANSCRIPT_NOTICE };
+      }
       // Pass the verdict the decision was made on so the salvage path does not
       // re-run livenessOf — a tmux call that waits the full 2s on timeout
       // (#238, same reason as #364).

@@ -1810,6 +1810,20 @@ export class SessionManager {
   }
 
   /**
+   * Whether the transcript `claude --resume <id>` would load still exists on
+   * disk (Issue #558). `claude --resume` keys the jsonl by the session's cwd,
+   * so a row recorded as `stopped` before claude ever wrote its transcript
+   * (a crash right after a supervisor restart) can never resume — the launch
+   * exits with "No conversation found". Callers use this to reject up front
+   * instead of spawning a doomed `claude --resume`. Same path
+   * `deriveTranscriptPath` builds (keyed by cwd, so it survives the worktree
+   * itself being removed on stop, #217).
+   */
+  hasResumableTranscript(projectDir: string, claudeSessionId: string): boolean {
+    return existsSync(deriveTranscriptPath(projectDir, claudeSessionId));
+  }
+
+  /**
    * Resume a previously-stopped Claude session in a fresh thread with full
    * relay wiring (Issue #161). Unlike {@link start}, this passes
    * `claude --resume <id>` so the conversation history is preserved.

@@ -774,6 +774,23 @@ async function handleResume(
     return;
   }
 
+  // Issue #558: `claude --resume <id>` reads the transcript keyed by the
+  // session's cwd; if that jsonl is gone (supervisor restart recorded a
+  // `stopped` row before claude ever wrote it), resume can only fail with
+  // "No conversation found". Catching it after launch surfaces the generic
+  // "一時的な障害の可能性があります" notice — misleading for a permanently
+  // unresumable session — and needlessly creates then deletes a thread. Reject
+  // up front with an actionable, path-free message instead.
+  if (!sessionManager.hasResumableTranscript(row.project_dir, sessionId)) {
+    await interaction.reply({
+      content:
+        "❌ このセッションは復帰できません（会話履歴が見つかりません）。\n" +
+        "新しく始めるには `/session start` を実行してください。",
+      flags: 64,
+    });
+    return;
+  }
+
   await interaction.deferReply();
 
   let createdThread: ThreadChannel | null = null;

@@ -87,6 +87,12 @@ function makeInteraction(opts: {
    * `channelName` via the parent, which the non-thread mock never reaches.
    */
   asThread?: boolean;
+  /**
+   * Issue #558: whether the session's transcript jsonl exists. Defaults to
+   * true so existing resume tests are unaffected; false exercises the
+   * "会話履歴が見つかりません" early rejection.
+   */
+  transcriptExists?: boolean;
 }) {
   const replies: ReplyRecord[] = [];
   const resumeCalls: unknown[][] = [];
@@ -159,6 +165,9 @@ function makeInteraction(opts: {
     count: () => 0,
     listRunningByChannel: () => [],
     livenessOfClaudeSession: () => opts.liveness ?? "dead",
+    // #558: default present so legacy resume tests proceed; set false to
+    // exercise the transcript-gone rejection without touching the real disk.
+    hasResumableTranscript: () => opts.transcriptExists ?? true,
     findResumableSession: (id: string) => {
       findCalls.push(id);
       return opts.resumableRow;
@@ -225,6 +234,47 @@ describe("/session resume validation (#161)", () => {
     expect(h.resumeCalls).toHaveLength(0);
     expect(h.threadCreated).toBe(false);
     expect(h.replies[0]!.content).toContain("見つかりません");
+  });
+
+  test("#558: transcript gone → history-not-found error, no resume, no thread", async () => {
+    const h = makeInteraction({
+      sessionId: VALID_ID,
+      channelName: "team-salary",
+      resumableRow: {
+        channel_name: "team-salary",
+        project_dir: "/Users/x/team_salary",
+        status: "stopped",
+      },
+      transcriptExists: false,
+    });
+    await h.run();
+
+    // No `claude --resume` is spawned, and no throwaway thread is created.
+    expect(h.resumeCalls).toHaveLength(0);
+    expect(h.threadCreated).toBe(false);
+    expect(h.threadDeleted).toBe(false);
+    expect(h.replies).toHaveLength(1);
+    expect(h.replies[0]!.flags).toBe(64);
+    // Actionable wording, NOT the misleading transient-fault notice (#558).
+    expect(h.replies[0]!.content).toContain("会話履歴が見つかりません");
+    expect(h.replies[0]!.content).not.toContain("一時的な障害");
+  });
+
+  test("#558: transcript present → resume proceeds as before (no regression)", async () => {
+    const h = makeInteraction({
+      sessionId: VALID_ID,
+      channelName: "team-salary",
+      resumableRow: {
+        channel_name: "team-salary",
+        project_dir: "/Users/x/team_salary",
+        status: "stopped",
+      },
+      transcriptExists: true,
+    });
+    await h.run();
+
+    expect(h.resumeCalls).toHaveLength(1);
+    expect(h.threadCreated).toBe(true);
   });
 
   test("session from a different channel → error", async () => {
