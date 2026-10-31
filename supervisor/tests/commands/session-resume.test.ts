@@ -93,6 +93,8 @@ function makeInteraction(opts: {
    * "会話履歴が見つかりません" early rejection.
    */
   transcriptExists?: boolean;
+  /** Issue #558: live session count, to exercise the MAX_SESSIONS gate order. */
+  count?: number;
 }) {
   const replies: ReplyRecord[] = [];
   const resumeCalls: unknown[][] = [];
@@ -162,7 +164,7 @@ function makeInteraction(opts: {
   };
 
   const sessionManager = {
-    count: () => 0,
+    count: () => opts.count ?? 0,
     listRunningByChannel: () => [],
     livenessOfClaudeSession: () => opts.liveness ?? "dead",
     // #558: default present so legacy resume tests proceed; set false to
@@ -275,6 +277,27 @@ describe("/session resume validation (#161)", () => {
 
     expect(h.resumeCalls).toHaveLength(1);
     expect(h.threadCreated).toBe(true);
+  });
+
+  test("#558: table full AND transcript gone → history message wins, not MAX_SESSIONS", async () => {
+    const h = makeInteraction({
+      sessionId: VALID_ID,
+      channelName: "team-salary",
+      resumableRow: {
+        channel_name: "team-salary",
+        project_dir: "/Users/x/team_salary",
+        status: "stopped",
+      },
+      transcriptExists: false,
+      count: 999, // well over MAX_SESSIONS
+    });
+    await h.run();
+
+    expect(h.resumeCalls).toHaveLength(0);
+    // The transcript check precedes the MAX_SESSIONS gate: a full table must
+    // not mask the real, unrecoverable reason (#558).
+    expect(h.replies[0]!.content).toContain("会話履歴が見つかりません");
+    expect(h.replies[0]!.content).not.toContain("最大セッション数");
   });
 
   test("session from a different channel → error", async () => {

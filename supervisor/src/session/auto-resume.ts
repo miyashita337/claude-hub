@@ -92,9 +92,10 @@ export type AutoResumeOutcome =
    * back to it instead of inventing a second wording.
    *
    * `no-transcript` is only produced for a caller that passed
-   * {@link AutoResumeDeps.transcriptExists} (the morning window, #504): the
-   * row has an id but claude never wrote its jsonl, so `--resume` would exit
-   * straight away with "No conversation found" (#485).
+   * {@link AutoResumeDeps.transcriptExists} — the morning window (#504) and,
+   * since #558, the generic wake: the row has an id but claude never wrote its
+   * jsonl, so `--resume` would exit straight away with "No conversation
+   * found" (#485).
    */
   | {
       kind: "not-resumable";
@@ -122,9 +123,10 @@ export interface AutoResumeDeps {
   /**
    * When given, resume is attempted only if this reports the transcript as
    * present; otherwise the outcome is `not-resumable` / `no-transcript` and
-   * nothing is launched. Opt-in so the generic wake keeps its behaviour (its
-   * missing-transcript notice is #486's scope); the morning window passes
-   * {@link transcriptExistsOnDisk} so it can fall back to a fresh start (#504).
+   * nothing is launched. Still optional (tests omit it), but both production
+   * callers now pass {@link transcriptExistsOnDisk}: the morning window to fall
+   * back to a fresh start (#504), and the generic wake to stop looping a doomed
+   * `--resume` on a thread whose jsonl is gone (#558).
    */
   transcriptExists?: (projectDir: string, claudeSessionId: string) => boolean;
 }
