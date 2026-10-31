@@ -1817,10 +1817,15 @@ export class SessionManager {
    * exits with "No conversation found". Callers use this to reject up front
    * instead of spawning a doomed `claude --resume`. Same path
    * `deriveTranscriptPath` builds (keyed by cwd, so it survives the worktree
-   * itself being removed on stop, #217).
+   * itself being removed on stop, #217). `home` is overridable for tests, like
+   * {@link transcriptExistsOnDisk}; production callers use the default.
    */
-  hasResumableTranscript(projectDir: string, claudeSessionId: string): boolean {
-    return existsSync(deriveTranscriptPath(projectDir, claudeSessionId));
+  hasResumableTranscript(
+    projectDir: string,
+    claudeSessionId: string,
+    home: string = homedir(),
+  ): boolean {
+    return existsSync(deriveTranscriptPath(projectDir, claudeSessionId, home));
   }
 
   /**

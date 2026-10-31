@@ -1,7 +1,13 @@
 import { test, expect, describe, beforeEach, afterEach, spyOn } from "bun:test";
-import { existsSync, mkdirSync, rmSync } from "fs";
+import {
+  existsSync,
+  mkdirSync,
+  mkdtempSync,
+  rmSync,
+  writeFileSync,
+} from "fs";
 import { tmpdir } from "os";
-import { resolve } from "path";
+import { dirname, join, resolve } from "path";
 // Pure path resolver (no DB access) — safe to import statically before the
 // SUPERVISOR_DB_PATH override below.
 import { resolveWorktreePath } from "../../src/session/worktree";
@@ -14,6 +20,7 @@ const { createFakeEffects } = await import(
   "../../src/session/adapters-fake"
 );
 const { insertSession, getDb } = await import("../../src/infra/db");
+const { deriveTranscriptPath } = await import("../../src/session/pending-work");
 import type { FakeSessionEffects } from "../../src/session/adapters-fake";
 import type { ChannelConfig } from "../../src/config/channels";
 
@@ -680,5 +687,41 @@ describe("redactPaneSecrets (PR #487 review)", () => {
     expect(out).not.toContain("hunter2");
     expect(out).not.toContain("QWxhZGRpbjpvcGVuIHNlc2FtZQQWxhZGRpbjpvcGVu");
     expect(out).toContain("[REDACTED]");
+  });
+});
+
+describe("SessionManager.hasResumableTranscript (#558)", () => {
+  const OTHER_ID = "11111111-1111-4111-8111-000000000002";
+  let manager: InstanceType<typeof SessionManager>;
+  let home: string;
+
+  beforeEach(() => {
+    manager = new SessionManager({
+      effects: createFakeEffects(),
+      gracefulKillTimeoutMs: 0,
+      resumePromptPollAttempts: 0,
+    });
+    // Temp HOME via the overridable param so the probe is deterministic and
+    // never touches the real ~/.claude tree.
+    home = mkdtempSync(join(tmpdir(), "has-transcript-"));
+  });
+
+  afterEach(async () => {
+    rmSync(home, { recursive: true, force: true });
+    await manager?.shutdownAll();
+  });
+
+  test("true only when the jsonl `claude --resume` would read exists", () => {
+    // The cwd string keys the path; the dir itself need not exist (#217).
+    const cwd = "/Users/x/team_salary";
+    expect(manager.hasResumableTranscript(cwd, VALID_ID, home)).toBe(false);
+
+    const path = deriveTranscriptPath(cwd, VALID_ID, home);
+    mkdirSync(dirname(path), { recursive: true });
+    writeFileSync(path, "{}\n");
+    expect(manager.hasResumableTranscript(cwd, VALID_ID, home)).toBe(true);
+
+    // A different session id in the same project dir does not count.
+    expect(manager.hasResumableTranscript(cwd, OTHER_ID, home)).toBe(false);
   });
 });
