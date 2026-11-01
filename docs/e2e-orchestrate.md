@@ -39,11 +39,11 @@ bun --env-file=supervisor/.env supervisor/tools/e2e-live.ts --scenario s2-5
 | # | 準備 | 理由 |
 |---|---|---|
 | 1 | Supervisor が **PR #325 以降**のコードで稼働（`launchctl kickstart -k "gui/$UID/com.claude-hub.supervisor"`） | `/orchestrate`（PR #324）と `POST /hub-work`（PR #325）が必要。プリフライトが `/hub-work` の 400 応答で機械確認する。**注意: Supervisor 再起動は running 中の全セッションを stop する**（`supervisor_restart`。worktree は保持され `/session resume` で再開可能）。再起動前に `bun run supervisor/tools/session-ctl.ts list` で確認すること |
-| 2 | driver Bot token が `supervisor/.env` にある（既定: `VIDEO_QA_BOT_TOKEN`。`E2E_DRIVER_TOKEN_ENV` で変更可） | テストドライバは Supervisor とは別 Bot として corp へ投稿する |
+| 2 | driver Bot token が `supervisor/.env` にある（既定の env 名: `E2E_DRIVER_BOT_TOKEN`。`E2E_DRIVER_TOKEN_ENV` で別 env 名を指せる）。**owner 保有の任意の Bot でよい**（Supervisor とは別 Bot）。未設定ならライブ部は FAIL ではなく SKIP（driver 無しでも全体は通る） | テストドライバは Supervisor とは別 Bot として corp へ投稿する。旧既定の VideoQA Bot は廃止済み |
 | 3 | `~/.claude/channels/discord/access.json` の corp グループ `allowFrom` に driver Bot の user id を追加 | `/orchestrate` の認可は `allowFrom`（bot.ts はこの経路を bot ドロップより前にインターセプト）。**この許可で widening するのは /orchestrate 起動のみ** — 通常スレッド relay は `message.author.bot` で落ちるため、driver Bot が既存セッションを操作できるようにはならない |
 | 4 | `orchestrate-runner` スキルが install 済み（`~/.claude/skills/orchestrate-runner/`） | S1 のオーケストレーター頭脳（agent-base PR #453） |
 
-プリフライトが 1〜4 を機械チェックする。1・2・4 の不足は FAIL + 対処を出力して停止（fail-closed）。
+プリフライトが 1〜4 を機械チェックする。1・4 の不足は FAIL + 対処を出力して停止（fail-closed）。2（driver Bot token）の不足はライブ部を SKIP（driver 無しでも全体は exit 0 で通る）。
 3（allowFrom）のみ未実施の場合は、`/orchestrate` 駆動シナリオ（S1 / S2-*）を SKIP として明示レポートし、
 認可不要の S1b（loopback の `POST /hub-work`）と S3 は実行する（部分縮退）。
 ドライバは access.json を**読み取り検査するだけで書き換えない** — 認可の追加は owner の明示操作とする。

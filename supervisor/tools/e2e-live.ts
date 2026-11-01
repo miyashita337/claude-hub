@@ -82,7 +82,10 @@ import { DISPATCH_MAX_CONCURRENT } from "../src/config/channels";
 const API = "https://discord.com/api/v10";
 
 // ---------- 設定（env 上書き可） ----------
-const DRIVER_TOKEN_ENV = process.env.E2E_DRIVER_TOKEN_ENV ?? "VIDEO_QA_BOT_TOKEN";
+// driver Bot の token を読む env 名。VideoQA Bot は廃止されたため、特定 Bot に固定した
+// 既定（旧 VIDEO_QA_BOT_TOKEN）をやめ、中立の E2E_DRIVER_BOT_TOKEN を既定にする。owner は
+// 任意の保有 Bot の token をこの env に入れる（別名で持つなら E2E_DRIVER_TOKEN_ENV で指す）。
+const DRIVER_TOKEN_ENV = process.env.E2E_DRIVER_TOKEN_ENV ?? "E2E_DRIVER_BOT_TOKEN";
 const CORP_CHANNEL_NAME = process.env.E2E_CORP_CHANNEL_NAME ?? "corp";
 const REPO = process.env.E2E_REPO ?? "miyashita337/claude-hub";
 /** hijoguchi（claudeHubExit）Bot の user id。非干渉アサート用（S1b/S3）。 */
@@ -265,8 +268,13 @@ async function main(): Promise<number> {
   }
 
   // ---------- プリフライト ----------
+  // driver Bot token 未設定なら live を SKIP（FAIL ではなく）。VideoQA Bot 廃止後、
+  // driver 無しでも全体は通る（exit 0）。live を回すには E2E_DRIVER_BOT_TOKEN（または
+  // E2E_DRIVER_TOKEN_ENV で指した env）に owner 保有 Bot の token を入れ、その Bot id を
+  // corp allowFrom に登録する（docs/e2e-orchestrate.md 前提 2/3）。
   if (!driverToken) {
-    record("PRE", "driver Bot token", "FAIL", `env ${DRIVER_TOKEN_ENV} が空`);
+    record("LIVE", "ライブ手順（driver Bot 未設定）", "SKIP",
+      `env ${DRIVER_TOKEN_ENV} が空。driver Bot を設定すると live が走る（docs/e2e-orchestrate.md）`);
     return finish();
   }
   const me = await rest("GET", "/users/@me");
