@@ -114,6 +114,8 @@ jobs:
           gh api "repos/${REPO}/issues/${PR_NUMBER}/comments" --paginate \
             --jq '.[] | select(.body | startswith("## 🤖 Claude レビュー")) | {id, created_at, body: .body[0:4000]}' \
             > "$GITHUB_WORKSPACE/.claude-review-summaries.jsonl"
+          # 件数だけをログに残す（本文は出さない）。0 件なのに過去の指摘がある場合の切り分け用
+          wc -l "$GITHUB_WORKSPACE/.claude-review-inline.jsonl" "$GITHUB_WORKSPACE/.claude-review-summaries.jsonl"
 
       # CLAUDE_CODE_SUBPROCESS_ENV_SCRUB=1 では Bash がサンドボックス（bubblewrap + socat）内で動く。
       # action はこれを allowed_non_write_users 指定時にしか入れないため、ここで入れる。
