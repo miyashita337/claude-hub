@@ -180,7 +180,7 @@ jobs:
           # `gh pr comment N:*` は前方一致（後ろに任意の引数を付けられる）なので、ファイルを読んで投稿できる
           # --body-file / -F と、既存コメントを書き換える --edit-last / --delete-last を明示 deny する。
           # Read の deny は Read ツールにしか効かず、gh 自身のファイル読み込みは止められないため。
-          # gh api は完全一致で許可しているので引数を足せない
+          # gh api は許可しない（既存コメントは起動前のステップで取得してファイルで渡す）
           claude_args: |
             --max-turns 30
             --allowedTools "Read(./**),Grep(./**),Glob(./**),Read(~/.claude/projects/**),mcp__github_inline_comment__create_inline_comment,Bash(gh pr comment ${{ env.PR_NUMBER }}:*),Bash(gh pr diff:*),Bash(gh pr view:*)"
