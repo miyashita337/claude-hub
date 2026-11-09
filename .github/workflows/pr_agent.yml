@@ -49,7 +49,8 @@ jobs:
     # - Bot 起因のイベントには反応しない（レビュー無限ループ防止）
     # - fork からの PR と draft は除外（fork は secrets が渡らず失敗するだけ。draft は
     #   ready_for_review で改めて起動するので、二重に分数と無料枠を使わないため）
-    # - PR / コメントの作者が OWNER / MEMBER / COLLABORATOR のときだけ（public リポで
+    # - PR / コメントの作者が OWNER / MEMBER / COLLABORATOR のときだけ。コメント起動でも PR 作成者を
+    #   確認する（issue_comment は base の secrets で動くため、外部作成者の diff を読ませない）（public リポで
     #   第三者に GEMINI_API_KEY の無料枠を消費させない。claude-hub#545 と同じ許可リスト）
     # - issue_comment は「PR 上」かつ「/ 始まりのコマンド」のときだけ。pr-agent は
     #   それ以外のコメントでは何もせず終わるのに 1 分課金される（agent-base 実測:
@@ -65,6 +66,7 @@ jobs:
           startsWith(github.event.comment.body, '/') &&
           !startsWith(github.event.comment.body, '/cursor-review') &&
           !startsWith(github.event.comment.body, '/claude-review') &&
+          contains(fromJSON('["OWNER","MEMBER","COLLABORATOR"]'), github.event.issue.author_association) &&
           contains(fromJSON('["OWNER","MEMBER","COLLABORATOR"]'), github.event.comment.author_association))
       )
     runs-on: ubuntu-latest

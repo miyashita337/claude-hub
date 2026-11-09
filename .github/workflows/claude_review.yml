@@ -61,7 +61,7 @@ jobs:
     # job レベルに置くことで、`if` が false の run（無関係なコメント・bot 自身の総評など）は
     # グループに入らず、待機中の /claude-review を押し出さない（workflow レベルだと全 run が入る）。
     # group は event 種別で分ける: 手動 /claude-review（観点指定付き）が、直後の push で起動した
-    # 自動 run にキャンセル・置き換えされないようにする（手動同士は順番待ち）
+    # 自動 run にキャンセル・置き換えされないようにする（手動同士は順番待ちだが、GitHub の仕様で待機できるのは最新の 1 件だけ）
     concurrency:
       group: claude-review-${{ github.event_name }}-${{ github.event.pull_request.number || github.event.issue.number }}
       cancel-in-progress: ${{ github.event_name == 'pull_request' }}
