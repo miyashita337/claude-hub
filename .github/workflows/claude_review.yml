@@ -151,13 +151,19 @@ jobs:
             投稿ルール:
             - 具体的な行に対する指摘は mcp__github_inline_comment__create_inline_comment でインライン投稿（重大度を先頭に [must] / [should] / [nit]）
             - 最後に `gh pr comment ${{ env.PR_NUMBER }} --body "..."` で総評を 1 件投稿
+              （本文は --body で直接渡す。--body-file / -F は権限で拒否される。本文に「 -F」のような
+              フラグ風の文字列を含むと拒否されることがあるので、その場合は言い換えて再投稿する）
               （見出し「## 🤖 Claude レビュー」、must / should 件数、問題がなければその旨）
           # 読み取りの信頼境界: secrets（環境変数・runner の資格情報・一時ファイル）が置かれる場所を
           # disallowedTools で明示 deny する。deny は allow より常に優先されるため、base の
           # .claude/settings.json が素の Read / Grep / Glob を許可していても効く（allowedTools の
           # ./** 限定は、プロジェクト設定に allow が無いリポ向けの多層防御）。/proc は全プロセスの環境変数
           # （OAuth トークン・GITHUB_TOKEN）、_temp はプロンプト等、runners は runner の資格情報
+          # `gh pr comment N:*` は前方一致（後ろに任意の引数を付けられる）なので、ファイルを読んで投稿できる
+          # --body-file / -F と、既存コメントを書き換える --edit-last / --delete-last を明示 deny する。
+          # Read の deny は Read ツールにしか効かず、gh 自身のファイル読み込みは止められないため。
+          # gh api は完全一致で許可しているので引数を足せない
           claude_args: |
             --max-turns 30
             --allowedTools "Read(./**),Grep(./**),Glob(./**),mcp__github_inline_comment__create_inline_comment,Bash(gh pr comment ${{ env.PR_NUMBER }}:*),Bash(gh pr diff:*),Bash(gh pr view:*),Bash(gh api repos/${{ github.repository }}/pulls/${{ env.PR_NUMBER }}/comments --paginate)"
-            --disallowedTools "Read(//proc/**),Read(//sys/**),Read(//tmp/**),Read(~/.claude/**),Read(~/.config/**),Read(~/.ssh/**),Read(~/.gitconfig),Read(//home/runner/work/_temp/**),Read(//home/runner/work/_actions/**),Read(//home/runner/runners/**),Read(//home/runner/actions-runner/**)"
+            --disallowedTools "Read(//proc/**),Read(//sys/**),Read(//tmp/**),Read(~/.claude/**),Read(~/.config/**),Read(~/.ssh/**),Read(~/.gitconfig),Read(//home/runner/work/_temp/**),Read(//home/runner/work/_actions/**),Read(//home/runner/runners/**),Read(//home/runner/actions-runner/**),Bash(gh * --body-file*),Bash(gh * -F*),Bash(gh * --edit-last*),Bash(gh * --delete-last*)"
