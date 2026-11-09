@@ -47,14 +47,19 @@ jobs:
         contains(fromJSON('["OWNER","MEMBER","COLLABORATOR"]'), github.event.pull_request.author_association)) ||
       (github.event_name == 'issue_comment' &&
         github.event.issue.pull_request &&
-        startsWith(github.event.comment.body, '/claude-review') &&
+        (github.event.comment.body == '/claude-review' ||
+          startsWith(github.event.comment.body, '/claude-review ') ||
+          startsWith(github.event.comment.body, format('/claude-review{0}', fromJSON('"\n"'))) ||
+          startsWith(github.event.comment.body, format('/claude-review{0}', fromJSON('"\r"')))) &&
         contains(fromJSON('["OWNER","MEMBER","COLLABORATOR"]'), github.event.comment.author_association))
     runs-on: ubuntu-latest
     # 自動レビューは同じ PR の古い run をキャンセルし、最新 commit だけをレビュー（枠と分数の節約）。
     # job レベルに置くことで、`if` が false の run（無関係なコメント・bot 自身の総評など）は
-    # グループに入らず、待機中の /claude-review を押し出さない（workflow レベルだと全 run が入る）
+    # グループに入らず、待機中の /claude-review を押し出さない（workflow レベルだと全 run が入る）。
+    # group は event 種別で分ける: 手動 /claude-review（観点指定付き）が、直後の push で起動した
+    # 自動 run にキャンセル・置き換えされないようにする（手動同士は順番待ち）
     concurrency:
-      group: claude-review-${{ github.event.pull_request.number || github.event.issue.number }}
+      group: claude-review-${{ github.event_name }}-${{ github.event.pull_request.number || github.event.issue.number }}
       cancel-in-progress: ${{ github.event_name == 'pull_request' }}
     # サブスク枠と Actions 分数の上限
     timeout-minutes: 20
