@@ -83,7 +83,7 @@ jobs:
       # pull_request の既定は PR を含む merge コミットなので、base コミットを明示する
       # （issue_comment では空 = デフォルトブランチ）
       - name: Checkout trusted base
-        uses: actions/checkout@v4
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262  # v4
         with:
           ref: ${{ github.event.pull_request.base.sha || '' }}
           fetch-depth: 1
@@ -97,7 +97,7 @@ jobs:
           printf '%s' "${BODY#/claude-review}" > "$GITHUB_WORKSPACE/.claude-review-focus.txt"
 
       - name: Claude review
-        uses: anthropics/claude-code-action@v1
+        uses: anthropics/claude-code-action@61a9c274fa7110a66dfafc1bbbced03833eb25fe  # v1（secrets を渡すため SHA 固定）
         with:
           claude_code_oauth_token: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
           github_token: ${{ github.token }}

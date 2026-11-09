@@ -76,7 +76,7 @@ jobs:
     steps:
       - name: PR Agent action step
         id: pragent
-        uses: the-pr-agent/pr-agent@v0.36.0
+        uses: the-pr-agent/pr-agent@ffe1f89a4dafc7d8e88b9cf010a3233e30b49f43  # v0.36.0（secrets を渡すため SHA 固定）
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           # --- モデル設定（Google AI Studio の Gemini API・無料枠）---
