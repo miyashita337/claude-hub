@@ -47,7 +47,8 @@ jobs:
   pr_agent_job:
     # 起動条件（Actions 分数と Gemini 無料枠の節約・第三者による消費の防止）:
     # - Bot 起因のイベントには反応しない（レビュー無限ループ防止）
-    # - fork からの PR は除外（secrets が渡らず失敗して赤くなるだけのため）
+    # - fork からの PR と draft は除外（fork は secrets が渡らず失敗するだけ。draft は
+    #   ready_for_review で改めて起動するので、二重に分数と無料枠を使わないため）
     # - PR / コメントの作者が OWNER / MEMBER / COLLABORATOR のときだけ（public リポで
     #   第三者に GEMINI_API_KEY の無料枠を消費させない。claude-hub#545 と同じ許可リスト）
     # - issue_comment は「PR 上」かつ「/ 始まりのコマンド」のときだけ。pr-agent は
@@ -57,6 +58,7 @@ jobs:
     if: >-
       github.event.sender.type != 'Bot' && (
         (github.event_name == 'pull_request' &&
+          !github.event.pull_request.draft &&
           github.event.pull_request.head.repo.full_name == github.repository &&
           contains(fromJSON('["OWNER","MEMBER","COLLABORATOR"]'), github.event.pull_request.author_association)) ||
         (github.event_name == 'issue_comment' && github.event.issue.pull_request &&
