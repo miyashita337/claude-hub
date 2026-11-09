@@ -69,6 +69,10 @@ jobs:
     timeout-minutes: 20
     env:
       PR_NUMBER: ${{ github.event.pull_request.number || github.event.issue.number }}
+      # Claude が起動するサブプロセス（gh 等）の環境から Anthropic / GitHub Actions の secrets を
+      # best-effort で除去する（claude-code-action の公式機能。PR 本文・diff 経由のプロンプト
+      # インジェクションで OAuth トークンを gh pr comment 等に流させない対策。完全ではない）
+      CLAUDE_CODE_SUBPROCESS_ENV_SCRUB: "1"
     steps:
       - name: Ack comment
         if: github.event_name == 'issue_comment'
