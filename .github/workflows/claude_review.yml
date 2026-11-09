@@ -138,6 +138,10 @@ jobs:
             - 具体的な行に対する指摘は mcp__github_inline_comment__create_inline_comment でインライン投稿（重大度を先頭に [must] / [should] / [nit]）
             - 最後に `gh pr comment ${{ env.PR_NUMBER }} --body "..."` で総評を 1 件投稿
               （見出し「## 🤖 Claude レビュー」、must / should 件数、問題がなければその旨）
+          # Read / Grep / Glob は作業ディレクトリ（信頼済み base）配下に限定する。素の Read/Grep/Glob を許可すると
+          # PR 本文・diff 経由のプロンプトインジェクションで /proc/self/environ（OAuth トークン）や
+          # ~/.claude・RUNNER_TEMP を読まれうる。作業ディレクトリ外は未許可＝非対話では拒否、/proc 等は明示 deny
           claude_args: |
             --max-turns 30
-            --allowedTools "Read,Grep,Glob,mcp__github_inline_comment__create_inline_comment,Bash(gh pr comment ${{ env.PR_NUMBER }}:*),Bash(gh pr diff:*),Bash(gh pr view:*),Bash(gh api repos/${{ github.repository }}/pulls/${{ env.PR_NUMBER }}/comments --paginate)"
+            --allowedTools "Read(./**),Grep(./**),Glob(./**),mcp__github_inline_comment__create_inline_comment,Bash(gh pr comment ${{ env.PR_NUMBER }}:*),Bash(gh pr diff:*),Bash(gh pr view:*),Bash(gh api repos/${{ github.repository }}/pulls/${{ env.PR_NUMBER }}/comments --paginate)"
+            --disallowedTools "Read(//proc/**),Read(~/.claude/**),Read(//home/runner/work/_temp/**)"
