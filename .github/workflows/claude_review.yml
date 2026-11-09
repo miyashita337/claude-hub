@@ -157,5 +157,5 @@ jobs:
           # （OAuth トークン・GITHUB_TOKEN）、_temp はプロンプト等、runners は runner の資格情報
           claude_args: |
             --max-turns 30
-            --allowedTools "Read(./**),Grep(./**),Glob(./**),mcp__github_inline_comment__create_inline_comment,Bash(gh pr comment ${{ env.PR_NUMBER }}:*),Bash(gh pr diff:*),Bash(gh pr view:*),Bash(gh api repos/${{ github.repository }}/pulls/${{ env.PR_NUMBER }}/comments --paginate)"
+            --allowedTools "Read(./**),Grep(./**),Glob(./**),mcp__github_inline_comment__create_inline_comment,Bash(gh pr comment ${{ env.PR_NUMBER }}:*),Bash(gh pr diff:*),Bash(gh pr view:*),Bash(gh api repos/${{ github.repository }}/pulls/${{ env.PR_NUMBER }}/comments:*)"
             --disallowedTools "Read(//proc/**),Read(//sys/**),Read(//tmp/**),Read(~/.claude/**),Read(~/.config/**),Read(~/.ssh/**),Read(~/.gitconfig),Read(//home/runner/work/_temp/**),Read(//home/runner/work/_actions/**),Read(//home/runner/runners/**),Read(//home/runner/actions-runner/**)"
