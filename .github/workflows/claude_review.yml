@@ -135,6 +135,8 @@ jobs:
             4. 既存の指摘を確認し、同じ内容を再投稿しない。
                - 総評: `gh pr view ${{ env.PR_NUMBER }} --json comments`（「## 🤖 Claude レビュー」）
                - インライン指摘と返信: `gh api repos/${{ github.repository }}/pulls/${{ env.PR_NUMBER }}/comments --paginate`
+                 （このコマンドは一字一句このまま実行する。`--jq` 等のオプションやパイプを足すと権限で拒否される。
+                 出力の JSON はそのまま読んで、各コメントの body / path / line / in_reply_to_id を確認する）
                前回までに指摘済みの内容（インライン指摘を含む。返信で「修正しない理由」が示された指摘や
                resolve 済みの指摘も含む）は再投稿しない。総評で「前回指摘のうち未対応: N 件」とだけ触れる。
                返信で修正しない理由が示されている場合は、その理由が誤っていると具体的に示せる場合に限って再指摘する。
@@ -157,5 +159,5 @@ jobs:
           # （OAuth トークン・GITHUB_TOKEN）、_temp はプロンプト等、runners は runner の資格情報
           claude_args: |
             --max-turns 30
-            --allowedTools "Read(./**),Grep(./**),Glob(./**),mcp__github_inline_comment__create_inline_comment,Bash(gh pr comment ${{ env.PR_NUMBER }}:*),Bash(gh pr diff:*),Bash(gh pr view:*),Bash(gh api repos/${{ github.repository }}/pulls/${{ env.PR_NUMBER }}/comments:*)"
+            --allowedTools "Read(./**),Grep(./**),Glob(./**),mcp__github_inline_comment__create_inline_comment,Bash(gh pr comment ${{ env.PR_NUMBER }}:*),Bash(gh pr diff:*),Bash(gh pr view:*),Bash(gh api repos/${{ github.repository }}/pulls/${{ env.PR_NUMBER }}/comments --paginate)"
             --disallowedTools "Read(//proc/**),Read(//sys/**),Read(//tmp/**),Read(~/.claude/**),Read(~/.config/**),Read(~/.ssh/**),Read(~/.gitconfig),Read(//home/runner/work/_temp/**),Read(//home/runner/work/_actions/**),Read(//home/runner/runners/**),Read(//home/runner/actions-runner/**)"
