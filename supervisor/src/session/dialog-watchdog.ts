@@ -143,7 +143,8 @@ export interface DialogWatchdog {
   stop(): void;
 }
 
-async function captureViaTmux(sessionName: string): Promise<string> {
+/** Also used by relay.ts's send-failure dialog recovery (Issue #562). */
+export async function captureViaTmux(sessionName: string): Promise<string> {
   try {
     const { stdout } = await execFileAsync(
       TMUX_PATH,
@@ -166,7 +167,8 @@ async function captureViaTmux(sessionName: string): Promise<string> {
   }
 }
 
-async function sendKeysViaTmux(sessionName: string, keys: string[]): Promise<void> {
+/** Also used by relay.ts's send-failure dialog recovery (Issue #562). */
+export async function sendKeysViaTmux(sessionName: string, keys: string[]): Promise<void> {
   for (const key of keys) {
     try {
       await execFileAsync(
