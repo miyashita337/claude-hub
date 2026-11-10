@@ -1177,8 +1177,20 @@ export async function sendWithDialogRecovery(
 
     const after = await readPane();
     if (after === null) throw err;
-    if (detectDialog(after)?.kind === dialog.kind) {
+    const remaining = detectDialog(after);
+    if (remaining?.kind === dialog.kind) {
       throw blocked(dialog, "still-open", "auto-accept keys did not close it");
+    }
+    // A DIFFERENT dialog surfaced once the first closed (PR #563 review). The
+    // resend would type into it, so it is never retried here — and one that a
+    // human must answer is reported as such, never chained into more keys (#423).
+    if (remaining) {
+      const humanOnly = !remaining.autoAcceptable || options.suppressAutoAccept?.() === true;
+      throw blocked(
+        remaining,
+        humanOnly ? (remaining.autoAcceptable ? "suppressed" : "manual") : "still-open",
+        `another dialog appeared after closing ${dialog.kind}; no key sent, not resent`
+      );
     }
     const probe = buildDeliveryProbe(flattenForSendKeys(options.text));
     if (countProbeOccurrences(after, probe) > countProbeOccurrences(pane, probe)) {

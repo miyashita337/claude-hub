@@ -154,6 +154,37 @@ describe("sendWithDialogRecovery (#562)", () => {
     expect(s.calls()).toBe(1);
   });
 
+  test("a different, human-only dialog appears after closing → no resend, no more keys (#423)", async () => {
+    const s = scriptedSend(1);
+    const k = keyRecorder();
+    const err = await sendWithDialogRecovery("claude-x", s.send, {
+      text: MSG,
+      capture: panes(INCIDENT_DIALOG, ASK_DIALOG),
+      sendKeys: k.sendKeys,
+      settleMs: 0,
+    }).catch((e: unknown) => e);
+    expect(err).toBeInstanceOf(DialogBlockedSendError);
+    expect((err as DialogBlockedSendError).dialog.kind).toBe("ask-user-question");
+    expect((err as DialogBlockedSendError).reason).toBe("manual");
+    expect(k.sent).toEqual([["C-m"]]);
+    expect(s.calls()).toBe(1);
+  });
+
+  test("a different auto-acceptable dialog appears after closing → not chained, not resent", async () => {
+    const s = scriptedSend(1);
+    const k = keyRecorder();
+    const err = await sendWithDialogRecovery("claude-x", s.send, {
+      text: MSG,
+      capture: panes(INCIDENT_DIALOG, "  Press Enter to continue"),
+      sendKeys: k.sendKeys,
+      settleMs: 0,
+    }).catch((e: unknown) => e);
+    expect((err as DialogBlockedSendError).dialog.kind).toBe("press-enter");
+    expect((err as DialogBlockedSendError).reason).toBe("still-open");
+    expect(k.sent).toHaveLength(1);
+    expect(s.calls()).toBe(1);
+  });
+
   test("text typed during the failed send appears after closing → not typed twice", async () => {
     const s = scriptedSend(1);
     const k = keyRecorder();
