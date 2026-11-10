@@ -990,7 +990,7 @@ export function buildSendFailureResult(err: unknown): RelayResult {
     text: "",
     chunks: [
       err instanceof DialogBlockedSendError
-        ? buildDialogBlockedSendMessage(err.dialog, err.tmuxSessionName)
+        ? buildDialogBlockedSendMessage(err.dialog, err.tmuxSessionName, err.reason)
         : SEND_FAILURE_USER_MESSAGE,
     ],
     error: String(err),
@@ -1003,11 +1003,30 @@ export function buildSendFailureResult(err: unknown): RelayResult {
 }
 
 /**
- * Issue #562: the send failed because a dialog that only a human may answer is
- * covering the input box. Carries the detected dialog so the user is told WHAT
- * is on screen instead of the generic "restart the session" advice — which
- * would not help (the dialog comes back with the TUI state) and, for an
- * AskUserQuestion, would throw away a question addressed to them.
+ * Why a dialog-blocked send was given up (Issue #562). Each one needs a
+ * different instruction, so the user-facing notice is chosen from it:
+ *  - `manual`: the family has no safe key (`autoAcceptable: false`)
+ *  - `suppressed`: an AskUserQuestion was just relayed for this thread, so no
+ *    key may be sent whatever the pane looks like (#423)
+ *  - `still-open`: the auto-accept keys were sent but the dialog is still there
+ *  - `cleared-not-resent`: the dialog closed, but the text is a slash command
+ *    and must not be typed a second time (#429)
+ *  - `late-render`: the dialog closed and the text typed while it was open then
+ *    appeared in the input box — resending would put it there twice
+ */
+export type DialogBlockedReason =
+  | "manual"
+  | "suppressed"
+  | "still-open"
+  | "cleared-not-resent"
+  | "late-render";
+
+/**
+ * Issue #562: the send failed because of a dialog covering the input box.
+ * Carries the detected dialog so the user is told WHAT is on screen instead of
+ * the generic "restart the session" advice — which would not help (the dialog
+ * comes back with the TUI state) and, for an AskUserQuestion, would throw away
+ * a question addressed to them.
  *
  * The message stays {@link SEND_UNVERIFIED_ERROR}: it IS that failure, and the
  * logs / `RelayResult.error` keep grepping the same marker.
@@ -1015,32 +1034,55 @@ export function buildSendFailureResult(err: unknown): RelayResult {
 export class DialogBlockedSendError extends Error {
   constructor(
     readonly dialog: DialogMatch,
-    readonly tmuxSessionName: string
+    readonly tmuxSessionName: string,
+    readonly reason: DialogBlockedReason
   ) {
     super(SEND_UNVERIFIED_ERROR);
     this.name = "DialogBlockedSendError";
   }
 }
 
+function dialogBlockedLead(dialog: DialogMatch, reason: DialogBlockedReason): string {
+  const head = "⚠️ メッセージを送信できませんでした: ";
+  if (reason === "cleared-not-resent") {
+    return `⚠️ 画面に開いていたダイアログ（${dialog.kind}）を閉じました。コマンドは二重実行を避けるため自動では再送していません（#429）。もう一度送ってください。`;
+  }
+  if (reason === "late-render") {
+    return `⚠️ 画面に開いていたダイアログ（${dialog.kind}）を閉じたところ、先に入力した文が入力欄に現れました。二重入力を避けるため再送していません。このスレッドで \`/session enter\` を実行すると送信（Enter）できます。`;
+  }
+  if (dialog.kind === "ask-user-question") {
+    return `${head}Claude が**あなたに質問**するダイアログ（AskUserQuestion）が画面に開いたままです。選択肢は自動では選びません（#423）。tmux attach して回答してから再送してください:`;
+  }
+  if (dialog.kind === "usage-limit" || dialog.kind === "all-orgs-limit") {
+    return `${head}Claude Code が利用上限（${dialog.kind}）に達しています。上限のリセットを待つか、tmux attach して \`/model\` で別モデルに切り替えてください:`;
+  }
+  if (reason === "suppressed") {
+    return `${head}画面にダイアログ（${dialog.kind}）が開いていますが、直前に Claude からの質問を中継したため、本人の回答を機械が代わりに選ばないよう自動では閉じていません（#423）。tmux attach して対応してから再送してください:`;
+  }
+  if (reason === "still-open") {
+    return `${head}画面のダイアログ（${dialog.kind}）を自動で閉じようとしましたが閉じませんでした。tmux attach して対応してから再送してください:`;
+  }
+  return `${head}画面にダイアログ（${dialog.kind}）が開いたままで、自動では閉じない種類です。tmux attach して対応してから再送してください:`;
+}
+
 /**
  * User-facing notice for {@link DialogBlockedSendError}. Unlike
- * {@link SEND_FAILURE_USER_MESSAGE} it names the tmux attach command: the
- * dialog-stuck heartbeat (dialog-stuck-handler.ts) already does, and attaching
- * is the only remedy for a dialog the machine must not answer.
+ * {@link SEND_FAILURE_USER_MESSAGE} it names the tmux attach command where a
+ * human is the remedy: the dialog-stuck heartbeat (dialog-stuck-handler.ts)
+ * already does, and attaching is the only way to answer a dialog the machine
+ * must not answer.
  */
 export function buildDialogBlockedSendMessage(
   dialog: DialogMatch,
-  tmuxSessionName: string
+  tmuxSessionName: string,
+  reason: DialogBlockedReason
 ): string {
-  const lead =
-    dialog.kind === "ask-user-question"
-      ? "⚠️ メッセージを送信できませんでした: Claude が**あなたに質問**するダイアログ（AskUserQuestion）が画面に開いたままです。選択肢は自動では選びません（#423）。tmux attach して回答してから再送してください:"
-      : `⚠️ メッセージを送信できませんでした: 画面にダイアログ（${dialog.kind}）が開いたままで、自動では閉じない種類です。tmux attach して対応してから再送してください:`;
+  const needsAttach = reason !== "cleared-not-resent" && reason !== "late-render";
   return [
-    lead,
-    "```",
-    `tmux -L ${TMUX_SOCKET} attach -t ${tmuxSessionName}`,
-    "```",
+    dialogBlockedLead(dialog, reason),
+    needsAttach ? "```" : "",
+    needsAttach ? `tmux -L ${TMUX_SOCKET} attach -t ${tmuxSessionName}` : "",
+    needsAttach ? "```" : "",
     // Same escaping as the dialog-stuck heartbeat: the line is arbitrary TUI
     // output and must not break out of the inline code span.
     dialog.line ? `検出行: \`${dialog.line.replace(/`/g, "'")}\`` : "",
@@ -1049,18 +1091,14 @@ export function buildDialogBlockedSendMessage(
     .join("\n");
 }
 
-/** How long the TUI gets to close a dialog before the resend (Issue #562). */
+/** How long the TUI gets to close a dialog before it is re-checked (Issue #562). */
 export const DIALOG_CLEAR_SETTLE_MS = 300;
 
 export interface DialogRecoveryOptions {
+  /** The text `send` types — used to notice it rendering late (Issue #562). */
+  text: string;
   /** Same contract as the watchdog's (Issue #423): true withholds every key. */
   suppressAutoAccept?: () => boolean;
-  /**
-   * False for text that must not be typed twice (slash commands, Issue #429).
-   * The dialog is still cleared, but the send is reported as failed instead of
-   * being repeated.
-   */
-  retypeAllowed: boolean;
   /** Test seams; production uses the watchdog's tmux helpers. */
   capture?: (sessionName: string) => string | Promise<string>;
   sendKeys?: (sessionName: string, keys: string[]) => void | Promise<void>;
@@ -1069,7 +1107,7 @@ export interface DialogRecoveryOptions {
 
 /**
  * Issue #562: run `send`, and when it fails with {@link SEND_UNVERIFIED_ERROR}
- * look at the pane ONCE for a dialog covering the input box.
+ * look at the pane for a dialog covering the input box.
  *
  * The dialog watchdog (#57) only runs while a sent message awaits its answer,
  * so a dialog that opened outside a turn (right after launch, in the incident)
@@ -1077,11 +1115,15 @@ export interface DialogRecoveryOptions {
  * hours. This closes that gap on the one path that can observe it — the
  * failing send itself.
  *
- *  - no dialog → the original error, unchanged
- *  - auto-acceptable and not suppressed → send the same keys the watchdog
- *    would, then resend exactly once (a second failure propagates as-is)
+ *  - no dialog (or the pane cannot be read) → the original error, unchanged
  *  - manual-only (`autoAcceptable: false`, or an AskUserQuestion was just
  *    relayed for this thread) → no key at all, {@link DialogBlockedSendError}
+ *  - auto-acceptable → send the same keys the watchdog would, re-read the
+ *    pane, and resend exactly once (a second failure propagates as-is) — unless
+ *    the dialog is still open, the text is a slash command (#429), or the text
+ *    typed during the failed send has since appeared. `sendToPane` never sends
+ *    Enter before it sees the text, so that late render sits unsubmitted in the
+ *    input box; typing it again would double it.
  */
 export async function sendWithDialogRecovery(
   tmuxSessionName: string,
@@ -1094,38 +1136,58 @@ export async function sendWithDialogRecovery(
     if (!(err instanceof Error && err.message === SEND_UNVERIFIED_ERROR)) throw err;
 
     const capture = options.capture ?? captureViaTmux;
-    let pane: string;
-    try {
-      pane = await capture(tmuxSessionName);
-    } catch (captureErr) {
+    const readPane = async (): Promise<string | null> => {
+      try {
+        return await capture(tmuxSessionName);
+      } catch (captureErr) {
+        console.warn(
+          `[Relay] dialog check after failed send skipped for ${tmuxSessionName} (capture-pane failed):`,
+          captureErr instanceof Error ? captureErr.message : String(captureErr)
+        );
+        return null;
+      }
+    };
+    const blocked = (dialog: DialogMatch, reason: DialogBlockedReason, note: string) => {
       console.warn(
-        `[Relay] dialog check after failed send skipped for ${tmuxSessionName} (capture-pane failed):`,
-        captureErr instanceof Error ? captureErr.message : String(captureErr)
+        `[Relay] send blocked by dialog on ${tmuxSessionName}: kind=${dialog.kind} ` +
+          `line=${JSON.stringify(dialog.line)} reason=${reason} — ${note}`
       );
-      throw err;
-    }
+      return new DialogBlockedSendError(dialog, tmuxSessionName, reason);
+    };
+
+    const pane = await readPane();
+    if (pane === null) throw err;
     const dialog = detectDialog(pane);
     if (!dialog) throw err;
 
-    if (!dialog.autoAcceptable || options.suppressAutoAccept?.() === true) {
-      console.warn(
-        `[Relay] send blocked by dialog on ${tmuxSessionName}: kind=${dialog.kind} ` +
-          `line=${JSON.stringify(dialog.line)} — manual-only, no key sent`
-      );
-      throw new DialogBlockedSendError(dialog, tmuxSessionName);
+    if (!dialog.autoAcceptable) throw blocked(dialog, "manual", "no key sent");
+    if (options.suppressAutoAccept?.() === true) {
+      throw blocked(dialog, "suppressed", "no key sent (an /ask was just relayed)");
     }
 
     console.warn(
       `[Relay] send blocked by dialog on ${tmuxSessionName}: kind=${dialog.kind} ` +
-        `line=${JSON.stringify(dialog.line)} — auto-accepting` +
-        (options.retypeAllowed ? ", then resending once" : " (no resend: slash command, #429)")
+        `line=${JSON.stringify(dialog.line)} — auto-accepting`
     );
     await (options.sendKeys ?? sendKeysViaTmux)(
       tmuxSessionName,
       AUTO_ACCEPT_KEYS[dialog.kind]
     );
-    if (!options.retypeAllowed) throw err;
     await new Promise((r) => setTimeout(r, options.settleMs ?? DIALOG_CLEAR_SETTLE_MS));
+
+    const after = await readPane();
+    if (after === null) throw err;
+    if (detectDialog(after)?.kind === dialog.kind) {
+      throw blocked(dialog, "still-open", "auto-accept keys did not close it");
+    }
+    const probe = buildDeliveryProbe(flattenForSendKeys(options.text));
+    if (countProbeOccurrences(after, probe) > countProbeOccurrences(pane, probe)) {
+      throw blocked(dialog, "late-render", "earlier text appeared after closing; not resent");
+    }
+    if (!allowsRetype(options.text)) {
+      throw blocked(dialog, "cleared-not-resent", "dialog closed; slash command not retyped (#429)");
+    }
+
     try {
       const outcome = await send();
       console.log(
@@ -1204,8 +1266,8 @@ export async function relayMessage(
           },
         }),
       {
+        text: fullMessage,
         suppressAutoAccept: () => hasRecentAsk(threadId),
-        retypeAllowed: allowsRetype(fullMessage),
       }
     );
     tracker.markEnd("b");
@@ -1232,7 +1294,11 @@ export async function relayMessage(
       err instanceof Error && err.message === SEND_UNVERIFIED_ERROR;
     console.error(
       `[Relay] sendToPane failed for ${tmuxSessionName}:`,
-      isUnverified ? SEND_UNVERIFIED_ERROR : summarizeExecError(err)
+      isUnverified ? SEND_UNVERIFIED_ERROR : summarizeExecError(err),
+      // Issue #562: keep the failure line self-contained when a dialog caused it.
+      err instanceof DialogBlockedSendError
+        ? `(dialog: ${err.dialog.kind}, ${err.reason})`
+        : ""
     );
     return buildSendFailureResult(err);
   }
