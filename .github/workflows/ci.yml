@@ -453,6 +453,47 @@ jobs:
       - name: Run real-device runner branching tests (#507)
         run: bash scripts/test-real-device-runner.sh
 
+      # OS detection + launchd/systemd dry-run + WSL keep-alive wiring and the
+      # keep-alive ps1 contract/parse check (pwsh ships on both runner images).
+      - name: Run autostart installer tests (#552)
+        run: bash scripts/test-install-autostart.sh
+
+  # The bots ship to both macOS (launchd) and WSL (systemd), so the shell
+  # scripts above must also work under macOS's /bin/bash 3.2 and BSD userland —
+  # and no Mac is always at hand to check by hand. Separate job (not a matrix
+  # on routing-tests) so the required "Routing Tests" check name is unchanged.
+  # macos-15 is pinned for the same reason as ubuntu-24.04 (#554).
+  shell-tests-macos:
+    name: Shell Tests (macOS)
+    runs-on: macos-15
+    defaults:
+      run:
+        working-directory: .
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Run start-hijoguchi template-render tests (#49 AC-4)
+        run: bash scripts/test-start-hijoguchi.sh
+
+      - name: Run routing matrix (25 cases, P0×12 gating)
+        run: bash scripts/test-hijoguchi-routing.sh
+
+      - name: Run claudeHubExit mechanical mention gate tests (#267)
+        run: bash scripts/test-hijoguchi-discord-gate.sh
+
+      - name: Run claudeHubExit turn-state producer tests (#312)
+        run: bash scripts/test-hijoguchi-record-turn-state.sh
+
+      # plutil -lint actually runs here (it self-skips on Linux).
+      - name: Run launchd plist placeholder tests (#198)
+        run: bash scripts/test-plist-placeholders.sh
+
+      - name: Run real-device runner branching tests (#507)
+        run: bash scripts/test-real-device-runner.sh
+
+      - name: Run autostart installer tests (#552)
+        run: bash scripts/test-install-autostart.sh
+
   # E2E verification of the Discord ↔ Supervisor ↔ Claude Code relay chain.
   # Covers AC-4/5/6/7 hermetically (tmux + mock claude + relay-server HTTP).
   # AC-1/2/3 require a live Discord bot token and are documented as manual
