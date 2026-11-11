@@ -50,6 +50,7 @@ export type DialogKind =
   | "bash-yn"
   | "numbered-choice"
   | "press-enter"
+  | "current-value-picker"
   | "feedback-survey"
   | "ask-user-question"
   | "usage-limit"
@@ -75,6 +76,9 @@ export interface DialogMatch {
  *    pressing 'y' explicitly (we don't try to detect default polarity).
  *  - numbered-choice: select option 1 (typically Yes/Continue).
  *  - press-enter: just Enter.
+ *  - current-value-picker: just Enter (Issue #562). Detection requires the
+ *    cursor to rest on the `✔` option — the value already in effect — so
+ *    confirming it changes nothing and only closes the picker.
  *  - feedback-survey: select option 0 (Dismiss). Issue #153: Claude Code's
  *    "How is Claude doing this session?" survey looks like a numbered choice,
  *    but options 1/2/3 *submit* feedback (1 = "Bad"). Only `0` (Dismiss)
@@ -99,6 +103,7 @@ export const AUTO_ACCEPT_KEYS: Record<DialogKind, string[]> = {
   "bash-yn": ["y", "C-m"],
   "numbered-choice": ["1", "C-m"],
   "press-enter": ["C-m"],
+  "current-value-picker": ["C-m"],
   "feedback-survey": ["0", "C-m"],
   "ask-user-question": [],
   "usage-limit": [],
@@ -187,6 +192,26 @@ const USAGE_LIMIT_MARKER = /^\s*You['’]ve reached your .+ limit\b/im;
  */
 const ALL_ORGS_LIMIT_MARKER =
   /^[\s⎿●✗✘]*API Error:\s*503\b.*all orgs rate-limited or unreachable/im;
+
+/**
+ * Issue #562: a settings picker (e.g. `Toggle thinking mode`) whose cursor
+ * rests on the option marked `✔` — the value already in effect.
+ *
+ * Evidence (verbatim pane capture, Issue #562, Claude Code v2.1.193):
+ *   `  ❯ 1. Enabled ✔  Claude will think before responding`
+ *   `  Enter to confirm · Esc to cancel`
+ *
+ * Both halves are required, and each one rules out a picker where Enter has a
+ * side effect (both measured on v2.1.311):
+ *  - the cursor line must carry `✔`: the folder-trust dialog shares the footer
+ *    but its cursor sits on `No, exit`, and Enter there quits Claude Code
+ *  - the footer must say `Enter to confirm`: the `/model` picker puts its
+ *    cursor on the `✔` entry too, but its Enter persists a new default
+ * Escape alone is not the remedy: sendToPane already sends one before every
+ * type, and in the incident the picker stayed open through all of them.
+ */
+const CURRENT_VALUE_CURSOR = /^\s*❯\s*\d+\.\s+\S.*✔/m;
+const CONFIRM_CANCEL_FOOTER = /^\s*Enter to confirm\s*·\s*Esc to cancel\s*$/m;
 
 /** Number of trailing lines to inspect. Dialogs render at the bottom of
  *  the visible pane; older content is scrollback noise. */
@@ -305,6 +330,16 @@ export function detectDialog(paneText: string): DialogMatch | null {
         };
       }
     }
+  }
+
+  // 3.5. Settings picker resting on its current value (Issue #562).
+  const currentValueMatch = windowText.match(CURRENT_VALUE_CURSOR);
+  if (currentValueMatch && CONFIRM_CANCEL_FOOTER.test(windowText)) {
+    return {
+      kind: "current-value-picker",
+      autoAcceptable: true,
+      line: currentValueMatch[0].trim(),
+    };
   }
 
   // 4. "Press <key> to continue".

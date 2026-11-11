@@ -381,3 +381,85 @@ describe("detectDialog — last-N-lines window", () => {
     expect(result).toBeNull();
   });
 });
+
+// Issue #562: a settings picker whose cursor rests on the option already in
+// effect. Verbatim pane capture from the 2026-11-10 incident (Claude Code
+// v2.1.193): the session sat on this dialog for ~4 hours because no detector
+// matched it — `numbered-choice` only knows `1. Yes` / `2. No`.
+describe("detectDialog — current-value picker (#562)", () => {
+  const INCIDENT_PANE = [
+    " ▐▛███▜▌   Claude Code v2.1.193",
+    "▝▜█████▛▘  Fable 5 · Claude Max",
+    "  ▘▘ ▝▝    ~/corp/.claude/worktrees/ar1110",
+    "",
+    "────────────────────────────────────────────────────────",
+    "  Toggle thinking mode",
+    "  Enable or disable thinking for this session.",
+    "",
+    "  ❯ 1. Enabled ✔  Claude will think before responding",
+    "    2. Disabled   Claude will respond without extended thinking",
+    "",
+    "  Enter to confirm · Esc to cancel",
+  ].join("\n");
+
+  test("detects the incident's Toggle thinking mode dialog", () => {
+    const result = detectDialog(INCIDENT_PANE);
+    expect(result).not.toBeNull();
+    expect(result!.kind).toBe("current-value-picker");
+    expect(result!.autoAcceptable).toBe(true);
+    expect(result!.line).toContain("1. Enabled ✔");
+  });
+
+  test("auto-accept is a bare Enter: it re-confirms the value already in effect", () => {
+    expect(AUTO_ACCEPT_KEYS["current-value-picker"]).toEqual(["C-m"]);
+  });
+
+  test("cursor NOT on the current value is not matched (Enter would change a setting)", () => {
+    const pane = INCIDENT_PANE.replace("  ❯ 1. Enabled ✔", "    1. Enabled ✔").replace(
+      "    2. Disabled ",
+      "  ❯ 2. Disabled "
+    );
+    expect(detectDialog(pane)).toBeNull();
+  });
+
+  test("the folder-trust dialog is not matched (cursor on 'No, exit', no ✔)", () => {
+    // Same footer, but Enter here exits Claude Code. Measured on v2.1.311.
+    const pane = [
+      " Quick safety check: Is this a project you created or one you trust?",
+      "",
+      " ❯ No, exit",
+      "   Yes, I trust this folder",
+      "",
+      " Enter to confirm · Esc to cancel",
+    ].join("\n");
+    expect(detectDialog(pane)).toBeNull();
+  });
+
+  test("the /model picker is not matched (its Enter persists a new default)", () => {
+    // Measured on v2.1.311: cursor on the ✔ entry, but the footer is
+    // `Enter to set as default`, i.e. Enter has a side effect.
+    const pane = [
+      "   Select model",
+      "   ❯ 4. Sonnet ✔               Sonnet 5.5 · Efficient for routine tasks",
+      "     5. Haiku                  Haiku 5.5 · Fastest for quick answers",
+      "",
+      "   Enter to set as default · s to use this session only · Esc to cancel",
+    ].join("\n");
+    expect(detectDialog(pane)).toBeNull();
+  });
+
+  test("prose quoting the footer without a ✔ cursor line is not matched", () => {
+    const pane = "The dialog says Enter to confirm · Esc to cancel at the bottom.";
+    expect(detectDialog(pane)).toBeNull();
+  });
+
+  test("an AskUserQuestion picker still wins (#423 ordering)", () => {
+    const pane = [
+      "  ❯ 1. Enabled ✔",
+      "    2. Disabled",
+      "    3. Type something.",
+      "  Enter to confirm · Esc to cancel",
+    ].join("\n");
+    expect(detectDialog(pane)!.kind).toBe("ask-user-question");
+  });
+});
