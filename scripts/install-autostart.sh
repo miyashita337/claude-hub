@@ -86,7 +86,7 @@ is_wsl() {
 
 # ----- WSL keep-alive (Windows scheduled task) --------------------------------
 
-# $1 = "" (install) or "-Uninstall". Returns non-zero on failure so the caller
+# Args are passed through to the ps1. Returns non-zero on failure so the caller
 # can surface it like the linger gap instead of silently skipping.
 wsl_keepalive_run() {
   if ! command -v powershell.exe >/dev/null 2>&1 || ! command -v wslpath >/dev/null 2>&1; then
@@ -94,26 +94,36 @@ wsl_keepalive_run() {
     return 1
   fi
   local win_path; win_path="$(wslpath -w "${KEEPALIVE_PS1}")"
-  # shellcheck disable=SC2086  # $1 is intentionally empty or a single switch
-  powershell.exe -NoProfile -ExecutionPolicy Bypass -File "${win_path}" $1
+  powershell.exe -NoProfile -ExecutionPolicy Bypass -File "${win_path}" "$@"
 }
 
 wsl_keepalive_install() {
+  # The task must boot THIS distro (the one hosting the bots); WSL sets
+  # WSL_DISTRO_NAME in every session.
+  local distro="${WSL_DISTRO_NAME:-}"
   if [ "$DRY_RUN" = "1" ]; then
-    log "[dry-run] WSL detected: would register Windows task claude-hub-wsl-keepalive via ${KEEPALIVE_PS1}"
+    log "[dry-run] WSL detected: would register Windows task claude-hub-wsl-keepalive for distro '${distro}' via ${KEEPALIVE_PS1}"
     return 0
   fi
-  if wsl_keepalive_run ""; then
+  if [ -z "$distro" ]; then
+    log "ACTION REQUIRED: WSL_DISTRO_NAME is empty — cannot tell which distro the keep-alive should boot."
+    return 1
+  fi
+  if wsl_keepalive_run -Distro "$distro"; then
     log "Registered Windows task claude-hub-wsl-keepalive (keeps the WSL VM up; re-boots it within 30s if killed)."
   else
     log "ACTION REQUIRED: WSL keep-alive task not registered. Bots stop whenever Windows powers off the VM."
-    log "  Run from WSL: powershell.exe -NoProfile -ExecutionPolicy Bypass -File \"\$(wslpath -w ${KEEPALIVE_PS1})\""
+    log "  Run from WSL: powershell.exe -NoProfile -ExecutionPolicy Bypass -File \"\$(wslpath -w ${KEEPALIVE_PS1})\" -Distro \"\$WSL_DISTRO_NAME\""
     return 1
   fi
 }
 
 wsl_keepalive_uninstall() {
-  wsl_keepalive_run "-Uninstall" || log "WARN: could not remove Windows task claude-hub-wsl-keepalive (remove it from Task Scheduler manually)."
+  if [ "$DRY_RUN" = "1" ]; then
+    log "[dry-run] WSL detected: would stop and remove Windows task claude-hub-wsl-keepalive"
+    return 0
+  fi
+  wsl_keepalive_run -Uninstall || log "WARN: could not remove Windows task claude-hub-wsl-keepalive (remove it from Task Scheduler manually)."
 }
 
 # ----- systemd (WSL2/Linux) --------------------------------------------------
@@ -205,6 +215,11 @@ systemd_install() {
 
 systemd_uninstall() {
   local dest; dest="$(systemd_user_dir)"
+  if [ "$DRY_RUN" = "1" ]; then
+    log "[dry-run] would disable + remove ${UNIT_SUPERVISOR}, ${UNIT_HIJOGUCHI}, ${UNIT_HEALTH_TIMER} from ${dest}"
+    if is_wsl; then wsl_keepalive_uninstall; fi
+    return 0
+  fi
   systemctl --user disable --now "${UNIT_HEALTH_TIMER}" 2>/dev/null || true
   systemctl --user disable --now "${UNIT_SUPERVISOR}" "${UNIT_HIJOGUCHI}" 2>/dev/null || true
   rm -f "${dest}/${UNIT_SUPERVISOR}" "${dest}/${UNIT_HIJOGUCHI}" \

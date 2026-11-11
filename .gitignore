@@ -12,7 +12,9 @@ logs/
 
 # Runtime
 pids/
-# Discord attachments saved by the supervisor (GC'd daily, see bot-operations.md)
+# Discord attachments saved by the supervisor. Ignoring them hides growth from
+# `git status`: deletion (30-day retention) only happens once the daily GC job
+# is installed manually (scripts/install-gc-attachments.sh, bot-operations.md).
 tmp/
 
 # OS

@@ -1,7 +1,7 @@
-# install-wsl-keepalive.ps1 — Windows-side companion to install-autostart.sh
+# install-wsl-keepalive.ps1 - Windows-side companion to install-autostart.sh
 #
 # Problem (2026-11-05 incident): the WSL-internal autostart chain
-# (systemd user units + linger, Issue #552) works — bots start 3s after WSL
+# (systemd user units + linger, Issue #552) works - bots start 3s after WSL
 # boots. But nothing on the WINDOWS side keeps WSL itself alive:
 #   - Windows sleep / overnight maintenance can terminate the WSL VM
 #     (observed: WSL poweroff at 03:08 JST while Windows stayed up)
@@ -23,28 +23,53 @@
 # Side effect to know: `wsl --shutdown` is auto-undone within 30s while this
 # task runs. To intentionally stop WSL: Stop-ScheduledTask first (see below).
 #
-# Usage (from WSL):
-#   powershell.exe -NoProfile -ExecutionPolicy Bypass -File "$(wslpath -w scripts/install-wsl-keepalive.ps1)"
-#   powershell.exe ... -File ... -Uninstall     # remove the task
-# Stop temporarily (Windows側):
+# This file is kept ASCII-only: Windows PowerShell 5.1 reads BOM-less files as
+# the ANSI code page, so non-ASCII text could be mis-decoded.
+#
+# Usage (from WSL; install-autostart.sh passes the current distro):
+#   powershell.exe -NoProfile -ExecutionPolicy Bypass -File "$(wslpath -w scripts/install-wsl-keepalive.ps1)" -Distro "$WSL_DISTRO_NAME"
+#   powershell.exe ... -File ... -Uninstall     # stop the loop + remove the task
+# Stop temporarily (Windows side):
 #   Stop-ScheduledTask -TaskName claude-hub-wsl-keepalive
 #   Disable-ScheduledTask -TaskName claude-hub-wsl-keepalive
 
 param(
-  [string]$Distro = 'Ubuntu',
+  [string]$Distro = '',
   [switch]$Uninstall
 )
 
+# Register/Unregister report failures as non-terminating errors, which would
+# still exit 0 under -File; Stop turns them into exit 1 for the caller.
+$ErrorActionPreference = 'Stop'
+
 $TaskName = 'claude-hub-wsl-keepalive'
+# Matches the wsl.exe client the loop starts (see $loop below).
+$KeepaliveCmdPattern = '%--exec sleep infinity%'
 
 if ($Uninstall) {
-  Unregister-ScheduledTask -TaskName $TaskName -Confirm:$false -ErrorAction SilentlyContinue
-  Write-Output "[wsl-keepalive] removed task $TaskName"
+  if (-not (Get-ScheduledTask -TaskName $TaskName -ErrorAction SilentlyContinue)) {
+    Write-Output "[wsl-keepalive] task $TaskName not installed; nothing to remove"
+    exit 0
+  }
+  # Unregister alone leaves the running loop and its wsl.exe child alive, and
+  # that child keeps holding the VM up after "uninstall".
+  Stop-ScheduledTask -TaskName $TaskName
+  Get-CimInstance Win32_Process -Filter "Name='wsl.exe' AND CommandLine LIKE '$KeepaliveCmdPattern'" |
+    Invoke-CimMethod -MethodName Terminate | Out-Null
+  Unregister-ScheduledTask -TaskName $TaskName -Confirm:$false
+  Write-Output "[wsl-keepalive] stopped and removed task $TaskName"
   exit 0
 }
 
+# The distro must be the one hosting the bots: with a wrong name the loop
+# fails every 30s while the task still shows Running. The name is spliced into
+# the task's command line, so only plain names are accepted.
+if ($Distro -notmatch '^[A-Za-z0-9._-]+$') {
+  Write-Error "[wsl-keepalive] -Distro is required and must match ^[A-Za-z0-9._-]+`$ (got '$Distro'). From WSL pass -Distro `"`$WSL_DISTRO_NAME`"."
+}
+
 # Inner loop: restart wsl.exe whenever it exits (VM killed / shutdown).
-$loop = "while(`$true){ wsl.exe -d $Distro --exec sleep infinity; Start-Sleep -Seconds 30 }"
+$loop = "while(`$true){ wsl.exe -d '$Distro' --exec sleep infinity; Start-Sleep -Seconds 30 }"
 
 $action = New-ScheduledTaskAction -Execute 'powershell.exe' `
   -Argument "-NoProfile -WindowStyle Hidden -Command `"$loop`""
@@ -53,7 +78,7 @@ $logonTrigger = New-ScheduledTaskTrigger -AtLogOn -User $env:USERNAME
 # Watchdog trigger: the logon trigger alone fires once per logon, so if the
 # keep-alive powershell itself dies (2026-11-09: exited 0xC000013A
 # STATUS_CONTROL_C_EXIT and stayed dead) nothing restarts it until the next
-# logon — RestartCount only covers failures to START. Re-firing every 5 min
+# logon - RestartCount only covers failures to START. Re-firing every 5 min
 # with MultipleInstances=IgnoreNew is a no-op while the loop is alive and a
 # relaunch within 5 min after it dies.
 $watchdogTrigger = New-ScheduledTaskTrigger -Once -At (Get-Date) `

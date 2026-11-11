@@ -66,8 +66,14 @@ assert "launchd mentions install-hijoguchi.sh" contains "$out_mac" "install-hijo
 assert "launchd mentions supervisor plist"     contains "$out_mac" "com.claude-hub.supervisor.plist"
 
 echo "=== 5. WSL keep-alive task is wired only on WSL ==="
-out_wsl="$(CLAUDE_HUB_WSL=1 run_installer systemd)"
+out_wsl="$(CLAUDE_HUB_WSL=1 WSL_DISTRO_NAME=Ubuntu-24.04 run_installer systemd)"
 assert "WSL: dry-run would register keep-alive task" contains "$out_wsl" "would register Windows task claude-hub-wsl-keepalive"
+# The task must boot the distro hosting the bots, not a hardcoded default.
+assert "WSL: keep-alive targets the current distro" contains "$out_wsl" "for distro 'Ubuntu-24.04'"
+# --uninstall --dry-run must not remove anything (Windows task included).
+out_wsl_un="$(CLAUDE_HUB_WSL=1 CLAUDE_HUB_INIT=systemd bash "${INSTALLER}" --uninstall --dry-run 2>&1)"
+assert "WSL uninstall dry-run: only reports task removal" contains "$out_wsl_un" "[dry-run] WSL detected: would stop and remove"
+assert "WSL uninstall dry-run: touches no units"          not_contains "$out_wsl_un" "Removed systemd user units"
 out_linux="$(CLAUDE_HUB_WSL=0 run_installer systemd)"
 assert "native Linux: no keep-alive task"          not_contains "$out_linux" "claude-hub-wsl-keepalive"
 assert "native Linux: says it skips keep-alive"    contains "$out_linux" "no WSL keep-alive task"
@@ -86,12 +92,22 @@ assert "ps1: repeating watchdog trigger"           contains "$ps1_body" "-Repeti
 assert "ps1: no duplicate loops (IgnoreNew)"       contains "$ps1_body" "-MultipleInstances IgnoreNew"
 assert "ps1: supports -Uninstall"                  contains "$ps1_body" "[switch]\$Uninstall"
 assert "ps1: no hardcoded user path"               not_contains "$ps1_body" "C:\\Users\\"
+assert "ps1: no hardcoded default distro"          not_contains "$ps1_body" "\$Distro = 'Ubuntu'"
+assert "ps1: validates the distro name"            contains "$ps1_body" "^[A-Za-z0-9._-]+\$"
+# Non-terminating Register/Unregister errors would otherwise exit 0.
+assert "ps1: errors are terminating"               contains "$ps1_body" "\$ErrorActionPreference = 'Stop'"
+assert "ps1: uninstall stops the running loop"     contains "$ps1_body" "Stop-ScheduledTask -TaskName \$TaskName"
+# PowerShell 5.1 reads BOM-less files as ANSI; keep the file ASCII-only.
+assert "ps1: ASCII only" test -z "$(LC_ALL=C grep -n '[^ -~	]' "${PS1}")"
 
 # Parse check where PowerShell exists (GitHub ubuntu/macos runners ship pwsh).
 if command -v pwsh >/dev/null 2>&1; then
   # -Command does not populate $args, so the path is spliced in (repo paths
   # contain no single quotes).
   parse_out="$(pwsh -NoProfile -Command "\$e=\$null; [void][System.Management.Automation.Language.Parser]::ParseFile('${PS1}',[ref]\$null,[ref]\$e); \$e | ForEach-Object { \$_.Message }" 2>&1)"
+  parse_status=$?
+  # A pwsh crash with no output must not read as "no syntax errors".
+  assert "ps1: parser ran (pwsh exit 0)"     test "$parse_status" -eq 0
   assert "ps1: parses without syntax errors" test -z "$parse_out"
   [ -n "$parse_out" ] && echo "$parse_out"
 else
