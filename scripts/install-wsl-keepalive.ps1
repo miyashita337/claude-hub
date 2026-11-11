@@ -21,7 +21,7 @@
 #   WSL is down and \\wsl.localhost paths are unreachable
 #
 # Side effect to know: `wsl --shutdown` is auto-undone within 30s while this
-# task runs. To intentionally stop WSL: Stop-ScheduledTask first (see below).
+# task runs. To intentionally stop WSL: disable + stop the task first (below).
 #
 # This file is kept ASCII-only: Windows PowerShell 5.1 reads BOM-less files as
 # the ANSI code page, so non-ASCII text could be mis-decoded.
@@ -29,9 +29,12 @@
 # Usage (from WSL; install-autostart.sh passes the current distro):
 #   powershell.exe -NoProfile -ExecutionPolicy Bypass -File "$(wslpath -w scripts/install-wsl-keepalive.ps1)" -Distro "$WSL_DISTRO_NAME"
 #   powershell.exe ... -File ... -Uninstall     # stop the loop + remove the task
-# Stop temporarily (Windows side):
-#   Stop-ScheduledTask -TaskName claude-hub-wsl-keepalive
+# Stop temporarily (Windows side). Disable comes first: Stop alone is undone
+# by the 5-minute watchdog trigger.
 #   Disable-ScheduledTask -TaskName claude-hub-wsl-keepalive
+#   Stop-ScheduledTask -TaskName claude-hub-wsl-keepalive
+#   wsl --shutdown
+# Resume: Enable-ScheduledTask, then Start-ScheduledTask.
 
 param(
   [string]$Distro = '',

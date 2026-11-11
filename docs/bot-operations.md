@@ -123,7 +123,7 @@ bash scripts/install-autostart.sh --dry-run     # 何もせず内容だけ表示
 - ラッパーが作る tmux セッション: `claude-supervisor` / `hijoguchi-wd`(watchdog) + `claudeHubExit`(bot 本体)。いずれも default socket
 - ログ: `logs/{supervisor,hijoguchi}.{stdout,stderr}.log`
 - **WSL は VM 自体の keep-alive も要る**: systemd は VM が起動すれば Bot を上げるが、Windows のスリープ・夜間メンテナンスで VM が止まると、誰かがターミナルを開くまで再起動しない（2026-11-05 に 12 時間停止）。WSL 上の `install-autostart.sh` は Windows のタスク `claude-hub-wsl-keepalive`（`scripts/install-wsl-keepalive.ps1`）も登録する。タスクは `wsl.exe` を開き続けて VM を保持し、VM が落ちたら 30 秒以内に起動し直す（起動するディストロは設置時の `WSL_DISTRO_NAME`）。アンインストールはタスクを止め、保持中の `wsl.exe` も終了してから削除する。ログオン時に加えて 5 分ごとにも起動し、タスク自体が落ちても 5 分以内に戻る（2026-11-09 にタスクが `0xC000013A` で終了したまま放置された対策）。macOS と WSL 以外の Linux では登録しない（判定は `/proc/sys/kernel/osrelease` の `microsoft`。`CLAUDE_HUB_WSL=1|0` で上書き可）
-  - 意図的に WSL を止めるとき: 先に Windows 側で `Stop-ScheduledTask -TaskName claude-hub-wsl-keepalive`（止めないと `wsl --shutdown` しても 30 秒で起動し直す）
+  - 意図的に WSL を止めるとき: Windows 側で `Disable-ScheduledTask -TaskName claude-hub-wsl-keepalive` → `Stop-ScheduledTask -TaskName claude-hub-wsl-keepalive` → `wsl --shutdown`。Stop だけだと 5 分ごとのトリガーでタスクが戻り、何もしないと `wsl --shutdown` しても 30 秒で起動し直す。再開は `Enable-ScheduledTask` → `Start-ScheduledTask`
   - 状態確認: `powershell.exe -NoProfile -Command "Get-ScheduledTask claude-hub-wsl-keepalive; Get-ScheduledTaskInfo claude-hub-wsl-keepalive"`（`State=Running` が正常）
 - テスト: `bash scripts/test-install-autostart.sh`（OS 検出・placeholder 置換・unit 契約・WSL keep-alive の配線と ps1 の設定値を systemctl/launcher/タスクスケジューラに触れず検証。CI は ubuntu と macOS の両方で実行）
 - 復旧確認: `systemctl --user is-active claude-hub-supervisor claude-hub-hijoguchi`（両 active）+ `tmux ls`（3 セッション）
