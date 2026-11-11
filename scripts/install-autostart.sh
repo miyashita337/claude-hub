@@ -19,6 +19,10 @@
 #   3. systemd is PID 1 (incl. WSL2)     -> systemd
 #   else: error (no supported init system found)
 #
+# On WSL (systemd path + Microsoft kernel) it also registers the Windows-side
+# keep-alive task (scripts/install-wsl-keepalive.ps1). macOS and native Linux
+# skip that step: launchd/systemd there run on the host itself, no VM to keep up.
+#
 # Usage:
 #   bash scripts/install-autostart.sh              # install for this OS
 #   bash scripts/install-autostart.sh --uninstall  # remove for this OS
@@ -39,6 +43,10 @@ UNIT_HEALTH_TIMER="claude-hub-healthcheck.timer"
 # Issue #63) — same status as the IDs filled into an installed launchd plist.
 LAUNCHER_SUPERVISOR="${HOME}/start-claude-hub-supervisor.sh"
 LAUNCHER_HIJOGUCHI="${HOME}/start-hijoguchi-wsl.sh"
+# WSL only: systemd starts the bots when the VM boots, but nothing on the
+# Windows side keeps the VM itself up (2026-11-05: VM powered off overnight,
+# bots down 12h). This registers a Windows scheduled task that holds WSL open.
+KEEPALIVE_PS1="${REPO_DIR}/scripts/install-wsl-keepalive.ps1"
 
 MODE="install"
 DRY_RUN=0
@@ -66,6 +74,48 @@ detect_init() {
   echo "unknown"; return 0
 }
 
+# WSL vs. native Linux share the systemd path; only WSL needs the Windows-side
+# keep-alive. CLAUDE_HUB_WSL=1|0 overrides detection (tests, odd kernels).
+is_wsl() {
+  case "${CLAUDE_HUB_WSL:-}" in
+    1) return 0 ;;
+    0) return 1 ;;
+  esac
+  grep -qi microsoft /proc/sys/kernel/osrelease 2>/dev/null
+}
+
+# ----- WSL keep-alive (Windows scheduled task) --------------------------------
+
+# $1 = "" (install) or "-Uninstall". Returns non-zero on failure so the caller
+# can surface it like the linger gap instead of silently skipping.
+wsl_keepalive_run() {
+  if ! command -v powershell.exe >/dev/null 2>&1 || ! command -v wslpath >/dev/null 2>&1; then
+    log "WARN: powershell.exe / wslpath not found (WSL interop disabled?) — cannot manage the WSL keep-alive task."
+    return 1
+  fi
+  local win_path; win_path="$(wslpath -w "${KEEPALIVE_PS1}")"
+  # shellcheck disable=SC2086  # $1 is intentionally empty or a single switch
+  powershell.exe -NoProfile -ExecutionPolicy Bypass -File "${win_path}" $1
+}
+
+wsl_keepalive_install() {
+  if [ "$DRY_RUN" = "1" ]; then
+    log "[dry-run] WSL detected: would register Windows task claude-hub-wsl-keepalive via ${KEEPALIVE_PS1}"
+    return 0
+  fi
+  if wsl_keepalive_run ""; then
+    log "Registered Windows task claude-hub-wsl-keepalive (keeps the WSL VM up; re-boots it within 30s if killed)."
+  else
+    log "ACTION REQUIRED: WSL keep-alive task not registered. Bots stop whenever Windows powers off the VM."
+    log "  Run from WSL: powershell.exe -NoProfile -ExecutionPolicy Bypass -File \"\$(wslpath -w ${KEEPALIVE_PS1})\""
+    return 1
+  fi
+}
+
+wsl_keepalive_uninstall() {
+  wsl_keepalive_run "-Uninstall" || log "WARN: could not remove Windows task claude-hub-wsl-keepalive (remove it from Task Scheduler manually)."
+}
+
 # ----- systemd (WSL2/Linux) --------------------------------------------------
 
 systemd_user_dir() { echo "${XDG_CONFIG_HOME:-$HOME/.config}/systemd/user"; }
@@ -87,6 +137,7 @@ systemd_install() {
     render_unit "${SYSTEMD_SRC}/${UNIT_HIJOGUCHI}"
     echo "----"
     log "[dry-run] would enable-linger, daemon-reload, enable --now both units"
+    if is_wsl; then wsl_keepalive_install; else log "[dry-run] native Linux: no WSL keep-alive task"; fi
     return 0
   fi
 
@@ -132,6 +183,13 @@ systemd_install() {
   log "Enabled + started both units + healthcheck timer. Status:"
   systemctl --user --no-pager --full status "${UNIT_SUPERVISOR}" "${UNIT_HIJOGUCHI}" 2>&1 | grep -E 'Loaded|Active' || true
 
+  # Without the keep-alive the units above only run while something else keeps
+  # the VM up — same "looks installed but won't survive" gap as missing linger.
+  local keepalive_ok=1
+  if is_wsl; then
+    wsl_keepalive_install || keepalive_ok=0
+  fi
+
   # linger is required for the stated goal (boot-without-login, Issue #552). The
   # services are up + enabled now, but without linger they stop when the last
   # session closes and won't start before first login. Return non-zero so the
@@ -142,6 +200,7 @@ systemd_install() {
     log "    sudo loginctl enable-linger $USER"
     return 1
   fi
+  [ "$keepalive_ok" = 1 ]
 }
 
 systemd_uninstall() {
@@ -151,6 +210,8 @@ systemd_uninstall() {
   rm -f "${dest}/${UNIT_SUPERVISOR}" "${dest}/${UNIT_HIJOGUCHI}" \
         "${dest}/${UNIT_HEALTH_SVC}" "${dest}/${UNIT_HEALTH_TIMER}"
   systemctl --user daemon-reload 2>/dev/null || true
+  # Remove the keep-alive too, or it keeps re-booting a VM the user wants down.
+  if is_wsl; then wsl_keepalive_uninstall; fi
   log "Removed systemd user units. (linger left intact; run 'loginctl disable-linger $USER' to undo.)"
 }
 

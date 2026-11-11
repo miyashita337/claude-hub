@@ -12,6 +12,8 @@ logs/
 
 # Runtime
 pids/
+# Discord attachments saved by the supervisor (GC'd daily, see bot-operations.md)
+tmp/
 
 # OS
 .DS_Store

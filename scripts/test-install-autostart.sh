@@ -65,6 +65,39 @@ echo "=== 4. launchd dry-run delegates to install-hijoguchi.sh ==="
 assert "launchd mentions install-hijoguchi.sh" contains "$out_mac" "install-hijoguchi.sh"
 assert "launchd mentions supervisor plist"     contains "$out_mac" "com.claude-hub.supervisor.plist"
 
+echo "=== 5. WSL keep-alive task is wired only on WSL ==="
+out_wsl="$(CLAUDE_HUB_WSL=1 run_installer systemd)"
+assert "WSL: dry-run would register keep-alive task" contains "$out_wsl" "would register Windows task claude-hub-wsl-keepalive"
+out_linux="$(CLAUDE_HUB_WSL=0 run_installer systemd)"
+assert "native Linux: no keep-alive task"          not_contains "$out_linux" "claude-hub-wsl-keepalive"
+assert "native Linux: says it skips keep-alive"    contains "$out_linux" "no WSL keep-alive task"
+out_mac_wsl="$(CLAUDE_HUB_WSL=1 run_installer launchd)"
+assert "macOS: never touches the WSL keep-alive"   not_contains "$out_mac_wsl" "keepalive"
+
+echo "=== 6. keep-alive ps1 keeps its load-bearing settings ==="
+PS1="${REPO_DIR}/scripts/install-wsl-keepalive.ps1"
+ps1_body="$(cat "${PS1}")"
+assert "ps1: task name matches installer"          contains "$ps1_body" "'claude-hub-wsl-keepalive'"
+# Default PT72H would silently kill the loop after 3 days.
+assert "ps1: ExecutionTimeLimit is zero"           contains "$ps1_body" "-ExecutionTimeLimit ([TimeSpan]::Zero)"
+assert "ps1: starts at logon"                      contains "$ps1_body" "New-ScheduledTaskTrigger -AtLogOn"
+# A dead loop is only relaunched by a repeating trigger (2026-11-09 incident).
+assert "ps1: repeating watchdog trigger"           contains "$ps1_body" "-RepetitionInterval"
+assert "ps1: no duplicate loops (IgnoreNew)"       contains "$ps1_body" "-MultipleInstances IgnoreNew"
+assert "ps1: supports -Uninstall"                  contains "$ps1_body" "[switch]\$Uninstall"
+assert "ps1: no hardcoded user path"               not_contains "$ps1_body" "C:\\Users\\"
+
+# Parse check where PowerShell exists (GitHub ubuntu/macos runners ship pwsh).
+if command -v pwsh >/dev/null 2>&1; then
+  # -Command does not populate $args, so the path is spliced in (repo paths
+  # contain no single quotes).
+  parse_out="$(pwsh -NoProfile -Command "\$e=\$null; [void][System.Management.Automation.Language.Parser]::ParseFile('${PS1}',[ref]\$null,[ref]\$e); \$e | ForEach-Object { \$_.Message }" 2>&1)"
+  assert "ps1: parses without syntax errors" test -z "$parse_out"
+  [ -n "$parse_out" ] && echo "$parse_out"
+else
+  echo "SKIP: pwsh not installed — ps1 parse check"
+fi
+
 echo
 echo "=== Summary: ${PASS} passed, ${FAIL} failed ==="
 [ "$FAIL" -eq 0 ]
