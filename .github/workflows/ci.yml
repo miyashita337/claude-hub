@@ -191,6 +191,7 @@ jobs:
                    tests/commands/session-status.test.ts \
                    tests/config/access-policy.test.ts \
                    tests/config/check-access-policy.test.ts \
+                   tests/config/channels-chrome.test.ts \
                    tests/discord/in-memory-client.test.ts \
                    tests/discord/real-client.test.ts \
                    tests/discord/mentions.test.ts \
