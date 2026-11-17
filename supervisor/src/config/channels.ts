@@ -54,6 +54,8 @@ export const CHANNEL_MAP = new Map<string, ChannelConfig>([
       channelName: "corp",
       dir: resolve(home, "corp"),
       displayName: "Corp CEO",
+      // #566: 記事の棚卸しで note 下書きの確認・作成・画像挿入（Claude in Chrome）を行う。
+      chromeEnabled: true,
       // #449: 朝レポのタップ決裁。コマンドの契約は corp src/cli.ts
       // （runProposalsCmd / runDecideProposalCmd）。--silent で npm の run
       // banner を stdout から除き、JSON だけを受け取る。
@@ -84,6 +86,8 @@ export const CHANNEL_MAP = new Map<string, ChannelConfig>([
       channelName: "team-salary",
       dir: resolve(home, "team_salary"),
       displayName: "Team Salary",
+      // #566: social 部署。記事 dispatch で note 下書きを Claude in Chrome で作成・更新する。
+      chromeEnabled: true,
     },
   ],
   [
