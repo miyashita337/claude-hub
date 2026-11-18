@@ -39,7 +39,8 @@ CI 版（Issue #111）が拾えない以下の局面を対象とする:
 | `--timeout-welcome <ms>` | `5000` | Welcome 待ち timeout |
 | `--timeout-response <ms>` | `30000` | 応答待ち timeout |
 | `--keep-thread` | off | 終了後に `/session stop` を送らず thread を残す（デバッグ用） |
-| `--skip-stop` | off | `/session stop` 検証をスキップ |
+| `--skip-stop` | off | `/session stop` 検証をスキップ（手順 4.5 の resume も行わない） |
+| `--skip-resume` | off | 手順 4.5（`/session resume` 検証）をスキップ |
 | `--expect-fail` | off | supervisor 停止状態での **失敗ケース検証**（Welcome timeout → FAIL を期待値とする） |
 
 > **重要（#175 補正）**: Issue 本文の初版は無引数 `/session start` を想定していたが、現行仕様では
@@ -60,6 +61,13 @@ DB="${SUPERVISOR_DB_PATH:-$HOME/claude-hub/supervisor/sessions.db}"; echo "db=$D
 ```
 
 `mcp__claude-in-chrome__list_connected_browsers` で拡張接続を確認。未接続なら停止。
+
+信頼されていないフォルダでの起動（フォルダ信頼の確認画面を Supervisor が承認する経路、#569 / #571）は
+Discord 経由では再現できない（対象チャンネルのフォルダが信頼済みだと画面が出ない）ため、実機検証ツールで別に確かめる:
+
+```bash
+bun supervisor/tools/verify-folder-trust.ts   # PASS: all cases / exit 0 を期待
+```
 
 ### 手順 1: Discord チャンネルへ navigate
 
@@ -108,6 +116,37 @@ DB="${SUPERVISOR_DB_PATH:-$HOME/claude-hub/supervisor/sessions.db}"; echo "db=$D
 
 4. アーカイブ screenshot を撮影
 
+`stopped_reason` は停止処理の途中で一時的に `tmux_exited` になり、その後 `manual` で確定する
+（高負荷時は数十秒かかる）。`stopped` になった時点で PASS とし、理由は確定後の値を記録する。
+
+### 手順 4.5: `/session resume <session_id>` → 会話の引き継ぎ確認
+
+`--keep-thread` / `--skip-stop` / `--skip-resume` 指定時はスキップ。会話の中身が引き継がれたことまで確かめるため、
+手順 3 の後（手順 4 の前）に、スレッドで次の合言葉を覚えさせておく:
+
+- `合言葉は ringo です。覚えたら OK とだけ返して` → `OK` が返ること
+
+手順 4 で止めた後:
+
+1. 停止した行の `claude_session_id` を取得
+
+   ```bash
+   sqlite3 "$DB" "SELECT claude_session_id FROM sessions WHERE thread_id='<手順 2 の thread_id>';"
+   ```
+
+2. **親チャンネル**（スレッド内ではない）で `/session resume` → `session_id` に上の値を入力 → Return
+3. **DB polling**: 同じ `claude_session_id` で `status='running'` の新しい行が出るまで待つ。
+   大きい会話や高負荷時は resume の準備に時間がかかるため、最大 5 分待つ（#163）
+
+   ```bash
+   sqlite3 "$DB" "SELECT thread_id,status FROM sessions WHERE claude_session_id='<id>' AND status='running';"
+   ```
+
+4. **検証**: 新しいスレッド（タイトル先頭 ♻️）に「♻️ … のセッションを復帰しました（resume）」が表示されること。
+   停止時に消えた worktree は作り直される（ログに `Re-created worktree for branch`、#217）
+5. 新しいスレッドで `さっきの合言葉は？単語だけ返して` を送信し、**`ringo` が返ること**（＝会話履歴が引き継がれた）
+6. 新しいスレッドで `/session stop` を送り、手順 4 と同じく `stopped` を確認
+
 ### 手順 5: レポート出力
 
 下記フォーマットで 1 メッセージにまとめて出力する。
@@ -120,7 +159,9 @@ DB="${SUPERVISOR_DB_PATH:-$HOME/claude-hub/supervisor/sessions.db}"; echo "db=$D
 | /session start → Welcome 表示 | < 5s | 4.2s | ✅ |
 | Welcome → ping 応答 | < 30s | 28.7s | ✅ |
 | /session stop → アーカイブ | < 5s | 3.1s | ✅ |
-| 総合 | 全 PASS | 3/3 PASS | ✅ |
+| /session resume → 復帰スレッド | < 5min | 32s | ✅ |
+| 復帰後に合言葉 → `ringo` | < 30s | 9.8s | ✅ |
+| 総合 | 全 PASS | 5/5 PASS | ✅ |
 
 スクリーンショット:
 - ss_xxxx (welcome 表示)
