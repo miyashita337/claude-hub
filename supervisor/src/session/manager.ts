@@ -303,17 +303,33 @@ const INPUT_READY_POLL_ATTEMPTS = 60;
  *   `   Yes, I trust this folder`
  *   ` Enter to confirm · Esc to cancel`
  *
- * Both option lines are required, adjacent and in this order, so prose that
- * merely quotes one of them does not match. An optional `N.` prefix tolerates
- * a numbered rendering.
+ * Both option lines must each be a whole line, adjacent and in this order, and
+ * the confirm footer must be present, so prose that merely quotes an option
+ * does not match. An optional `N.` prefix tolerates a numbered rendering.
  *
- * Accepting is safe here: every projectDir comes from CHANNEL_MAP, i.e. a
- * folder the owner registered for this Supervisor.
+ * Trust scope (PR #570 review): the dialog is accepted only when the folder it
+ * names (`Accessing workspace:` line) is exactly the session's projectDir —
+ * either the CHANNEL_MAP folder the owner registered, or the worktree the
+ * Supervisor itself created under it for a `/session start <branch>` issued by
+ * an allowFrom user (a branch of that same owner repo). Any other path, or a
+ * path the pane does not show in full, is left untouched and the dialog stays.
  */
 const FOLDER_TRUST_RE =
-  /^[\s❯]*(?:\d+\.\s*)?No, exit\b.*\n[\s❯]*(?:\d+\.\s*)?Yes, I trust this folder\b/m;
+  /^[ \t❯]*(?:\d+\.[ \t]*)?No, exit[ \t]*\n[ \t❯]*(?:\d+\.[ \t]*)?Yes, I trust this folder[ \t]*$/m;
+const FOLDER_TRUST_FOOTER_RE = /^[ \t]*Enter to confirm[ \t]*·[ \t]*Esc to cancel[ \t]*$/m;
+const FOLDER_TRUST_WORKSPACE_RE = /^[ \t]*Accessing workspace:[ \t]*\n[ \t]*(\S.*?)[ \t]*$/m;
 /** The trust dialog's cursor already rests on the "Yes" option. */
-const FOLDER_TRUST_YES_SELECTED_RE = /^\s*❯\s*(?:\d+\.\s*)?Yes, I trust this folder\b/m;
+const FOLDER_TRUST_YES_SELECTED_RE = /^[ \t]*❯[ \t]*(?:\d+\.[ \t]*)?Yes, I trust this folder[ \t]*$/m;
+
+/**
+ * Keys that accept the folder-trust dialog in `pane` for `projectDir`, or null
+ * when the pane does not show that dialog for exactly that folder.
+ */
+export function folderTrustAcceptKeys(pane: string, projectDir: string): string[] | null {
+  if (!FOLDER_TRUST_RE.test(pane) || !FOLDER_TRUST_FOOTER_RE.test(pane)) return null;
+  if (pane.match(FOLDER_TRUST_WORKSPACE_RE)?.[1] !== projectDir) return null;
+  return FOLDER_TRUST_YES_SELECTED_RE.test(pane) ? ["C-m"] : ["Down", "C-m"];
+}
 
 /**
  * Build the argv for the `claude` invocation in a supervisor session.
@@ -2247,12 +2263,13 @@ export class SessionManager {
       if (!(await this.effects.tmux.hasSession(tmuxName))) return false;
       const pane = await this.effects.tmux.capturePane(tmuxName);
       if (INPUT_READY_RE.test(pane)) return true;
-      if (FOLDER_TRUST_RE.test(pane)) {
-        // Issue #569: answer "Yes, I trust this folder" so the TUI can become
-        // ready; otherwise the relay's Escape quits Claude Code. Keys are
-        // derived from where the cursor is now, so a re-poll that still sees
-        // the dialog never toggles the selection back to "No, exit".
-        const keys = FOLDER_TRUST_YES_SELECTED_RE.test(pane) ? ["C-m"] : ["Down", "C-m"];
+      // Issue #569: answer "Yes, I trust this folder" so the TUI can become
+      // ready; otherwise the relay's Escape quits Claude Code. Keys are derived
+      // from where the cursor is now, so a re-poll that still sees the dialog
+      // never toggles the selection back to "No, exit".
+      const projectDir = this.sessions.get(threadId)?.projectDir;
+      const keys = projectDir ? folderTrustAcceptKeys(pane, projectDir) : null;
+      if (keys) {
         console.log(
           `[SessionManager] Folder-trust dialog on ${tmuxName}; accepting (keys: ${keys.join(" ")})`
         );

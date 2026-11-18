@@ -79,86 +79,135 @@ describe("SessionManager.waitForInputReady (RW-025/047)", () => {
  * Issue #569: an untrusted projectDir (e.g. a corp worktree) shows Claude
  * Code's folder-trust dialog instead of the input-ready marker, and the relay's
  * leading Escape answers it with "cancel" — Claude Code quits on the first
- * message. waitForInputReady must accept the dialog so the TUI becomes ready.
+ * message. waitForInputReady must accept the dialog so the TUI becomes ready,
+ * but only for the session's own projectDir (PR #570 review).
  */
+const { folderTrustAcceptKeys } = await import("../../src/session/manager");
+
+const PROJECT_DIR = "/Users/x/corp/.claude/worktrees/1119";
+
+// Verbatim shape of the pane captured in Issue #569 (Claude Code v2.1.327).
+function trustPane(dir: string = PROJECT_DIR, cursorOnYes = false): string {
+  return [
+    " Accessing workspace:",
+    ` ${dir}`,
+    " Quick safety check: Is this a project you created or one you trust?",
+    cursorOnYes ? "   No, exit" : " ❯ No, exit",
+    cursorOnYes ? " ❯ Yes, I trust this folder" : "   Yes, I trust this folder",
+    " Enter to confirm · Esc to cancel",
+  ].join("\n");
+}
+
+describe("folderTrustAcceptKeys (#569)", () => {
+  test("cursor on 'No, exit' → Down then Enter", () => {
+    expect(folderTrustAcceptKeys(trustPane(), PROJECT_DIR)).toEqual(["Down", "C-m"]);
+  });
+
+  test("cursor already on 'Yes' → Enter only", () => {
+    expect(folderTrustAcceptKeys(trustPane(PROJECT_DIR, true), PROJECT_DIR)).toEqual(["C-m"]);
+  });
+
+  test("a numbered rendering of the options is still accepted", () => {
+    const pane = trustPane().replace("❯ No, exit", "❯ 1. No, exit").replace(
+      "   Yes, I trust this folder",
+      "   2. Yes, I trust this folder"
+    );
+    expect(folderTrustAcceptKeys(pane, PROJECT_DIR)).toEqual(["Down", "C-m"]);
+  });
+
+  test("a dialog for a different folder is not accepted", () => {
+    expect(folderTrustAcceptKeys(trustPane("/Users/x/elsewhere"), PROJECT_DIR)).toBeNull();
+  });
+
+  test("a dialog for a parent of the projectDir is not accepted", () => {
+    expect(folderTrustAcceptKeys(trustPane("/Users/x/corp"), PROJECT_DIR)).toBeNull();
+  });
+
+  test("without the confirm footer it is not treated as the dialog", () => {
+    const pane = trustPane().replace(" Enter to confirm · Esc to cancel", "");
+    expect(folderTrustAcceptKeys(pane, PROJECT_DIR)).toBeNull();
+  });
+
+  test("prose that continues past the option text does not match", () => {
+    const pane = [
+      " Accessing workspace:",
+      ` ${PROJECT_DIR}`,
+      "No, exit the current screen first.",
+      "Yes, I trust this folder is the label.",
+      " Enter to confirm · Esc to cancel",
+    ].join("\n");
+    expect(folderTrustAcceptKeys(pane, PROJECT_DIR)).toBeNull();
+  });
+});
+
 describe("SessionManager.waitForInputReady folder-trust dialog (#569)", () => {
   let manager: InstanceType<typeof SessionManager>;
   let effects: FakeSessionEffects;
 
-  // Verbatim shape of the pane captured in Issue #569 (Claude Code v2.1.327).
-  const TRUST_PANE = [
-    " Accessing workspace:",
-    " /Users/x/corp/.claude/worktrees/1119",
-    " Quick safety check: Is this a project you created or one you trust?",
-    " ❯ No, exit",
-    "   Yes, I trust this folder",
-    " Enter to confirm · Esc to cancel",
-  ].join("\n");
+  function registerSession(projectDir: string): void {
+    // waitForInputReady reads the session's projectDir to scope the trust
+    // acceptance; register a minimal entry instead of driving start().
+    (manager as unknown as { sessions: Map<string, { projectDir: string }> }).sessions.set(
+      THREAD_ID,
+      { projectDir }
+    );
+  }
+
+  /** Make the fake pane switch to the ready screen once keys land. */
+  function becomeReadyOnKeys(): void {
+    const origSendKeys = effects.tmux.sendKeys.bind(effects.tmux);
+    effects.tmux.sendKeys = async (name, keys) => {
+      await origSendKeys(name, keys);
+      effects.tmux.setPaneContent(tmuxName, READY_PANE);
+    };
+  }
 
   beforeEach(() => {
     effects = createFakeEffects();
     manager = new SessionManager({
       effects,
       gracefulKillTimeoutMs: 0,
-      inputReadyPollAttempts: 50,
+      inputReadyPollAttempts: 5,
       inputReadyPollIntervalMs: 5,
     });
     effects.tmux.newSession(tmuxName, "claude ...");
   });
 
   afterEach(async () => {
+    (manager as unknown as { sessions: Map<string, unknown> }).sessions.clear();
     await manager?.shutdownAll();
   });
 
-  test("moves the cursor from 'No, exit' to 'Yes' and confirms, then reports ready", async () => {
-    effects.tmux.setPaneContent(tmuxName, TRUST_PANE);
-    // The fake pane switches to the ready screen once the keys land.
-    const origSendKeys = effects.tmux.sendKeys.bind(effects.tmux);
-    effects.tmux.sendKeys = async (name, keys) => {
-      await origSendKeys(name, keys);
-      effects.tmux.setPaneContent(tmuxName, READY_PANE);
-    };
+  test("accepts the dialog for the session's own projectDir, then reports ready", async () => {
+    registerSession(PROJECT_DIR);
+    effects.tmux.setPaneContent(tmuxName, trustPane());
+    becomeReadyOnKeys();
 
     expect(await manager.waitForInputReady(THREAD_ID)).toBe(true);
     expect(effects.tmux.sendKeysCalls).toEqual([{ name: tmuxName, keys: ["Down", "C-m"] }]);
   });
 
-  test("only confirms when the cursor already rests on 'Yes'", async () => {
-    effects.tmux.setPaneContent(
-      tmuxName,
-      TRUST_PANE.replace(" ❯ No, exit", "   No, exit").replace(
-        "   Yes, I trust this folder",
-        " ❯ Yes, I trust this folder"
-      )
-    );
-    const origSendKeys = effects.tmux.sendKeys.bind(effects.tmux);
-    effects.tmux.sendKeys = async (name, keys) => {
-      await origSendKeys(name, keys);
-      effects.tmux.setPaneContent(tmuxName, READY_PANE);
-    };
+  test("sends no keys when the dialog names a folder other than the session's projectDir", async () => {
+    registerSession("/Users/x/other-project");
+    effects.tmux.setPaneContent(tmuxName, trustPane());
 
-    expect(await manager.waitForInputReady(THREAD_ID)).toBe(true);
-    expect(effects.tmux.sendKeysCalls).toEqual([{ name: tmuxName, keys: ["C-m"] }]);
-  });
-
-  test("sends no keys for prose that merely mentions one of the options", async () => {
-    effects.tmux.setPaneContent(
-      tmuxName,
-      "⏺ The dialog offers \"Yes, I trust this folder\" or No, exit.\n❯ \n  ⏵⏵ bypass permissions on"
-    );
-
-    expect(await manager.waitForInputReady(THREAD_ID)).toBe(true);
+    expect(await manager.waitForInputReady(THREAD_ID)).toBe(false);
     expect(effects.tmux.sendKeysCalls).toEqual([]);
   });
 
-  test("never sends keys when the dialog is absent and the marker never appears", async () => {
-    manager = new SessionManager({
-      effects,
-      gracefulKillTimeoutMs: 0,
-      inputReadyPollAttempts: 3,
-      inputReadyPollIntervalMs: 5,
-    });
-    effects.tmux.setPaneContent(tmuxName, "Loading project context...");
+  test("sends no keys when no session is registered for the thread", async () => {
+    effects.tmux.setPaneContent(tmuxName, trustPane());
+
+    expect(await manager.waitForInputReady(THREAD_ID)).toBe(false);
+    expect(effects.tmux.sendKeysCalls).toEqual([]);
+  });
+
+  test("sends no keys for prose that quotes the options (no ready marker on screen)", async () => {
+    registerSession(PROJECT_DIR);
+    effects.tmux.setPaneContent(
+      tmuxName,
+      '⏺ The dialog offers "Yes, I trust this folder" or "No, exit".\n❯ '
+    );
 
     expect(await manager.waitForInputReady(THREAD_ID)).toBe(false);
     expect(effects.tmux.sendKeysCalls).toEqual([]);
