@@ -59,7 +59,9 @@ async function runCase(c: Case, index: number): Promise<boolean> {
   const base = realpathSync(mkdtempSync(join(tmpdir(), "trust-verify-")));
   const dir = c.suffix ? join(base, c.suffix) : base;
   mkdirSync(dir, { recursive: true });
-  const session = `trust-verify-${index}`;
+  // pid makes the name unique per run, so two concurrent runs on the shared
+  // socket never collide or kill each other's session in `finally` (PR #572 review).
+  const session = `trust-verify-${process.pid}-${index}`;
   const log = (msg: string) => console.log(`[${c.name}] ${msg}`);
   log(`folder (${dir.length} chars): ${dir}`);
 
