@@ -86,11 +86,14 @@ const { folderTrustAcceptKeys } = await import("../../src/session/manager");
 
 const PROJECT_DIR = "/Users/x/corp/.claude/worktrees/1119";
 
-// Verbatim shape of the pane captured in Issue #569 (Claude Code v2.1.327).
+// Shape of the real pane (Issue #571 measurement, Claude Code v2.1.327): a
+// blank line separates the header from the path.
 function trustPane(dir: string = PROJECT_DIR, cursorOnYes = false): string {
   return [
     " Accessing workspace:",
+    "",
     ` ${dir}`,
+    "",
     " Quick safety check: Is this a project you created or one you trust?",
     cursorOnYes ? "   No, exit" : " ❯ No, exit",
     cursorOnYes ? " ❯ Yes, I trust this folder" : "   Yes, I trust this folder",
@@ -115,6 +118,20 @@ describe("folderTrustAcceptKeys (#569)", () => {
     expect(folderTrustAcceptKeys(pane, PROJECT_DIR)).toEqual(["Down", "C-m"]);
   });
 
+  test("a path hard-wrapped at the pane width is joined back before comparing (#571)", () => {
+    // Verbatim wrap from an 80-column tmux pane (Issue #571).
+    const dir =
+      "/private/var/folders/g8/bstc0n_s6013tlqsf7vxvcy00000gp/T/trust-verify-wKYw4K/worktrees/" +
+      "x".repeat(70);
+    const pane = trustPane(dir).replace(
+      ` ${dir}`,
+      [" /private/var/folders/g8/bstc0n_s6013tlqsf7vxvcy00000gp/T/trust-verify-wKYw4K/w",
+       " orktrees/" + "x".repeat(69),
+       " x"].join("\n")
+    );
+    expect(folderTrustAcceptKeys(pane, dir)).toEqual(["Down", "C-m"]);
+  });
+
   test("a dialog for a different folder is not accepted", () => {
     expect(folderTrustAcceptKeys(trustPane("/Users/x/elsewhere"), PROJECT_DIR)).toBeNull();
   });
@@ -131,7 +148,9 @@ describe("folderTrustAcceptKeys (#569)", () => {
   test("prose that continues past the option text does not match", () => {
     const pane = [
       " Accessing workspace:",
+      "",
       ` ${PROJECT_DIR}`,
+      "",
       "No, exit the current screen first.",
       "Yes, I trust this folder is the label.",
       " Enter to confirm · Esc to cancel",
