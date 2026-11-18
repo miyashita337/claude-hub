@@ -282,7 +282,7 @@ function throwResumeSessionExited(
  * `/` while the TUI is still booting (CLAUDE.md / skills / MCP) and strand the
  * text un-submitted (RW-025 / RW-027 / RW-047 timing class).
  */
-const INPUT_READY_RE = /bypass permissions|\? for shortcuts/i;
+export const INPUT_READY_RE = /bypass permissions|\? for shortcuts/i;
 /**
  * Poll attempts (×interval) to detect the input-ready marker before giving up.
  * A fresh dispatch session (mcpProfile "none") boots in ~5-15s; 60×1s = 60s is a
@@ -317,7 +317,33 @@ const INPUT_READY_POLL_ATTEMPTS = 60;
 const FOLDER_TRUST_RE =
   /^[ \t❯]*(?:\d+\.[ \t]*)?No, exit[ \t]*\n[ \t❯]*(?:\d+\.[ \t]*)?Yes, I trust this folder[ \t]*$/m;
 const FOLDER_TRUST_FOOTER_RE = /^[ \t]*Enter to confirm[ \t]*·[ \t]*Esc to cancel[ \t]*$/m;
-const FOLDER_TRUST_WORKSPACE_RE = /^[ \t]*Accessing workspace:[ \t]*\n[ \t]*(\S.*?)[ \t]*$/m;
+const FOLDER_TRUST_WORKSPACE_HEADER_RE = /^[ \t]*Accessing workspace:[ \t]*$/;
+
+/**
+ * The folder path the trust dialog names, or null when it cannot be read.
+ *
+ * Measured on a real pane (Issue #571, Claude Code v2.1.327, 80-column tmux):
+ * a blank line separates the `Accessing workspace:` header from the path, and
+ * a path longer than the pane is hard-wrapped across lines, each indented by
+ * one space:
+ *   ` Accessing workspace:`
+ *   ``
+ *   ` /private/var/folders/…/trust-verify-wKYw4K/w`
+ *   ` orktrees/xxxx…`
+ * So: skip blank lines after the header, then join the following non-blank
+ * lines (trimmed) up to the next blank line. A space that falls exactly on a
+ * wrap boundary is lost, which only makes the comparison fail (no keys sent).
+ */
+function readTrustDialogWorkspace(pane: string): string | null {
+  const lines = pane.split("\n");
+  const header = lines.findIndex((l) => FOLDER_TRUST_WORKSPACE_HEADER_RE.test(l));
+  if (header < 0) return null;
+  let i = header + 1;
+  while (i < lines.length && !lines[i]!.trim()) i++;
+  const parts: string[] = [];
+  for (; i < lines.length && lines[i]!.trim(); i++) parts.push(lines[i]!.trim());
+  return parts.length ? parts.join("") : null;
+}
 /** The trust dialog's cursor already rests on the "Yes" option. */
 const FOLDER_TRUST_YES_SELECTED_RE = /^[ \t]*❯[ \t]*(?:\d+\.[ \t]*)?Yes, I trust this folder[ \t]*$/m;
 
@@ -327,7 +353,7 @@ const FOLDER_TRUST_YES_SELECTED_RE = /^[ \t]*❯[ \t]*(?:\d+\.[ \t]*)?Yes, I tru
  */
 export function folderTrustAcceptKeys(pane: string, projectDir: string): string[] | null {
   if (!FOLDER_TRUST_RE.test(pane) || !FOLDER_TRUST_FOOTER_RE.test(pane)) return null;
-  if (pane.match(FOLDER_TRUST_WORKSPACE_RE)?.[1] !== projectDir) return null;
+  if (readTrustDialogWorkspace(pane) !== projectDir) return null;
   return FOLDER_TRUST_YES_SELECTED_RE.test(pane) ? ["C-m"] : ["Down", "C-m"];
 }
 
