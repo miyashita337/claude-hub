@@ -292,6 +292,30 @@ const INPUT_READY_RE = /bypass permissions|\? for shortcuts/i;
 const INPUT_READY_POLL_ATTEMPTS = 60;
 
 /**
+ * Issue #569: Claude Code's folder-trust dialog, shown on launch in a folder
+ * whose `hasTrustDialogAccepted` is not set in `~/.claude.json` — even with
+ * `--dangerously-skip-permissions`. It blocks the TUI before the input-ready
+ * marker appears, and the relay's leading Escape (sendToPane) answers it with
+ * "cancel", which quits Claude Code: the session dies on its first message.
+ *
+ * Evidence (pane capture, Issue #569, Claude Code v2.1.327):
+ *   ` ❯ No, exit`
+ *   `   Yes, I trust this folder`
+ *   ` Enter to confirm · Esc to cancel`
+ *
+ * Both option lines are required, adjacent and in this order, so prose that
+ * merely quotes one of them does not match. An optional `N.` prefix tolerates
+ * a numbered rendering.
+ *
+ * Accepting is safe here: every projectDir comes from CHANNEL_MAP, i.e. a
+ * folder the owner registered for this Supervisor.
+ */
+const FOLDER_TRUST_RE =
+  /^[\s❯]*(?:\d+\.\s*)?No, exit\b.*\n[\s❯]*(?:\d+\.\s*)?Yes, I trust this folder\b/m;
+/** The trust dialog's cursor already rests on the "Yes" option. */
+const FOLDER_TRUST_YES_SELECTED_RE = /^\s*❯\s*(?:\d+\.\s*)?Yes, I trust this folder\b/m;
+
+/**
  * Build the argv for the `claude` invocation in a supervisor session.
  *
  * Issue #104 / Epic #101: by default supervisor sessions disable Chrome
@@ -2223,6 +2247,17 @@ export class SessionManager {
       if (!(await this.effects.tmux.hasSession(tmuxName))) return false;
       const pane = await this.effects.tmux.capturePane(tmuxName);
       if (INPUT_READY_RE.test(pane)) return true;
+      if (FOLDER_TRUST_RE.test(pane)) {
+        // Issue #569: answer "Yes, I trust this folder" so the TUI can become
+        // ready; otherwise the relay's Escape quits Claude Code. Keys are
+        // derived from where the cursor is now, so a re-poll that still sees
+        // the dialog never toggles the selection back to "No, exit".
+        const keys = FOLDER_TRUST_YES_SELECTED_RE.test(pane) ? ["C-m"] : ["Down", "C-m"];
+        console.log(
+          `[SessionManager] Folder-trust dialog on ${tmuxName}; accepting (keys: ${keys.join(" ")})`
+        );
+        await this.effects.tmux.sendKeys(tmuxName, keys);
+      }
       await new Promise((resolve) =>
         setTimeout(resolve, this.inputReadyPollIntervalMs)
       );
